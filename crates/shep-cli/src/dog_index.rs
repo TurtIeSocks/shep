@@ -237,8 +237,10 @@ pub async fn fetch_index(url: &str) -> Result<Index, IndexError> {
 /// HTTPS only, with a carve-out for a loopback literal: `SHEP_DOG_INDEX` is
 /// an override for testing and self-hosting, and there is no wire between
 /// two processes on one host. Exact equality against [`LOOPBACK_HOSTS`], so
-/// neither `http://127.0.0.1.example.com/` nor `http://evil.com@127.0.0.1/`
-/// talks its way through a prefix or suffix match.
+/// `http://127.0.0.1.example.com/` cannot talk its way through a prefix or
+/// suffix match. The sibling case, `http://evil.com@127.0.0.1/`, no longer
+/// reaches here at all: [`fetch::parse_url`] runs first and refuses a
+/// `user@` authority outright.
 ///
 /// # Errors
 /// - [`IndexError::InsecureUrl`] if `target` is `http://` and its host is
@@ -935,7 +937,6 @@ mod tests {
     async fn a_host_that_merely_contains_a_loopback_literal_is_still_refused() {
         for url in [
             "http://127.0.0.1.example.com/dogs.json",
-            "http://evil.com@127.0.0.1/dogs.json",
             "http://localhost.example.com/dogs.json",
         ] {
             assert!(
@@ -943,6 +944,21 @@ mod tests {
                 "{url} was not refused"
             );
         }
+    }
+
+    /// The third URL that used to sit in the loop above. It is still
+    /// refused, but a step earlier and by a different rule:
+    /// [`fetch::parse_url`] refuses a `user@` authority before
+    /// [`require_secure_url`] ever sees a host to compare.
+    #[tokio::test]
+    async fn a_loopback_literal_behind_a_userinfo_prefix_is_refused_at_parse_time() {
+        let err = fetch_index("http://evil.com@127.0.0.1/dogs.json")
+            .await
+            .expect_err("refused");
+        assert!(
+            matches!(err, IndexError::Fetch(FetchError::Url(_))),
+            "wrong variant: {err:?}"
+        );
     }
 
     /// The await's forcing mechanism is `fetch_index`'s own ten second

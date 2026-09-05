@@ -19,6 +19,7 @@ use crate::cli::{DogsArgs, FoldArgs, Format, SelectorArgs};
 use crate::commands::selector::parse_selector;
 use crate::dog_index::{self, AvailableDog, DogSourceKind};
 use crate::exit::ExitCode;
+use crate::fetch;
 use crate::flourish;
 use crate::output::{
     AvailableDogRows, DogRows, Render, RolledSheep, RolledSheepRows, Streams, emit, emit_described,
@@ -259,12 +260,26 @@ fn matches_filter(filter: &str, haystacks: &[&str]) -> bool {
 /// A failure to read or parse the index names the URL and exits
 /// [`ExitCode::Failure`]: [`dog_index::IndexError`] carries it on one
 /// variant only.
+///
+/// The one URL not named is one holding an `@`. A dog index URL is a
+/// public location, which is why this quotes it at all, but
+/// `SHEP_DOG_INDEX` is an operator's own string and nothing stops a
+/// password reaching it. This message is built here rather than by
+/// [`dog_index::IndexError`], so the refusals inside [`crate::fetch`] do
+/// not cover it, and it asks
+/// [`fetch::url_for_message`](crate::fetch::url_for_message) rather than
+/// deciding for itself: an earlier version asked
+/// `url_carries_credentials` instead and printed urls that `parse_url`
+/// had just withheld.
 pub async fn available_dogs(streams: &mut Streams<'_>, args: &DogsArgs) -> ExitCode {
     let url = dog_index::index_url();
     let index = match dog_index::fetch_index(&url).await {
         Ok(index) => index,
         Err(err) => {
-            let message = format!("reading the dog index from {url}: {err}");
+            let message = format!(
+                "reading the dog index from {}: {err}",
+                fetch::url_for_message(&url)
+            );
             return streams.fail(ExitCode::Failure, &message);
         }
     };

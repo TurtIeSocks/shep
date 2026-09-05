@@ -138,8 +138,9 @@ pub trait ConfigSource: Send + Sync {
 ///
 /// # Errors
 /// - [`rules::RulesError`] as [`rules::Rules::new`]: a rule routing to a
-///   sink the section does not define, an unknown event kind, or an
-///   insecure webhook scheme.
+///   sink the section does not define, an unknown event kind, or a sink
+///   url that cannot work (an insecure webhook scheme, or credentials
+///   before the host).
 pub fn rules_for(config: &BarkConfig) -> Result<Rules, rules::RulesError> {
     let rule_list = if config.rules.is_empty() {
         Rules::default_rules(&config.sinks)

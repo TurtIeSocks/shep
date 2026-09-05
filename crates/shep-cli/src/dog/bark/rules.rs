@@ -150,9 +150,10 @@ pub enum RulesError {
         /// The kind string that matches no [`ProcessEventKind`].
         kind: String,
     },
-    /// A `[bark.sinks]` entry is a Discord or Slack webhook configured
-    /// with `http://`. See [`sinks::require_secure_scheme`].
-    InsecureSink(SinkConfigError),
+    /// A `[bark.sinks]` entry's url cannot work: a Discord or Slack
+    /// webhook over `http://`, or a url carrying credentials before the
+    /// host. See [`sinks::require_usable_url`].
+    UnusableSink(SinkConfigError),
 }
 
 impl fmt::Display for RulesError {
@@ -168,7 +169,7 @@ impl fmt::Display for RulesError {
                 f,
                 "rule {index}'s event trigger names \"{kind}\", which is not an event kind on the wire"
             ),
-            Self::InsecureSink(source) => write!(f, "{source}"),
+            Self::UnusableSink(source) => write!(f, "{source}"),
         }
     }
 }
@@ -176,7 +177,7 @@ impl fmt::Display for RulesError {
 impl core::error::Error for RulesError {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
-            Self::InsecureSink(source) => Some(source),
+            Self::UnusableSink(source) => Some(source),
             Self::UnknownSink { .. } | Self::NoSinks { .. } | Self::UnknownKind { .. } => None,
         }
     }
@@ -184,7 +185,7 @@ impl core::error::Error for RulesError {
 
 impl From<SinkConfigError> for RulesError {
     fn from(source: SinkConfigError) -> Self {
-        Self::InsecureSink(source)
+        Self::UnusableSink(source)
     }
 }
 
@@ -222,12 +223,13 @@ impl Rules {
     /// - [`RulesError::NoSinks`]: a rule routes to no sink.
     /// - [`RulesError::UnknownKind`]: an `Event` rule names a kind that is
     ///   not on the wire.
-    /// - [`RulesError::InsecureSink`]: a `[dog.bark.sinks]` entry is a
-    ///   Discord or Slack webhook using `http://`, checked whether or not
-    ///   any rule routes to it.
+    /// - [`RulesError::UnusableSink`]: a `[dog.bark.sinks]` entry is a
+    ///   Discord or Slack webhook using `http://`, or carries credentials
+    ///   before its host. Both are checked whether or not any rule routes
+    ///   to that sink.
     pub fn new(rules: Vec<Rule>, sinks: &BTreeMap<String, Sink>) -> Result<Self, RulesError> {
         for (name, sink) in sinks {
-            sinks::require_secure_scheme(name, sink)?;
+            sinks::require_usable_url(name, sink)?;
         }
         for (index, rule) in rules.iter().enumerate() {
             if rule.sinks.is_empty() {
@@ -443,6 +445,29 @@ mod tests {
             },
         );
         sinks
+    }
+
+    /// The seam that matters: an operator hears about this when
+    /// `dogs.toml` is read, not when a rule first fires days later.
+    #[test]
+    fn a_sink_url_carrying_credentials_is_refused_when_the_rules_are_built() {
+        let mut sinks = BTreeMap::new();
+        sinks.insert(
+            "ops".to_owned(),
+            Sink::Json {
+                url: "http://user:hunter2@localhost/hook".to_owned(),
+                body: None,
+            },
+        );
+        let err = Rules::new(Vec::new(), &sinks).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RulesError::UnusableSink(SinkConfigError::UrlCredentials { .. })
+            ),
+            "{err:?}"
+        );
+        assert!(!format!("{err} {err:?}").contains("hunter2"));
     }
 
     fn base_info(name: &str, status: ProcStatus) -> ProcessInfo {

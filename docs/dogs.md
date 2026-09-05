@@ -207,6 +207,12 @@ within = "2m"
 sinks = ["oncall"]
 ```
 
+A sink URL cannot carry credentials. `https://user:pass@hooks.example.com/`
+is refused when `dogs.toml` is read, not when a rule first fires: nothing
+here sends an `Authorization` header, so the pair could only be discarded
+or sent as part of a hostname. Discord and Slack put the secret in the path
+instead, which is why the whole URL is a credential.
+
 Leave `[[bark.rules]]` out entirely and the bark dog does not stay
 silent — one rule is built in by default, firing on every configured sink
 whenever a sheep reaches `Errored`. That is deliberate: it is the alert

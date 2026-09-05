@@ -6,7 +6,7 @@
 //! lives in `crate::fetch`, shared with `shep dogs --available`.
 //!
 //! `http://` is accepted for a [`Sink::Json`] endpoint; only
-//! [`require_secure_scheme`] rejects it, for Discord and Slack. No
+//! [`require_usable_url`] rejects it, for Discord and Slack. No
 //! redirect is ever followed. This module's own tests exercise only the
 //! plaintext path; the TLS handshake is `rustls`'s tested surface, not
 //! this module's.
@@ -78,7 +78,7 @@ impl Sink {
     /// This sink's webhook URL, whichever variant it is.
     ///
     /// Not exposed past this module: [`deliver`] and
-    /// [`require_secure_scheme`] are the only callers.
+    /// [`require_usable_url`] are the only callers.
     fn url(&self) -> &str {
         match self {
             Self::Discord { url } | Self::Slack { url } | Self::Json { url, .. } => url,
@@ -113,6 +113,14 @@ pub enum SinkConfigError {
         /// `"discord"` or `"slack"`.
         kind: &'static str,
     },
+    /// Sink `name`'s url carries a `user@` or `user:pass@` prefix, which
+    /// [`crate::fetch::parse_url`] refuses. Caught here so an operator
+    /// hears about it when the config is read, rather than when a rule
+    /// first fires and the delivery fails.
+    UrlCredentials {
+        /// The sink's config key under `[dog.bark.sinks]`, never the url.
+        name: String,
+    },
 }
 
 impl fmt::Display for SinkConfigError {
@@ -124,13 +132,17 @@ impl fmt::Display for SinkConfigError {
                  {kind} only serves https://, and a {kind} webhook url is a \
                  bearer credential that must not travel in cleartext"
             ),
+            Self::UrlCredentials { name } => {
+                write!(f, "sink \"{name}\": {}", crate::fetch::CREDENTIALS_REFUSAL)
+            }
         }
     }
 }
 
 impl core::error::Error for SinkConfigError {}
 
-/// Refuses a Discord or Slack sink configured with `http://`.
+/// Refuses a sink whose url cannot work: a Discord or Slack webhook over
+/// `http://`, or any sink carrying credentials before the host.
 ///
 /// A Discord or Slack webhook url is the bearer credential; `http://`
 /// would let anyone on the wire capture it. discord.com and slack.com
@@ -138,10 +150,22 @@ impl core::error::Error for SinkConfigError {}
 /// [`Sink::Json`] is left permissive: an operator's own endpoint may
 /// legitimately have no TLS.
 ///
+/// One function rather than two called in sequence: the caller asks
+/// whether this sink's url is usable, and the next rule to be added
+/// belongs here rather than in a line somebody has to remember to add at
+/// the call site.
+///
 /// # Errors
+/// - [`SinkConfigError::UrlCredentials`]: `sink`'s url carries a `user@`
+///   or `user:pass@` prefix, whichever kind it is.
 /// - [`SinkConfigError::InsecureScheme`]: `sink` is [`Sink::Discord`] or
 ///   [`Sink::Slack`] with a url not starting `https://`.
-pub fn require_secure_scheme(name: &str, sink: &Sink) -> Result<(), SinkConfigError> {
+pub fn require_usable_url(name: &str, sink: &Sink) -> Result<(), SinkConfigError> {
+    if fetch::url_carries_credentials(sink.url()) {
+        return Err(SinkConfigError::UrlCredentials {
+            name: name.to_owned(),
+        });
+    }
     let Some(kind) = sink.https_only_kind() else {
         return Ok(());
     };
@@ -616,7 +640,7 @@ mod tests {
         let sink = Sink::Discord {
             url: "http://discord.com/api/webhooks/1/super-secret-token".to_string(),
         };
-        let err = require_secure_scheme("ops", &sink).unwrap_err();
+        let err = require_usable_url("ops", &sink).unwrap_err();
         assert!(matches!(
             err,
             SinkConfigError::InsecureScheme {
@@ -632,7 +656,7 @@ mod tests {
         let sink = Sink::Slack {
             url: "http://hooks.slack.com/services/T0/B0/super-secret-token".to_string(),
         };
-        let err = require_secure_scheme("ops", &sink).unwrap_err();
+        let err = require_usable_url("ops", &sink).unwrap_err();
         assert!(matches!(
             err,
             SinkConfigError::InsecureScheme { kind: "slack", .. }
@@ -648,7 +672,35 @@ mod tests {
             url: "http://127.0.0.1:8080/hook".to_string(),
             body: None,
         };
-        require_secure_scheme("ops", &sink).unwrap();
+        require_usable_url("ops", &sink).unwrap();
+    }
+
+    /// Refused whatever the kind. A `Json` sink's endpoint is the
+    /// operator's own and may be plain `http://`, but no kind can carry a
+    /// password, because nothing here sends an `Authorization` header.
+    #[test]
+    fn a_sink_url_carrying_credentials_is_refused_at_config_load() {
+        for sink in [
+            Sink::Json {
+                url: "http://user:hunter2@127.0.0.1:8080/hook".to_string(),
+                body: None,
+            },
+            Sink::Discord {
+                url: "https://user:hunter2@discord.com/api/webhooks/1/tok".to_string(),
+            },
+        ] {
+            let err = require_usable_url("ops", &sink).unwrap_err();
+            assert!(
+                matches!(err, SinkConfigError::UrlCredentials { .. }),
+                "{err:?}"
+            );
+            assert_eq!(
+                err.to_string(),
+                "sink \"ops\": credentials before the host (`user@` or `user:pass@`) are not \
+                 supported; the url is not echoed, since it carries one"
+            );
+            assert!(!format!("{err} {err:?}").contains("hunter2"));
+        }
     }
 
     // `Sink` has no `#[serde(flatten)]` near `deny_unknown_fields`, unlike

@@ -4707,6 +4707,52 @@ fn available_dogs_reports_a_server_error_naming_the_url() {
     assert!(stderr.contains("500"), "stderr: {stderr}");
 }
 
+/// The one url `available_dogs` does not name. `SHEP_DOG_INDEX` is an
+/// operator's own string, so a password can reach it, and this message is
+/// built outside `fetch` and outside `IndexError` where neither refusal
+/// covers it.
+#[test]
+fn available_dogs_names_no_url_that_carries_credentials() {
+    // A sentinel per component, none of them a substring of anything the
+    // message says on its own. A password redacted while the username or
+    // the host it was paired with still prints is a narrower leak, not a
+    // closed one.
+    for url in [
+        "ftp://sentineluser:hunter2@sentinelhost.invalid/dogs.json",
+        // Scheme-relative, so there is no `://` to split the authority on.
+        "//sentineluser:hunter2@sentinelhost.invalid/dogs.json",
+        // The `@` is in a path here, so the authority predicate says no
+        // and only the blunt printing rule stands between this and
+        // stderr. `parse_url` withheld this url while the sentence around
+        // it printed the same one, until both asked the same question.
+        "file:///etc/sentineluser:hunter2@sentinelhost.invalid",
+    ] {
+        let home = TempDir::new().unwrap();
+
+        let output = shep(home.path())
+            .env("SHEP_DOG_INDEX", url)
+            .arg("dogs")
+            .arg("--available")
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{url}: an unfetchable url must not exit success: {output:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for secret in ["hunter2", "sentineluser", "sentinelhost.invalid"] {
+            assert!(
+                !stderr.contains(secret),
+                "{url}: stderr printed {secret}: {stderr}"
+            );
+        }
+        assert!(
+            stderr.contains("a url that may carry credentials"),
+            "{url}: stderr must say why it withheld the url: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn available_dogs_reports_a_truncated_body_naming_the_url() {
     let home = TempDir::new().unwrap();

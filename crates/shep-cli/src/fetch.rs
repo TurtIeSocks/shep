@@ -2,7 +2,8 @@
 //! URL parsing ([`parse_url`]) and TLS setup ([`tls_connector`]) it shares
 //! with `dog::bark::sinks`. An HTTP client, where `crate::http` is a
 //! hand-rolled, TLS-free server. Either scheme is accepted; a caller
-//! wanting only `https://` enforces that itself.
+//! wanting only `https://` enforces that itself. A URL carrying
+//! credentials before the host (`user@`, `user:pass@`) is refused.
 //!
 //! [`get`] refuses, in this order: a 3xx naming a `Location`; any other
 //! non-2xx; any `Transfer-Encoding`, since it reads exactly
@@ -33,10 +34,16 @@ pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 
 /// A URL, parsed into what [`get`] needs to reach it.
 ///
-/// `Debug` is derived and not redacted: `parse_url` does not strip a
-/// `user:pass@host` authority, so `host` can carry credentials from a URL
-/// that has them.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// `Debug` is REDACTED (IR-41), and `path` is the field that needs it: a
+/// Discord or Slack webhook URL is a bearer credential and carries its
+/// token as a path segment, which is why
+/// [`Sink`](crate::dog::bark::sinks::Sink) redacts its own `Debug` too. A
+/// `Target` printed into a log, a panic message or an error chain must not
+/// hand that token to whoever reads the log.
+///
+/// `host` needs no redaction: [`parse_url`] refuses a `user@` or
+/// `user:pass@` authority rather than folding it into `host`.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Target {
     /// `true` for `https://`, `false` for `http://`.
     pub https: bool,
@@ -48,6 +55,19 @@ pub struct Target {
     pub path: String,
 }
 
+/// Manual: a derived `Debug` would print `path` in full, and `path` is
+/// where a webhook's own credential lives. Every `Target` collapses to its
+/// scheme, host and port, with `path` withheld.
+impl fmt::Debug for Target {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Target {{ https: {}, host: {:?}, port: {}, path: <redacted> }}",
+            self.https, self.host, self.port
+        )
+    }
+}
+
 /// Why [`parse_url`] or [`get`] failed.
 ///
 /// `Debug` needs no redaction: every field is a URL this module was given
@@ -56,6 +76,13 @@ pub struct Target {
 pub enum FetchError {
     /// `url` did not parse as an absolute `http://`/`https://` URL. Carries
     /// a human-readable reason, never the raw bytes of a malformed input.
+    ///
+    /// The reason quotes `url` only through [`url_for_message`], which
+    /// withholds anything holding an `@`. That is the backstop under
+    /// [`url_carries_credentials`], which reads an authority and so can
+    /// misread a url far enough off the grammar. An authority that really
+    /// does carry `user@` or `user:pass@` gets its own reason,
+    /// [`CREDENTIALS_REFUSAL`].
     Url(String),
     /// The connection failed, the TLS handshake failed, or the response
     /// was not well-formed HTTP: no parseable status line, a header block
@@ -152,46 +179,148 @@ impl From<std::io::Error> for FetchError {
     }
 }
 
+/// The reason [`parse_url`] and [`super::dog::bark::sinks`] both give for
+/// a URL carrying credentials. It names no URL, which is the point: the
+/// text being refused is the text holding the password.
+pub const CREDENTIALS_REFUSAL: &str = concat!(
+    "credentials before the host (`user@` or `user:pass@`) are not supported; ",
+    "the url is not echoed, since it carries one"
+);
+
+/// How `url` may be named in a message: itself, or a fixed placeholder.
+///
+/// Deliberately blunter than [`url_carries_credentials`], and deliberately
+/// the only rule any message consults. That predicate reads an authority,
+/// so it can say precisely why a sink was refused; this one asks only
+/// whether printing the text might print a secret, and an `@` anywhere is
+/// enough to decline.
+///
+/// Two rules for one question drift, and did: [`parse_url`] withheld
+/// `file:///etc/user:pw@host` on its own `@` test while
+/// [`available_dogs`](crate::commands::query::available_dogs) printed that
+/// same url in the sentence around it, because it asked the predicate
+/// instead.
+pub fn url_for_message(url: &str) -> &str {
+    if url.contains('@') {
+        "a url that may carry credentials"
+    } else {
+        url
+    }
+}
+
+/// Where `rest`, an authority followed by whatever came after it, stops
+/// being the authority.
+///
+/// `/`, `?` and `#` all end it. Splitting on `/` alone reads
+/// `example.com?contact=alice@example.com` as one authority, which makes
+/// [`url_carries_credentials`] call an `@` in a query a credential.
+fn authority_of(rest: &str) -> &str {
+    match rest.find(['/', '?', '#']) {
+        Some(i) => &rest[..i],
+        None => rest,
+    }
+}
+
+/// Whether `url`'s authority carries a `user@` or `user:pass@` prefix.
+///
+/// The rule [`parse_url`] refuses on, separated out so a caller holding a
+/// URL it has not parsed yet can refuse the same shape at config-load time
+/// rather than at first use.
+///
+/// Deliberately blind to the scheme, and to whether there is one at all.
+/// Keying this on `http://`/`https://` would have answered `false` for
+/// `ftp://user:pass@host/` and for `HTTPS://user:pass@host/`, which
+/// [`parse_url`] then refuses on the SCHEME instead, in a message that
+/// quotes the whole url and hands the password back. A url this cannot
+/// parse is exactly the one whose refusal must not echo it.
+///
+/// The cost is that `mailto:someone@example.com` reads as credentials.
+/// It is refused either way, and a wrong reason on a url nothing here can
+/// fetch is cheaper than a right one that prints a password.
+pub fn url_carries_credentials(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_scheme, rest)| rest);
+    // A scheme-relative url has an authority with no scheme in front of
+    // it, so there is no `://` to split on and the authority would
+    // otherwise read as the empty string before the first `/`.
+    let rest = rest.strip_prefix("//").unwrap_or(rest);
+    authority_of(rest).contains('@')
+}
+
 /// Parses `url` into a [`Target`] naming where [`get`] should connect.
 ///
 /// Hand-rolled: a fetch target is never more than a scheme, a host, an
 /// optional port and a path.
 ///
+/// Credentials before the host are refused rather than stripped: nothing
+/// downstream of here sends an `Authorization` header, so a `user:pass@`
+/// prefix could only ever be silently discarded or silently sent as part
+/// of a hostname. `ProbeTarget::parse` refuses the same shape for the same
+/// reason.
+///
+/// The authority ends at the first `/`, `?` or `#`. A query belongs to
+/// the path from there; a fragment is dropped, being the client's own and
+/// having no place in a request target.
+///
 /// # Errors
 /// - [`FetchError::Url`] if `url` does not start with `http://` or
-///   `https://`, names a non-numeric port, or names no host.
+///   `https://`, carries a `user@` or `user:pass@` authority, names a
+///   non-numeric port, or names no host. No such message quotes a `url`
+///   holding an `@`; see [`url_for_message`].
 pub fn parse_url(url: &str) -> Result<Target, FetchError> {
+    // Ahead of the host/port split, which trusts the last colon: without
+    // this, `user:pass@host:8443` parses to the host `user:pass@host` and
+    // `user:pass@host` to the host `user` and the port `pass@host`, so a
+    // password reaches either a `Target` field or, through that split's
+    // own refusal, an error message quoting the whole URL.
+    if url_carries_credentials(url) {
+        return Err(FetchError::Url(CREDENTIALS_REFUSAL.to_owned()));
+    }
     let (https, rest) = match url.strip_prefix("https://") {
         Some(rest) => (true, rest),
         None => match url.strip_prefix("http://") {
             Some(rest) => (false, rest),
             None => {
                 return Err(FetchError::Url(format!(
-                    "{url} does not start with http:// or https://"
+                    "{} does not start with http:// or https://",
+                    url_for_message(url)
                 )));
             }
         },
     };
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
+    let authority = authority_of(rest);
+    let remainder = &rest[authority.len()..];
+    // A fragment is the client's own: RFC 3986 gives it no meaning to a
+    // server and RFC 7230's origin-form target has no field for it, so
+    // carrying it into `path` would put it on the wire in the request
+    // line. A query is the opposite and belongs there.
+    let remainder = remainder.split('#').next().unwrap_or(remainder);
+    // A `?` remainder has no leading `/` of its own and an origin-form
+    // target needs one, as does an absent path.
+    let path = match remainder.chars().next() {
+        Some('/') => remainder.to_owned(),
+        Some(_) => format!("/{remainder}"),
+        None => "/".to_owned(),
     };
     let (host, port) = match authority.rsplit_once(':') {
         Some((h, p)) => (
             h,
-            p.parse()
-                .map_err(|_err| FetchError::Url(format!("{url} has a non-numeric port")))?,
+            p.parse().map_err(|_err| {
+                FetchError::Url(format!("{} has a non-numeric port", url_for_message(url)))
+            })?,
         ),
         None => (authority, if https { 443 } else { 80 }),
     };
     if host.is_empty() {
-        return Err(FetchError::Url(format!("{url} has no host")));
+        return Err(FetchError::Url(format!(
+            "{} has no host",
+            url_for_message(url)
+        )));
     }
     Ok(Target {
         https,
         host: host.to_string(),
         port,
-        path: path.to_string(),
+        path,
     })
 }
 
@@ -674,6 +803,122 @@ mod tests {
             Err(FetchError::Url(_))
         ));
         assert!(matches!(parse_url("not a url"), Err(FetchError::Url(_))));
+    }
+
+    /// Both halves matter. The refusal is the fix; the exact string is
+    /// what proves the refusal did not itself print the password, which is
+    /// what quoting `url` in the message would have done.
+    #[test]
+    fn a_url_carrying_credentials_is_refused_without_echoing_them() {
+        for url in [
+            "https://user:hunter2@example.com:8443/webhook",
+            "https://user:hunter2@example.com/webhook",
+            "http://hunter2@example.com/webhook",
+            // Schemes this module cannot fetch at all. Each used to be
+            // refused on the scheme, in a message quoting the whole url.
+            "ftp://user:hunter2@example.com/webhook",
+            "HTTPS://user:hunter2@example.com/webhook",
+            "user:hunter2@example.com/webhook",
+            // Scheme-relative: an authority with nothing in front of it,
+            // so there is no `://` to find and the leading `//` has to be
+            // stepped over or the authority reads as empty.
+            "//user:hunter2@example.com/webhook",
+        ] {
+            let err = parse_url(url).unwrap_err();
+            assert!(matches!(err, FetchError::Url(_)), "{url}: {err:?}");
+            assert_eq!(
+                err.to_string(),
+                "not a fetchable url: credentials before the host (`user@` or `user:pass@`) are \
+                 not supported; the url is not echoed, since it carries one",
+                "{url}"
+            );
+            assert!(!format!("{err} {err:?}").contains("hunter2"), "{url}");
+        }
+    }
+
+    /// The backstop under [`url_carries_credentials`]. That predicate
+    /// reads an authority, and a url far enough off the grammar is one it
+    /// can misread: in each of these the `@` is in a path, so the
+    /// predicate says `false` and some other refusal is what sees the url.
+    /// Every refusal names the url through [`url_for_message`] rather than
+    /// trusting the predicate to have been right about where the authority
+    /// ended.
+    #[test]
+    fn no_refusal_quotes_a_url_holding_an_at_sign() {
+        for url in [
+            // Refused on the scheme.
+            "file:///etc/pass@wd",
+            // Refused on the port, with the `@` off in the path.
+            "https://example.com:notaport/etc/pass@wd",
+        ] {
+            assert!(!url_carries_credentials(url), "{url}");
+            let err = parse_url(url).unwrap_err();
+            let rendered = format!("{err} {err:?}");
+            assert!(!rendered.contains("pass@wd"), "{url}: {rendered}");
+            assert!(
+                rendered.contains("a url that may carry credentials"),
+                "{url}: {rendered}"
+            );
+        }
+    }
+
+    /// Neither a query nor a fragment is part of the host. Reading them as
+    /// authority made an `@` in a query look like a credential, so
+    /// `?contact=alice@example.com` was refused as one.
+    ///
+    /// They part company after that: a query is the request target's, a
+    /// fragment is the client's and is dropped.
+    #[test]
+    fn a_query_joins_the_path_and_a_fragment_is_dropped() {
+        for (url, path) in [
+            (
+                "https://example.com?contact=alice@example.com",
+                "/?contact=alice@example.com",
+            ),
+            ("https://example.com#a@b", "/"),
+            ("https://example.com/hook#frag", "/hook"),
+            ("https://example.com/hook?a=b#frag", "/hook?a=b"),
+            ("https://example.com/hook?a=b", "/hook?a=b"),
+            ("https://example.com", "/"),
+        ] {
+            let target = parse_url(url).unwrap_or_else(|err| panic!("{url}: {err}"));
+            assert_eq!(target.host, "example.com", "{url}");
+            assert_eq!(target.port, 443, "{url}");
+            assert_eq!(target.path, path, "{url}");
+        }
+        assert!(!url_carries_credentials(
+            "https://example.com?contact=alice@example.com"
+        ));
+    }
+
+    /// The door the fragment would have gone out of. `parse_url` dropping
+    /// it is the fix; this is the assertion that nothing downstream puts
+    /// it back.
+    #[test]
+    fn no_fragment_reaches_the_request_line() {
+        let target = parse_url("https://example.com/hook?a=b#sentinelfragment")
+            .expect("a url with a query and a fragment parses");
+        let request = build_get_request(&target);
+        assert!(
+            request.starts_with("GET /hook?a=b HTTP/1.1\r\n"),
+            "{request}"
+        );
+        assert!(!request.contains("sentinelfragment"), "{request}");
+    }
+
+    /// A Discord webhook URL is a bearer credential and carries its token
+    /// as a path segment, so `Target`'s `Debug` withholds the path the way
+    /// `Sink`'s withholds the whole URL.
+    #[test]
+    fn a_targets_debug_redacts_the_path() {
+        let target = parse_url("https://discord.com/api/webhooks/123/s3cr3t-token")
+            .expect("a plain https url parses");
+        let rendered = format!("{target:?}");
+        assert_eq!(
+            rendered,
+            r#"Target { https: true, host: "discord.com", port: 443, path: <redacted> }"#
+        );
+        assert!(!rendered.contains("s3cr3t-token"));
     }
 
     /// A smuggling-style ambiguity: picking one would let a proxy make
