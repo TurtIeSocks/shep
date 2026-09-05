@@ -7,6 +7,10 @@ name: test
 # Every job carries `timeout-minutes`: a ceiling against a hang, not a
 # performance budget, at roughly three times the last green runtime with a
 # floor of ten minutes. GitHub's default when absent is 360.
+#
+# Every `uses:` is pinned by commit, and .github/dependabot.yml moves the
+# pins. No secrets here, but a moved tag could rewrite the cache every job
+# restores or the filter that decides whether the matrix runs at all.
 on:
   push:
     branches: [main]
@@ -14,6 +18,12 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+# One run per ref. A newer push cancels a pull request's run, since the old
+# head's verdict is no longer the question. A push to main cancels nothing:
+# main's runs are the record the release workflows and the ruleset read.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   # Decides which jobs below need the full Rust matrix. `typos` always runs
   # regardless, since it reads prose and a docs-only change edits exactly that.
@@ -38,7 +48,7 @@ jobs:
       bench: ${{ steps.filter.outputs.bench }}
       packaging: ${{ steps.filter.outputs.packaging }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Pinned by commit, not a moving tag: this action's output decides
       # whether any test runs at all, so a moved tag could silently skip the
       # whole matrix.
@@ -56,6 +66,11 @@ jobs:
               - 'docs/whistle/tools.md'
               - 'docs/lookout/frames.txt'
               - 'docs/lookout/frames.ansi'
+              # cargo-deny's config, and the report that runs after every
+              # nextest leg. A change to either is a change to what the
+              # Rust jobs do.
+              - 'deny.toml'
+              - '.github/actions/**'
             # benches/ is its own workspace, excluded from the root one, so
             # the main matrix never compiles it and only the bench job below
             # cares when it changes.
@@ -79,7 +94,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -114,7 +129,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: |
           mkdir -p tap/Formula
           cp packaging/homebrew/shep.rb tap/Formula/shep.rb
@@ -125,9 +140,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup toolchain install 1.93 --profile minimal --component clippy,rustfmt
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo +1.93 fmt --all -- --check
       # `--all-features` mirrors the project's own task gate (CLAUDE.md).
       # Without it, everything behind shep-daemon's `test-fakes` feature is
@@ -140,9 +155,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup toolchain install nightly --profile minimal
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo +nightly doc --workspace --all-features --no-deps
         env: { RUSTDOCFLAGS: "-Dwarnings --cfg docsrs" }
   typos:
@@ -150,8 +165,8 @@ jobs:
     timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: crate-ci/typos@v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: crate-ci/typos@d43b6c087ac471e2ea7b8af622ff15f05c0c365b # v1.50.1
   test:
     needs: changes
     # `!cancelled()` only: without it, a failed `changes` job skips this job
@@ -173,14 +188,15 @@ jobs:
     # slowest one: `windows-latest` / stable, 355s on the last green run.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       - run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       # `--all-features` mirrors the task gate (CLAUDE.md).
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2.87.5
+        with: { tool: nextest }
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       - run: "cargo +${{ matrix.toolchain }} nextest run --profile ci --workspace --locked --all-features -E 'not (test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a))'"
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
@@ -188,6 +204,12 @@ jobs:
       # or they stop running on this platform. 14 of them, 6.8s warm.
       - run: 'cargo +${{ matrix.toolchain }} test --workspace --locked --all-features --doc'
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
+      # `!cancelled()`: this runs after a failed test step, when the junit is
+      # worth reading; after a failed toolchain install it finds no file.
+      - uses: ./.github/actions/nextest-report
+        if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+        with:
+          name: junit-test-${{ matrix.os }}-${{ matrix.toolchain }}
   minimal-versions:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
@@ -196,13 +218,18 @@ jobs:
     # gets the cache hit the other Linux jobs do.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup toolchain install nightly stable --profile minimal
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo +nightly generate-lockfile -Z minimal-versions
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2.87.5
+        with: { tool: nextest }
       - run: "cargo +stable nextest run --profile ci --workspace -E 'not (test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a))'"
       - run: 'cargo +stable test --workspace --doc'
+      - uses: ./.github/actions/nextest-report
+        if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+        with:
+          name: junit-minimal-versions
   musl:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
@@ -211,18 +238,23 @@ jobs:
     # of a branch.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
       # `--test-threads 2`: musl's allocator is markedly slower than glibc's
       # under `cli_e2e`'s roughly ninety real shepherd/sheep spawns, so full
       # parallelism reports scheduling delay as a product failure. Two, not
       # one: this is contention, not a wall-clock tier like `slow`, and the
       # job has headroom against its twenty-minute timeout.
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2.87.5
+        with: { tool: nextest }
       - run: "cargo nextest run --profile ci --workspace --locked --target x86_64-unknown-linux-musl --test-threads 2 -E 'not (test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a))'"
       - run: 'cargo test --workspace --locked --target x86_64-unknown-linux-musl --doc'
+      - uses: ./.github/actions/nextest-report
+        if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+        with:
+          name: junit-musl
   # `cargo check`, not clippy: shep-daemon's unix-gated `boot`/`sys`/
   # `server`/`tokio_runner` report 51 dead-code warnings on this target that
   # are not dead on any platform shep ships, and silencing them would need
@@ -241,9 +273,9 @@ jobs:
     # 39s on the last green run; the floor is doing all the work.
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup toolchain install stable --profile minimal --target x86_64-pc-windows-gnu
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: sudo apt-get update && sudo apt-get install -y mingw-w64
       - run: cargo check --workspace --all-targets --all-features --locked --target x86_64-pc-windows-gnu
   features:
@@ -261,16 +293,24 @@ jobs:
     # `windows-latest` last time it was green.
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       - run: rustup toolchain install stable --profile minimal
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2.87.5
+        with: { tool: nextest }
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       - run: "cargo nextest run --profile ci -p shep-daemon --locked --no-default-features -E 'not (test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a))'"
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
+      # This job runs nextest twice under the one `ci` profile, and both
+      # runs write the same junit path, so the second overwrites the first
+      # before anything reads it. One report per run, named for its tier.
+      - uses: ./.github/actions/nextest-report
+        if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+        with:
+          name: junit-features-${{ matrix.os }}-daemon-no-default-features
       - run: 'cargo test -p shep-daemon --locked --no-default-features --doc'
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       # shep-client's `schema` feature defaults on; a dog can turn it off,
@@ -279,9 +319,16 @@ jobs:
       - run: cargo test -p shep-client --locked --no-default-features
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       - run: "cargo nextest run --profile ci --workspace --locked --all-features -E 'not (test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a))'"
+        id: all-features
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       - run: 'cargo test --workspace --locked --all-features --doc'
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
+      # Only once the workspace run has run: after a red first tier it is
+      # skipped and the junit on disk is still the first tier's.
+      - uses: ./.github/actions/nextest-report
+        if: ${{ !cancelled() && steps.all-features.outcome != 'skipped' && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+        with:
+          name: junit-features-${{ matrix.os }}
   # Runs serially on a quiet machine: `::slow::` waits on real FSEvents/
   # inotify delivery and real elapsed time, the boot race asserts exactly
   # one of two threads wins for one `$SHEP_HOME`, the signal test gives a
@@ -307,11 +354,17 @@ jobs:
     # runs single-threaded, so this one gets more headroom than 3x.
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup toolchain install stable --profile minimal
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - uses: taiki-e/install-action@nextest
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2.87.5
+        with: { tool: nextest }
       - run: "cargo nextest run --profile ci-slow --workspace --locked --all-features -E 'test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a)'"
+      - uses: ./.github/actions/nextest-report
+        if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+        with:
+          name: junit-slow-${{ matrix.os }}
+          profile: ci-slow
   # `cargo llvm-cov`'s default `--tests` skips examples, and two of
   # `daemon_e2e`'s reload tests exec `examples/reuse_port_sheep`, the
   # SO_REUSEPORT fixture the reload measurement rests on. `--all-targets`
@@ -329,18 +382,44 @@ jobs:
     # also installs a tool before it starts.
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup toolchain install stable --profile minimal --component llvm-tools
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - uses: taiki-e/install-action@cargo-llvm-cov
-      - uses: taiki-e/install-action@nextest
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2.87.5
+        # Block style: in a flow mapping the comma is YAML's separator, so
+        # `{ tool: a,b }` installs `a` and passes a stray `b` key.
+        with:
+          tool: cargo-llvm-cov,nextest
       - run: |
+          # shellcheck disable=SC1090
           source <(cargo llvm-cov show-env --sh)
           cargo llvm-cov clean --workspace
-          cargo nextest run --profile ci --workspace --locked -E 'not (test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a))'
+          cargo nextest run --profile ci --workspace --locked --all-features -E 'not (test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a))'
           cargo llvm-cov report --lcov --output-path lcov.info
-      - uses: actions/upload-artifact@v4
+      - uses: ./.github/actions/nextest-report
+        if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+        with:
+          name: junit-coverage
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: coverage, path: lcov.info }
+  # cargo-deny against deny.toml: RustSec advisories, licences, duplicate
+  # versions and sources. On the `rust` filter, which includes Cargo.lock
+  # and deny.toml, so a Dependabot bump gets it too. Ten minutes is a
+  # ceiling; the check runs in under one.
+  deny:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          # `[graph] all-features = true` in deny.toml already covers the
+          # feature set; this is the action's own default, stated so it
+          # cannot drift from the file.
+          arguments: --all-features
   bench:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.bench == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
@@ -355,9 +434,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with: { workspaces: benches }
       # `--test` runs each benchmark once and asserts nothing: the point on a
       # shared runner is proving the harness compiles and executes, not
@@ -379,8 +458,8 @@ jobs:
     container:
       image: rust:1.88
     steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # `--exact` on this one test, not a bare `--ignored`: the workspace's
       # other two `#[ignore]`s are child halves of cross-process race tests,
       # re-exec'd by their own parents, and assert nothing on their own.

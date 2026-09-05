@@ -1,0 +1,19 @@
+#!/bin/sh
+# Runs `typos` over the staged files when it is installed; skipped when it
+# is not, since the `typos` job in test.yml is the gate.
+#
+# Install: git config core.hooksPath .githooks
+
+command -v typos >/dev/null 2>&1 || exit 0
+
+# The index, not the working tree: `checkout-index` writes the staged blobs
+# under a temporary prefix and typos reads those. NUL-delimited, since three
+# tracked filenames carry spaces. No grep: the emptiness test must not
+# depend on which grep is first on PATH.
+[ -n "$(git diff --cached --name-only --diff-filter=ACMR)" ] || exit 0
+staged=$(mktemp -d) || exit 0
+trap 'rm -rf "$staged"' EXIT
+git diff --cached -z --name-only --diff-filter=ACMR \
+    | git checkout-index -z --stdin --prefix="$staged/"
+config=$(git rev-parse --show-toplevel)/_typos.toml
+cd "$staged" && find . -type f -print0 | xargs -0 typos --config "$config" --

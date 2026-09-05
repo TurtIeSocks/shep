@@ -114,13 +114,14 @@ fn pid_is_alive(pid: u32) -> bool {
     system.process(Pid::from_u32(pid)).is_some()
 }
 
-/// The pid of a live child of `parent`, or `None`.
+/// Every live `ping` the sheep has spawned.
 ///
-/// Read from the process table rather than having the sheep report its own
-/// child's pid, which would need PowerShell. Callers `expect` this: a
-/// grandchild it cannot find fails the test rather than skipping the
-/// assertion.
-fn child_of(parent: u32) -> Option<u32> {
+/// Every live `ping` the sheep spawned, read from the process table since
+/// the sheep cannot report a pid without PowerShell. Filtered by image name:
+/// `cmd` also owns a `conhost.exe` the job does not, and a map's iteration
+/// order handed that one back a third of the time. Callers fail on an empty
+/// answer rather than skip the assertion.
+fn pings_under(parent: u32) -> Vec<u32> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate};
     let mut system = sysinfo::System::new();
     system.refresh_processes_specifics(
@@ -131,8 +132,16 @@ fn child_of(parent: u32) -> Option<u32> {
     system
         .processes()
         .values()
-        .find(|process| process.parent() == Some(Pid::from_u32(parent)))
+        .filter(|process| process.parent() == Some(Pid::from_u32(parent)))
+        .filter(|process| {
+            // `PING.EXE` on some Windows builds, `ping.exe` on others.
+            process
+                .name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case("ping.exe")
+        })
         .map(|process| process.pid().as_u32())
+        .collect()
 }
 
 /// fails if a real child's stdout never reaches its log file.
@@ -184,21 +193,26 @@ async fn kill_tree_stops_a_long_running_sheep_and_reports_a_recognisable_code() 
 ///
 /// The sheep is a `cmd` batch that launches a background `ping` with
 /// `start /b` and waits, giving `kill_tree` a grandchild to contain.
+/// Every `ping` the sheep spawned has to die, not whichever the table
+/// listed first.
 #[tokio::test]
 async fn kill_tree_reaches_a_grandchild_and_not_just_the_sheep() {
     let dir = tempfile::tempdir().unwrap();
     let mut spec = cmd_spec(&dir, &["echo", "placeholder"]);
     // `cmd` from a batch file, not `powershell -Command`: PowerShell hangs
     // this suite.
+    //
+    // The pings count to 600 so a loaded machine cannot age them out before
+    // the kill; see `LONG_RUNNING`.
     const CRLF: &str = "\r\n";
     let script = dir.path().join("lamb.cmd");
     std::fs::write(
         &script,
         [
             "@echo off",
-            "start /b ping -n 60 127.0.0.1 >nul",
+            "start /b ping -n 600 127.0.0.1 >nul",
             "echo LAMB-STARTED",
-            "ping -n 60 127.0.0.1 >nul",
+            "ping -n 600 127.0.0.1 >nul",
             "",
         ]
         .join(CRLF),
@@ -213,26 +227,42 @@ async fn kill_tree_reaches_a_grandchild_and_not_just_the_sheep() {
     // comes from the process table, since `cmd` cannot report one.
     wait_for_log(&spec.out_file, "LAMB-STARTED").await;
     let sheep = proc.pid();
-    let lamb = child_of(sheep).expect(
-        "the sheep's grandchild must be visible in the process table, or this \
-         case proves nothing about containment",
-    );
+    // Both pings, not whichever is up first: `LAMB-STARTED` is echoed
+    // between the background ping and the foreground one, so a snapshot on
+    // the echo can miss the second. Bounded by [`SETTLE`].
+    let discovery = tokio::time::Instant::now() + SETTLE;
+    let lambs = loop {
+        let pings = pings_under(sheep);
+        if pings.len() >= 2 {
+            break pings;
+        }
+        assert!(
+            tokio::time::Instant::now() < discovery,
+            "both fixture pings must be visible in the process table before \
+             containment is tested; saw {pings:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
 
-    assert!(
-        pid_is_alive(lamb),
-        "grandchild {lamb} must be live before the kill, or this proves nothing"
-    );
+    for lamb in &lambs {
+        assert!(
+            pid_is_alive(*lamb),
+            "grandchild {lamb} must be live before the kill, or this proves nothing"
+        );
+    }
 
     proc.kill_tree().unwrap();
     let _ = tokio::time::timeout(SETTLE, proc.wait()).await;
 
     let deadline = tokio::time::Instant::now() + SETTLE;
-    while pid_is_alive(lamb) {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "grandchild {lamb} outlived kill_tree: the job object is not containing the tree"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    for lamb in lambs {
+        while pid_is_alive(lamb) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "grandchild {lamb} outlived kill_tree: the job object is not containing the tree"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 }
 
