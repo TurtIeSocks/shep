@@ -35,6 +35,7 @@
 
 use core::fmt;
 use core::time::Duration;
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::io::ErrorKind;
 #[cfg(unix)]
@@ -1043,6 +1044,22 @@ pub struct BootOptions {
     /// itself — the same division [`Self::socket`] and
     /// [`Self::max_cron_sleep`] already follow.
     pub dogs: Vec<DogSpec>,
+    /// Every dog name this shepherd may hold a section for, running or
+    /// not: the built-in dogs plus every name `[daemon] adopted_dogs`
+    /// records, plus whatever `[daemon] enabled_dogs` names.
+    ///
+    /// Assembled by the caller from the same file [`Self::dogs`] comes out
+    /// of, and for the same reason: shep-daemon never reads `shep.toml`
+    /// itself.
+    ///
+    /// A SUPERSET of [`Self::dogs`], and the difference is the whole point
+    /// of carrying both. That one is the spawn list, so it holds only the
+    /// dogs an operator has switched on; this one holds the dogs that
+    /// EXIST. `Request::SetDogConfig` is guarded on this one, because the
+    /// dog most in need of configuring is the one that is disabled or has
+    /// never started (the dog-config design, decision 4) and a guard on
+    /// the running set refuses exactly that dog.
+    pub known_dogs: Vec<String>,
     /// Wipe the in-memory flock registry before [`RunningDaemon::run`]'s
     /// teardown writes the final muster roll, so that roll always describes
     /// an empty flock — regardless of whether the session ended through an
@@ -1377,6 +1394,12 @@ pub async fn boot<R: ProcessRunner>(
         registry,
         snapshot_path: paths.snapshot.clone(),
         dogs_config: paths.dogs_config.clone(),
+        known_dogs: options
+            .known_dogs
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into(),
         paths: paths.clone(),
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
         dog_refusals,

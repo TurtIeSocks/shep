@@ -74,6 +74,21 @@ pub struct RpcContext {
     /// makes `shep disable X && shep enable X` pick up an edited section
     /// (`crate::dogs::dog_section`).
     pub(crate) dogs_config: PathBuf,
+    /// Every dog name this shepherd may hold a section for, running or
+    /// not.
+    ///
+    /// The built-in dogs plus every name `[daemon] adopted_dogs` and
+    /// `[daemon] enabled_dogs` carry, assembled by the CLI and handed over
+    /// in [`crate::boot::BootOptions::known_dogs`] -- this crate does not
+    /// read `shep.toml`. Fixed for the life of the process, and refreshed
+    /// by a `shep daemon reload`, whose successor re-execs and re-reads
+    /// that file.
+    ///
+    /// A set rather than the caller's `Vec`, because the one question
+    /// asked of it is membership, and a built-in name can appear in both
+    /// of the two lists it is built from. Behind an `Arc` because
+    /// [`RpcContext`] is cloned once per connection and this never changes.
+    pub(crate) known_dogs: Arc<BTreeSet<String>>,
     /// This daemon's `$SHEP_HOME` layout, for assembling a dog's app config.
     pub(crate) paths: ShepPaths,
     /// This daemon's crate version, echoed in the handshake.
@@ -721,9 +736,21 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
         }
         // The inverse of every other config door's guard, and deliberately
         // so: `dogs.toml` holds dogs' sections and nothing else, so what
-        // this one refuses is a SHEEP, and a name nobody registered at all.
-        // Asked before the file is opened, so a mistyped name cannot leave
-        // a table behind for a dog that will never exist.
+        // this one refuses is a SHEEP, and a name that is no dog of this
+        // shepherd's. Asked before the file is opened, so a mistyped name
+        // cannot leave a table behind for a dog that will never exist.
+        //
+        // Asked of [`RpcContext::known_dogs`] and NOT of the running
+        // flock. A guard on `supervisor.list()` compiles, passes a test
+        // that enables a dog first, and refuses the one dog this feature
+        // exists for: the dog-config design's decision 4 is that the dog
+        // most in need of configuring is the one that is disabled or has
+        // never started, so an operator who adopts a dog and opens its
+        // pane to set a webhook before switching it on would be told
+        // there is no such dog. The running set is still consulted, as a
+        // widening: a dog adopted and enabled since this shepherd booted
+        // is not in the list the CLI handed over at boot, and refusing
+        // that one would be the same bug in its second shape.
         //
         // Written here rather than through the supervisor: `dogs.toml` is
         // not supervisor state the way the override store is, and the two
@@ -733,11 +760,14 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
         // section written with nothing publishing that topic leaves a
         // running dog reading the old one.
         Request::SetDogConfig { name, toml } => {
-            let known = ctx.supervisor.list().await;
-            if !known
-                .iter()
-                .any(|info| info.name == name && info.dog.is_some())
-            {
+            let running_dog = || async {
+                ctx.supervisor
+                    .list()
+                    .await
+                    .iter()
+                    .any(|info| info.name == name && info.dog.is_some())
+            };
+            if !ctx.known_dogs.contains(&name) && !running_dog().await {
                 return reply(Err(RpcError {
                     code: RpcErrorCode::NotFound,
                     message: format!("no dog named {name}"),
@@ -3804,6 +3834,106 @@ mod tests {
         assert!(
             topics.iter().any(|topic| topic == "config.dog.bark"),
             "{topics:?}"
+        );
+    }
+
+    /// fails if the write door is guarded on the RUNNING set. The dog most
+    /// in need of configuring is the one that is switched off: an operator
+    /// adopts a dog, sets its webhook, and only then enables it, which is
+    /// the sequence the dog-config design's decision 4 argues for by name.
+    /// A guard on `supervisor.list()` refuses exactly that dog, and this
+    /// one has never been started at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_dog_that_is_adopted_and_never_started_can_still_be_configured() {
+        let mut h = harness(vec![]);
+        h.ctx.known_dogs = Arc::new(["otel".to_string()].into_iter().collect());
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::SetDogConfig {
+                        name: "otel".to_string(),
+                        toml: "endpoint = \"http://127.0.0.1:4317\"\n".to_string().into(),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+
+        assert_eq!(
+            reply.result.unwrap(),
+            Response::DogConfigSet {
+                name: "otel".to_string()
+            }
+        );
+        let text = std::fs::read_to_string(&h.ctx.dogs_config).unwrap();
+        assert!(text.contains("4317"), "{text}");
+    }
+
+    /// fails for the same reason as the case above, one step further along:
+    /// a built-in dog an operator has enabled but that is not up right now
+    /// -- crashed, stopped, or simply not spawned on this boot -- is still
+    /// a dog whose section this shepherd holds. The harness starts nothing,
+    /// so `bark` is known and absent from the flock.
+    #[tokio::test(start_paused = true)]
+    async fn a_dog_that_is_enabled_but_not_running_can_still_be_configured() {
+        let h = harness(vec![]);
+        assert!(h.ctx.supervisor.list().await.is_empty());
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::SetDogConfig {
+                        name: "bark".to_string(),
+                        toml: "poll = \"30s\"\n".to_string().into(),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+
+        assert_eq!(
+            reply.result.unwrap(),
+            Response::DogConfigSet {
+                name: "bark".to_string()
+            }
+        );
+    }
+
+    /// fails if the boot-time list is the ONLY thing consulted. A dog
+    /// adopted and enabled since this shepherd started is not in the list
+    /// the CLI handed over at boot -- that list is refreshed by a `shep
+    /// daemon reload` and by nothing else -- so a guard that stopped there
+    /// would refuse a dog that is up and answering right now.
+    #[tokio::test(start_paused = true)]
+    async fn a_dog_adopted_since_boot_is_reached_through_the_running_flock() {
+        let mut h = harness(vec![ProcScript::never_exits()]);
+        h.ctx.known_dogs = Arc::new(BTreeSet::new());
+        enable_dog(&h.ctx, 1, "bark").await;
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::SetDogConfig {
+                        name: "bark".to_string(),
+                        toml: "poll = \"30s\"\n".to_string().into(),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+
+        assert_eq!(
+            reply.result.unwrap(),
+            Response::DogConfigSet {
+                name: "bark".to_string()
+            }
         );
     }
 
