@@ -660,6 +660,51 @@ pub fn sheep_config_view() -> SheepConfigView {
     )
 }
 
+/// The bark dog's `[bark]` section as `Request::DogConfig` would answer it:
+/// a comment, two scalars, and a sink holding a webhook credential.
+///
+/// The comment is load-bearing rather than decoration: a write goes out as
+/// the WHOLE section, so a pane that re-rendered it from the parsed values
+/// would delete this line on the operator's own keystroke.
+pub fn dog_section() -> String {
+    "# how often\npoll = \"60s\"\nhistory_bytes = 4096\n\n[sinks.ops]\nkind = \"slack\"\nurl = \"https://hooks.example/x\"\n"
+        .to_string()
+}
+
+/// A dashboard with the bark dog's config pane open, opened the way the
+/// event loop opens it: `e` on the settings screen's own dog row, then the
+/// schema its binary answered with, then the shepherd's section. The
+/// control gate is open, so the pane can write.
+///
+/// bark is [`settings_snapshot`]'s first dog, and the six scalar rows
+/// always sort ahead of the dogs, so row 6 is its row.
+pub fn app_in_dog_pane() -> App {
+    let mut app = app_with(flock_of(3, 0), plain());
+    app.set_control_for_tests(Control::Allowed);
+    app.update(Msg::Key(KeyPress::Settings));
+    app.update(Msg::Settings {
+        result: Ok(settings_snapshot()),
+    });
+    for _ in 0..6 {
+        app.update(Msg::Key(KeyPress::SelectDown));
+    }
+    app.update(Msg::Key(KeyPress::Edit));
+    app.update(Msg::DogPane {
+        name: "bark".to_string(),
+        adopted_path: None,
+        result: Ok(crate::dog::builtin_schema("bark").expect("bark is a built-in")),
+    });
+    app.update(Msg::Replied {
+        sent: Sent::DogSection {
+            name: "bark".to_string(),
+        },
+        result: Ok(Response::DogSection {
+            toml: dog_section().into(),
+        }),
+    });
+    app
+}
+
 /// [`app_in_sheep_pane`] with the control gate open: the pane can write.
 ///
 /// The gate is set BEFORE the pane opens, so nothing about how it opened

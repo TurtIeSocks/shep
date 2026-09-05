@@ -931,6 +931,10 @@ fn ask_version(
 /// Asks `path` for its config schema with [`SCHEMA_FLAG`], and reads the
 /// answer as JSON.
 ///
+/// `pub(crate)` because `adopt` is no longer the only caller: `shep
+/// lookout`'s dog config pane asks the same question at open, since nothing
+/// records the answer (see below).
+///
 /// No `Result`, because nothing a candidate does to this probe can refuse
 /// an adopt (decision 4): a dog whose schema flag is broken may still do
 /// its job perfectly, and the version probe has already answered the only
@@ -943,7 +947,7 @@ fn ask_version(
 /// stored schema would be wrong at the moment it mattered, and a stale
 /// schema is worse than a stale version number because it mislabels which
 /// field is a credential.
-fn ask_schema(path: &Path, home: &Path, name: &str, budget: Duration) -> DogSchema {
+pub(crate) fn ask_schema(path: &Path, home: &Path, name: &str, budget: Duration) -> DogSchema {
     // A run that exited 0 and printed nothing is a dog with no schema, not
     // a dog whose schema failed to parse: empty input IS invalid JSON, so
     // without this the ordinary case would earn the warning meant for a

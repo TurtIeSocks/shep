@@ -140,6 +140,7 @@ fn section_header(label: &str, palette: Palette) -> Line<'static> {
 fn title_line(pane: &ConfigPane, palette: Palette, width: u16) -> Line<'static> {
     let kind = match pane.target() {
         PaneTarget::Sheep { .. } => "sheep config",
+        PaneTarget::Dog { .. } => "dog config",
     };
     Line::from(Span::styled(
         format!(
@@ -442,17 +443,36 @@ pub fn pane_lines(
         )));
         body_budget -= 1;
     }
-    if pane.fields().is_empty() || body_budget == 0 {
-        return lines;
+    // The one line a dog pane has that a sheep pane does not, and decision 4
+    // is why: shep does not know what a dog's field costs, so every row's
+    // COST cell is empty. Said once here rather than guessed thirty times up
+    // there. Reserved out of the body budget before the rows are laid out,
+    // for the same reason the confirm echo is -- a footer appended
+    // afterwards is a line nothing counted.
+    let footer = match pane.target() {
+        PaneTarget::Sheep { .. } => None,
+        PaneTarget::Dog { name, .. } => (body_budget > 0)
+            .then(|| format!("shep publishes the change; {name} decides what to reload")),
+    };
+    if footer.is_some() {
+        body_budget -= 1;
     }
-    let total = pane.rows().len();
-    let cursor_row = pane.view().cursor().min(total - 1);
-    lines.extend(super::scroll::to_cursor(
-        cursor_row,
-        pane.view().offset(),
-        |offset| body_from(pane, palette, width, body_budget, offset),
-        || cursor_only(pane, palette, width, body_budget, cursor_row),
-    ));
+    if !pane.fields().is_empty() && body_budget > 0 {
+        let total = pane.rows().len();
+        let cursor_row = pane.view().cursor().min(total - 1);
+        lines.extend(super::scroll::to_cursor(
+            cursor_row,
+            pane.view().offset(),
+            |offset| body_from(pane, palette, width, body_budget, offset),
+            || cursor_only(pane, palette, width, body_budget, cursor_row),
+        ));
+    }
+    if let Some(text) = footer {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", fit(&text, body_width(width))),
+            palette.muted(),
+        )));
+    }
     lines
 }
 
@@ -1017,6 +1037,78 @@ mod tests {
             !text.iter().any(|line| line.contains("set cwd")),
             "an editor is not a confirm: {text:?}"
         );
+    }
+
+    /// A dog pane over the bark dog, with a sink in its section.
+    fn bark_pane() -> ConfigPane {
+        let schema = crate::dog::builtin_schema("bark").expect("bark is a built-in");
+        ConfigPane::dog(
+            "bark".into(),
+            None,
+            schema,
+            "poll = \"60s\"\nhistory_bytes = 4096\n\n[sinks.ops]\nkind = \"slack\"\nurl = \"https://hooks.example/x\"\n"
+                .into(),
+        )
+    }
+
+    /// The whole dog pane at a comfortable width. The snapshot is the
+    /// assertion: the title says `dog config`, the rows are flat with no
+    /// section headers (decision 3), every COST cell is empty, and the foot
+    /// says once that the dog decides (decision 4).
+    ///
+    /// The three assertions ahead of it are the ones worth failing loudly
+    /// rather than as a snapshot diff: a webhook URL on screen is the leak
+    /// the whole secret contract exists to prevent.
+    #[test]
+    fn a_dog_pane_at_a_comfortable_width() {
+        let text = text_of(&pane_lines(&bark_pane(), fixtures::plain(), 120, 0));
+        assert!(
+            !text.iter().any(|line| line.contains("hooks.example")),
+            "a secret is never rendered: {text:?}"
+        );
+        assert!(text.iter().any(|line| line.contains("<set>")), "{text:?}");
+        assert!(
+            text.iter()
+                .any(|line| line.contains("decides what to reload")),
+            "{text:?}"
+        );
+        insta::assert_snapshot!("dog_pane_wide", text.join("\n"));
+    }
+
+    /// fails if the footer stops being counted, which is how the line that
+    /// says a row was cut becomes the line that overruns the terminal.
+    #[test]
+    fn a_dog_panes_footer_is_paid_for_out_of_the_height_it_was_given() {
+        let mut pane = bark_pane();
+        for height in 1..=20u16 {
+            pane.set_rows(usize::from(height.saturating_sub(1)));
+            for cursor in [0usize, 2, 4] {
+                pane.move_to_first();
+                pane.move_by(isize::try_from(cursor).unwrap());
+                let text = text_of(&pane_lines(&pane, fixtures::plain(), 120, height));
+                assert!(
+                    text.len() <= usize::from(height),
+                    "height {height}, cursor {cursor}: {text:?}"
+                );
+            }
+        }
+    }
+
+    /// fails if any line of a dog pane renders wider than the terminal it
+    /// was drawn for -- the footer is the newest line and the longest, and
+    /// `Buffer::set_line` clips in silence.
+    #[test]
+    fn every_dog_pane_line_fits_the_width_it_was_drawn_for() {
+        let pane = bark_pane();
+        for width in super::super::MIN_TERM_WIDTH..=200 {
+            for line in text_of(&pane_lines(&pane, fixtures::plain(), width, 0)) {
+                assert!(
+                    visible_width(&line) <= usize::from(width),
+                    "width {width} drew {}: {line:?}",
+                    visible_width(&line)
+                );
+            }
+        }
     }
 
     /// The env sub-screen at a comfortable width. The snapshot is the

@@ -28,13 +28,14 @@
 
 use core::fmt;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use shep_client::RequestError;
 use shep_core::config::LogLevel;
 use shep_core::protocol::{
-    BusEvent, DogSource, EnvValue, Lamb, ProcessEventKind, ProcessInfo, Request, Response,
-    SelectorSpec,
+    BusEvent, DogSectionToml, DogSource, EnvValue, Lamb, ProcessEventKind, ProcessInfo, Request,
+    Response, SelectorSpec,
 };
 use shep_core::status::ProcStatus;
 
@@ -242,6 +243,26 @@ pub enum Msg {
         /// Whether the write landed, or why it did not.
         result: Result<(), String>,
     },
+    /// An [`Effect::LoadDogPane`]'s schema probe has answered.
+    ///
+    /// The SCHEMA half only. The section arrives separately, over the wire
+    /// as [`Sent::DogSection`], because the two come from different places:
+    /// the schema from the dog's own binary and the section from the
+    /// shepherd. This arm parks the schema and raises the request for the
+    /// second half; the pane is built when that lands.
+    ///
+    /// `Result<_, String>` for the reason [`Self::Settings`]'s own doc
+    /// gives: this reducer holds no error types from `commands`, and the
+    /// refusal an operator reads is a rendered sentence either way.
+    DogPane {
+        /// The dog.
+        name: String,
+        /// The adopted binary, or [`None`] for a built-in, echoed back so
+        /// the pane records what it probed.
+        adopted_path: Option<PathBuf>,
+        /// The dog's schema, or why there is no pane for it (decision 10).
+        result: Result<serde_json::Value, String>,
+    },
     /// An [`Effect::WriteDog`] this reducer asked for has landed.
     ///
     /// `Result<DogSource, String>` rather than the config commands' own
@@ -374,6 +395,25 @@ pub enum Effect {
     /// makes `--allow-control` a property of this effect rather than a
     /// check each key handler has to remember. See its own doc.
     WriteSetting(SettingEdit, WriteAuthority),
+    /// Probe one dog for its config schema; the answer lands as
+    /// [`Msg::DogPane`].
+    ///
+    /// A dog's schema is not persisted anywhere, so the pane asks at open:
+    /// `shep adopt` uses the answer for the vet and records only the path.
+    /// A built-in dog IS this binary, so it is asked in-process
+    /// (`crate::dog::builtin_schema`); an adopted one is spawned with the
+    /// schema flag, which is why `super::run_ui` runs this on
+    /// `spawn_blocking` -- it costs up to `VERSION_BUDGET` of somebody
+    /// else's binary starting up, and the redraw task cannot wait for that.
+    ///
+    /// No [`WriteAuthority`]: this reads. The pane it opens is gated on
+    /// every keystroke that writes, the same as a sheep pane.
+    LoadDogPane {
+        /// The dog.
+        name: String,
+        /// The adopted binary, or [`None`] for a built-in.
+        adopted_path: Option<PathBuf>,
+    },
     /// Apply one dog's file half; the result lands as [`Msg::DogWritten`].
     ///
     /// Raised by [`App::confirm_setting`] once an armed dog row's Enter
@@ -549,6 +589,45 @@ pub enum Sent {
         /// Proof the control gate was open.
         authority: WriteAuthority,
     },
+    /// One dog's `[<name>]` section, for the dog config pane. Raised once
+    /// the pane's schema probe has answered, and again by `r` from inside an
+    /// open dog pane and after a landed write.
+    ///
+    /// The SCHEMA is not asked for here and never travels the wire: it comes
+    /// off the dog's own binary ([`Effect::LoadDogPane`]), because nothing
+    /// records one -- `shep adopt` uses it for the vet and writes down only
+    /// the path.
+    DogSection {
+        /// Which dog was asked about.
+        name: String,
+    },
+    /// One dog's whole section, off the dog pane's own `Enter`.
+    ///
+    /// The whole section rather than one key, because
+    /// `Request::SetDogConfig` replaces the table: `ConfigPane::edited_section`
+    /// applies the edit through `toml_edit`, so the operator's comments and
+    /// key order survive a write shep did not author.
+    ///
+    /// NOT a `Request::ApplyConfig`, and not for [`Self::ApplyField`]'s
+    /// reason either -- a dog has no override store and no Flockfile. Its
+    /// section is the operator's outright, and `dogs.toml` is the one copy
+    /// of it.
+    ///
+    /// The [`WriteAuthority`] is not decoration, for the reason
+    /// [`Effect::WriteSetting`]'s own doc gives.
+    SetDogSection {
+        /// The dog.
+        name: String,
+        /// Which write this is, so a reply settles its own in-flight line
+        /// and no other. See [`PanePending::Sent`].
+        ticket: u64,
+        /// The section, edit applied. [`DogSectionToml`] rather than a
+        /// `String` so a `{:?}` of this enum cannot print the webhook
+        /// credentials a dog's section routinely holds (IR-41).
+        toml: DogSectionToml,
+        /// Proof the control gate was open.
+        authority: WriteAuthority,
+    },
     /// One env key of one sheep, off the env sub-screen's own `Enter`.
     ///
     /// Its own variant beside [`Self::ApplyField`] rather than a value of
@@ -617,6 +696,11 @@ impl Sent {
                 // everything above it is not.
                 value: value.as_value().clone(),
             },
+            Self::DogSection { name } => Request::DogConfig { name: name.clone() },
+            Self::SetDogSection { name, toml, .. } => Request::SetDogConfig {
+                name: name.clone(),
+                toml: toml.clone(),
+            },
             Self::SetEnv {
                 name, key, value, ..
             } => Request::SetSheepEnv {
@@ -640,6 +724,27 @@ pub struct DogEdit {
     pub name: String,
     /// `true` to enable, `false` to disable.
     pub enable: bool,
+}
+
+/// A dog's schema, and the binary it was probed from.
+///
+/// Held on [`App`] between the probe answering ([`Msg::DogPane`]) and the
+/// section landing ([`Sent::DogSection`]), and then for as long as the pane
+/// is open, so a refresh re-reads the section without respawning the dog.
+///
+/// `Debug` is derived rather than redacted (IR-41): a name, a binary's path
+/// and a JSON Schema. A schema describes values without carrying any -- the
+/// same argument `super::field::Field`'s own derived `Debug` makes, and a
+/// dog's defaults come from its binary describing itself rather than from
+/// this flock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DogProbe {
+    /// The dog.
+    pub name: String,
+    /// The adopted binary, or [`None`] for a built-in.
+    pub adopted_path: Option<PathBuf>,
+    /// What it answered the schema flag with.
+    pub schema: serde_json::Value,
 }
 
 /// What the cursor can sit on: one sheep, or the header above an app's
@@ -1403,6 +1508,16 @@ pub struct App {
     /// `None` both while a first read is in flight and after a close, and
     /// those two want opposite things done with a reply.
     config_target: Option<String>,
+    /// The dog a config pane is open for, or wanted for, and the schema its
+    /// binary answered with.
+    ///
+    /// [`Self::config_target`]'s twin, and it carries a schema because a
+    /// dog's is probed once at open and then reused: `r`, and the re-read a
+    /// landed write raises, ask the shepherd for the SECTION again and never
+    /// respawn the dog's binary. Cleared with `config_target`, on exactly
+    /// the same keystrokes, so a reply nobody is waiting for is dropped in
+    /// silence rather than re-opening a pane the operator has left.
+    dog_target: Option<DogProbe>,
     /// The open config pane, or `None`. Opened by `e` on a selected sheep,
     /// and closed by `e` or `Escape` from inside it.
     ///
@@ -1444,6 +1559,7 @@ impl App {
             action: None,
             settings: None,
             config_target: None,
+            dog_target: None,
             config_pane: None,
             style: (StyleLevel::Full, StyleSource::Default),
         }
@@ -1590,6 +1706,10 @@ impl App {
                 }
                 Sent::Dog { name, enable, .. } => self.on_dog_reply(name, enable, result),
                 Sent::SheepConfig { name } => self.on_sheep_config(&name, result),
+                Sent::DogSection { name } => self.on_dog_section(&name, result),
+                Sent::SetDogSection { name, ticket, .. } => {
+                    self.on_dog_section_set(&name, ticket, result)
+                }
                 Sent::ApplyField {
                     name, ticket, key, ..
                 } => self.on_field_applied(&name, ticket, &key, result),
@@ -1658,6 +1778,29 @@ impl App {
                     }
                     self.notice = Some(Notice {
                         text: format!("{name}: env {key} was not sent"),
+                        grave: true,
+                    });
+                    Effect::None
+                }
+                // The dog twins of the two arms above, and they say the
+                // same two things for the same two reasons: a read nobody
+                // took is reported rather than swallowed, because `e`
+                // dropped in silence looks exactly like a key that is not
+                // bound, and a write nobody took has to clear the pane's
+                // own "sent, waiting" line.
+                Sent::DogSection { name } => {
+                    self.notice = Some(Notice {
+                        text: format!("{name}: its config was not asked for"),
+                        grave: true,
+                    });
+                    Effect::None
+                }
+                Sent::SetDogSection { name, ticket, .. } => {
+                    if let Some(pane) = self.config_pane.as_mut() {
+                        pane.settle(ticket);
+                    }
+                    self.notice = Some(Notice {
+                        text: format!("{name}: its config was not sent"),
                         grave: true,
                     });
                     Effect::None
@@ -1799,6 +1942,39 @@ impl App {
                     } else if let Some(settings) = self.settings.as_mut() {
                         settings.pending = None;
                     }
+                    self.notice = Some(Notice {
+                        text: message,
+                        grave: true,
+                    });
+                    Effect::None
+                }
+            },
+            // A dog's schema probe answered. `Ok` parks the schema and asks
+            // the shepherd for the section, which is the half this binary
+            // cannot answer for itself; the pane is built when that lands
+            // (`Self::on_dog_section`). `Err` is decision 10 -- a dog with
+            // no schema gets no pane, and the refusal names the file and the
+            // tool that does edit it.
+            //
+            // The settings screen is deliberately LEFT OPEN here. It closes
+            // only once the pane really exists, the same rule `e` on the
+            // dashboard already follows: a screen that vanished on the
+            // keypress and then refused would leave the operator staring at
+            // a dashboard wondering which of the two things happened.
+            Msg::DogPane {
+                name,
+                adopted_path,
+                result,
+            } => match result {
+                Ok(schema) => {
+                    self.dog_target = Some(DogProbe {
+                        name: name.clone(),
+                        adopted_path,
+                        schema,
+                    });
+                    Effect::Send(Sent::DogSection { name })
+                }
+                Err(message) => {
                     self.notice = Some(Notice {
                         text: message,
                         grave: true,
@@ -2185,6 +2361,128 @@ impl App {
         }
     }
 
+    /// One `Request::DogConfig` reply: the dog's section, which is the
+    /// second half of an open.
+    ///
+    /// Guarded on [`Self::dog_target`] the way [`Self::on_sheep_config`] is
+    /// guarded on `config_target`, and for the same reason: a reply for a
+    /// dog the operator has already left must not re-open a pane over the
+    /// screen they went back to.
+    ///
+    /// The schema comes off `dog_target` rather than off the wire. Nothing
+    /// records a dog's schema, so the probe that ran at open is the only
+    /// copy, and a refresh reuses it rather than respawning the binary.
+    fn on_dog_section(&mut self, name: &str, result: Result<Response, RequestError>) -> Effect {
+        let Some(probe) = self.dog_target.clone().filter(|probe| probe.name == name) else {
+            return Effect::None;
+        };
+        match result {
+            Ok(Response::DogSection { toml }) => {
+                // Everything a refresh has to carry across, read before the
+                // rebuild replaces the pane: see `Self::on_sheep_config`,
+                // which states the argument for each. A dog pane has no env
+                // sub-screen, so only two of the three apply.
+                let carried = self.config_pane.as_ref().map(|pane| pane.view().clone());
+                let carried_edit = self
+                    .config_pane
+                    .as_ref()
+                    .and_then(|pane| pane.pending_edit().cloned());
+                let mut pane = ConfigPane::dog(
+                    probe.name,
+                    probe.adopted_path,
+                    probe.schema,
+                    toml.as_str().to_owned(),
+                );
+                pane.adopt_pending_edit(carried_edit);
+                if let Some(carried) = carried {
+                    pane.adopt_view(carried);
+                }
+                self.config_pane = Some(pane);
+                // The settings screen is what a dog pane opens over, and it
+                // closes only now -- once there is something to look at.
+                self.settings = None;
+                self.release_text_mode_if_unowned();
+            }
+            Ok(_unrecognised) => {
+                self.notice = Some(Notice {
+                    text: format!(
+                        "{name}: the shepherd answered something this lookout does not understand"
+                    ),
+                    grave: true,
+                });
+            }
+            Err(RequestError::Rpc(err)) => {
+                self.notice = Some(Notice {
+                    text: format!("{name}: {}", err.message),
+                    grave: true,
+                });
+            }
+            Err(other) => {
+                self.notice = Some(Notice {
+                    text: format!("{name}: {other}"),
+                    grave: true,
+                });
+            }
+        }
+        Effect::None
+    }
+
+    /// One `Request::SetDogConfig` reply.
+    ///
+    /// The pane settles either way, and a success re-reads the section --
+    /// the same shape [`Self::on_field_applied`] has, for the same reason:
+    /// the screen shows what the shepherd now holds rather than what the
+    /// operator asked for.
+    ///
+    /// The sentence says the change was published and stops there. Whether
+    /// the dog acted on it is the dog's own answer, which this reply does
+    /// not carry and shep cannot predict -- the same fact the pane's footer
+    /// states (decision 4).
+    fn on_dog_section_set(
+        &mut self,
+        name: &str,
+        ticket: u64,
+        result: Result<Response, RequestError>,
+    ) -> Effect {
+        if let Some(pane) = self.config_pane.as_mut() {
+            pane.settle(ticket);
+        }
+        match result {
+            Ok(Response::DogConfigSet { .. }) => {
+                self.notice = Some(Notice {
+                    text: format!("{name}: its config is written, and {name} is told"),
+                    grave: false,
+                });
+                Effect::Send(Sent::DogSection {
+                    name: name.to_owned(),
+                })
+            }
+            Ok(_unrecognised) => {
+                self.notice = Some(Notice {
+                    text: format!(
+                        "{name}: the shepherd answered something this lookout does not understand"
+                    ),
+                    grave: true,
+                });
+                Effect::None
+            }
+            Err(RequestError::Rpc(err)) => {
+                self.notice = Some(Notice {
+                    text: format!("{name}: {}", err.message),
+                    grave: true,
+                });
+                Effect::None
+            }
+            Err(other) => {
+                self.notice = Some(Notice {
+                    text: format!("{name}: {other}"),
+                    grave: true,
+                });
+                Effect::None
+            }
+        }
+    }
+
     /// One `Request::SetSheepField` reply.
     ///
     /// The pane settles either way -- a question that has been answered is
@@ -2515,12 +2813,26 @@ impl App {
                 }
                 return Effect::LoadSettings;
             }
+            // The probe, not the open, and for the reason
+            // `on_key`'s own `e` gives about a sheep: the pane shows the
+            // dog's real schema and the shepherd's real section, or it
+            // shows nothing. An armed candidate eats it first, the same
+            // cancel-before-act rule every other key on this screen
+            // follows.
+            KeyPress::Edit => {
+                if let Some(settings) = self.settings.as_mut()
+                    && settings.is_armed()
+                {
+                    settings.pending = None;
+                    return Effect::None;
+                }
+                return self.probe_dog_schema();
+            }
             // Unreachable from here, and named rather than wildcarded so a
             // future variant does not fall silently into an arm that
             // ignores it: an action key in particular must never be
             // mistaken for one this screen answers.
             KeyPress::Action(_)
-            | KeyPress::Edit
             | KeyPress::FilterStart
             | KeyPress::TextChar(_)
             | KeyPress::TextBackspace
@@ -2528,6 +2840,36 @@ impl App {
             | KeyPress::TextAbandon => {}
         }
         Effect::None
+    }
+
+    /// `e` on the settings screen: probe the dog under the cursor for its
+    /// schema.
+    ///
+    /// Nothing at all on a scalar row -- the six of them are the settings
+    /// screen's own subject, and `space` and `Enter` already edit them.
+    /// Silent rather than refused, the same rule `confirm_field` states: a
+    /// refusal about a row that was never going to act trains an operator
+    /// to ignore the status bar.
+    ///
+    /// The dogs this can reach are exactly the rows the screen is already
+    /// showing -- `BUILT_IN_DOGS` plus every `adopted_dogs` key -- so no
+    /// listing request is needed to tell a name the daemon knows from one
+    /// it does not. An adopted-but-disabled dog is in that list on purpose:
+    /// configure-then-enable is the ordinary order.
+    fn probe_dog_schema(&mut self) -> Effect {
+        let Some(settings) = self.settings.as_ref() else {
+            return Effect::None;
+        };
+        let Some(SettingsRow::Dog(index)) = settings.cursor() else {
+            return Effect::None;
+        };
+        let Some(dog) = settings.snapshot().dogs.get(index) else {
+            return Effect::None;
+        };
+        Effect::LoadDogPane {
+            name: dog.name.clone(),
+            adopted_path: dog.adopted_path.clone(),
+        }
     }
 
     /// `e`'s own handler: refuse a dog here, else ask the shepherd.
@@ -2643,13 +2985,7 @@ impl App {
             KeyPress::Quit => return Effect::Quit,
             // Both close. `Escape` closes rather than cascading to a filter
             // clear or a quit, exactly as it does on the settings screen.
-            KeyPress::Edit | KeyPress::Escape => {
-                self.config_pane = None;
-                // Cleared together, always. A read still in flight for this
-                // pane must not re-open it behind the operator's back.
-                self.config_target = None;
-                self.release_text_mode_if_unowned();
-            }
+            KeyPress::Edit | KeyPress::Escape => self.close_pane(),
             KeyPress::SelectUp
             | KeyPress::SelectDown
             | KeyPress::SelectFirst
@@ -2667,12 +3003,7 @@ impl App {
             // Re-reads the same sheep, so an override applied from another
             // window shows up. The cursor survives it: see
             // `Self::on_sheep_config`.
-            KeyPress::Refresh => {
-                if let Some(pane) = self.config_pane.as_ref() {
-                    let name = pane.target().name().to_owned();
-                    return Effect::Send(Sent::SheepConfig { name });
-                }
-            }
+            KeyPress::Refresh => return self.reread_pane(),
             KeyPress::Cycle => return self.cycle_field(),
             KeyPress::Confirm => return self.confirm_field(),
             KeyPress::Action(_)
@@ -2684,6 +3015,37 @@ impl App {
             | KeyPress::TextAbandon => {}
         }
         Effect::None
+    }
+
+    /// `r` from inside a pane: ask for the same target again, by whichever
+    /// of the two doors it came in.
+    ///
+    /// A dog's SCHEMA is not re-probed. It came from the dog's binary at
+    /// open and is parked on [`Self::dog_target`]; re-probing would respawn
+    /// somebody else's binary on a keystroke whose job is to re-read a file.
+    fn reread_pane(&mut self) -> Effect {
+        let Some(pane) = self.config_pane.as_ref() else {
+            return Effect::None;
+        };
+        let name = pane.target().name().to_owned();
+        match pane.target() {
+            PaneTarget::Sheep { .. } => Effect::Send(Sent::SheepConfig { name }),
+            PaneTarget::Dog { .. } => Effect::Send(Sent::DogSection { name }),
+        }
+    }
+
+    /// Drops the open pane and everything a reply for it would re-open.
+    ///
+    /// Both targets are cleared, always, and not only the one the pane
+    /// happens to hold: a read for the OTHER kind can be in flight when this
+    /// runs (`e` on a dog, then the settings screen closes and `e` opens a
+    /// sheep), and a stale one left set is exactly the re-open behind the
+    /// operator's back `config_target` exists to prevent.
+    fn close_pane(&mut self) {
+        self.config_pane = None;
+        self.config_target = None;
+        self.dog_target = None;
+        self.release_text_mode_if_unowned();
     }
 
     /// The refusal a locked row gets, in that row's own words.
@@ -2764,7 +3126,38 @@ impl App {
             return Effect::None;
         };
         self.next_write_ticket += 1;
-        let PaneTarget::Sheep { name } = pane.target().clone();
+        // A dog leaves by its own door and carries its whole section, not
+        // one key: `Request::SetDogConfig` replaces the table, and
+        // `edited_section` is what applies the edit through `toml_edit` so
+        // the operator's comments survive it. `None` there is a section that
+        // stopped parsing between the read and the keystroke, which is
+        // reported rather than sent as an empty table.
+        if let PaneTarget::Dog { name, .. } = pane.target().clone() {
+            match pane.edited_section(&edit) {
+                Some(toml) => {
+                    return Effect::Send(Sent::SetDogSection {
+                        name,
+                        ticket,
+                        toml: toml.into(),
+                        authority,
+                    });
+                }
+                // Settled here rather than left in flight: nothing went out,
+                // so a bar saying "sent, waiting for the shepherd" would be
+                // waiting on a request nobody has.
+                None => {
+                    pane.settle(ticket);
+                    self.notice = Some(Notice {
+                        text: format!("{name}: its section in dogs.toml does not parse"),
+                        grave: true,
+                    });
+                    return Effect::None;
+                }
+            }
+        }
+        let PaneTarget::Sheep { name } = pane.target().clone() else {
+            return Effect::None;
+        };
         match edit {
             PaneEdit::SetEnv { key, value } => Effect::Send(Sent::SetEnv {
                 name,
@@ -2893,11 +3286,7 @@ impl App {
                 }
                 self.release_text_mode_if_unowned();
             }
-            KeyPress::Edit => {
-                self.config_pane = None;
-                self.config_target = None;
-                self.release_text_mode_if_unowned();
-            }
+            KeyPress::Edit => self.close_pane(),
             KeyPress::SelectUp
             | KeyPress::SelectDown
             | KeyPress::SelectFirst
@@ -2912,12 +3301,7 @@ impl App {
                     }
                 }
             }
-            KeyPress::Refresh => {
-                if let Some(pane) = self.config_pane.as_ref() {
-                    let name = pane.target().name().to_owned();
-                    return Effect::Send(Sent::SheepConfig { name });
-                }
-            }
+            KeyPress::Refresh => return self.reread_pane(),
             KeyPress::Confirm => {
                 if self.config_pane.as_ref().is_some_and(ConfigPane::is_armed) {
                     return self.send_armed();
@@ -7895,5 +8279,266 @@ mod tests {
             ))),
         });
         assert!(app.config_pane().is_some());
+    }
+    /// fails if `e` on the settings screen's dog row stops probing, or
+    /// starts probing something other than the row under the cursor. The
+    /// path is what carries a probe to an ADOPTED dog's own binary; a
+    /// built-in answers in-process and has none.
+    #[test]
+    fn e_on_a_settings_dog_row_probes_that_dogs_own_binary() {
+        let mut app = fixtures::app_in_settings_on_dog("otel");
+        assert_eq!(
+            app.update(Msg::Key(KeyPress::Edit)),
+            Effect::LoadDogPane {
+                name: "otel".to_string(),
+                adopted_path: Some(std::path::PathBuf::from("/usr/local/bin/shep-otel")),
+            }
+        );
+        assert!(
+            app.config_pane().is_none(),
+            "the pane opens on the answer, never on the keypress"
+        );
+        assert!(
+            app.settings().is_some(),
+            "and the screen stays up until it does"
+        );
+    }
+
+    /// fails if `e` on one of the six scalar rows starts doing something.
+    /// Those rows are the settings screen's own subject, and `space` and
+    /// `Enter` already edit them.
+    #[test]
+    fn e_on_a_settings_scalar_row_does_nothing_at_all() {
+        let mut app = fixtures::app_in_settings();
+        assert_eq!(app.update(Msg::Key(KeyPress::Edit)), Effect::None);
+        assert!(app.config_pane().is_none());
+        assert!(app.notice().is_none(), "and says nothing about it");
+    }
+
+    /// fails if a dog that publishes no schema gets a pane anyway, or if
+    /// the refusal stops naming the file an operator edits instead
+    /// (decision 10).
+    #[test]
+    fn a_dog_with_no_schema_gets_no_pane_and_is_told_where_to_edit() {
+        let mut app = fixtures::app_in_settings_on_dog("otel");
+        app.update(Msg::Key(KeyPress::Edit));
+        assert_eq!(
+            app.update(Msg::DogPane {
+                name: "otel".to_string(),
+                adopted_path: None,
+                result: Err("otel publishes no schema; edit dogs.toml with $EDITOR".to_string()),
+            }),
+            Effect::None
+        );
+        assert!(app.config_pane().is_none());
+        assert!(
+            app.settings().is_some(),
+            "the screen the operator pressed `e` on is still there"
+        );
+        let notice = app.notice().expect("a refusal is reported").to_string();
+        assert!(notice.contains("dogs.toml"), "{notice}");
+        assert!(notice.contains("$EDITOR"), "{notice}");
+    }
+
+    /// fails if the schema stops being the first of two halves: the pane
+    /// cannot be drawn until the shepherd has answered with the section,
+    /// which is the half this binary has no copy of.
+    #[test]
+    fn a_schema_asks_for_the_section_and_the_section_opens_the_pane() {
+        let mut app = fixtures::app_in_settings_on_dog("metrics");
+        app.update(Msg::Key(KeyPress::Edit));
+        assert_eq!(
+            app.update(Msg::DogPane {
+                name: "metrics".to_string(),
+                adopted_path: None,
+                result: Ok(crate::dog::builtin_schema("metrics").expect("a built-in")),
+            }),
+            Effect::Send(Sent::DogSection {
+                name: "metrics".to_string()
+            })
+        );
+        assert!(app.config_pane().is_none(), "one half is not a pane");
+        app.update(Msg::Replied {
+            sent: Sent::DogSection {
+                name: "metrics".to_string(),
+            },
+            result: Ok(Response::DogSection {
+                toml: "bind = \"0.0.0.0:9615\"\n".to_string().into(),
+            }),
+        });
+        let pane = app.config_pane().expect("both halves are a pane");
+        assert_eq!(pane.target().name(), "metrics");
+        assert_eq!(pane.value("bind"), "0.0.0.0:9615");
+        assert!(
+            app.settings().is_none(),
+            "the settings screen closes once there is something to look at"
+        );
+    }
+
+    /// fails if a section arriving for a dog the operator has already left
+    /// re-opens a pane over the screen they went back to -- the same
+    /// property `config_target` buys for a sheep.
+    #[test]
+    fn a_section_for_a_dog_nobody_is_waiting_for_is_dropped() {
+        let mut app = fixtures::app_in_dog_pane();
+        app.update(Msg::Key(KeyPress::Escape));
+        assert!(app.config_pane().is_none());
+        app.update(Msg::Replied {
+            sent: Sent::DogSection {
+                name: "bark".to_string(),
+            },
+            result: Ok(Response::DogSection {
+                toml: fixtures::dog_section().into(),
+            }),
+        });
+        assert!(app.config_pane().is_none(), "a late reply re-opens nothing");
+    }
+
+    /// fails if a section for the WRONG dog replaces the pane. Its twin
+    /// above proves the pane is dropped once nobody is waiting; this one
+    /// proves the name is checked while somebody still is, which is the
+    /// half a cleared target cannot cover.
+    #[test]
+    fn a_section_for_a_different_dog_does_not_replace_the_pane() {
+        let mut app = fixtures::app_in_dog_pane();
+        app.update(Msg::Replied {
+            sent: Sent::DogSection {
+                name: "metrics".to_string(),
+            },
+            result: Ok(Response::DogSection {
+                toml: "bind = \"0.0.0.0:9615\"\n".to_string().into(),
+            }),
+        });
+        let pane = app.config_pane().expect("the bark pane is still open");
+        assert_eq!(pane.target().name(), "bark");
+        assert_eq!(
+            pane.value("poll"),
+            "60s",
+            "and still holds bark's own section"
+        );
+    }
+
+    /// fails if a dog's write stops carrying the WHOLE section, or if it
+    /// stops going out through `SetDogConfig` -- a dog has no override
+    /// store and no Flockfile, so `ApplyConfig` has nothing to mean here.
+    #[test]
+    fn a_dog_pane_write_carries_the_whole_edited_section() {
+        let mut app = fixtures::app_in_dog_pane();
+        let index = app
+            .config_pane()
+            .expect("the pane is open")
+            .fields()
+            .fields()
+            .iter()
+            .position(|field| field.key == "poll")
+            .expect("poll is a bark field");
+        app.update(Msg::Key(KeyPress::SelectFirst));
+        for _ in 0..index {
+            app.update(Msg::Key(KeyPress::SelectDown));
+        }
+        app.update(Msg::Key(KeyPress::Confirm));
+        for _ in 0..3 {
+            app.update(Msg::Key(KeyPress::TextBackspace));
+        }
+        for typed in "30s".chars() {
+            app.update(Msg::Key(KeyPress::TextChar(typed)));
+        }
+        app.update(Msg::Key(KeyPress::TextApply));
+        let Effect::Send(Sent::SetDogSection { name, toml, .. }) =
+            app.update(Msg::Key(KeyPress::Confirm))
+        else {
+            panic!("the confirm sends the section");
+        };
+        assert_eq!(name, "bark");
+        assert!(
+            toml.as_str().contains("poll = \"30s\""),
+            "{}",
+            toml.as_str()
+        );
+        assert!(
+            toml.as_str().contains("# how often"),
+            "a comment shep did not write survives: {}",
+            toml.as_str()
+        );
+    }
+
+    /// fails if a landed write stops re-reading the section, or if the
+    /// sentence starts promising the dog acted on it. Only the dog knows
+    /// that, which is the same fact the pane's own footer states.
+    #[test]
+    fn a_landed_dog_write_re_reads_the_section_and_promises_nothing_more() {
+        let mut app = fixtures::app_in_dog_pane();
+        assert_eq!(
+            app.update(Msg::Replied {
+                sent: Sent::DogSection {
+                    name: "bark".to_string(),
+                },
+                result: Ok(Response::DogConfigSet {
+                    name: "bark".to_string()
+                }),
+            }),
+            Effect::None,
+            "a reply routed by its own request, and this one is not the write"
+        );
+        let Effect::Send(Sent::DogSection { name }) = app.update(Msg::Replied {
+            sent: Sent::SetDogSection {
+                name: "bark".to_string(),
+                ticket: 0,
+                toml: fixtures::dog_section().into(),
+                authority: WriteAuthority::granted(&app).expect("the fixture opens the gate"),
+            },
+            result: Ok(Response::DogConfigSet {
+                name: "bark".to_string(),
+            }),
+        }) else {
+            panic!("a landed write re-reads");
+        };
+        assert_eq!(name, "bark");
+        let notice = app
+            .notice()
+            .expect("a landed write is reported")
+            .to_string();
+        assert!(notice.contains("bark is told"), "{notice}");
+    }
+
+    /// fails if `r` in a dog pane starts re-probing the dog's binary. The
+    /// schema was read at open and is parked on the app; a keystroke whose
+    /// job is to re-read a file must not respawn somebody else's process.
+    #[test]
+    fn r_in_a_dog_pane_re_reads_the_section_and_never_re_probes() {
+        let mut app = fixtures::app_in_dog_pane();
+        assert_eq!(
+            app.update(Msg::Key(KeyPress::Refresh)),
+            Effect::Send(Sent::DogSection {
+                name: "bark".to_string()
+            })
+        );
+    }
+
+    /// fails if a dog's map field starts offering the sheep env sub-screen,
+    /// which writes through `Request::SetSheepEnv` and would name a sheep
+    /// that does not exist. It refuses with `Lock::NoWidget`'s own sentence.
+    #[test]
+    fn enter_on_a_dogs_map_field_refuses_rather_than_opening_the_env_screen() {
+        let mut app = fixtures::app_in_dog_pane();
+        let index = app
+            .config_pane()
+            .expect("the pane is open")
+            .fields()
+            .fields()
+            .iter()
+            .position(|field| field.key == "sinks")
+            .expect("sinks is a bark field");
+        app.update(Msg::Key(KeyPress::SelectFirst));
+        for _ in 0..index {
+            app.update(Msg::Key(KeyPress::SelectDown));
+        }
+        assert_eq!(app.update(Msg::Key(KeyPress::Confirm)), Effect::None);
+        assert!(
+            app.config_pane().expect("still open").env().is_none(),
+            "a dog has no env sub-screen"
+        );
+        let notice = app.notice().expect("a locked row answers").to_string();
+        assert!(notice.contains("no editor in this pane"), "{notice}");
     }
 }

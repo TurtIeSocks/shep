@@ -8,6 +8,7 @@
 //! template. See [`PaneEdit`] for why the `ApplyConfig` route this pane
 //! shipped with was wrong.
 
+use std::path::PathBuf;
 use std::time::Instant;
 
 use serde_json::{Map, Value};
@@ -19,20 +20,32 @@ use super::viewport::Viewport;
 
 /// Which thing the pane is editing.
 ///
-/// One variant today. An enum rather than a bare name because a dog is the
-/// second thing this pane will edit, and a dog decides for itself what a
-/// published change reloads -- which is what [`ConfigPane::cost`]'s
-/// [`Option`] is for. The variant for it is added by the task that can
-/// construct one; an unconstructible variant is dead code, and this repo
-/// does not carry an `#[allow(dead_code)]` to hold a place.
+/// Two things, and they are not the same shape of edit. A sheep's config is
+/// shep's own document, so shep knows what every field costs; a dog's
+/// section belongs to the dog, so shep publishes the change and the dog
+/// decides what to reload -- which is what [`ConfigPane::cost`]'s [`Option`]
+/// is for.
 ///
-/// `Debug` is derived (IR-41): a name, not a value the pane withholds.
+/// `Debug` is derived (IR-41): a name and a binary's path, neither of which
+/// is a value the pane withholds. A dog's SECTION can carry a credential and
+/// is held on [`ConfigPane`] instead, behind that type's own redacted
+/// `Debug`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaneTarget {
     /// One sheep, by name.
     Sheep {
         /// The sheep.
         name: String,
+    },
+    /// One dog, by name, with the binary its schema was probed from.
+    Dog {
+        /// The dog.
+        name: String,
+        /// The adopted binary, or [`None`] for a built-in -- whose schema
+        /// comes from `crate::dog::builtin_schema`, since a built-in dog is
+        /// this same binary. Kept so a re-probe asks the same path the pane
+        /// opened on.
+        adopted_path: Option<PathBuf>,
     },
 }
 
@@ -41,7 +54,7 @@ impl PaneTarget {
     #[must_use]
     pub fn name(&self) -> &str {
         match self {
-            Self::Sheep { name } => name,
+            Self::Sheep { name } | Self::Dog { name, .. } => name,
         }
     }
 }
@@ -507,6 +520,15 @@ pub struct ConfigPane {
     view: Viewport,
     pending_edit: Option<PanePending>,
     env: Option<EnvPane>,
+    /// The dog's `[<name>]` table as TOML TEXT, and [`None`] for a sheep.
+    ///
+    /// Kept beside the parsed `values` rather than instead of them, because
+    /// the two answer different questions: `values` is what the rows render,
+    /// and this is what a write edits. `Request::SetDogConfig` replaces the
+    /// whole section, so an edit that re-rendered it from `values` would
+    /// throw away every comment the operator wrote -- see
+    /// [`Self::edited_section`].
+    section: Option<String>,
 }
 
 impl core::fmt::Debug for ConfigPane {
@@ -576,7 +598,112 @@ impl ConfigPane {
             view: Viewport::new(),
             pending_edit: None,
             env: None,
+            section: None,
         }
+    }
+
+    /// A pane over one dog's `[<name>]` section.
+    ///
+    /// `schema` is the dog's own answer to the schema flag -- probed at open
+    /// rather than read from anywhere, because nothing records one: `shep
+    /// adopt` uses it for the vet and writes down only the path. `section`
+    /// is the table as `Request::DogConfig` rendered it, empty when
+    /// `dogs.toml` has no such table.
+    ///
+    /// FLAT, in schema order, with no group headers (decision 3): a dog's
+    /// schema carries no `init.group`, and inventing sections for one would
+    /// be shep deciding how somebody else's config reads.
+    ///
+    /// A [`FieldKind::Map`] row is marked not editable, so it draws
+    /// [`Lock::NoWidget`] and refuses with that lock's own sentence. The
+    /// env sub-screen is the only map editor this pane has and it is a
+    /// SHEEP's env: it writes through `Request::SetSheepEnv` and renders
+    /// [`Self::env_keys`], neither of which means anything for a dog.
+    #[must_use]
+    pub fn dog(
+        name: String,
+        adopted_path: Option<PathBuf>,
+        schema: Value,
+        section: String,
+    ) -> Self {
+        let defs = schema
+            .get("$defs")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let properties = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let set = FieldSet::from_properties(&properties, &defs, &[]);
+        let fields = FieldSet::from_fields(
+            set.fields()
+                .iter()
+                .cloned()
+                .map(|mut field| {
+                    if field.kind == FieldKind::Map {
+                        field.editable = false;
+                    }
+                    field
+                })
+                .collect(),
+            &[],
+        );
+        let values: Map<String, Value> = section
+            .parse::<toml::Table>()
+            .ok()
+            .and_then(|table| serde_json::to_value(table).ok())
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        Self {
+            target: PaneTarget::Dog { name, adopted_path },
+            fields,
+            values,
+            env_keys: Vec::new(),
+            overridden: Vec::new(),
+            pending: Vec::new(),
+            view: Viewport::new(),
+            pending_edit: None,
+            env: None,
+            section: Some(section),
+        }
+    }
+
+    /// The section with `edit` applied, comments and key order intact, ready
+    /// for `Request::SetDogConfig`. [`None`] for a sheep pane, for an env
+    /// edit, and for a section that does not parse.
+    ///
+    /// `toml_edit` rather than a re-render of [`Self::values`], and that is
+    /// the whole reason this method exists: the request replaces the section
+    /// wholesale, so a re-render would delete every comment in it on the
+    /// operator's own keystroke.
+    ///
+    /// A `null` value REMOVES the key, which is how the pane's empty buffer
+    /// unsets one, and is what puts the dog back on its own default.
+    #[must_use]
+    pub fn edited_section(&self, edit: &PaneEdit) -> Option<String> {
+        let section = self.section.as_deref()?;
+        let PaneEdit::Set { key, value } = edit else {
+            return None;
+        };
+        let mut doc: toml_edit::DocumentMut = section.parse().ok()?;
+        match value.as_value() {
+            Value::Null => {
+                doc.remove(key);
+            }
+            Value::Bool(flag) => doc[key] = toml_edit::value(*flag),
+            // A number that is neither an i64 nor an f64 is not something
+            // TOML can hold, so the edit is refused rather than rounded.
+            Value::Number(number) => match (number.as_i64(), number.as_f64()) {
+                (Some(int), _) => doc[key] = toml_edit::value(int),
+                (None, Some(float)) => doc[key] = toml_edit::value(float),
+                (None, None) => return None,
+            },
+            Value::String(text) => doc[key] = toml_edit::value(text.as_str()),
+            other => doc[key] = toml_edit::value(other.to_string()),
+        }
+        Some(doc.to_string())
     }
 
     /// The one in-flight edit, or [`None`].
@@ -974,6 +1101,9 @@ impl ConfigPane {
     pub fn cost(&self, key: &str) -> Option<ApplyGroup> {
         match self.target {
             PaneTarget::Sheep { .. } => Some(apply_group(key)),
+            // The dog decides, not shep. Said once at the foot of the pane
+            // rather than guessed per row (decision 4).
+            PaneTarget::Dog { .. } => None,
         }
     }
 
@@ -1365,6 +1495,112 @@ mod tests {
         assert_eq!(env.apply_typing(), Some(("A".to_owned(), None)));
     }
 
+    /// The bark section every dog test below reads: a comment, a scalar,
+    /// and a sink carrying a credential.
+    fn bark_section() -> String {
+        "# how often\npoll = \"60s\"\nhistory_bytes = 4096\n\n[sinks.ops]\nkind = \"slack\"\nurl = \"https://hooks.example/x\"\n".to_owned()
+    }
+
+    fn bark_pane() -> ConfigPane {
+        let schema = crate::dog::builtin_schema("bark").expect("bark is a built-in");
+        ConfigPane::dog("bark".into(), None, schema, bark_section())
+    }
+
+    /// fails if a dog pane starts inventing sections for a schema that
+    /// declares none (decision 3), if the secret marker stops reaching the
+    /// field set, or if shep starts claiming to know what a dog's field
+    /// costs (decision 4).
+    #[test]
+    fn a_dog_pane_is_flat_in_schema_order_and_marks_the_secret() {
+        let pane = bark_pane();
+        assert!(
+            pane.fields()
+                .fields()
+                .iter()
+                .all(|field| field.group.is_none()),
+            "a dog's schema carries no group, so the pane draws no headers"
+        );
+        let keys: Vec<&str> = pane
+            .fields()
+            .fields()
+            .iter()
+            .map(|f| f.key.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            ["history_bytes", "poll", "rules", "sink_timeout", "sinks"],
+            "schema order, which for a serde_json map is alphabetical"
+        );
+        assert!(
+            pane.fields()
+                .by_key("sinks")
+                .expect("sinks is a field")
+                .secret
+        );
+        assert_eq!(pane.value("poll"), "60s");
+        assert_eq!(pane.cost("poll"), None);
+    }
+
+    /// fails if the pane starts offering an editor for a shape it has none
+    /// for, which for a dog is the map `sinks` is. It draws
+    /// [`Lock::NoWidget`], never [`Lock::Refused`]: shep writes that section
+    /// happily, this screen simply has no widget for a table of tables.
+    #[test]
+    fn a_dogs_map_field_is_locked_for_want_of_a_widget_and_not_refused() {
+        let pane = bark_pane();
+        assert_eq!(pane.lock("sinks"), Some(Lock::NoWidget));
+        assert_eq!(pane.lock("rules"), Some(Lock::NoWidget));
+        assert_eq!(pane.lock("poll"), None);
+    }
+
+    /// fails if a write starts re-rendering the section from the parsed
+    /// values, which would delete every comment in a file shep does not
+    /// author on the operator's own keystroke.
+    #[test]
+    fn an_edited_section_keeps_its_comments_and_changes_one_key() {
+        let pane = bark_pane();
+        let out = pane
+            .edited_section(&PaneEdit::Set {
+                key: "poll".into(),
+                value: serde_json::json!("30s").into(),
+            })
+            .expect("the fixture section parses");
+        assert!(out.contains("# how often"), "{out}");
+        assert!(out.contains("poll = \"30s\""), "{out}");
+        assert!(out.contains("history_bytes = 4096"), "{out}");
+        assert!(out.contains("url = \"https://hooks.example/x\""), "{out}");
+    }
+
+    /// fails if an empty buffer stops unsetting a dog's key, which is how
+    /// the pane puts one back on the dog's own default.
+    #[test]
+    fn a_null_edit_removes_the_key_from_the_section() {
+        let pane = bark_pane();
+        let out = pane
+            .edited_section(&PaneEdit::Set {
+                key: "history_bytes".into(),
+                value: serde_json::Value::Null.into(),
+            })
+            .expect("the fixture section parses");
+        assert!(!out.contains("history_bytes"), "{out}");
+        assert!(out.contains("# how often"), "{out}");
+    }
+
+    /// fails if a sheep pane grows a section, which would send a sheep's
+    /// config out through a dog's door.
+    #[test]
+    fn a_sheep_pane_has_no_section_to_edit() {
+        let pane = ConfigPane::sheep(web());
+        assert_eq!(
+            pane.edited_section(&PaneEdit::Set {
+                key: "cwd".into(),
+                value: serde_json::json!("/srv").into(),
+            }),
+            None
+        );
+    }
+
+    /// fails if a live config value ever reaches a `{:?}` (IR-41).
     /// fails if a live config value ever reaches a `{:?}` (IR-41).
     ///
     /// `cwd` and `script` routinely hold a home directory and `args` holds
@@ -1462,6 +1698,21 @@ mod tests {
         assert_eq!(
             format!("{env:?}"),
             "EnvPane { keys: 2, cursor: 2, typing: true }"
+        );
+    }
+
+    /// fails if a dog pane's `Debug` starts printing the section it holds
+    /// (IR-41). A dog's section is the single most credential-dense thing
+    /// this screen ever loads -- bark's own `sinks` table is a webhook URL
+    /// with a bearer token in it -- and the redaction is on the pane rather
+    /// than on each type that carries the text, which is the rule this
+    /// branch settled on after two hand-written redactions missed one.
+    #[test]
+    fn a_dog_panes_debug_names_no_section() {
+        let pane = bark_pane();
+        assert_eq!(
+            format!("{pane:?}"),
+            r#"ConfigPane { target: Dog { name: "bark", adopted_path: None }, fields: 5, env_keys: 0, cursor: 0 }"#
         );
     }
 

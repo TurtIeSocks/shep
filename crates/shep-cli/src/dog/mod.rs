@@ -46,6 +46,27 @@ use crate::exit::ExitCode;
 /// [`run_dog`] refuses it before touching the socket.
 pub(crate) const BUILT_IN_DOGS: [&str; 2] = ["metrics", "bark"];
 
+/// The schema a built-in dog would print for the schema flag, without
+/// spawning anything: a built-in dog IS this binary, so the answer is one
+/// call away rather than a subprocess and a timeout away.
+///
+/// [`None`] for a name that is not a built-in, which is how a caller tells
+/// an adopted dog (spawn its recorded path and ask) from a built-in (this).
+/// Also [`None`] when the schema could not be built at all, which is
+/// `config_schema` refusing a `#[shep(secret)]` mark that landed on no
+/// property -- a bug in this binary rather than a fact about the dog, and
+/// the caller has one way of saying "no schema" either way.
+pub(crate) fn builtin_schema(name: &str) -> Option<serde_json::Value> {
+    use shep_client::dogs::config_schema;
+
+    let schema = match name {
+        "metrics" => config_schema::<metrics::MetricsConfig>().ok()?,
+        "bark" => config_schema::<bark::BarkConfig>().ok()?,
+        _ => return None,
+    };
+    serde_json::to_value(schema).ok()
+}
+
 /// A dog's connection to the shepherd, and its own configuration.
 ///
 /// The whole of the dog contract from the dog's side: locate the socket
@@ -465,6 +486,26 @@ impl bark::FlockSource for Arc<ClientShepherd> {
 impl bark::ConfigSource for Arc<ClientShepherd> {
     async fn section(&self) -> Result<String, RequestError> {
         bark::ConfigSource::section(&**self).await
+    }
+}
+
+#[cfg(test)]
+mod builtin_schema_tests {
+    use super::*;
+
+    /// fails if a built-in stops answering in-process, if a stranger starts
+    /// answering, or if the secret marker stops reaching the schema a pane
+    /// reads -- which is the one thing standing between a webhook bearer
+    /// token and the screen.
+    #[test]
+    fn both_built_ins_answer_and_a_stranger_does_not() {
+        assert!(builtin_schema("metrics").is_some());
+        let bark = builtin_schema("bark").expect("bark is a built-in");
+        assert_eq!(
+            bark["properties"]["sinks"][shep_core::dogs::SECRET_KEY],
+            true
+        );
+        assert!(builtin_schema("otel").is_none());
     }
 }
 

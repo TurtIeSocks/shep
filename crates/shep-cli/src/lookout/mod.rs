@@ -237,6 +237,7 @@ pub async fn lookout(
         msg_rx,
         poll_tx,
         request_tx,
+        paths.home.clone(),
         paths.daemon_config.clone(),
         paths.socket.clone(),
         source::LocalReader::new(),
@@ -341,9 +342,16 @@ pub async fn run_ui<B: Backend, S, L>(
     mut msgs: mpsc::Receiver<Msg>,
     polls: mpsc::Sender<()>,
     requests: mpsc::Sender<self::app::Sent>,
-    // The settings screen's own read target. Carried as two owned `PathBuf`s
+    // `$SHEP_HOME` as this invocation resolved it. Only
+    // `Effect::LoadDogPane` reads it, and it has to be the resolved one
+    // rather than whatever a probed binary would inherit: `commands::dogs`'s
+    // own `ask` sets `SHEP_HOME` for the candidate, and an adopted dog that
+    // resolved the DEFAULT home instead of `--home`'s would find the live
+    // daemon's socket during a probe that is only meant to read a schema.
+    home: std::path::PathBuf,
+    // The settings screen's own read target. Carried as owned `PathBuf`s
     // rather than `&ShepPaths`, so a test can hand this loop an arbitrary
-    // pair without constructing a real `ShepPaths` -- and cloned into
+    // set without constructing a real `ShepPaths` -- and cloned into
     // `Effect::LoadSettings`'s `spawn_blocking` closure each time the screen
     // opens, since that closure outlives this function's own stack frame.
     daemon_config: std::path::PathBuf,
@@ -654,6 +662,67 @@ where
                 }));
                 dirty = true;
             }
+            // The dog config pane's schema probe, off this task for a
+            // sharper reason than the file reads above: for an ADOPTED dog
+            // this spawns somebody else's binary and waits up to
+            // `VERSION_BUDGET` for it to print and exit. Awaiting that here
+            // would freeze the redraw, the tick and the bus drain for a
+            // second on every `e`, and a candidate that hangs is killed at
+            // the budget rather than before it.
+            //
+            // A BUILT-IN dog costs none of that -- it is this binary, so the
+            // answer is one call -- and still goes the same way rather than
+            // inline: which of the two a name is belongs in one place, and
+            // this arm answering both keeps the reducer from having to know.
+            //
+            // Decision 10: anything other than a published schema is no
+            // pane, and the refusal names the file an operator edits
+            // instead. `Unreadable` and `Silent` say the same thing here
+            // even though `adopt` tells them apart -- `adopt` is judging the
+            // binary, and this is answering "can I draw a form", where the
+            // answer is no either way.
+            Effect::LoadDogPane { name, adopted_path } => {
+                let home = home.clone();
+                let handle = tokio::task::spawn_blocking(move || {
+                    let schema = match (crate::dog::builtin_schema(&name), adopted_path.as_deref())
+                    {
+                        (Some(schema), _) => Some(schema),
+                        (None, Some(path)) => {
+                            match crate::commands::dogs::ask_schema(
+                                path,
+                                &home,
+                                &name,
+                                crate::commands::dogs::VERSION_BUDGET,
+                            ) {
+                                crate::commands::dogs::DogSchema::Published(schema) => Some(schema),
+                                crate::commands::dogs::DogSchema::Silent
+                                | crate::commands::dogs::DogSchema::Unreadable => None,
+                            }
+                        }
+                        (None, None) => None,
+                    };
+                    let result = schema.ok_or_else(|| {
+                        format!("{name} publishes no schema; edit dogs.toml with $EDITOR")
+                    });
+                    Msg::DogPane {
+                        name,
+                        adopted_path,
+                        result,
+                    }
+                });
+                inflight.push(Box::pin(async move {
+                    // A `spawn_blocking` that panicked is the one case this
+                    // has no `Msg` for, and it is reported as the same
+                    // refusal rather than dropped: a keystroke that produces
+                    // silence reads as a key that is not bound.
+                    handle.await.unwrap_or_else(|err| Msg::DogPane {
+                        name: String::new(),
+                        adopted_path: None,
+                        result: Err(format!("the schema probe failed: {err}")),
+                    })
+                }));
+                dirty = true;
+            }
             // The one arm that writes `shep.toml`'s `enabled_dogs`, off this
             // task and out of this loop's way for the same reason
             // `Effect::WriteSetting`'s own arm gives:
@@ -795,6 +864,7 @@ mod tests {
                 msg_rx,
                 poll_tx,
                 request_tx,
+                PathBuf::from("/tmp/shep-lookout-tests"),
                 PathBuf::from("/tmp/shep-lookout-tests/shep.toml"),
                 PathBuf::from("/tmp/shep-lookout-tests/run/shep.sock"),
                 FakeLocal::default(),
@@ -847,6 +917,7 @@ mod tests {
                 msg_rx,
                 poll_tx,
                 request_tx,
+                PathBuf::from("/tmp/shep-lookout-tests"),
                 PathBuf::from("/tmp/shep-lookout-tests/shep.toml"),
                 PathBuf::from("/tmp/shep-lookout-tests/run/shep.sock"),
                 FakeLocal::default(),
@@ -926,6 +997,7 @@ mod tests {
                 msg_rx,
                 poll_tx,
                 request_tx,
+                PathBuf::from("/tmp/shep-lookout-tests"),
                 PathBuf::from("/tmp/shep-lookout-tests/shep.toml"),
                 PathBuf::from("/tmp/shep-lookout-tests/run/shep.sock"),
                 local,
@@ -1004,6 +1076,7 @@ mod tests {
                 msg_rx,
                 poll_tx,
                 request_tx,
+                PathBuf::from("/tmp/shep-lookout-tests"),
                 PathBuf::from("/tmp/shep-lookout-tests/shep.toml"),
                 PathBuf::from("/tmp/shep-lookout-tests/run/shep.sock"),
                 local,
@@ -1111,6 +1184,7 @@ mod tests {
                 msg_rx,
                 poll_tx,
                 request_tx,
+                PathBuf::from("/tmp/shep-lookout-tests"),
                 PathBuf::from("/tmp/shep-lookout-tests/shep.toml"),
                 PathBuf::from("/tmp/shep-lookout-tests/run/shep.sock"),
                 local,
@@ -1182,6 +1256,7 @@ mod tests {
                 msg_rx,
                 poll_tx,
                 request_tx,
+                PathBuf::from("/tmp/shep-lookout-tests"),
                 PathBuf::from("/tmp/shep-lookout-tests/shep.toml"),
                 PathBuf::from("/tmp/shep-lookout-tests/run/shep.sock"),
                 local,
@@ -1250,6 +1325,7 @@ mod tests {
                 msg_rx,
                 poll_tx,
                 request_tx,
+                PathBuf::from("/tmp/shep-lookout-tests"),
                 PathBuf::from("/tmp/shep-lookout-tests/shep.toml"),
                 PathBuf::from("/tmp/shep-lookout-tests/run/shep.sock"),
                 local,
@@ -1354,6 +1430,7 @@ mod tests {
                 msg_rx,
                 poll_tx,
                 request_tx,
+                dir.path().to_path_buf(),
                 config.clone(),
                 socket_default,
                 FakeLocal::default(),
