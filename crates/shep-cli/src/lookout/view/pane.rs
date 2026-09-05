@@ -134,7 +134,7 @@ fn section_header(label: &str, palette: Palette) -> Line<'static> {
 /// It used to say `read-only` too, and that stopped being true the moment
 /// `space` and `Enter` started writing. It is NOT replaced by a
 /// control-dependent word here: what the keys do belongs in the key hint,
-/// which reads the gate already (`view::status::PANE_HINT`), and a title
+/// which reads the gate already (`view::status::pane_hint`), and a title
 /// that needed a footnote about `--allow-control` is exactly the asterisk
 /// that file's standing rule forbids.
 fn title_line(pane: &ConfigPane, palette: Palette, width: u16) -> Line<'static> {

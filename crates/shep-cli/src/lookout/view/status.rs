@@ -375,9 +375,10 @@ const fn pane_hint(control: Control, env_open: bool) -> &'static str {
 /// The key hint.
 ///
 /// Three forms now: the settings screen's own, and the dashboard's two. The
-/// config pane's is [`PANE_HINT`] above and is not one of these -- it is a
-/// constant rather than a branch here, because that screen has one form and
-/// `hint_for`'s whole subject is choosing between several.
+/// config pane's are [`pane_hint`]'s above and are not among these -- that
+/// screen branches on a different pair of questions (the control gate and
+/// whether the env sub-screen is open), which is why it is its own function
+/// rather than four more arms here.
 /// `settings_open` picks between them, and wins outright, because the
 /// dashboard's `x`/`R`/`L`/`r`/`/` mean nothing while the screen owns the
 /// keyboard. This file's standing rule: a hint that needs a footnote to be

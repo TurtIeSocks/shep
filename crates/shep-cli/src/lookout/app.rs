@@ -3126,11 +3126,14 @@ impl App {
     /// Sends whatever the pane has armed, whichever of its two screens
     /// armed it.
     ///
-    /// One function for both, because the arm is one field
-    /// ([`ConfigPane::pending_edit`]) and only the [`PaneEdit`] variant
-    /// inside it differs: a field edit leaves as a
-    /// `Request::SetSheepField`, an env edit as a `Request::SetSheepEnv`.
-    /// Both record an operator override for one key.
+    /// One function for all three, because the arm is one field
+    /// ([`ConfigPane::pending_edit`]) and only its destination differs. A
+    /// sheep's field edit leaves as a `Request::SetSheepField` and its env
+    /// edit as a `Request::SetSheepEnv`, both recording an operator
+    /// override for one key. A DOG leaves by a third door, before either:
+    /// `Request::SetDogConfig` carries the whole `dogs.toml` section rather
+    /// than a key, so the target is read first and the [`PaneEdit`] variant
+    /// only decides the other two.
     fn send_armed(&mut self) -> Effect {
         let Some(authority) = self.authorize_write() else {
             return Effect::None;
@@ -3354,10 +3357,10 @@ impl App {
     /// [`Self::on_settings_text_key`]'s own doc gives: this repository does
     /// not widen an accepted input grammar without a basis in the spec.
     ///
-    /// The two editors differ in what `TextApply` does, and deliberately.
-    /// A field edit ARMS -- the operator's next `Enter`, on the now-closed
-    /// editor, is what sends it. An env edit SENDS, for the reason
-    /// [`Self::on_env_key`] gives.
+    /// Both editors ARM on `TextApply`: the operator's next `Enter`, on the
+    /// now-closed editor, is what sends it. This doc said an env edit
+    /// SENDS, which it did until [`Self::on_env_key`] made that screen stop
+    /// being the one exception -- see its own doc for the argument.
     fn on_pane_text_key(&mut self, key: KeyPress) -> Effect {
         if key == KeyPress::Quit {
             return Effect::Quit;

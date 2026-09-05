@@ -82,9 +82,12 @@ pub enum Lock {
 
 /// One row of the pane.
 ///
-/// One variant today. Named rather than left as a bare index because the
-/// env sub-screen is a second kind of row a later task adds, and a `usize`
-/// that silently changes meaning is the failure that would cause.
+/// One variant, and it stays one: the env sub-screen went a different way
+/// and got [`EnvRow`] of its own, because its `+ new` row is not an index
+/// into anything and would have made this enum answer for two screens.
+/// Named rather than left as a bare index anyway -- a `usize` travelling
+/// between [`ConfigPane::rows`], the viewport and the renderer says nothing
+/// about what it indexes, and this one says.
 ///
 /// `Debug` is derived (IR-41): an index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

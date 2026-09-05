@@ -3331,12 +3331,12 @@ fn pending_fields(entry: &ProcessEntry) -> Vec<String> {
 
 /// The one sentence every door that refuses to touch a dog's config says.
 ///
-/// Three doors say it: [`Actor::apply_one`], where a Flockfile named a dog;
+/// Four doors say it: [`Actor::apply_one`], where a Flockfile named a dog;
 /// [`Actor::handle_sheep_config`], where a pane asked to read one; and
-/// [`Actor::handle_set_sheep_env`], where a pane asked to write one. An
-/// operator who meets it from any of them is being told the same thing and
-/// pointed at the same verb, which is the reason it is one function rather
-/// than three literals that drift.
+/// [`Actor::handle_set_sheep_env`] and [`Actor::handle_set_sheep_field`],
+/// where a pane asked to write one. An operator who meets it from any of
+/// them is being told the same thing and pointed at the same verb, which is
+/// the reason it is one function rather than four literals that drift.
 fn dog_config_refusal(name: &str) -> String {
     format!(
         "{name} is a dog, and a dog's config comes from `shep adopt` rather than \
@@ -6438,8 +6438,10 @@ impl<R: ProcessRunner> Actor<R> {
         // the reason `handle_set_sheep_env`'s own guard gives at length: a
         // dog runs at the daemon's own trust level, a dog is never in the
         // override store so nothing further down would catch it, and this
-        // door reaches `script` and `args` directly. `apply_one` and
-        // `handle_scale` refuse a dog with the same sentence.
+        // door reaches `script` and `args` directly. `apply_one` refuses a
+        // dog with this same sentence; `handle_scale` refuses one too, but
+        // with its own -- a count is not a config write, so it says a dog
+        // runs one process, under `InvalidScale` rather than `IsADog`.
         if self
             .sheep
             .get(&id)

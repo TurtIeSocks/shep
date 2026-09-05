@@ -239,9 +239,9 @@ pub fn spawn_cron_worker(
                         | SupervisorError::Overrides(_)),
                     ) => {
                         // A restart touches no log files, starts no reload,
-                        // scales nothing and registers no batch, and it never
-                        // reads or writes the override store, so none of
-                        // the eight can arrive.
+                        // scales nothing and registers no batch, it names no
+                        // dog and no field, and it never reads or writes the
+                        // override store, so none of the nine can arrive.
                         // Named rather than swept into a catch-all, so a
                         // variant this path CAN produce still fails to
                         // compile here.
