@@ -27,6 +27,7 @@ use ratatui::text::{Line, Span};
 use super::super::app::{App, Settings, SettingsRow};
 use super::super::theme::Palette;
 use super::flock::{fit, mark};
+use super::scroll::Attempt;
 use crate::commands::settings::{ScalarView, SettingField, SettingsSnapshot};
 use crate::style::StyleSource;
 use crate::vocabulary::Reported;
@@ -551,14 +552,11 @@ fn section_for(settings: &Settings, field: SettingField) -> &str {
 /// offset it hands over is a starting point here, walked down one row at a
 /// time until the cursor's row fits.
 ///
-/// The walk can run out. A four-line body has no room for the `[dogs]`
-/// block above a dog row, and at `view::MIN_HEIGHT` that is the whole
-/// budget -- the last offset draws two markers, two blanks and no data at
-/// all. So when it runs out it gives up on the layout rather than on the
-/// cursor: [`cursor_only`] draws that one row without its section chrome.
-/// The cursor is therefore drawn at every height this screen claims to
-/// support, and the frame at the floor looks unlike every other frame on
-/// purpose. Zero means unlimited, for a test with no terminal behind it.
+/// The walk itself is [`super::scroll::to_cursor`], shared with the config
+/// pane, and so is its last resort: a four-line body has no room for the
+/// `[dogs]` block above a dog row, and at `view::MIN_HEIGHT` that is the
+/// whole budget, so [`cursor_only`] draws that one row without its section
+/// chrome. Zero means unlimited, for a test with no terminal behind it.
 ///
 /// [`Viewport`]: crate::lookout::viewport::Viewport
 fn content_lines(
@@ -581,18 +579,12 @@ fn content_lines(
     if total_rows == 0 {
         return body_from(app, settings, palette, width, budget, 0).lines;
     }
-    // At most one pass per row, over six scalars and a handful of dogs.
-    let mut offset = settings.view().offset().min(cursor_row);
-    loop {
-        let attempt = body_from(app, settings, palette, width, budget, offset);
-        if attempt.cursor_drawn {
-            return attempt.lines;
-        }
-        if offset >= cursor_row {
-            return cursor_only(app, settings, palette, width, budget, cursor_row);
-        }
-        offset += 1;
-    }
+    super::scroll::to_cursor(
+        cursor_row,
+        settings.view().offset(),
+        |offset| body_from(app, settings, palette, width, budget, offset),
+        || cursor_only(app, settings, palette, width, budget, cursor_row),
+    )
 }
 
 /// The cursor's own row, alone, for a body too short to hold the chrome
@@ -653,19 +645,6 @@ fn cursor_only(
         )));
     }
     lines
-}
-
-/// One attempt at the body, drawn from data row `offset` down.
-///
-/// No `Debug`: it is built and consumed inside [`content_lines`], and a
-/// `Vec<Line>` prints as noise rather than as anything a test would assert
-/// on.
-struct Attempt {
-    /// The body, never longer than the budget it was built against.
-    lines: Vec<Line<'static>>,
-    /// Whether the cursor's own row was one of them. False means the
-    /// chrome ate the budget and the caller must scroll further.
-    cursor_drawn: bool,
 }
 
 /// Lays the body out from data row `offset`, spending at most `budget`

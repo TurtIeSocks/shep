@@ -10,6 +10,7 @@ pub mod bleats;
 pub mod detail;
 pub mod flock;
 pub mod host;
+pub mod scroll;
 pub mod settings;
 pub mod status;
 
