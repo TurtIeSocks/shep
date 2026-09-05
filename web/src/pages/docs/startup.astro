@@ -78,7 +78,15 @@ removed  /Library/LaunchDaemons/io.github.turtiesocks.shep.deploy.plist  absent`
       A unit that was never installed reports <code>absent</code> rather than
       failing. There's nothing left to guess at, on either verb. Under
       <code>sudo</code>, the unit is built for <code>$SUDO_USER</code> rather
-      than root, so it supervises the flock the operator actually has.
+      than root, so it supervises the flock the operator actually has, and
+      its <code>$SHEP_HOME</code> is that user's own <code>~/.shep</code>
+      unless <code>--home</code> or a <code>$SHEP_HOME</code> that survived
+      <code>sudo</code> says otherwise. shep won't create that
+      directory for another user, since root would own it and the daemon
+      couldn't open it. If it isn't there yet, run any shep verb as that
+      user first, or point <code>--home</code> or <code>$SHEP_HOME</code> at
+      a directory that already exists: a named home is refused when missing,
+      never created.
     </p>
 
     <h2>The PATH capture, and its one trap</h2>

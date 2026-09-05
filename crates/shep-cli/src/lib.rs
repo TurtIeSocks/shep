@@ -418,7 +418,7 @@ fn must_render_bare(stdout_is_terminal: bool, fmt: cli::Format) -> bool {
 /// A type rather than a bare [`ExitCode`]: two of the three carry the path
 /// they are about, and an operator cannot act on a refusal that omits it.
 #[derive(Debug)]
-enum HomeRefusal {
+pub(crate) enum HomeRefusal {
     /// None of `--home`, `$SHEP_HOME` or `$HOME` resolved a root directory.
     Unresolved,
     /// `--home`/`$SHEP_HOME` named a directory that is not there. Never
@@ -466,7 +466,7 @@ impl HomeRefusal {
     ///
     /// `Internal` rather than `Usage` for the io case: the operator asked for
     /// something reasonable and shep failed at it.
-    fn code(&self) -> ExitCode {
+    pub(crate) fn code(&self) -> ExitCode {
         match self {
             Self::Unresolved | Self::Missing(_) => ExitCode::Usage,
             Self::Io { .. } => ExitCode::Internal,
@@ -554,6 +554,30 @@ fn scaffold_first_run_interpreters(paths: &ShepPaths) {
     }
 }
 
+/// Creates `paths.home` if it is not there, with the first-run scaffold the
+/// shared gate in [`run`] gives every other verb's fresh home.
+///
+/// `startup` is the caller, for its own default home: the target user's
+/// `<passwd home>/.shep`, which [`ensure_home`] cannot resolve since it
+/// reads this process's environment. A named home never reaches this;
+/// `run` sends one through the shared gate, which refuses a missing one.
+///
+/// # Errors
+///
+/// [`HomeRefusal::Io`] when the directory could not be created.
+#[cfg(unix)]
+pub(crate) fn create_default_home(
+    streams: &mut Streams<'_>,
+    paths: ShepPaths,
+) -> Result<(), HomeRefusal> {
+    let (paths, home_is_new) = ensure_home_at(paths, false)?;
+    if home_is_new {
+        scaffold_first_run_interpreters(&paths);
+        welcome::on_first_run(streams, &paths.home, std::io::stderr().is_terminal());
+    }
+    Ok(())
+}
+
 /// Parses, resolves `$SHEP_HOME` for the verbs that need it, and dispatches
 /// to the verb's own module.
 ///
@@ -561,11 +585,14 @@ fn scaffold_first_run_interpreters(paths: &ShepPaths) {
 /// connects or autostarts. `Start` and `Muster` are the only two arms that
 /// bring a shepherd up, through [`connect_or_spawn_client`].
 ///
-/// `Startup` and `Unstartup` skip the shared `$SHEP_HOME` gate below;
-/// `unstartup` ignores `--home` entirely, since a removal is addressed by
-/// the unit's path and label alone. `style` is already forced to
-/// [`style::StyleLevel::Bare`] if the hard rule applies; `resolved_style` is
-/// the unforced pair `Commands::Style` and the lookout settings screen read.
+/// `Startup` and `Unstartup` skip the shared `$SHEP_HOME` gate below: with
+/// no `--home`/`$SHEP_HOME` the unit's home is the TARGET user's passwd
+/// home, which the gate would get wrong under `sudo`, and a named one goes
+/// through [`ensure_home`] inside the `Startup` arm. `unstartup` ignores
+/// `--home` entirely, since a removal is addressed by the unit's path and
+/// label alone. `style` is already forced to [`style::StyleLevel::Bare`] if
+/// the hard rule applies; `resolved_style` is the unforced pair
+/// `Commands::Style` and the lookout settings screen read.
 async fn run(
     cli: Cli,
     style: style::Presentation,
@@ -618,31 +645,27 @@ async fn run(
             }
             return run_daemon_command(fmt, &cli.global, args).await;
         }
-        // Through `ensure_home`, not raw `--home`: this verb installs a unit
-        // without starting anything, so `$SHEP_HOME` must exist beforehand.
+        // A named home goes through the shared gate: refused if missing,
+        // never created. With none, the startup module resolves the target
+        // user's `<passwd home>/.shep`; `ensure_home` would read this
+        // process's `$HOME`, which `sudo` sets to root's.
         Commands::Startup(ref args) => {
             #[cfg(windows)]
             let _ = args;
-            let (paths, home_is_new) = match ensure_home(&cli.global) {
-                Ok(resolved) => resolved,
-                Err(refusal) => {
-                    let code = refusal.code();
-                    emit_error_locked(fmt, code, &refusal.to_string());
-                    return code;
+            let named_home = if cli.global.home.is_some() {
+                match ensure_home(&cli.global) {
+                    Ok((paths, _)) => Some(paths.home),
+                    Err(refusal) => {
+                        let code = refusal.code();
+                        emit_error_locked(fmt, code, &refusal.to_string());
+                        return code;
+                    }
                 }
+            } else {
+                None
             };
-            if home_is_new {
-                scaffold_first_run_interpreters(&paths);
-                let mut err = std::io::stderr();
-                let mut sink = std::io::sink();
-                let mut streams = Streams {
-                    out: &mut sink,
-                    err: &mut err,
-                    style,
-                    fmt,
-                };
-                welcome::on_first_run(&mut streams, &paths.home, std::io::stderr().is_terminal());
-            }
+            #[cfg(windows)]
+            let _ = named_home;
             let mut out = std::io::stdout().lock();
             let mut err = std::io::stderr().lock();
             let mut streams = Streams {
@@ -652,7 +675,7 @@ async fn run(
                 fmt,
             };
             #[cfg(unix)]
-            return startup::startup(&mut streams, Some(paths.home.as_path()), args);
+            return startup::startup(&mut streams, named_home.as_deref(), args);
             #[cfg(windows)]
             return streams.fail(ExitCode::Failure, WINDOWS_NO_SERVICE);
         }
@@ -1441,6 +1464,28 @@ mod tests {
             !created_again,
             "a home that was already there is not newly created"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn creating_startups_default_home_scaffolds_it_like_the_shared_gate() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = paths_at(root.path());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut streams = Streams {
+            out: &mut out,
+            err: &mut err,
+            style: style::Presentation::BARE,
+            fmt: cli::Format::Table,
+        };
+
+        create_default_home(&mut streams, paths.clone()).expect("a default home is created");
+        assert!(paths.home.is_dir());
+        let written = std::fs::read_to_string(&paths.daemon_config).unwrap();
+        assert!(written.contains("[interpreters]"), "{written}");
+
+        create_default_home(&mut streams, paths).expect("a home already there is left alone");
     }
 
     #[cfg(unix)]

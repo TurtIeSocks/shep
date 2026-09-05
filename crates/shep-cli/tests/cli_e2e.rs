@@ -7664,3 +7664,55 @@ fn add_with_nothing_to_add_is_a_usage_error() {
         "and no shepherd was started to answer a request nobody made"
     );
 }
+
+/// `$SUDO_USER` names `nobody` (passwd home `/var/empty` on macOS,
+/// `/nonexistent` on Linux) and `$HOME` is a throwaway standing in for
+/// root's. The refusal must name nobody's `~/.shep`, not `$HOME/.shep`.
+/// Skipped as root: a broken gate would really install a unit.
+#[cfg(unix)]
+#[test]
+fn a_sudo_startup_without_home_carries_the_target_users_home_not_this_processes() {
+    if nix::unistd::geteuid().is_root() {
+        eprintln!("skipping: as root this would really install a unit if the gate were broken");
+        return;
+    }
+    let Ok(Some(nobody)) = nix::unistd::User::from_name("nobody") else {
+        eprintln!("skipping: no `nobody` user to stand in for $SUDO_USER");
+        return;
+    };
+    let fake_root_home = TempDir::new().unwrap();
+
+    let output = Command::cargo_bin("shep")
+        .unwrap()
+        .env("HOME", fake_root_home.path())
+        .env("SUDO_USER", "nobody")
+        .env_remove("SHEP_HOME")
+        .arg("startup")
+        .arg("--init")
+        .arg("systemd")
+        .timeout(CMD_TIMEOUT)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let target_home = nobody.dir.join(".shep");
+    let refusal = format!(
+        "error[usage]: no directory at {}; create it first (any shep verb run as nobody \
+         creates that user's own ~/.shep), or pass --home with the $SHEP_HOME this unit \
+         should carry",
+        target_home.display()
+    );
+    assert!(
+        stderr.lines().any(|line| line == refusal),
+        "the refusal names nobody's own home and both ways out: {stderr}"
+    );
+    assert!(
+        !stderr.contains(fake_root_home.path().to_str().unwrap()),
+        "and never this process's $HOME: {stderr}"
+    );
+    assert!(
+        !fake_root_home.path().join(".shep").exists(),
+        "nothing is created under a $HOME that is not the target user's"
+    );
+}

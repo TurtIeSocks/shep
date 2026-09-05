@@ -570,6 +570,14 @@ shep startup resolves the target user (--user, else $SUDO_USER, else invoking us
 
 `docs/writing-plans/plans/2026-08-12-shep-phase8-cutover.md:107 (decisions 18-19), 2345`
 
+### startup creates a default home only for the user running it
+
+With no --home/$SHEP_HOME, shep startup creates the target user's <passwd home>/.shep only when that user is the one running shep. Another user's missing default is refused, naming the user and both ways out: run any shep verb as that user first, or pass --home. A named home still goes through the shared gate, which refuses a missing one and never creates it.
+
+**Why:** Under sudo this process is root, and a directory root creates inside the target user's home is root's at 0700, so the daemon the unit starts as that user could not open it. The entry above was true of target_home and false of the dispatch from 2026-08-17 to 2026-09-04: run's Startup arm resolved this process's $HOME, created it, and passed it down as if the operator had typed --home, so a plain `sudo shep startup --user deploy` put /root/.shep in the unit. Every test drove target_home directly; the e2e test below drives the binary.
+
+`crates/shep-cli/tests/cli_e2e.rs` (a_sudo_startup_without_home_carries_the_target_users_home_not_this_processes), `crates/shep-cli/src/lib.rs` (the Commands::Startup arm)
+
 ### systemd readiness (sd_notify) needs no dependency and no unsafe
 
 Readiness notification to $NOTIFY_SOCKET is implemented with plain std: UnixDatagram for a filesystem path, and std::os::linux::net::SocketAddrExt::from_abstract_name (stable since 1.70, under the 1.88 MSRV) for an abstract-namespace address.
