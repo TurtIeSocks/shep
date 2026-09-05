@@ -643,8 +643,10 @@ esc/s close   j/k select   g/G fir… read-only`;
       <li><code>Esc</code> closes the pane; it never quits lookout</li>
     </ul>
     <p>
-      One edit changes one field. shep is sent the app with exactly that key
-      declared and nothing else, so no other value moves,
+      One edit changes one field, and it is recorded as yours: the key picks
+      up the <code>*</code> marker here and in <code>shep flock</code>'s
+      <code>CFG</code> column, and a later <code>shep start</code> of the
+      app's Flockfile leaves it alone. Nothing else in the config moves,
       <code>instances</code> included.
     </p>
     <p class="fine">

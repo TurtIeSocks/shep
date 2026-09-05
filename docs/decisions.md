@@ -1788,3 +1788,21 @@ A dog's own settings now live under `[<name>]` in `$SHEP_HOME/dogs.toml` instead
 **Why:** Making `dogs.toml` hand-editable, the same way `shep.toml` is, means an operator can write a section into it before ever upgrading, so a migration that merged silently would have to pick a winner between two values for the same key with nothing to go on. Refusing is the only answer that does not guess, and it costs nothing but an edit: the fix is deleting one of the two sections and starting the daemon again. This was not in the original spec for the move; it came out of writing the migration itself, once the hand-editable file made the collision possible.
 
 `verified crates/shep-core/src/config/dogs.rs (DogsConfig) and crates/shep-cli/src/commands/dog_migration.rs (migrate_dog_sections, DogMigrationError::WouldOverwrite)`
+
+## Config pane writes
+
+### A pane edit gets its own request, `SetSheepField`, instead of a one-key `ApplyConfig`
+
+The config-panes spec said a sheep edit needed no new wire verb, because `ApplyConfig` already merges a config into a running app. It does, and one `DeclaredApp` declaring one key at `ResetDepth::File` really does move that field and nothing else. The pane shipped that way and it was wrong for a reason the field-moving argument never touches.
+
+**Why:** `merge_declared` spends the operator's override for every key it puts back, and the comment above the line says exactly why: a key just reset to the template is not a key an operator is still holding a value for. That is correct for a Flockfile load and false for a pane, whose declared value IS the operator's. So an edit landed and vanished from `ProcessEntry::overridden` on the same round trip: the `*` the pane draws never appeared, `shep flock`'s CFG column counted nothing, and the docs page saying `*` means an operator overrode it was false for the one surface built to set overrides.
+
+`SetSheepField { name, key, value }` writes the override directly rather than pretending to be a template. It is `SetSheepEnv`'s twin end to end, and deliberately so: the same dog guard with the same sentence from `dog_config_refusal`, the same validate-then-write-then-park ordering, the same `InvalidConfig`-for-the-caller and `Internal`-for-the-store split, and the same registry record so the edit reaches the muster roll rather than surviving only a handover. Task 4 built that shape for `env` and stopped; the general case was the gap.
+
+`env` is refused by the new door and keeps `SetSheepEnv`, because a whole env map is never sent -- the pane is not told the values -- so a request carrying one value would wipe every other key. `name` and `instances` are refused too: both are `ApplyGroup::Structural`, and the count moves through `Scale`.
+
+The reply is `SheepFieldSet { name, key, pending }` rather than `Response::Applied`'s three lists. `applied`, `pending` and `refused` exist because `ApplyConfig` carries N apps of M fields; this carries one field of one sheep, so `refused` would be a second way to say no beside the `Err` arm and the two lists collapse to one bit. That bit is not redundant with the field's own `ApplyGroup`, which the caller already knows: `autostart` is `NextSpawn` and yet in force the moment it lands, because `restorable()` reads it at muster rather than at a spawn, and a `Live` field whose config subset will not normalize on its own parks instead of applying. Neither is visible from the client.
+
+`PROTOCOL_VERSION` did not move again. It went to 4 earlier on the same branch, for the entry above, and one bump covers every additive variant that ships with it.
+
+`verified crates/shep-core/src/protocol/request.rs (Request::SetSheepField, Response::SheepFieldSet), crates/shep-daemon/src/supervisor.rs (handle_set_sheep_field, and merge_declared's next.fields.remove(key) which is the line this exists to avoid), crates/shep-daemon/src/rpc.rs (a_field_edit_is_reported_as_an_operator_override)`
