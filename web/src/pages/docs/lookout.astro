@@ -574,7 +574,9 @@ esc/s close   j/k select   g/G fir… read-only`;
       <code>e</code> on a selected sheep opens its config over the dashboard:
       every Flockfile field, the value in force, and what changing it would
       cost. It writes as well, behind <code>--allow-control</code>. Without
-      the flag every edit key refuses the same way <code>x</code> does.
+      the flag the edit keys refuse the same way <code>x</code> does. A row
+      marked <code>=</code> or <code>~</code> gives its own reason instead,
+      in both states, because the flag would not have helped it.
     </p>
     <p>Two markers can sit in front of a key:</p>
     <ul>
@@ -658,6 +660,12 @@ esc/s close   j/k select   g/G fir… read-only`;
       empty one removes the key. <code>Enter</code> on the
       <code>+ new</code> row takes <code>KEY=value</code>.
       <code>Esc</code> goes back to the field list.
+    </p>
+    <p>
+      Env writes arm and confirm like every other one, a set as much as a
+      removal. The old value is overwritten in the store as soon as the
+      shepherd answers, and this screen cannot read a value back to put it
+      there again, so an overwrite loses as much as a delete does.
     </p>
     <p class="fine">
       env is spawn-time in every case, so nothing set here reaches the running
