@@ -14,6 +14,7 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use shep_core::config::ApplyGroup;
 
@@ -210,6 +211,26 @@ fn confirm_text(pane: &ConfigPane) -> Option<&str> {
     }
 }
 
+/// The one line the field list reserves under its title: an armed or
+/// in-flight question when there is one, else the selected field's own
+/// help text while `h` has it open. [`None`] when neither applies.
+///
+/// A question outranks help: it is what the operator's next keystroke
+/// answers, and help is dismissed by a keystroke of the operator's own
+/// choosing, so it can wait for the slot back.
+fn top_line(pane: &ConfigPane, palette: Palette) -> Option<(String, Style)> {
+    if let Some(text) = confirm_text(pane) {
+        return Some((text.to_owned(), palette.attention()));
+    }
+    if pane.help_open()
+        && let Some(PaneRow::Field(index)) = pane.cursor()
+        && let Some(field) = pane.fields().fields().get(index)
+    {
+        return Some((field.help.clone(), palette.muted()));
+    }
+    None
+}
+
 /// The env sub-screen: the sheep's env key names, and a row to add one on.
 ///
 /// Values are never drawn: `Request::SheepConfig` answers with keys alone,
@@ -385,12 +406,13 @@ pub fn pane_lines(
     // screen has: `view::status` draws the same sentence on a fixed row,
     // and both read `ConfigPane::pending_edit`. Subtracted from the
     // budget rather than appended, per `body_from`'s own doc on markers.
-    if let Some(text) = confirm_text(pane)
+    // `h`'s help text shares the slot: see `top_line`.
+    if let Some((text, style)) = top_line(pane, palette)
         && body_budget > 0
     {
         lines.push(Line::from(Span::styled(
-            format!("  {}", fit(text, body_width(width))),
-            palette.attention(),
+            format!("  {}", fit(&text, body_width(width))),
+            style,
         )));
         body_budget -= 1;
     }
@@ -858,6 +880,73 @@ mod tests {
             sent[1], text[1],
             "the wording must not change between the question and its answer"
         );
+    }
+
+    /// `max_memory`'s own blurb, read off the same schema `Field::help`
+    /// is built from.
+    #[test]
+    fn help_open_draws_the_selected_fields_own_text_under_the_title() {
+        let mut pane = web_pane();
+        pane.move_to_key("max_memory");
+        pane.toggle_help();
+        let text = text_of(&pane_lines(&pane, fixtures::plain(), 120, 0));
+        assert!(
+            text.iter()
+                .any(|line| line.contains("Restart the app if it climbs above this much memory")),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn toggling_help_again_dismisses_it() {
+        let mut pane = web_pane();
+        pane.move_to_key("max_memory");
+        pane.toggle_help();
+        pane.toggle_help();
+        let text = text_of(&pane_lines(&pane, fixtures::plain(), 120, 0));
+        assert!(
+            !text.iter().any(|line| line.contains("Restart the app")),
+            "{text:?}"
+        );
+    }
+
+    /// A question is what the operator's next keystroke answers; help is
+    /// dismissed on the operator's own schedule, so it waits for the slot
+    /// back rather than fighting the confirm for it.
+    #[test]
+    fn an_armed_edit_outranks_open_help_for_the_shared_slot() {
+        let mut pane = web_pane();
+        pane.move_to_key("autorestart");
+        pane.toggle_help();
+        pane.cycle(Instant::now());
+        let text = text_of(&pane_lines(&pane, fixtures::plain(), 120, 0));
+        assert!(text[1].contains("set autorestart"), "{:?}", text[1]);
+    }
+
+    /// The hard constraint this item's brief calls out: a line drawn into
+    /// the fixed slot under the title is still one line counted against
+    /// the same budget every other line in the pane is, at every width
+    /// and height the pane claims to draw at.
+    #[test]
+    fn help_text_still_respects_the_width_and_height_budgets() {
+        let mut pane = web_pane();
+        pane.move_to_key("max_memory");
+        pane.toggle_help();
+        for width in super::super::MIN_TERM_WIDTH..=200 {
+            for line in text_of(&pane_lines(&pane, fixtures::plain(), width, 0)) {
+                assert!(
+                    visible_width(&line) <= usize::from(width),
+                    "width {width}: {line:?}"
+                );
+            }
+        }
+        for height in 1..=30u16 {
+            let text = text_of(&pane_lines(&pane, fixtures::plain(), 120, height));
+            assert!(
+                text.len() <= usize::from(height),
+                "height {height}: {text:?}"
+            );
+        }
     }
 
     /// The pane's cursor, walked onto `key` the way an operator walks it.

@@ -506,6 +506,8 @@ pub struct ConfigPane {
     view: Viewport,
     pending_edit: Option<PanePending>,
     env: Option<EnvPane>,
+    /// Whether `h` is showing the selected field's own help text.
+    help_open: bool,
     /// The dog's `[<name>]` table as TOML text, and [`None`] for a sheep.
     ///
     /// Kept beside the parsed `values` rather than instead of them, because
@@ -584,6 +586,7 @@ impl ConfigPane {
             view: Viewport::new(),
             pending_edit: None,
             env: None,
+            help_open: false,
             section: None,
         }
     }
@@ -652,6 +655,7 @@ impl ConfigPane {
             view: Viewport::new(),
             pending_edit: None,
             env: None,
+            help_open: false,
             section: Some(section),
         }
     }
@@ -717,6 +721,30 @@ impl ConfigPane {
     /// Closes it, leaving the field list up.
     pub(super) fn close_env(&mut self) {
         self.env = None;
+    }
+
+    /// Whether `h` is showing the selected field's own help text.
+    #[must_use]
+    pub fn help_open(&self) -> bool {
+        self.help_open
+    }
+
+    /// Flips it.
+    pub(super) fn toggle_help(&mut self) {
+        self.help_open = !self.help_open;
+    }
+
+    /// Dismisses it. A no-op when it is already closed, so `Escape` can
+    /// call this unconditionally.
+    pub(super) fn close_help(&mut self) {
+        self.help_open = false;
+    }
+
+    /// Carries a previous pane's help visibility across a rebuild, the
+    /// same reason [`Self::adopt_view`] carries the cursor: a re-read must
+    /// not dismiss a note the operator has not dismissed.
+    pub(super) fn set_help_open(&mut self, open: bool) {
+        self.help_open = open;
     }
 
     /// The key under the cursor, and why the pane will not edit it, when it
@@ -1446,6 +1474,24 @@ mod tests {
         assert!(
             !matches!(value.as_value(), serde_json::Value::String(_)),
             "an integer field must not travel as a string"
+        );
+    }
+
+    #[test]
+    fn toggling_help_flips_it_and_closing_it_is_idempotent() {
+        let mut pane = ConfigPane::sheep(web());
+        assert!(!pane.help_open());
+        pane.toggle_help();
+        assert!(pane.help_open());
+        pane.toggle_help();
+        assert!(!pane.help_open());
+        pane.toggle_help();
+        pane.close_help();
+        assert!(!pane.help_open());
+        pane.close_help();
+        assert!(
+            !pane.help_open(),
+            "closing an already-closed help is a no-op"
         );
     }
 

@@ -276,14 +276,15 @@ fn pane_editor(pane: &ConfigPane) -> Option<(String, &str)> {
 /// The env sub-screen gets its own pair since `esc` means something else
 /// there: it backs out to the field list rather than closing the pane.
 /// `g`/`G` and `r` are named in both, since they are bound on both
-/// screens in both control states.
+/// screens in both control states. `h` is a no-op on this sub-screen's
+/// own rows, so it is named only on the field-list forms.
 const fn pane_hint(control: Control, env_open: bool) -> &'static str {
     match (control, env_open) {
         (Control::ReadOnly, false) => {
-            "esc close   j/k select   g/G first/last   r refresh   q quit"
+            "esc close   j/k select   g/G first/last   r refresh   h help   q quit"
         }
         (Control::Allowed, false) => {
-            "esc close   j/k select   g/G first/last   r refresh   space cycle   e edit   q quit"
+            "esc close   j/k select   g/G first/last   r refresh   space cycle   e edit   h help   q quit"
         }
         (Control::ReadOnly, true) => "esc back   j/k select   g/G first/last   r refresh   q quit",
         (Control::Allowed, true) => {
@@ -679,6 +680,7 @@ mod tests {
         }
         for both in [&closed, &open] {
             assert!(both.contains("esc close"), "got {both:?}");
+            assert!(both.contains("h help"), "got {both:?}");
             assert!(both.contains("q quit"), "got {both:?}");
             assert!(!both.contains("x stop"), "got {both:?}");
         }

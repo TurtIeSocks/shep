@@ -99,6 +99,9 @@ pub enum KeyPress {
     /// there: an operator should not have to remember two keys for one
     /// job. `Escape` is the only key that closes a pane or a sub-screen.
     Edit,
+    /// `h`: shows the selected field's own help text, in the config pane.
+    /// Pressing it again, or `Escape`, dismisses it. Bound nowhere else.
+    Help,
 }
 
 /// Everything that can change the dashboard.
@@ -1766,6 +1769,9 @@ impl App {
                     .config_pane
                     .as_ref()
                     .and_then(|pane| pane.pending_edit().cloned());
+                // Carried for the same reason as the cursor: a re-read must
+                // not dismiss a help note the operator has not dismissed.
+                let carried_help = self.config_pane.as_ref().is_some_and(ConfigPane::help_open);
                 let mut pane = ConfigPane::sheep(*view);
                 pane.adopt_pending_edit(carried_edit);
                 if let Some(carried) = carried {
@@ -1774,6 +1780,7 @@ impl App {
                 if let Some((carried, cursor_key)) = carried_env {
                     pane.adopt_env_view(carried, cursor_key.as_deref());
                 }
+                pane.set_help_open(carried_help);
                 self.config_pane = Some(pane);
                 // The rebuilt pane carries no editor, so the keyboard must
                 // not still think one is open.
@@ -1884,6 +1891,7 @@ impl App {
                     .config_pane
                     .as_ref()
                     .and_then(|pane| pane.pending_edit().cloned());
+                let carried_help = self.config_pane.as_ref().is_some_and(ConfigPane::help_open);
                 let mut pane = ConfigPane::dog(
                     probe.name,
                     probe.adopted_path,
@@ -1894,6 +1902,7 @@ impl App {
                 if let Some(carried) = carried {
                     pane.adopt_view(carried);
                 }
+                pane.set_help_open(carried_help);
                 self.config_pane = Some(pane);
                 // The settings screen is what a dog pane opens over, and it
                 // closes only now, once there is something to look at.
@@ -2184,6 +2193,9 @@ impl App {
             KeyPress::Edit => self.ask_for_config(),
             // `space` acts only on the settings screen.
             KeyPress::Cycle => Effect::None,
+            // `h` names a field's help text, and the dashboard has no
+            // field selected.
+            KeyPress::Help => Effect::None,
         }
     }
 
@@ -2261,7 +2273,8 @@ impl App {
             | KeyPress::TextChar(_)
             | KeyPress::TextBackspace
             | KeyPress::TextApply
-            | KeyPress::TextAbandon => {}
+            | KeyPress::TextAbandon
+            | KeyPress::Help => {}
         }
         Effect::None
     }
@@ -2353,16 +2366,17 @@ impl App {
     /// [`Self::config_pane`] is `Some`.
     ///
     /// Movement walks fields, `r` re-reads, `space` arms a cycle, `Enter`
-    /// or `e` edits the row under the cursor or sends an armed edit, and
-    /// `Escape` closes the pane. Everything else is named rather than
-    /// wildcarded, so a stray variant cannot fall silently into an arm
-    /// that ignores it.
+    /// or `e` edits the row under the cursor or sends an armed edit, `h`
+    /// toggles the selected field's own help text, and `Escape` closes
+    /// help if it is open, else the pane. Everything else is named rather
+    /// than wildcarded, so a stray variant cannot fall silently into an
+    /// arm that ignores it.
     ///
-    /// An armed edit eats the first movement key, `Escape` and `r` instead
-    /// of doing their ordinary job, so a reflexive `Enter` never lands on
-    /// a row the operator has lost track of. `Enter`, `e` and `space` are
-    /// exempt, since a choice or an armed edit still has to reach its own
-    /// next value or its own send.
+    /// An armed edit eats the first movement key, `Escape`, `h` and `r`
+    /// instead of doing their ordinary job, so a reflexive `Enter` never
+    /// lands on a row the operator has lost track of. `Enter`, `e` and
+    /// `space` are exempt, since a choice or an armed edit still has to
+    /// reach its own next value or its own send.
     fn on_pane_key(&mut self, key: KeyPress) -> Effect {
         self.notice = None;
         if self
@@ -2389,9 +2403,20 @@ impl App {
         }
         match key {
             KeyPress::Quit => return Effect::Quit,
-            // `Escape` closes rather than cascading to a filter clear or a
-            // quit, exactly as it does on the settings screen.
-            KeyPress::Escape => self.close_pane(),
+            // Backs out one level at a time: help first, if it is open,
+            // else the pane. `Escape` closes rather than cascading to a
+            // filter clear or a quit, exactly as it does on the settings
+            // screen.
+            KeyPress::Escape => {
+                let help_open = self.config_pane.as_ref().is_some_and(ConfigPane::help_open);
+                if help_open {
+                    if let Some(pane) = self.config_pane.as_mut() {
+                        pane.close_help();
+                    }
+                } else {
+                    self.close_pane();
+                }
+            }
             KeyPress::SelectUp
             | KeyPress::SelectDown
             | KeyPress::SelectFirst
@@ -2415,6 +2440,11 @@ impl App {
             // opened the pane with `e` should not have to learn a second
             // key to use it.
             KeyPress::Confirm | KeyPress::Edit => return self.confirm_field(),
+            KeyPress::Help => {
+                if let Some(pane) = self.config_pane.as_mut() {
+                    pane.toggle_help();
+                }
+            }
             KeyPress::Action(_)
             | KeyPress::Settings
             | KeyPress::FilterStart
@@ -2727,7 +2757,8 @@ impl App {
             | KeyPress::TextChar(_)
             | KeyPress::TextBackspace
             | KeyPress::TextApply
-            | KeyPress::TextAbandon => {}
+            | KeyPress::TextAbandon
+            | KeyPress::Help => {}
         }
         Effect::None
     }
@@ -6199,6 +6230,40 @@ mod tests {
             app.config_pane().is_none(),
             "the second escape closes the pane"
         );
+    }
+
+    #[test]
+    fn h_toggles_help_and_escape_dismisses_it_before_closing_the_pane() {
+        let mut app = fixtures::app_in_sheep_pane();
+        pane_to(&mut app, "max_memory");
+        let _ = app.update(Msg::Key(KeyPress::Help));
+        assert!(app.config_pane().unwrap().help_open());
+        // Escape dismisses help first; the pane is still open.
+        let _ = app.update(Msg::Key(KeyPress::Escape));
+        assert!(!app.config_pane().unwrap().help_open());
+        assert!(
+            app.config_pane().is_some(),
+            "the first escape only closes help"
+        );
+        // A second `h` toggles it back open, and pressing it again closes it.
+        let _ = app.update(Msg::Key(KeyPress::Help));
+        assert!(app.config_pane().unwrap().help_open());
+        let _ = app.update(Msg::Key(KeyPress::Help));
+        assert!(!app.config_pane().unwrap().help_open());
+        // Escape with help already closed closes the pane, same as ever.
+        let _ = app.update(Msg::Key(KeyPress::Escape));
+        assert!(app.config_pane().is_none());
+    }
+
+    /// `h` has no field to show help for on the env sub-screen, so it is
+    /// silently ignored there rather than reaching back to the field list.
+    #[test]
+    fn h_does_nothing_on_the_env_sub_screen() {
+        let mut app = fixtures::app_in_sheep_pane_with_control();
+        pane_to(&mut app, "env");
+        let _ = app.update(Msg::Key(KeyPress::Confirm));
+        assert_eq!(app.update(Msg::Key(KeyPress::Help)), Effect::None);
+        assert!(!app.config_pane().unwrap().help_open());
     }
 
     #[test]
