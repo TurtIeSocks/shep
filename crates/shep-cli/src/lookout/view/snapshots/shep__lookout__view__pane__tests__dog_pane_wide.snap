@@ -4,7 +4,7 @@ expression: "text.join(\"\\n\")"
 ---
   bark  (dog config)                                                                                                    
 >  history_bytes              4096                                                                                      
-   poll                       1m                                                                                        
+   poll                       60s                                                                                       
  ~ rules                      (unset)                                                                                   
    sink_timeout               (unset)                                                                                   
  ~ sinks                      <set>                                                                                     

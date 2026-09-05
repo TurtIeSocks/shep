@@ -182,21 +182,6 @@ pub enum PaneEdit {
     },
 }
 
-/// `canonical` with `unit` appended when it is bare digits.
-///
-/// [`MemSize`] and [`UpDuration`] both print bare digits, with no unit at
-/// all, for exactly the ambiguous case: a byte count that is not a whole
-/// `K`/`M`/`G`, or a millisecond count that is not a whole `s`/`m`/`h`.
-/// Every other case already ends in a letter of its own, so appending
-/// unconditionally would print `"3Gb"` for three gibibytes.
-fn with_bare_unit(canonical: String, unit: &str) -> String {
-    if canonical.bytes().all(|b| b.is_ascii_digit()) {
-        format!("{canonical}{unit}")
-    } else {
-        canonical
-    }
-}
-
 impl PaneEdit {
     /// Which field or env key this edit moves.
     #[must_use]
@@ -1127,16 +1112,21 @@ impl ConfigPane {
     /// A `raw` that fails to parse, including whatever is mid-edit, comes
     /// back unchanged: this has no business guessing at a string shep is
     /// about to refuse on its own.
+    ///
+    /// Only a bare number is annotated. A value naming its own unit is the
+    /// operator's spelling and survives as written, so a `60s` on disk is
+    /// never redrawn as the `1m` its own `Display` would canonicalize it to.
     fn resolved_display(&self, key: &str, raw: &str) -> String {
+        if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+            return raw.to_owned();
+        }
         match self.fields.by_key(key).and_then(|field| field.value_kind) {
-            Some(ValueKind::MemSize) => raw.parse::<MemSize>().map_or_else(
-                |_| raw.to_owned(),
-                |size| with_bare_unit(size.to_string(), " B"),
-            ),
-            Some(ValueKind::UpDuration) => raw.parse::<UpDuration>().map_or_else(
-                |_| raw.to_owned(),
-                |duration| with_bare_unit(duration.to_string(), "ms"),
-            ),
+            Some(ValueKind::MemSize) => raw
+                .parse::<MemSize>()
+                .map_or_else(|_| raw.to_owned(), |_| format!("{raw} B")),
+            Some(ValueKind::UpDuration) => raw
+                .parse::<UpDuration>()
+                .map_or_else(|_| raw.to_owned(), |_| format!("{raw}ms")),
             None => raw.to_owned(),
         }
     }
@@ -1539,6 +1529,23 @@ mod tests {
         assert_eq!(pane.display_value("kill_timeout"), "1600ms");
         assert_eq!(pane.value("kill_timeout"), "1600");
         assert_eq!(pane.display_value("listen_timeout"), "3s");
+    }
+
+    /// A dog's values come from the section its operator wrote, so a
+    /// spelling that `UpDuration::Display` would canonicalize to `1m`
+    /// stays as `60s`. A sheep's arrive already canonicalized, `UpDuration`
+    /// serializing through its own `Display`, so this is the pane that can
+    /// tell the difference.
+    #[test]
+    fn a_dogs_own_spelling_of_a_duration_survives_the_pane() {
+        let schema = serde_json::json!({
+            "properties": {
+                "poll": { "type": "string", "$ref": "#/$defs/UpDuration" }
+            },
+            "$defs": { "UpDuration": { "type": "string" } }
+        });
+        let pane = ConfigPane::dog("bark".into(), None, schema, "poll = \"60s\"\n".into());
+        assert_eq!(pane.display_value("poll"), "60s");
     }
 
     /// 64 bytes is not a whole `K`/`M`/`G`, so `MemSize::Display` prints
