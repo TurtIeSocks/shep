@@ -101,8 +101,8 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
 
     <h3 id="the-cfg-column">The CFG column</h3>
     <p>
-      A sheep with config waiting on it is marked here; every other sheep
-      reads <code>-</code>. <code>!2</code> means two fields are parked for
+      A sheep with config waiting on it, or with settings of its own, is
+      marked here; every other sheep reads <code>-</code>. <code>!2</code> means two fields are parked for
       this sheep's next spawn, left there by a Flockfile load that would have
       had to kill the process to apply them, and
       <code>shep reload &lt;name&gt;</code> promotes them.
@@ -115,14 +115,12 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
     </p>
     <p class="fine">
       The cell has a second marker, <code>*2</code>, for fields an operator
-      has set that the sheep's current Flockfile does not declare. No
-      release can print it yet. No verb writes an operator-set value into the
-      override store today, so on any flock shep itself built the count is
-      zero and the cell reads <code>-</code> or <code>!N</code>. It is documented here because
-      it arrives with the verb that writes one, and because pending will take
-      the cell ahead of it when a sheep has both: a parked field is one
-      command away from taking effect, while an override has been true since
-      the last load.
+      has set that the sheep's current Flockfile does not declare. The door
+      that writes them is <a href="/docs/lookout">the config pane</a>:
+      <code>e</code> on a sheep in <code>shep lookout</code>, behind
+      <code>--allow-control</code>. Pending takes the cell when a sheep has
+      both: a parked field is one command away from taking effect, while an
+      override has been true since the last load.
     </p>
 
     <h2 id="grouped-instances">Multi-instance apps group</h2>
