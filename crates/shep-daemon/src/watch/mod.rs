@@ -345,8 +345,8 @@ async fn run_group(
 ///
 /// One owner rather than a copy per suite, since every one of them
 /// drives the same debouncer at the same delay. `TEST_DELAY` and
-/// `NO_EVENT_WINDOW` are load-bearing together; see the assertion beside
-/// `dropping_the_source_stops_delivery` in `source`.
+/// `NO_EVENT_WINDOW` are load-bearing together; see the assertion at the
+/// top of `source`'s tests.
 #[cfg(test)]
 pub(crate) mod real_time {
     use core::time::Duration;

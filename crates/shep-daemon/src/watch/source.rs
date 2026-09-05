@@ -215,14 +215,13 @@ mod tests {
     use super::*;
     use crate::watch::real_time::{NO_EVENT_WINDOW, SMOKE_DEADLINE, TEST_DELAY};
 
-    // `NO_EVENT_WINDOW` must stay several `TEST_DELAY`s wide, or a leaked
-    // debouncer's stray batch could land after the window closes and
-    // `dropping_the_source_stops_delivery` would stop catching it.
+    // `NO_EVENT_WINDOW` must stay several `TEST_DELAY`s wide: a debounced
+    // batch takes up to one delay to land, so a window narrower than that
+    // proves nothing when it stays quiet.
     const _: () = assert!(
         NO_EVENT_WINDOW.as_millis() >= TEST_DELAY.as_millis() * 4,
-        "NO_EVENT_WINDOW must stay at least 4x TEST_DELAY, or \
-         dropping_the_source_stops_delivery stops catching a leaked \
-         debouncer guard"
+        "NO_EVENT_WINDOW must stay at least 4x TEST_DELAY, or a quiet window \
+         proves nothing about a debounced event that has not landed yet"
     );
 
     /// Canonicalizes `dir`'s path: on macOS, `TempDir::path()` returns a
@@ -440,8 +439,8 @@ mod tests {
         }
 
         // fails if the debouncer guard is leaked (kept alive past the
-        // `WatchSource`'s drop): a write after the drop would still reach
-        // `rx` within the window below.
+        // `WatchSource`'s drop): the OS thread then never lets go of its
+        // sender, and the channel never closes.
         #[tokio::test]
         async fn dropping_the_source_stops_delivery() {
             let dir = tempfile::tempdir().unwrap();
@@ -461,23 +460,20 @@ mod tests {
             .await;
 
             drop(source);
-            std::fs::write(root.join("second.txt"), b"hello").unwrap();
 
-            // A stray batch naming `first.txt` is not the leak: the
-            // debouncer's OS thread may emit one final batch after the
-            // stop flag flips. Only a batch naming `second.txt`, written
-            // after the drop, means delivery did not stop.
-            let deadline = Instant::now() + NO_EVENT_WINDOW;
-            // Loop, not one recv: a first.txt straggler must not hide a
-            // second.txt leak arriving right after it in the same window.
+            // Delivery has stopped when the channel closes, which the thread
+            // does by exiting; a batch on the way out is the documented final
+            // one. A write after the drop would prove nothing: a thread still
+            // winding down can see it, and a thread that has exited cannot.
+            let deadline = Instant::now() + SMOKE_DEADLINE;
             loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 match timeout(remaining, rx.recv()).await {
-                    Err(_) => break,   // window elapsed with nothing further, expected
-                    Ok(None) => break, // sender dropped alongside the debouncer thread, expected
-                    Ok(Some(batch)) => assert!(
-                        !batch.paths.iter().any(|p| p.ends_with("second.txt")),
-                        "unexpected batch delivered after WatchSource was dropped: {batch:?}"
+                    Ok(None) => break,
+                    Ok(Some(_)) => continue,
+                    Err(_) => panic!(
+                        "the watcher thread outlived its WatchSource by {SMOKE_DEADLINE:?}: \
+                         the debouncer guard leaked"
                     ),
                 }
             }
