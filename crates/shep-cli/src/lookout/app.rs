@@ -2880,8 +2880,13 @@ impl App {
     /// about, so the round trip produced `log-rotate: log-rotate is a dog,
     /// and ...`. It also refuses for the wrong reason for this door: the
     /// daemon is talking about where a dog's config comes from, and what an
-    /// operator pressing `e` needs to know is that this pane is not the
-    /// screen for one.
+    /// operator pressing `e` needs to know is which screen edits a dog.
+    ///
+    /// It is a screen, not a refusal: this sentence said the config pane is
+    /// for a sheep, which stopped being true when the dog pane shipped, and
+    /// left an operator with no next keystroke. `s` then `e` on the dog's
+    /// own row is the path, and it is the one the settings screen's own
+    /// `Edit` arm takes.
     ///
     /// [`Self::selected_row`] rather than [`Self::selected_name`] for the
     /// check, and both are right: a dog runs one process, so it is never a
@@ -2893,7 +2898,7 @@ impl App {
         {
             let name = row.info.name.clone();
             self.notice = Some(Notice {
-                text: format!("{name} is a dog, and the config pane is for a sheep"),
+                text: format!("{name} is a dog; press `s` for settings, then `e` on its row"),
                 grave: true,
             });
             return Effect::None;
@@ -3054,11 +3059,27 @@ impl App {
     /// config write is not the same as this pane having no widget for a
     /// shape a Flockfile writes perfectly well. A generic third sentence
     /// would put the pane back where it was before [`Lock`] existed.
+    ///
+    /// A refused row names the verb that DOES move it (decision 5), which
+    /// only the two Structural fields have. The daemon's own refusal for
+    /// the same write already named `shep stock`; this pane refuses
+    /// locally, so its weaker sentence was the only one an operator saw.
+    /// The wildcard keeps that sentence for a Structural field this binary
+    /// has not been taught a remedy for, which is the honest answer rather
+    /// than a guessed verb.
     fn lock_refusal(key: &str, lock: Lock) -> String {
         match lock {
-            Lock::Refused => {
-                format!("{key} is not something a config write changes, from here or anywhere")
-            }
+            Lock::Refused => match key {
+                "instances" => {
+                    format!("{key} is not a config write; `shep stock` moves an instance count")
+                }
+                "name" => {
+                    format!("{key} is not a config write; a name change is a different sheep")
+                }
+                _ => {
+                    format!("{key} is not something a config write changes, from here or anywhere")
+                }
+            },
             Lock::NoWidget => {
                 format!("{key} has no editor in this pane; a Flockfile still sets it")
             }
@@ -7884,6 +7905,19 @@ mod tests {
         assert_ne!(refused, no_widget, "two facts, two sentences");
     }
 
+    /// fails if the pane refuses a Structural field without naming the
+    /// verb that does move it (decision 5). The daemon's own refusal for
+    /// the same field names `shep stock`; the pane refuses locally, so its
+    /// weaker sentence was the only one an operator ever saw.
+    #[test]
+    fn a_refused_field_names_the_verb_that_owns_it() {
+        let mut app = fixtures::app_in_sheep_pane_with_control();
+        pane_to(&mut app, "instances");
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let said = app.notice().expect("a refusal is raised").to_string();
+        assert!(said.contains("`shep stock`"), "{said}");
+    }
+
     /// fails if `space` and `Enter` answer the same locked row two
     /// different ways.
     ///
@@ -8201,6 +8235,23 @@ mod tests {
         );
         assert!(said.contains("is a dog"), "got {said:?}");
         assert!(app.config_pane().is_none());
+    }
+
+    /// fails if `e` on a dog row withholds the path that does work. The
+    /// old sentence said the config pane is for a sheep, which stopped
+    /// being true when the dog pane shipped, and left the operator with a
+    /// refusal and no next keystroke.
+    #[test]
+    fn e_on_a_dog_row_names_the_screen_that_does_edit_a_dog() {
+        let mut app = fixtures::with_selection(
+            ProcessInfo::builder(9, "log-rotate", ProcStatus::Online)
+                .dog(Some(shep_core::protocol::DogSource::BuiltIn))
+                .build(),
+        );
+        let _ = app.update(Msg::Key(KeyPress::Edit));
+        let said = app.notice().map(ToString::to_string).unwrap_or_default();
+        assert!(said.contains("`s`"), "{said}");
+        assert!(!said.contains("the config pane is for a sheep"), "{said}");
     }
 
     /// fails if a refusal that names nothing reaches an operator naming
