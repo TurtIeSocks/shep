@@ -166,10 +166,12 @@ pub(crate) fn render_ping(streams: &mut Streams<'_>, status: &ShepherdStatus) ->
     }
 }
 
-// unix only: the cases bind a raw `UnixListener` to stand in for a live
-// shepherd.
+// unix only: the socket-backed case has not been run against the Windows
+// named-pipe transport.
 #[cfg(all(test, unix))]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use super::*;
 
     fn at(online: Option<Online>) -> ShepherdStatus {
@@ -218,15 +220,23 @@ mod tests {
         }
     }
 
-    /// A handshake that never completes reports not online. `probe` never
-    /// gets far enough to send `Request::Ping`.
-    #[tokio::test]
+    /// A shepherd wedged past its own handshake is not online: `probe`
+    /// connects and handshakes, then reports offline because the
+    /// [`Request::Ping`] it sends is never answered.
+    ///
+    /// `handshook` is the load-bearing assertion. A handshake that failed
+    /// would give the same `None`, and the liveness path would go untested
+    /// while the test still passed.
+    ///
+    /// `start_paused` so the request deadline costs no wall clock.
+    #[tokio::test(start_paused = true)]
     async fn a_socket_that_handshakes_but_never_answers_is_not_online() {
         let dir = tempfile::tempdir().unwrap();
         let path = shep_client::testing::control_address(dir.path());
-        // Accepts and completes nothing: the connect succeeds but the
-        // handshake does not, so `Client::connect` fails here.
-        let _listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (_fake, handshook) = shep_client::testing::fake_daemon_wedged_after_handshake(
+            &path,
+            shep_client::testing::sample_ack(),
+        );
 
         let env =
             |key: &str| (key == "SHEP_HOME").then(|| dir.path().to_string_lossy().into_owned());
@@ -234,6 +244,10 @@ mod tests {
         paths.socket = path;
 
         let status = ShepherdStatus::probe(&paths).await;
+        assert!(
+            handshook.load(Ordering::SeqCst),
+            "the handshake has to complete, or this covers a failed connect and not the ping"
+        );
         assert_eq!(
             status.online, None,
             "a wedged socket is not an online shepherd"

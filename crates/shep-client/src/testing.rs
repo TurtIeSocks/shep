@@ -113,6 +113,37 @@ pub async fn serve_one_request(
     })
 }
 
+/// Binds `path`, accepts one connection, completes the handshake with `ack`,
+/// and then answers nothing: the shepherd that holds a socket and a finished
+/// handshake while wedged past the point of serving a request. A request made
+/// against it times out rather than being refused or cut off.
+///
+/// The `handshook` flag is returned separately from the task, for the reason
+/// [`fake_daemon_accepting_repeatedly`] returns its counter separately: the
+/// task never ends, so nothing it returned could be read.
+///
+/// Synchronous, so a caller can connect straight away without a sleep.
+///
+/// Panics if `path` cannot be bound, or on any accept or handshake failure.
+pub fn fake_daemon_wedged_after_handshake(
+    path: &Path,
+    ack: HelloAck,
+) -> (JoinHandle<()>, Arc<AtomicBool>) {
+    let mut listener = Listener::bind(path).unwrap();
+    let handshook = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&handshook);
+    let handle = tokio::spawn(async move {
+        let stream = listener.accept().await.unwrap();
+        let mut frames = Framed::new(stream, codec());
+        let _hello = handshake(&mut frames, ack).await;
+        flag.store(true, Ordering::SeqCst);
+        // Holds `frames` open: dropping it would close the connection, and a
+        // closed connection is a different answer from no answer at all.
+        std::future::pending::<()>().await;
+    });
+    (handle, handshook)
+}
+
 /// Binds `path` and answers every connection, one handshake and one request
 /// each, with `reply`, until the returned handle is aborted.
 ///
