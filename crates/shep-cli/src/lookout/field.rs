@@ -99,19 +99,41 @@ impl FieldSet {
     /// no schema (the settings screen builds its six by hand).
     #[must_use]
     pub fn from_fields(mut fields: Vec<Field>, group_order: &[&str]) -> Self {
+        // Every group `group_order` does not name, in the order it first
+        // appears. Without this, all of them ranked `(1, 0)` alike, so two
+        // distinct unknown groups stayed interleaved wherever the caller
+        // had interleaved them -- and a renderer pushes a header whenever
+        // the group changes, so each one would have drawn its name twice.
+        // Unreachable for the Flockfile schema, where `GROUP_ORDER` names
+        // all four; reachable the moment a dog's own `--schema` answer
+        // names a group this binary has never heard of.
+        let mut unknown: Vec<String> = Vec::new();
+        for field in &fields {
+            if let Some(group) = field.group.as_deref()
+                && !group_order.contains(&group)
+                && !unknown.iter().any(|seen| seen == group)
+            {
+                unknown.push(group.to_owned());
+            }
+        }
         let rank = |group: Option<&str>| -> (usize, usize) {
             match group {
                 None => (2, 0),
                 Some(g) => match group_order.iter().position(|known| *known == g) {
                     Some(i) => (0, i),
-                    None => (1, 0),
+                    None => (
+                        1,
+                        unknown
+                            .iter()
+                            .position(|seen| seen == g)
+                            .unwrap_or(usize::MAX),
+                    ),
                 },
             }
         };
         // Stable, so within-group order is whatever the caller gave. The
-        // sort is also what makes a group CONTIGUOUS, which every renderer
-        // relies on: a header is pushed when the group changes, so a group
-        // split in two would have its name drawn twice.
+        // sort is also what makes every group CONTIGUOUS, which every
+        // renderer relies on.
         fields.sort_by_key(|f| rank(f.group.as_deref()));
         Self { fields }
     }
@@ -367,6 +389,35 @@ mod tests {
         assert_eq!(set.by_key("a").unwrap().help, "blurb");
         assert_eq!(set.by_key("b").unwrap().help, "desc");
         assert_eq!(set.by_key("c").unwrap().help, "c");
+    }
+
+    /// fails if two groups `group_order` does not name stay interleaved.
+    ///
+    /// They all ranked equal, so a stable sort left them exactly where the
+    /// caller had them, and a renderer pushing a header on every group
+    /// change would have drawn each of these twice. `GROUP_ORDER` names all
+    /// four Flockfile groups, so only a dog's own `--schema` answer reaches
+    /// this.
+    #[test]
+    fn two_groups_the_order_does_not_name_still_come_out_contiguous() {
+        let p = props(json!({
+            "a": { "type": "boolean", "init": { "group": "zebra" } },
+            "b": { "type": "boolean", "init": { "group": "aardvark" } },
+            "c": { "type": "boolean", "init": { "group": "zebra" } },
+            "d": { "type": "boolean", "init": { "group": "aardvark" } },
+        }));
+        let set = FieldSet::from_properties(&p, &Default::default(), &[]);
+        let keys: Vec<&str> = set.fields().iter().map(|f| f.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["a", "c", "b", "d"],
+            "first appearance wins, and neither group is split"
+        );
+        assert_eq!(
+            groups_of(&set),
+            ["zebra", "aardvark"],
+            "each name appears once, which is what a header per change needs"
+        );
     }
 
     #[test]
