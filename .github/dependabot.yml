@@ -54,3 +54,9 @@ updates:
       prefix: chore
       include: scope
     labels: [dependencies]
+    # `@astrojs/check` peers on `typescript@^5 || ^6`, so a major bump here
+    # makes `npm ci` fail to resolve and takes the Pages deploy with it.
+    # Drop this once that peer range covers 7.
+    ignore:
+      - dependency-name: typescript
+        update-types: [version-update:semver-major]
