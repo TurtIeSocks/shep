@@ -268,30 +268,26 @@ fn pane_editor(pane: &ConfigPane) -> Option<(String, &str)> {
 /// The config pane's own key hint.
 ///
 /// Four forms, not one: a hint that needs a footnote to be true is an
-/// asterisk. `space cycle` and `enter edit` are named only under
+/// asterisk. `space cycle` and `e edit` are named only under
 /// [`Control::Allowed`], since under [`Control::ReadOnly`] both refuse.
+/// `Enter` still does what `e` does, but the hint has room for only one
+/// of the two, so it names the key that also opened the pane.
 ///
-/// The env sub-screen gets its own pair since two keys mean something
-/// else there: `esc` backs out to the field list rather than closing the
-/// pane, and `enter` sets a value rather than opening a field editor.
+/// The env sub-screen gets its own pair since `esc` means something else
+/// there: it backs out to the field list rather than closing the pane.
 /// `g`/`G` and `r` are named in both, since they are bound on both
 /// screens in both control states.
-///
-/// The read-only field-list form must stay byte-identical, so nothing
-/// that measured it moves.
 const fn pane_hint(control: Control, env_open: bool) -> &'static str {
     match (control, env_open) {
         (Control::ReadOnly, false) => {
-            "esc/e close   j/k select   g/G first/last   r refresh   q quit"
+            "esc close   j/k select   g/G first/last   r refresh   q quit"
         }
         (Control::Allowed, false) => {
-            "esc/e close   j/k select   g/G first/last   r refresh   space cycle   enter edit   q quit"
+            "esc close   j/k select   g/G first/last   r refresh   space cycle   e edit   q quit"
         }
-        (Control::ReadOnly, true) => {
-            "esc back   e close   j/k select   g/G first/last   r refresh   q quit"
-        }
+        (Control::ReadOnly, true) => "esc back   j/k select   g/G first/last   r refresh   q quit",
         (Control::Allowed, true) => {
-            "esc back   e close   j/k select   g/G first/last   r refresh   enter set   q quit"
+            "esc back   j/k select   g/G first/last   r refresh   e set   q quit"
         }
     }
 }
@@ -671,7 +667,7 @@ mod tests {
             &super::super::fixtures::app_in_sheep_pane_with_control(),
             200,
         ));
-        for key in ["space cycle", "enter edit"] {
+        for key in ["space cycle", "e edit"] {
             assert!(
                 !closed.contains(key),
                 "{key} advertised read-only: {closed:?}"
@@ -682,7 +678,7 @@ mod tests {
             );
         }
         for both in [&closed, &open] {
-            assert!(both.contains("esc/e close"), "got {both:?}");
+            assert!(both.contains("esc close"), "got {both:?}");
             assert!(both.contains("q quit"), "got {both:?}");
             assert!(!both.contains("x stop"), "got {both:?}");
         }
@@ -695,9 +691,12 @@ mod tests {
         app.update(Msg::Key(KeyPress::Confirm));
         let bar = rendered(&status_line(&app, 200));
         assert!(bar.contains("esc back"), "got {bar:?}");
-        assert!(bar.contains("e close"), "got {bar:?}");
-        assert!(!bar.contains("esc/e close"), "got {bar:?}");
-        assert!(bar.contains("enter set"), "got {bar:?}");
+        assert!(bar.contains("e set"), "got {bar:?}");
+        assert!(
+            !bar.contains("e close"),
+            "e no longer closes anything: {bar:?}"
+        );
+        assert!(!bar.contains("enter set"), "got {bar:?}");
     }
 
     /// `g`/`G` and `r` are bound on the field list and the env sub-screen,
@@ -775,7 +774,7 @@ mod tests {
     fn the_config_pane_gets_its_own_key_hint() {
         let app = super::super::fixtures::app_in_sheep_pane();
         let bar = status_line(&app, 120).to_string();
-        assert!(bar.contains("esc/e close"), "got {bar:?}");
+        assert!(bar.contains("esc close"), "got {bar:?}");
         assert!(bar.contains("r refresh"), "got {bar:?}");
         assert!(!bar.contains("x stop"), "got {bar:?}");
         assert!(!bar.contains("s settings"), "got {bar:?}");

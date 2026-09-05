@@ -639,7 +639,7 @@ esc/s close   j/k select   g/G fir… read-only`;
     </p>
     <p>Keys, local to the pane while it's open:</p>
     <ul>
-      <li><code>e</code> opens the pane, and closes it again</li>
+      <li><code>e</code> opens the pane from the dashboard</li>
       <li><code>j</code>/<code>k</code>, arrows move the cursor one row</li>
       <li><code>g</code>/<code>G</code> jump to the first or last field</li>
       <li>
@@ -650,8 +650,10 @@ esc/s close   j/k select   g/G fir… read-only`;
         one for a choice. Press it again to walk another step.
       </li>
       <li>
-        <code>Enter</code> opens the editor on a text or number field, and
-        sends whatever is armed. Two keystrokes to change a field, never one.
+        <code>e</code> or <code>Enter</code> opens the editor on a text or
+        number field, and sends whatever is armed. Two keystrokes to change
+        a field, never one. Inside the pane the two keys do exactly the
+        same thing, so learning either is enough.
       </li>
       <li><code>Esc</code> closes the pane; it never quits lookout</li>
     </ul>
@@ -668,13 +670,14 @@ esc/s close   j/k select   g/G fir… read-only`;
       <code>shep reload &lt;sheep&gt;</code> is what promotes a parked one.
     </p>
     <p>
-      <code>Enter</code> on the <code>env</code> row opens a sub-screen of
-      that sheep's env key names. No value ever appears there, because the
-      shepherd never sends one: every key reads <code>&lt;set&gt;</code>.
-      <code>Enter</code> on a key types a new value for it, and applying an
-      empty one removes the key. <code>Enter</code> on the
-      <code>+ new</code> row takes <code>KEY=value</code>.
-      <code>Esc</code> goes back to the field list.
+      <code>e</code> or <code>Enter</code> on the <code>env</code> row opens
+      a sub-screen of that sheep's env key names. No value ever appears
+      there, because the shepherd never sends one: every key reads
+      <code>&lt;set&gt;</code>. <code>e</code> or <code>Enter</code> on a
+      key types a new value for it, and applying an empty one removes the
+      key. Either on the <code>+ new</code> row takes
+      <code>KEY=value</code>. <code>Esc</code> goes back to the field list;
+      a second <code>Esc</code> from there closes the pane.
     </p>
     <p>
       Env writes arm and confirm like every other one, a set as much as a
@@ -697,7 +700,9 @@ esc/s close   j/k select   g/G fir… read-only`;
       <code>e</code> on a dog row of the settings screen opens the same pane
       over that dog's <code>[&lt;name&gt;]</code> section in
       <code>dogs.toml</code>. <code>e</code> on the dashboard does not: a dog
-      is not a sheep, and the row there says so instead.
+      is not a sheep, and the row there says so instead. Inside the pane,
+      <code>e</code> is the field list's own edit key, the same as on a
+      sheep's config; only <code>Esc</code> closes it.
     </p>
     <p>
       The form comes from the dog. Shep asks the binary for its schema when
