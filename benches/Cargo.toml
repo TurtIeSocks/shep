@@ -20,7 +20,7 @@ shep-daemon = { path = "../crates/shep-daemon" }
 # (rayon, plotters, cargo_bench_support) and naming cargo_bench_support back
 # on keeps rayon and plotters out of a bench crate that only runs via
 # `cargo bench`.
-criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]
 name = "memory_sample"
