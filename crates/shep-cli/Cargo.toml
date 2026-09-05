@@ -255,7 +255,13 @@ tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }
 # the hand-rolled daemon fakes this crate's command tests drive. A
 # dev-dependency, so the feature is on for the test targets and off for the
 # shipped binary.
-shep-client = { workspace = true, features = ["test-support"] }
+# Path-only, with no `version`, for the reason `crates/shep-macros/Cargo.toml`
+# spells out: `cargo publish` keeps a dev-dependency that carries a version and
+# drops one that does not, so a version here would make packaging this crate
+# require a shep-client release that may not exist yet. That is not a deadlock
+# from this side, since shep publishes last, but it is the same publish-order
+# constraint and it buys nothing. `scripts/check-dev-deps.py` enforces the rule.
+shep-client = { path = "../shep-client", features = ["test-support"] }
 # Snapshot coverage for `--format json` payloads.
 insta.workspace = true
 # The real-binary e2e tier (`tests/cli_e2e.rs`).
