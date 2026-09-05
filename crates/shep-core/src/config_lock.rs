@@ -76,9 +76,9 @@ impl ConfigLock {
     /// Blocks until this process holds `path`'s lock exclusively.
     ///
     /// # Errors
-    /// The lock file could not be created beside `path`, or `flock` failed
-    /// for a reason other than contention (contention blocks rather than
-    /// failing).
+    /// The single open that creates the lock file beside `path` and takes
+    /// exclusive share access on it failed for a reason other than
+    /// contention. A sharing violation is retried, not returned.
     #[cfg(windows)]
     pub fn acquire(path: &Path) -> std::io::Result<Self> {
         use std::os::windows::fs::OpenOptionsExt as _;
@@ -175,9 +175,13 @@ mod tests {
     }
 
     #[test]
-    fn a_staged_config_file_is_owner_only() {
+    fn a_staged_config_file_is_owner_only_named_for_the_pair_and_lands_where_asked() {
         let dir = tempfile::tempdir().unwrap();
         let tmp = create_config_file(dir.path()).unwrap();
+        assert_eq!(tmp.path().parent(), Some(dir.path()));
+        let name = tmp.path().file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("shep"), "{name}");
+        assert!(name.ends_with(".toml.tmp"), "{name}");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
