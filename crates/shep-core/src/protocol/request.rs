@@ -383,7 +383,11 @@ pub enum Request {
         /// The env key.
         key: String,
         /// The value, or `None` to remove the key.
-        value: Option<String>,
+        ///
+        /// [`EnvValue`], not a bare `String`, for the reason that type's
+        /// own doc gives: this is the most secret-dense field on the wire
+        /// and a derived `Debug` on [`Request`] would print it (IR-41).
+        value: Option<EnvValue>,
     },
     /// Replaces one dog's `[<name>]` section in `dogs.toml` and publishes
     /// `config.dog.<name>` so a running dog re-reads it.
@@ -1416,6 +1420,60 @@ impl fmt::Debug for DogSectionToml {
     }
 }
 
+/// One environment variable's value, on its way to a sheep.
+///
+/// A newtype for one reason, the same one [`DogSectionToml`] exists for: an
+/// env value is the single most secret-dense thing a client can send this
+/// daemon (a database URL, an API token, a signing key), and a derived
+/// `Debug` on [`Request`] would print it in the clear the moment anything
+/// logs a request. Every other secret-bearing field on this wire is already
+/// protected by its inner type -- [`AppConfig`]'s own manual `Debug` prints
+/// `env: <N vars>` -- and a bare `String` here would have been the first
+/// field in the enum without that protection.
+///
+/// One direction only. Nothing ever sends one back: [`Request::SheepConfig`]
+/// answers with the env KEYS and no values at all, which is decision 12 of
+/// the overrides design.
+///
+/// `#[serde(transparent)]` makes the wire representation identical to a
+/// bare `String`, so this newtype changes nothing about
+/// [`crate::protocol::PROTOCOL_VERSION`] or the pinned snapshot fixtures.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EnvValue(String);
+
+impl EnvValue {
+    /// The value.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for EnvValue {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl core::ops::Deref for EnvValue {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Debug prints a length and never the value (IR-41) -- see the type doc for
+/// why. Exact-string-tested below (`env_value_debug_does_not_leak`) so a
+/// future `#[derive(Debug)]` fails that test instead of silently reopening
+/// the leak.
+impl fmt::Debug for EnvValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "EnvValue(<{} bytes>)", self.0.len())
+    }
+}
+
 /// One registered sheep whose stored config differs from a caller's copy:
 /// the answer [`Request::ConfigDrift`] is asking for
 ///
@@ -2412,6 +2470,30 @@ mod tests {
         assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
     }
 
+    /// fails if an env value can be printed by a `{:?}` on a `Request`.
+    /// This is the most secret-dense field on the wire, and the second half
+    /// pins that the newtype protecting it costs the wire nothing: a bare
+    /// string either way, so no fixture and no protocol version moves for
+    /// it.
+    #[test]
+    fn env_value_debug_does_not_leak() {
+        let request = Request::SetSheepEnv {
+            name: "web".to_string(),
+            key: "DATABASE_URL".to_string(),
+            value: Some("postgres://user:hunter2@localhost/app".to_string().into()),
+        };
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("hunter2"), "{debug}");
+        assert!(debug.contains("EnvValue(<37 bytes>)"), "{debug}");
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(
+            json.contains(r#""value":"postgres://user:hunter2@localhost/app""#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
+    }
+
     /// fails if a config pane's answer can carry an env VALUE. The pane
     /// edits everything else about a sheep, so the config itself has to
     /// travel; `env` is the one map in it that holds secrets, and decision
@@ -2768,7 +2850,7 @@ mod tests {
                 body: Request::SetSheepEnv {
                     name: "web".to_string(),
                     key: "DATABASE_URL".to_string(),
-                    value: Some("postgres://localhost/app".to_string()),
+                    value: Some("postgres://localhost/app".to_string().into()),
                 },
             },
             // The second request carrying a `DogSectionToml`, and pinned

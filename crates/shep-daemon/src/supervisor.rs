@@ -52,7 +52,7 @@ use shep_core::config::{
 use shep_core::overrides::{self, AppOverrides};
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{
-    ActionOutcome, ActionReply, BusEvent, DogSource, ExitInfo, LineOutcome, LineReply,
+    ActionOutcome, ActionReply, BusEvent, DogSource, EnvValue, ExitInfo, LineOutcome, LineReply,
     ProcessEventKind, ProcessInfo, SheepConfigView, SheepDrift, SignalOutcome, SignalReply, Smit,
     sort_flock,
 };
@@ -466,10 +466,17 @@ pub(crate) enum Command {
         /// The env key.
         key: String,
         /// The value, or `None` to remove the key.
-        value: Option<String>,
-        /// Answers `false` when no sheep has that name, and an error only
-        /// when the override store itself could not be read or written.
-        reply: oneshot::Sender<Result<bool, SupervisorError>>,
+        ///
+        /// [`EnvValue`], not a bare `String`: this enum derives `Debug` and
+        /// an env value is the most secret-dense thing that reaches it
+        /// (IR-41). The wire type carries the same protection for the same
+        /// reason.
+        value: Option<EnvValue>,
+        /// Answers the config now parked for the sheep's next spawn, which
+        /// `rpc.rs` hands to the registry, or `None` when no sheep has that
+        /// name. An error only when the request is refused or the override
+        /// store itself could not be read or written.
+        reply: oneshot::Sender<Result<Option<ResolvedApp>, SupervisorError>>,
     },
     /// Attaches a marker to one sheep by name, or clears it.
     ///
@@ -1079,7 +1086,15 @@ impl SupervisorHandle {
     }
 
     /// Sets `key` on `name`'s env, or removes it with `None`, recorded as an
-    /// operator override. Answers `Ok(false)` when no sheep has that name.
+    /// operator override. Answers `Ok(None)` when no sheep has that name.
+    ///
+    /// The `Some` carries the config now parked for that sheep's next spawn.
+    /// `rpc.rs` hands it to [`crate::registry::FlockRegistry::record`], the
+    /// way the `Scale` and `ApplyConfig` arms hand it theirs: the muster roll
+    /// is written from the registry and nothing on the restore path reads the
+    /// override store, so an edit that skipped this survives a
+    /// `shep daemon reload` (the handover blob carries `pending`) and is lost
+    /// by a cold restart.
     ///
     /// The running child holds the env it was spawned from, so the change
     /// parks for that sheep's next spawn rather than reaching it now, and
@@ -1098,8 +1113,8 @@ impl SupervisorHandle {
         &self,
         name: String,
         key: String,
-        value: Option<String>,
-    ) -> Result<bool, SupervisorError> {
+        value: Option<EnvValue>,
+    ) -> Result<Option<ResolvedApp>, SupervisorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Msg::Command(Command::SetSheepEnv {
@@ -3171,6 +3186,26 @@ fn reached_spec(
         serde_json::from_value(serde_json::Value::Object(next)).map_err(|err| err.to_string())?;
     config.instances = instances;
     normalize(config).map_err(|err| err.to_string())
+}
+
+/// The field names `entry`'s parked config differs from its running spec on,
+/// or empty when nothing is parked.
+///
+/// Two readers ask this and they must never disagree about the same sheep:
+/// [`ProcessInfo::pending`], which every listing renders, and
+/// [`Actor::handle_sheep_config`], which a config pane renders. One
+/// definition so the pane and the flock table cannot drift, the same reason
+/// [`Actor::representative_id`] is one function.
+///
+/// An empty answer covers two different states -- nothing parked, and a
+/// parked config that turned out identical to the spec -- and the callers
+/// part company there rather than here: `ProcessInfo::pending` reports
+/// `None` for both, because its own doc says `None` means nothing parked and
+/// an empty list is not nothing parked.
+fn pending_fields(entry: &ProcessEntry) -> Vec<String> {
+    entry.pending.as_ref().map_or_else(Vec::new, |parked| {
+        entry.spec.config().drifted_fields(parked.config())
+    })
 }
 
 /// The one sentence every door that refuses to touch a dog's config says.
@@ -6007,17 +6042,15 @@ impl<R: ProcessRunner> Actor<R> {
         // show what the sheep is MEANT to be, or an operator's own parked
         // edit reads as never having landed. `pending` beside it is what
         // says the running child does not have it yet, and it is computed
-        // exactly as `ProcessInfo::pending` is, so the pane and the listing
-        // never disagree about the same sheep.
+        // off the same helper the listing uses, so the pane and the flock
+        // table never disagree about the same sheep.
         let Some(config) = self.intended_spec(id).map(|spec| spec.config().clone()) else {
             return Ok(None);
         };
         Ok(Some(SheepConfigView::new(
             config,
             self.overridden_for(name),
-            slot.entry.pending.as_ref().map_or_else(Vec::new, |parked| {
-                slot.entry.spec.config().drifted_fields(parked.config())
-            }),
+            pending_fields(&slot.entry),
         )))
     }
 
@@ -6055,9 +6088,9 @@ impl<R: ProcessRunner> Actor<R> {
         name: &str,
         key: &str,
         value: Option<&str>,
-    ) -> Result<bool, SupervisorError> {
+    ) -> Result<Option<ResolvedApp>, SupervisorError> {
         let Some(id) = self.representative_id(name) else {
-            return Ok(false);
+            return Ok(None);
         };
         // BEFORE the store is read and long before it is written. A dog
         // runs at the daemon's own trust level and its binary is what `shep
@@ -6080,18 +6113,24 @@ impl<R: ProcessRunner> Actor<R> {
         // `apply_one`'s own reason for reading `intended` rather than
         // `running`.
         let Some(mut intended) = self.intended_spec(id).map(|spec| spec.config().clone()) else {
-            return Ok(false);
+            return Ok(None);
         };
+        // Captured before the edit, because the removal branch below needs
+        // to know whether there was anything to remove.
+        let was_in_config = intended.env.contains_key(key);
         match value {
             Some(value) => intended.env.insert(key.to_string(), value.to_string()),
             None => intended.env.remove(key),
         };
+
         let parked =
             normalize(intended).map_err(|err| SupervisorError::InvalidEnv(err.to_string()))?;
 
         let mut record = overrides::get(&self.paths.overrides, name)
             .map_err(|err| SupervisorError::Overrides(err.to_string()))?
             .unwrap_or_default();
+        // Read before the `entry` below borrows the record mutably.
+        let file_declares = record.declared_env.contains(key);
         // A flat JSON object under the `env` key, which is the shape
         // `merge_declared` reads to decide which env keys an operator has
         // established. Anything else there is a store this build cannot act
@@ -6106,6 +6145,7 @@ impl<R: ProcessRunner> Actor<R> {
                 "{name}'s stored `env` override is not an object"
             )));
         };
+        let was_overridden = map.contains_key(key);
         match value {
             Some(value) => map.insert(
                 key.to_string(),
@@ -6113,6 +6153,40 @@ impl<R: ProcessRunner> Actor<R> {
             ),
             None => map.remove(key),
         };
+        // # What a removal MEANS in the store
+        //
+        // Dropping the operator's own value is only half an answer, and for
+        // a key the operator never set it is no answer at all: `map.remove`
+        // is then a no-op, the store comes back `{}`, and the edit lives
+        // nowhere but `ProcessEntry::pending` -- lost to a cold restart and
+        // invisible in the CFG column, for a change the operator just made.
+        //
+        // So a removal leaves a JSON `null` TOMBSTONE under the key,
+        // whenever the key was in the config and something other than this
+        // store put it there. Three cases, and each falls out of the
+        // condition rather than needing an arm:
+        //
+        // - the key came from the app's config and was never overridden:
+        //   tombstone, because the removal IS the operator's edit and
+        //   nothing else records it;
+        // - the key was an operator override the file also declares:
+        //   tombstone, because dropping the override alone would let the
+        //   file's value read as current when the operator has removed it;
+        // - the key was an operator override and nothing else supplies it:
+        //   plain removal, because the operator has simply withdrawn their
+        //   own value and the sheep no longer differs from its file. A
+        //   tombstone here would mark a sheep forever for a key that exists
+        //   nowhere.
+        //
+        // Nothing materializes an override's VALUE into a config -- the env
+        // branch of `merge_declared` reads this map for its KEYS only -- so
+        // a null is read exactly as "somebody has spoken for this key",
+        // which is what stops a later plain load silently putting it back.
+        // `--reset=env` and `--reset=all` clear it through `establish_env`,
+        // which is right: a reset is the operator asking for the file's env.
+        if value.is_none() && was_in_config && (!was_overridden || file_declares) {
+            map.insert(key.to_string(), serde_json::Value::Null);
+        }
         let emptied = map.is_empty();
         // A removal that left nothing behind takes the `env` key with it,
         // for the reason `merge_declared` states where it spends an
@@ -6138,7 +6212,7 @@ impl<R: ProcessRunner> Actor<R> {
             slot.entry.pending = Some(parked.clone());
             slot.entry.overridden.clone_from(&overridden);
         }
-        Ok(true)
+        Ok(Some(parked))
     }
 
     /// One app's half of [`Self::handle_apply_config`].
@@ -9709,18 +9783,18 @@ fn to_info(entry: &ProcessEntry, smits: &Smits) -> ProcessInfo {
         )
         .instance(Some(entry.instance))
         // The field names `spec` and `pending` differ on, or `None` when
-        // nothing is parked. `.filter` rather than a bare `Some(vec)`: a
-        // parked config that turned out identical to `spec` (an earlier
-        // load promoted every field an operator cared about, say) must not
-        // report `pending: Some([])` -- the doc on `ProcessInfo::pending`
-        // says `None` means nothing parked, and an empty list is not
-        // nothing parked, it is nothing DIFFERING about what is parked.
-        // Cheap either way: an in-memory `AppConfig` comparison, no disk
-        // I/O.
-        .pending(entry.pending.as_ref().and_then(|parked| {
-            let fields = entry.spec.config().drifted_fields(parked.config());
+        // nothing is parked. Emptiness is collapsed into `None` here rather
+        // than in `pending_fields`: a parked config that turned out
+        // identical to `spec` (an earlier load promoted every field an
+        // operator cared about, say) must not report `pending: Some([])` --
+        // the doc on `ProcessInfo::pending` says `None` means nothing
+        // parked, and an empty list is not nothing parked, it is nothing
+        // DIFFERING about what is parked. Cheap either way: an in-memory
+        // `AppConfig` comparison, no disk I/O.
+        .pending({
+            let fields = pending_fields(entry);
             (!fields.is_empty()).then_some(fields)
-        }))
+        })
         // Read off the cached field, never the override store directly --
         // see `ProcessEntry::overridden`'s own doc for why: that field is
         // kept correct by every path that can register or replace a sheep,

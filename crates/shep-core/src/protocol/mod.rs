@@ -60,10 +60,10 @@ pub use channel::{CHANNEL_VERSION, ChildMessage, ShepherdMessage};
 pub use events::{BusEvent, ProcessEventKind};
 pub use frame::ServerFrame;
 pub use request::{
-    ActionOutcome, ActionReply, DogSectionToml, DogSource, Envelope, ExitInfo, Hello, HelloAck,
-    HelloReply, Lamb, LineOutcome, LineReply, ProcessInfo, ProcessInfoBuilder, Reply, Request,
-    Response, RpcError, RpcErrorCode, SelectorSpec, SheepApplied, SheepConfigView, SheepDrift,
-    SignalOutcome, SignalReply, Smit, SmitError, sort_flock,
+    ActionOutcome, ActionReply, DogSectionToml, DogSource, EnvValue, Envelope, ExitInfo, Hello,
+    HelloAck, HelloReply, Lamb, LineOutcome, LineReply, ProcessInfo, ProcessInfoBuilder, Reply,
+    Request, Response, RpcError, RpcErrorCode, SelectorSpec, SheepApplied, SheepConfigView,
+    SheepDrift, SignalOutcome, SignalReply, Smit, SmitError, sort_flock,
 };
 pub use wire::{MAX_FRAME_BYTES, WireError, codec, decode_frame, encode_frame};
 

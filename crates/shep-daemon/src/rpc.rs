@@ -670,8 +670,20 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                 .set_sheep_env(name.clone(), key.clone(), value)
                 .await
             {
-                Ok(true) => reply(Ok(Response::SheepEnvSet { name, key })),
-                Ok(false) => reply(Err(RpcError {
+                // Recorded exactly as `Start`, `Add`, `Scale` and
+                // `ApplyConfig` record theirs, and for the reason
+                // `Scale`'s arm gives: the muster roll is written from the
+                // registry (`snapshot::muster`) and nothing on the restore
+                // path reads the override store, so an env edit that
+                // skipped this would survive a `shep daemon reload` -- the
+                // handover blob carries `pending` -- and vanish on a cold
+                // restart. The same field class behaving differently
+                // depending on which request set it is the bug.
+                Ok(Some(app)) => {
+                    ctx.registry.record(&[app]);
+                    reply(Ok(Response::SheepEnvSet { name, key }))
+                }
+                Ok(None) => reply(Err(RpcError {
                     code: RpcErrorCode::NotFound,
                     message: format!("no sheep named {name}"),
                     daemon_version: None,
@@ -2758,6 +2770,30 @@ mod tests {
         assert!(err.message.contains("bark is a dog"), "{}", err.message);
     }
 
+    /// Reads one sheep's config view, for the cases that assert on it.
+    async fn sheep_config_view(
+        ctx: &RpcContext,
+        id: u64,
+        name: &str,
+    ) -> shep_core::protocol::SheepConfigView {
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    id,
+                    Request::SheepConfig {
+                        name: name.to_string(),
+                    },
+                ),
+                ctx,
+            )
+            .await,
+        );
+        match reply.result {
+            Ok(Response::SheepConfig(view)) => view,
+            other => panic!("expected SheepConfig, got {other:?}"),
+        }
+    }
+
     /// fails if a config pane's answer carries an env VALUE, and fails if
     /// it stops listing the keys. Both halves are the point: a pane that
     /// cannot name the keys cannot offer to edit them, and one that is
@@ -2830,7 +2866,7 @@ mod tests {
                     Request::SetSheepEnv {
                         name: "web".to_string(),
                         key: "NEW".to_string(),
-                        value: Some("1".to_string()),
+                        value: Some("1".to_string().into()),
                     },
                 ),
                 &h.ctx,
@@ -2878,7 +2914,7 @@ mod tests {
         let h = harness(vec![ProcScript::never_exits()]);
         start_web_with_a_secret(&h.ctx).await;
 
-        for (id, value) in [(2, Some("1".to_string())), (3, None)] {
+        for (id, value) in [(2, Some("1".to_string().into())), (3, None)] {
             let reply = reply_of(
                 dispatch(
                     envelope(
@@ -2919,6 +2955,163 @@ mod tests {
         assert!(view.overridden.is_empty(), "{view:?}");
     }
 
+    /// fails if an env edit survives a `shep daemon reload` and is lost by
+    /// a cold restart, which is the shape this bug took. The muster roll is
+    /// written from the `FlockRegistry` and nothing on the restore path
+    /// reads the override store, so a handler that parks a config without
+    /// recording it looks correct in every live test and forgets the edit
+    /// the next time the machine comes up.
+    ///
+    /// Asserts the roll rather than the registry's own accessor: the roll
+    /// is what `shep muster` actually restores from.
+    #[tokio::test(start_paused = true)]
+    async fn a_set_env_reaches_the_roll_a_cold_restart_would_come_back_on() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::SetSheepEnv {
+                        name: "web".to_string(),
+                        key: "NEW".to_string(),
+                        value: Some("1".to_string().into()),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        assert!(reply.result.is_ok(), "{:?}", reply.result);
+
+        let infos = list_flock(&h.ctx, 3).await;
+        let roll = h.ctx.registry.roll(&infos, 0);
+        let web = roll
+            .apps
+            .iter()
+            .find(|entry| entry.app.name == "web")
+            .expect("web is in the roll");
+        assert_eq!(web.app.env.get("NEW").map(String::as_str), Some("1"));
+    }
+
+    /// fails if removing an env key the operator never overrode records
+    /// nothing. `map.remove` is a no-op for a key that was supplied by the
+    /// app's own config, so without a tombstone the store comes back empty,
+    /// the CFG column marks nothing, and the removal lives only in
+    /// `ProcessEntry::pending` -- for a change the operator just made.
+    ///
+    /// `removing_the_last_env_override_stops_marking_the_sheep` cannot
+    /// reach this: it removes a key it set itself, which is the one case
+    /// that must NOT leave a tombstone.
+    #[tokio::test(start_paused = true)]
+    async fn removing_a_key_the_operator_never_set_is_still_recorded() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::SetSheepEnv {
+                        name: "web".to_string(),
+                        key: "DB_PASS".to_string(),
+                        value: None,
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        assert!(reply.result.is_ok(), "{:?}", reply.result);
+
+        let stored = shep_core::overrides::get(&h.ctx.paths.overrides, "web")
+            .unwrap()
+            .expect("the removal is recorded");
+        assert_eq!(
+            stored.fields["env"]["DB_PASS"],
+            serde_json::Value::Null,
+            "a removal is a tombstone, not an absence"
+        );
+
+        let view = sheep_config_view(&h.ctx, 3, "web").await;
+        assert_eq!(view.overridden, ["env"]);
+        assert!(!view.env_keys.contains(&"DB_PASS".to_string()));
+    }
+
+    /// fails if `SetSheepEnv` writes the store before it validates. Two
+    /// halves, and the second is the one a refactor breaks: `SHEP_NAME` is
+    /// injected per instance and refused in a hand-written env, so this is
+    /// a real refusal an operator can meet from a free-text pane, and a
+    /// handler that wrote first would leave a stored override for a config
+    /// the daemon will not accept.
+    #[tokio::test(start_paused = true)]
+    async fn an_env_key_normalize_refuses_is_invalid_config_and_writes_nothing() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::SetSheepEnv {
+                        name: "web".to_string(),
+                        key: "SHEP_NAME".to_string(),
+                        value: Some("impostor".to_string().into()),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Err(err) = reply.result else {
+            panic!("a reserved env key was accepted")
+        };
+        assert_eq!(err.code, RpcErrorCode::InvalidConfig);
+        assert!(
+            shep_core::overrides::get(&h.ctx.paths.overrides, "web")
+                .unwrap()
+                .is_none(),
+            "the refusal still wrote the store"
+        );
+    }
+
+    /// fails if an unreadable override store is reported as anything but a
+    /// daemon-side fault. It is the one failure here that is neither the
+    /// caller's request nor a refusal they can act on by asking
+    /// differently, which is the whole reason it has a variant of its own
+    /// rather than sharing `InvalidEnv`'s.
+    #[tokio::test(start_paused = true)]
+    async fn an_unreadable_override_store_is_internal_not_a_bad_request() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+        std::fs::write(&h.ctx.paths.overrides, "{ this is not json").unwrap();
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::SetSheepEnv {
+                        name: "web".to_string(),
+                        key: "NEW".to_string(),
+                        value: Some("1".to_string().into()),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Err(err) = reply.result else {
+            panic!("an unreadable store was reported as success")
+        };
+        assert_eq!(err.code, RpcErrorCode::Internal);
+        assert!(
+            err.message.contains("overrides store unusable"),
+            "{}",
+            err.message
+        );
+    }
+
     /// fails if a variant added to `Request` never gets a dispatch arm.
     ///
     /// The one test here that cannot be replaced by reading the code.
@@ -2932,6 +3125,12 @@ mod tests {
     /// Every request below names something that does not exist, so a real
     /// arm refuses each of them and nothing is asserted about the refusal
     /// but which one it is.
+    ///
+    /// **The list is hand-written and nothing makes it exhaustive.** There
+    /// is no way to enumerate a `#[non_exhaustive]` enum's variants at
+    /// runtime, so a fourth variant added to `Request` is covered by this
+    /// test only if its author adds it here. If you are adding one, add it
+    /// here.
     #[tokio::test(start_paused = true)]
     async fn every_new_variant_reaches_an_arm_and_not_the_wildcard() {
         let h = harness(vec![]);
