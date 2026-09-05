@@ -228,7 +228,9 @@ impl Client {
             .await
             .map_err(|_send_error| RequestError::Closed)?;
 
-        let budget = deadline + DEADLINE_GRACE;
+        // Saturating: `deadline` is the caller's, and `Duration`'s `Add`
+        // panics rather than saturating on overflow.
+        let budget = deadline.saturating_add(DEADLINE_GRACE);
         match tokio::time::timeout(budget, reply_rx).await {
             Ok(Ok(outcome)) => outcome,
             Ok(Err(_recv_error)) => Err(RequestError::Closed),
