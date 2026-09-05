@@ -548,9 +548,17 @@ fn section_for(settings: &Settings, field: SettingField) -> &str {
 /// headers, the dogs caption, the dog column header and the two markers
 /// cost -- and every one of those used to be pushed uncounted, which is how
 /// the cursor's own row ended up past the height on a short terminal. The
-/// offset it hands over is a starting point here, walked down until the
-/// cursor's row actually fitted. Zero means unlimited, for a test with no
-/// terminal behind it.
+/// offset it hands over is a starting point here, walked down one row at a
+/// time until the cursor's row fits.
+///
+/// The walk can run out. A four-line body has no room for the `[dogs]`
+/// block above a dog row, and at `view::MIN_HEIGHT` that is the whole
+/// budget -- the last offset draws two markers, two blanks and no data at
+/// all. So when it runs out it gives up on the layout rather than on the
+/// cursor: [`cursor_only`] draws that one row without its section chrome.
+/// The cursor is therefore drawn at every height this screen claims to
+/// support, and the frame at the floor looks unlike every other frame on
+/// purpose. Zero means unlimited, for a test with no terminal behind it.
 ///
 /// [`Viewport`]: crate::lookout::viewport::Viewport
 fn content_lines(
@@ -567,15 +575,84 @@ fn content_lines(
     } else {
         usize::from(height)
     };
+    // Six scalars are unconditional, so an empty screen is unreachable
+    // today. Handled rather than indexed on faith, because the fallback
+    // below has a row to draw and this does not.
+    if total_rows == 0 {
+        return body_from(app, settings, palette, width, budget, 0).lines;
+    }
     // At most one pass per row, over six scalars and a handful of dogs.
     let mut offset = settings.view().offset().min(cursor_row);
     loop {
         let attempt = body_from(app, settings, palette, width, budget, offset);
-        if attempt.cursor_drawn || offset >= cursor_row {
+        if attempt.cursor_drawn {
             return attempt.lines;
+        }
+        if offset >= cursor_row {
+            return cursor_only(app, settings, palette, width, budget, cursor_row);
         }
         offset += 1;
     }
+}
+
+/// The cursor's own row, alone, for a body too short to hold the chrome
+/// that row's section costs.
+///
+/// The last resort, reached only when every offset down to the cursor's own
+/// left it undrawn. `MIN_HEIGHT` is six rows, which is four of body, and a
+/// dog row needs the blank line, the `[dogs]` header, the caption and the
+/// column header above it before it may be drawn at all -- six lines for
+/// one row. The screen used to answer that by drawing two markers and two
+/// blank lines: honest about how much was hidden, and silent about the one
+/// row the operator had selected. A screen that declares a minimum height
+/// should draw something at it, and the selected row is the something.
+///
+/// Markers are added around it while they fit, the cursor's row first: it
+/// is the one line this function exists to guarantee.
+fn cursor_only(
+    app: &App,
+    settings: &Settings,
+    palette: Palette,
+    width: u16,
+    budget: usize,
+    cursor_row: usize,
+) -> Vec<Line<'static>> {
+    let rows = settings.rows();
+    let table_width = body_width(width);
+    let mut lines = Vec::new();
+    match rows.get(cursor_row) {
+        Some(SettingsRow::Scalar(field)) => lines.push(scalar_line(
+            *field,
+            scalar_view(settings.snapshot(), *field),
+            true,
+            table_width,
+        )),
+        Some(SettingsRow::Dog(index)) => {
+            let dogs = dog_rows(app, table_width);
+            if let Some(dog) = dogs.get(*index) {
+                lines.push(dog_line(dog, columns_for(table_width), table_width, true));
+            }
+        }
+        None => {}
+    }
+
+    let hidden_below = rows.len().saturating_sub(cursor_row + 1);
+    if cursor_row > 0 && lines.len() < budget {
+        lines.insert(
+            0,
+            Line::from(Span::styled(
+                format!("  ... {cursor_row} above"),
+                palette.muted(),
+            )),
+        );
+    }
+    if hidden_below > 0 && lines.len() < budget {
+        lines.push(Line::from(Span::styled(
+            format!("  ... {hidden_below} below"),
+            palette.muted(),
+        )));
+    }
+    lines
 }
 
 /// One attempt at the body, drawn from data row `offset` down.
@@ -1021,6 +1098,79 @@ mod tests {
         // nothing. The scroll in the frame above is the renderer's, which is
         // the only layer that knows what the chrome costs.
         assert_eq!(settings.view().offset(), 0);
+    }
+
+    /// The whole screen at `height`, through the same `note_body_rows` and
+    /// `draw` the event loop runs before every frame.
+    fn screen_at(app: &mut App, height: u16) -> String {
+        let area = Rect::new(0, 0, 120, height);
+        app.note_body_rows(super::super::body_rows(area));
+        let mut terminal = Terminal::new(TestBackend::new(120, height)).unwrap();
+        terminal
+            .draw(|frame| super::super::draw(app, frame))
+            .unwrap();
+        render_text(terminal.backend().buffer())
+    }
+
+    /// How many rows the frame marks as selected. One, always.
+    fn marked(text: &str) -> usize {
+        text.lines().filter(|line| line.starts_with('>')).count()
+    }
+
+    /// fails if any single step of a walk to the bottom and back loses the
+    /// cursor, at any height this screen says it can draw.
+    ///
+    /// The two tests either side of this one each sit at one position and
+    /// never drive the walk, which is the part that can go wrong: the
+    /// offset moves one row per step, and whether the cursor's row fits
+    /// depends on how much section chrome that particular step drags with
+    /// it. Six is `view::MIN_HEIGHT`, four lines of body, where a dog row
+    /// costs six lines to draw in place and the screen falls back to
+    /// drawing that row alone.
+    #[test]
+    fn the_cursor_survives_every_step_of_a_walk_down_and_back_up() {
+        for height in [6u16, 7, 8, 10, 14, 20] {
+            let mut app = fixtures::app_in_settings_with_dog_drift();
+            let total = app.settings().unwrap().rows().len();
+            for step in 0..=total {
+                let text = screen_at(&mut app, height);
+                assert_eq!(marked(&text), 1, "{height} rows, {step} down:\n{text}");
+                app.update(Msg::Key(KeyPress::SelectDown));
+            }
+            for step in 0..=total {
+                let text = screen_at(&mut app, height);
+                assert_eq!(marked(&text), 1, "{height} rows, {step} up:\n{text}");
+                app.update(Msg::Key(KeyPress::SelectUp));
+            }
+        }
+    }
+
+    /// fails if a window opening in the middle of a section stops naming
+    /// the section it opened in.
+    ///
+    /// `settings_short` exercises this only in its mild form: it opens at
+    /// `[style]`, whose one row IS the section, so the header sits where it
+    /// would anyway. This opens inside `[daemon]`, three rows past that
+    /// header, and the header still has to be drawn -- what rule 3 means by
+    /// "the header labels a scrolled view".
+    #[test]
+    fn a_window_opening_mid_section_still_draws_the_header_it_scrolled_past() {
+        let mut app = fixtures::app_in_settings_on(SettingField::MaxCronSleep);
+        let text = screen_at(&mut app, 6);
+        let body: Vec<&str> = text.lines().map(str::trim_end).collect();
+        assert!(
+            body.iter().any(|line| line.trim() == "[daemon]"),
+            "the section above the window is named: {text}"
+        );
+        assert!(
+            !text.contains("log_level"),
+            "and the rows between its header and the window are gone: {text}"
+        );
+        assert_eq!(marked(&text), 1, "{text}");
+        assert!(
+            body.iter().any(|line| line.starts_with("> max_cron_sleep")),
+            "the marked row is the cursor's: {text}"
+        );
     }
 
     /// fails if the marker that says rows were cut is itself the row that
