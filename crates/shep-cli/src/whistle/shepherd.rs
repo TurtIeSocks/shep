@@ -1,13 +1,13 @@
 //! One connection per tool call.
 //!
-//! lookout holds a long-lived connection with a reconnect ladder and a freeze
-//! state, because a dashboard that loses its shepherd must keep showing what
-//! it last knew. whistle has no screen: a tool call is one request and one
-//! reply, so this connects, sends, and drops. A shepherd restarted between two
-//! calls is invisible — no stale handle, no ladder, no state machine.
+//! lookout holds a long-lived connection with a reconnect ladder and a
+//! freeze state, because a dashboard must keep showing what it last knew.
+//! whistle has no screen: it connects, sends, and drops. A shepherd
+//! restarted between two calls is invisible; there is no stale handle to
+//! notice it.
 //!
-//! The cost is one `connect(2)` and one handshake per call, over a local unix
-//! socket, between calls a model makes seconds apart.
+//! One `connect(2)` and one handshake per call, over a local unix socket,
+//! is cheap between calls a model makes seconds apart.
 
 use std::path::{Path, PathBuf};
 
@@ -19,13 +19,9 @@ use crate::exit::ExitCode;
 
 /// The socket, and the one operation anything in `whistle` performs on it.
 ///
-/// Not an error enum, so IR-20's `#[non_exhaustive]` rule does not apply; and
-/// shep-cli is `[[bin]]`-only, so nothing here is in a library crate at all.
-///
 /// `super::read`'s five tools and `super::control`'s four both call
 /// [`Self::call`]/[`Self::call_with_ack`] through `Whistle::shepherd`, one
-/// held per `Whistle`. `Whistle::new` (`whistle/mod.rs`) builds that
-/// `Shepherd` with [`Self::new`], from `ShepPaths::socket`.
+/// held per `Whistle`.
 #[derive(Debug, Clone)]
 pub struct Shepherd {
     socket: PathBuf,
@@ -40,16 +36,14 @@ impl Shepherd {
 
     /// Connects, sends one request, and drops the connection.
     ///
-    /// **Never `connect_or_spawn`.** `shep start` and `shep muster` autostart a
-    /// shepherd because a person asked them to; a model calling `list_flock`
-    /// against a machine with no daemon running must be told so, not handed a
-    /// daemon it did not ask for.
+    /// Never `connect_or_spawn`: a model calling `list_flock` against a
+    /// machine with no daemon running must be told so, not handed one it
+    /// did not ask for.
     ///
     /// # Errors
     ///
-    /// A [`CallToolResult`] with `is_error: true` — never an
-    /// [`rmcp::ErrorData`] — carrying the shepherd's own message. See
-    /// [`refusal`] for why the distinction is load-bearing.
+    /// A [`CallToolResult`] with `is_error: true`, never an
+    /// [`rmcp::ErrorData`], carrying the shepherd's own message.
     pub async fn call(&self, request: Request) -> Result<Response, CallToolResult> {
         self.call_with_ack(request)
             .await
@@ -58,11 +52,9 @@ impl Shepherd {
 
     /// [`Self::call`], plus the handshake the connection was opened with.
     ///
-    /// `get_metrics` needs `daemon_version` and `daemon_pid` for
-    /// `super::facts::MetricsReading`, and those live on the [`Client`]
-    /// (`Client::daemon() -> &HelloAck`, shep-client/src/client.rs:175) which
-    /// [`Self::call`] drops before it returns. Rather than making every caller
-    /// deal with a tuple, `call` delegates here and throws the ack away.
+    /// `get_metrics` needs `daemon_version` and `daemon_pid`, which live on
+    /// the [`Client`] that [`Self::call`] drops before returning; `call`
+    /// delegates here and throws the ack away.
     ///
     /// # Errors
     ///
@@ -88,26 +80,16 @@ impl Shepherd {
 }
 
 /// Refuses `client` if its shepherd disagrees with this binary's crate
-/// version, reusing [`crate::refuse_version_skew`] — the same guard the
-/// seams in `lib.rs` apply for every other verb.
+/// version, reusing [`crate::refuse_version_skew`].
 ///
-/// **Never writes to stdout.** This module's own doc: stdout is the MCP
-/// transport, and one stray byte on it corrupts a JSON-RPC stream the peer
-/// cannot resynchronise. `refuse_version_skew`'s own two render branches
-/// only ever write to a `Streams`' `err` field (`Streams::fail` routes
-/// through `emit_error(&mut *self.err, ..)`; its `Format::Table` branch
-/// writes to `streams.err` directly), so handing it a `Streams` whose `out`
-/// is [`std::io::sink`] and whose `err` is the real stderr is safe: the
-/// human-readable refusal lands where an operator tailing this process's
-/// stderr can see it, and the transport is never touched. The MODEL sees a
-/// separate, in-band [`CallToolResult`] built here, the same shape
-/// [`connect_refusal`] and [`refusal`] already use for every other failure
-/// this call can meet.
+/// Never writes to stdout: `out` is [`std::io::sink`] and only `err` is
+/// the real stderr, since stdout is whistle's MCP transport. The model
+/// sees a separate, in-band [`CallToolResult`] built here.
 ///
 /// # Errors
-/// A [`CallToolResult`] with `is_error: true`, carrying the same facts
-/// [`crate::refuse_version_skew`]'s own message does, when the shepherd's
-/// crate version differs from this binary's.
+///
+/// A [`CallToolResult`] with `is_error: true` when the shepherd's crate
+/// version differs from this binary's.
 fn refuse_if_skewed(client: &Client) -> Result<(), CallToolResult> {
     let mut sink = std::io::sink();
     let mut err = std::io::stderr();
@@ -133,16 +115,10 @@ fn refuse_if_skewed(client: &Client) -> Result<(), CallToolResult> {
     )
 }
 
-/// A connect failure, as an in-band tool error naming the socket ONCE.
+/// A connect failure, as an in-band tool error naming the socket once.
 ///
-/// `ConnectError`'s own `Display` already prints
-/// ``could not connect to `<path>`: <source>`` (shep-client's
-/// connection.rs:78-80), so this wrapper does not repeat the path — it adds
-/// only the words that say what is missing rather than what failed, which is
-/// what a model can act on.
-///
-/// [`Shepherd::call_with_ack`] is its only call site — reached from every
-/// tool in `super::read` and `super::control`.
+/// `ConnectError`'s `Display` already prints the path, so this wrapper adds
+/// only the words that say what is missing rather than what failed.
 fn connect_refusal(socket: &Path, err: &ConnectError) -> CallToolResult {
     let _ = socket; // named in the signature for call-site readability; the
     // path itself comes out of `err`'s own Display.
@@ -154,32 +130,18 @@ fn connect_refusal(socket: &Path, err: &ConnectError) -> CallToolResult {
 
 /// A request failure, as an in-band tool error carrying the shepherd's words.
 ///
-/// **`CallToolResult::structured_error`, not `Err(ErrorData)`.** rmcp turns an
-/// `Err(ErrorData)` into a JSON-RPC protocol error — `impl IntoCallToolResult
-/// for ErrorData` returns `Err(self)` (rmcp handler/server/tool.rs:119-123) —
-/// and MCP reserves protocol errors for unknown tools and malformed params. A
-/// host is free to show one to the user and not to the model. A daemon refusal
-/// is an execution failure the model must see and can act on, so it goes
-/// in-band with `is_error: true` (rmcp model.rs:3990).
+/// `structured_error`, not `Err(ErrorData)`: MCP reserves protocol errors
+/// for unknown tools and malformed params, and a daemon refusal is an
+/// execution failure the model must see and can act on.
 ///
-/// The daemon's message is passed through unaltered, including the cases where
-/// its code is imprecise — `rpc.rs` maps `SupervisorError::ReloadInFlight` to
-/// `RpcErrorCode::Internal` and says in its own comment that it does so "under
-/// protest", the right answer being a conflict code the wire does not have
-/// yet. A model reading "api is already being reloaded" can act on that. A
-/// model reading a nicer code whistle invented would be reading fiction.
-///
-/// Reached the same way [`connect_refusal`] is: through `super::read`'s and
-/// `super::control`'s tools.
+/// The message passes through unaltered, even when the code is imprecise:
+/// `rpc.rs` maps `SupervisorError::ReloadInFlight` to `RpcErrorCode::Internal`
+/// under protest, since the wire has no conflict code yet.
 fn refusal(err: &RequestError) -> CallToolResult {
     let (code, message) = match err {
-        // `ExitCode::from(RpcErrorCode)` then `code_str()`, rather than a
-        // second `match` spelling the codes out here: `exit.rs` is already the
-        // one place this binary decides how a daemon error code is spelled
-        // (`not_found`, `invalid_config`, ...) — see exit.rs:71 and :95 — and
-        // a copy would be a second spelling to drift. The MESSAGE is untouched
-        // — no lowercasing, no rewrapping — because it routinely carries an
-        // app's own name, and `Api` is not `api`.
+        // `exit.rs` is the one place this binary spells a daemon error
+        // code; a second `match` here would drift. The message is
+        // untouched: it routinely carries an app's own name.
         RequestError::Rpc(rpc) => (
             ExitCode::from(rpc.code).code_str().to_string(),
             rpc.message.clone(),
@@ -194,16 +156,11 @@ fn refusal(err: &RequestError) -> CallToolResult {
     }))
 }
 
-/// whistle's OWN refusal, before anything reaches the wire.
+/// whistle's own refusal, before anything reaches the wire.
 ///
-/// One shape for both kinds, so a model never has to learn two. `super::read`
-/// (Task 6) is the first caller — an unreadable log file (`tail_bleats`) and
-/// an unreadable `barks.jsonl` (`list_barks`) both go through this, rather
-/// than each tool inventing its own error shape. `start_sheep`'s
-/// already-running refusal (`whistle/control.rs`, Task 7) will be a third.
-///
-/// Not an error enum, so IR-20's `#[non_exhaustive]` rule does not apply; and
-/// shep-cli is `[[bin]]`-only, so nothing here is in a library crate at all.
+/// One shape for every caller: an unreadable log file (`tail_bleats`), an
+/// unreadable `barks.jsonl` (`list_barks`), and `start_sheep`'s
+/// already-running refusal all go through this.
 pub fn own_refusal(code: &str, message: String) -> CallToolResult {
     CallToolResult::structured_error(serde_json::json!({
         "code": code,
@@ -216,9 +173,8 @@ mod tests {
     use super::*;
     use shep_core::protocol::{RpcError, RpcErrorCode};
 
-    /// A [`HelloAck`] this binary's own [`refuse_if_skewed`] never refuses —
-    /// [`shep_client::testing::sample_ack`]'s `"9.9.9"` always would, now
-    /// that `call_with_ack` guards every call this fixture drives through.
+    /// A [`HelloAck`] whose version [`refuse_if_skewed`] never refuses,
+    /// since `sample_ack`'s `"9.9.9"` always would.
     fn matching_ack() -> HelloAck {
         HelloAck {
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -226,14 +182,9 @@ mod tests {
         }
     }
 
-    /// fails if a daemon-side refusal stops reaching the model verbatim, or
-    /// stops being IN-BAND. shep does not paraphrase the shepherd: "api is
-    /// already being reloaded" is actionable and a whistle-invented
-    /// replacement is not — but a message a host routes to the user instead
-    /// of the model is just as lost. `is_error: true` on a `CallToolResult`
-    /// is what keeps it in front of the model; an `Err(ErrorData)` becomes a
-    /// JSON-RPC protocol error (rmcp handler/server/tool.rs:119-123) and the
-    /// host decides.
+    /// shep does not paraphrase the shepherd: `is_error: true` keeps the
+    /// message in front of the model, where an `Err(ErrorData)` would
+    /// become a host-routed protocol error instead.
     #[test]
     fn a_daemon_refusal_is_an_in_band_error_keeping_its_own_message() {
         let result = refusal(&RequestError::Rpc(RpcError {
@@ -252,13 +203,10 @@ mod tests {
         );
     }
 
-    /// fails if an unreachable shepherd stops naming the socket. "connection
-    /// refused" alone tells a model nothing it can act on; the path is what
-    /// an operator greps for.
+    /// "connection refused" alone tells a model nothing it can act on; the
+    /// path is what an operator greps for.
     ///
-    /// `ConnectError::Connect` is a STRUCT variant carrying both fields
-    /// (`crates/shep-client/src/connection.rs:44-49`) — constructing it as a
-    /// tuple variant does not compile.
+    /// `ConnectError::Connect` is a struct variant, not a tuple one.
     #[test]
     fn an_unreachable_shepherd_names_the_socket_once() {
         let socket = std::path::Path::new("/nonexistent/shep/run/shep.sock");
@@ -279,10 +227,8 @@ mod tests {
             message.contains("no shepherd"),
             "and says what is missing, not just what failed: {message}"
         );
-        // ONCE, not twice. `ConnectError`'s own `Display` already prints
-        // ``could not connect to `<path>` `` (connection.rs:78-80), so a
-        // wrapper that prepends the path too says it twice — which reads as
-        // two different sockets to anything skimming.
+        // Once, not twice: `ConnectError`'s own `Display` already prints
+        // the path, so a wrapper that prepends it too reads as two sockets.
         assert_eq!(
             message.matches("/nonexistent/shep/run/shep.sock").count(),
             1,
@@ -290,12 +236,8 @@ mod tests {
         );
     }
 
-    /// fails if `call` starts holding a connection between calls. Two calls
-    /// against a shepherd that was restarted in between must both succeed —
-    /// this is the whole reason there is no ladder here.
-    ///
-    /// IR-46: bounded, because a `call` that hung on a dead handle would
-    /// otherwise hang the suite rather than fail it.
+    /// Bounded: a `call` that hung on a dead handle would otherwise hang
+    /// the suite rather than fail it.
     #[tokio::test]
     async fn two_calls_survive_a_shepherd_that_restarted_in_between() {
         let dir = tempfile::tempdir().unwrap();
@@ -323,23 +265,14 @@ mod tests {
         // The shepherd goes away entirely: task aborted, socket file removed.
         // A `Shepherd` holding a connection would be holding a dead one.
         first.abort();
-        // AWAITED, not just aborted. `JoinHandle::abort` only REQUESTS
-        // cancellation — the task's resources, the bound listener among
-        // them, are released when it is actually reclaimed. On unix that
-        // race is invisible because the socket file is unlinked explicitly
-        // below; on Windows the still-live pipe instance makes the rebind
-        // fail with `ERROR_ACCESS_DENIED`, since `Listener::bind` asks for
-        // `first_pipe_instance`. Awaiting the cancellation is what makes
-        // "the shepherd went away" actually true before the next one binds.
+        // Awaited, not just aborted: `abort` only requests cancellation,
+        // and the bound listener is released only once it is reclaimed.
+        // On Windows an unreclaimed pipe fails the rebind below with
+        // `ERROR_ACCESS_DENIED`.
         let _ = first.await;
-        // Unix only: on that tier the listener leaves a socket FILE behind
-        // that outlives the aborted task, so the address stays connectable
-        // until it is unlinked and the test would not be simulating a
-        // departed shepherd without this. A named pipe has no directory
-        // entry and stops existing when its last handle closes — which the
-        // abort above already did — so there is nothing to remove, and
-        // asking to remove it fails with `ERROR_INVALID_PARAMETER` (87)
-        // rather than doing nothing.
+        // Unix only: the listener leaves a socket file behind that outlives
+        // the aborted task, so it must be unlinked to simulate a departed
+        // shepherd. A named pipe has no directory entry to remove.
         #[cfg(unix)]
         std::fs::remove_file(&socket).unwrap();
 
@@ -359,10 +292,8 @@ mod tests {
         second.abort();
     }
 
-    /// fails if `call_with_ack`'s guard stops refusing a skewed shepherd, or
-    /// starts doing it by writing to stdout — the one byte this module's
-    /// own doc says must never happen. `whistle` drives the daemon on every
-    /// tool call, so it can never be one of `RECOVERY_VERBS`.
+    /// Must refuse without writing to stdout, the one byte this module's
+    /// doc says must never happen.
     #[tokio::test]
     async fn a_version_skewed_shepherd_is_an_in_band_refusal() {
         let dir = tempfile::tempdir().unwrap();

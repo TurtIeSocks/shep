@@ -1,32 +1,14 @@
 //! `whisper`: write one line to matched sheep's stdin.
 //!
-//! One verb, one call site, following `trigger`/`signal`'s own precedent:
-//! inlining the one match this needs reads more plainly than a shared
-//! generic wrapper nothing else here would call.
+//! A line carrying an embedded newline or carriage return is refused
+//! locally, so it costs no round trip. The daemon re-validates it anyway:
+//! peer input is untrusted.
 //!
-//! A line carrying an embedded newline or carriage return is checked
-//! locally, before the round trip — two commands where the operator typed
-//! one is a usage error they caused, and it should cost neither a
-//! connection nor a daemon round trip. The daemon re-validates anyway
-//! (`shep-daemon`'s own `Request::SendLine` arm), because peer input is
-//! untrusted and a client is not the only thing that can send a frame.
+//! A row's own outcome is never a request failure. `shep whisper` exits
+//! non-`Success` only when the RPC itself failed.
 //!
-//! Sent with the client's plain default deadline: nothing on this path
-//! waits on the app the way `trigger` waits on its `action_timeout` — the
-//! shepherd's own write is bounded well inside that default.
-//!
-//! A row's own outcome — `Sent`, `NoStdin`, `NotWritten` — is never a
-//! request failure: the daemon reports it per matched sheep, following
-//! `Trigger`/`Signal`'s own precedent, so `shep whisper` exits
-//! non-`Success` only when the RPC itself failed (a malformed selector or
-//! line caught locally, a selector that matched nothing, a daemon this
-//! client could not reach). What each row says is `SentLineRows`'s job
-//! (`output/rows.rs`), not this module's.
-//!
-//! `sent` means the bytes were written and flushed to the pipe — not that
-//! the app read them. A pipe holds 64 KiB before it blocks, and there is
-//! nothing on this path that could tell a read app from an app that never
-//! reads its stdin at all.
+//! `sent` means the bytes were written and flushed to the pipe, not that the
+//! app read them.
 
 use shep_client::Client;
 use shep_core::protocol::{Request, Response, SelectorSpec};
@@ -90,8 +72,7 @@ mod tests {
         }
     }
 
-    /// Runs the verb against a fake daemon that captures envelopes, and hands
-    /// back the exit code, stdout, stderr and the capture channel.
+    /// Runs the verb against a fake daemon that captures envelopes.
     async fn run(
         args: &WhisperArgs,
     ) -> (
@@ -118,9 +99,6 @@ mod tests {
     }
 
     /// `"/[/"` is one of the only three inputs the selector grammar rejects.
-    /// A verb that skipped the client-side parse would send it and exit
-    /// `NotFound` instead of `Usage`, and the daemon would see a request it
-    /// never should have.
     #[tokio::test]
     async fn a_malformed_selector_exits_usage_without_a_round_trip() {
         let (code, _out, _err, mut envelopes) = run(&args("/[/", "gc")).await;
@@ -131,10 +109,6 @@ mod tests {
         );
     }
 
-    /// fails if a line carrying a newline reaches the wire. The daemon refuses
-    /// it too, and deliberately in both places — but the operator gets a faster
-    /// and more specific answer from the side that knows what they typed, and
-    /// this side must not spend a connection to learn it.
     #[tokio::test]
     async fn a_line_with_an_embedded_newline_exits_usage_without_a_round_trip() {
         let (code, _out, err, mut envelopes) = run(&args("repl", "gc\nquit")).await;
@@ -147,9 +121,7 @@ mod tests {
         assert!(rendered.contains("one line"), "{rendered}");
     }
 
-    /// fails if a carriage return slips through. `\r` is the one an operator
-    /// produces by accident — pasting from a file with CRLF endings — and it
-    /// reaches a shell as a command with a stray control character in it.
+    /// `\r` is the one an operator produces by accident, pasting CRLF text.
     #[tokio::test]
     async fn a_line_with_a_carriage_return_is_refused_too() {
         let (code, _out, _err, mut envelopes) = run(&args("repl", "gc\r")).await;
@@ -157,11 +129,8 @@ mod tests {
         assert!(envelopes.try_recv().is_err());
     }
 
-    /// The envelope's own `body`, not just that the call succeeded. Two
-    /// mistakes only this catches: a selector converted with the wrong helper,
-    /// and a terminator appended client-side — the wire's contract is that the
-    /// line does NOT carry one, and the shepherd's writer is the single place
-    /// that adds it.
+    /// The wire's contract is that the line carries no terminator; the
+    /// shepherd's writer is the single place that adds one.
     #[tokio::test]
     async fn the_request_carries_the_selector_and_the_bare_line() {
         let (_code, _out, _err, mut envelopes) = run(&args("repl", "gc")).await;
@@ -175,11 +144,8 @@ mod tests {
         );
     }
 
-    /// A response this client does not recognise (the fake daemon's generic
-    /// `Pong`, standing in for a `Response` variant this verb's `match` has no
-    /// arm for) must not be read as any of the outcomes — it is `Internal`, the
-    /// rule every other verb's extract follows for `Response`'s
-    /// `#[non_exhaustive]`.
+    /// The fake daemon's `Pong` stands in for a `Response` variant this
+    /// `match` has no arm for.
     #[tokio::test]
     async fn an_unrecognised_response_exits_internal() {
         let (code, out, err, _envelopes) = run(&args("repl", "gc")).await;
@@ -188,9 +154,6 @@ mod tests {
         assert!(!err.is_empty());
     }
 
-    /// fails if a `NotFound` reply is swallowed. A selector that matched no
-    /// registered sheep is the one way this verb fails as a whole request —
-    /// distinct from a matched sheep with no pipe, which is a `no_stdin` ROW.
     #[tokio::test]
     async fn a_not_found_reply_exits_not_found_rather_than_being_swallowed() {
         let dir = tempfile::tempdir().unwrap();

@@ -1,34 +1,21 @@
 //! Request-target resolution, pure tier.
 //!
-//! No `cfg`, no I/O: [`resolve`] takes the raw HTTP request target (the
-//! bytes between the method and the protocol on the request line — an
-//! opaque `&str` as far as `crate::http` is concerned) and returns either a
-//! root-relative sequence of segments or the precise reason it refused the
-//! target. Everything here compiles on every target this workspace ships,
-//! Windows included, and is exercised by the Windows cross-check — the `\`
-//! and `:` refusals below exist specifically because this module is not
-//! `#[cfg(unix)]`.
+//! No `cfg`, no I/O: [`resolve`] takes the raw HTTP request target and
+//! returns either a root-relative sequence of segments or the precise
+//! reason it refused the target. Compiles on every target this workspace
+//! ships, Windows included.
 //!
-//! # Order, and why the obvious order is wrong
-//!
-//! Decoding the whole target and then splitting on `/` lets a `%2f` create a
-//! separator after the fact, so `..%2f..%2fetc%2fpasswd` would become
-//! `../../etc/passwd` *after* a traversal check already ran on a single
-//! segment. [`resolve`] splits first and decodes each segment second, so a
-//! decoded `/` is a forbidden byte inside a segment rather than a separator
-//! between two.
-//!
-//! The filesystem half of request handling — the containment walk, the
-//! symlink refusal, the open — lives in `serve::fs`, `#[cfg(unix)]` and
-//! `async`: both are syscalls, and a syscall inside a tokio task must not be
-//! the blocking `std::fs` kind.
+//! Splits on `/` before decoding each segment, so a `%2f` cannot smuggle
+//! a separator past a traversal check already run on the segment before it.
+//! The filesystem half, the containment walk and the open, lives in
+//! `serve::fs`, `#[cfg(unix)]` and `async`.
 
 use core::fmt;
 
 /// Why a request target cannot be resolved. Every variant is a 400.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
-    /// The target does not begin with `/` — an absolute-form target
+    /// The target does not begin with `/`: an absolute-form target
     /// (`GET http://host/x`), the asterisk form (`OPTIONS *`), a bare
     /// relative path, or an empty string.
     NotAbsolute,
@@ -44,7 +31,7 @@ pub enum Refusal {
     ForbiddenByte,
     /// A decoded segment is not valid UTF-8.
     NotUtf8,
-    /// A `..` with nothing left to pop — the target reaches above the root.
+    /// A `..` with nothing left to pop: the target reaches above the root.
     AboveRoot,
 }
 
@@ -68,33 +55,15 @@ impl core::error::Error for Refusal {}
 /// Resolves a request target to a root-relative sequence of segments, or
 /// refuses it.
 ///
-/// 1. Refuses a target that does not start with `/`.
-/// 2. Cuts the query at the first `?` and a fragment at the first `#`,
-///    discarding both.
-/// 3. Splits on `/`.
-/// 4. Percent-decodes each segment, byte by byte, refusing a malformed
-///    escape.
-/// 5. Refuses a decoded segment containing a NUL byte, any other control
-///    byte, `/`, `\`, or `:`, or one that is not valid UTF-8.
-/// 6. Walks the segments: `""` and `"."` are skipped, `".."` pops, and a
-///    `".."` with nothing left to pop is a refusal rather than a clamp to
-///    root. Everything else is pushed.
-///
-/// An absolute-*looking* target such as `/etc/passwd` is never refused by
-/// this function — every segment is pushed onto a stack that starts empty,
-/// so `/etc/passwd` resolves to `["etc", "passwd"]` and is looked for
-/// *inside* whatever root the caller joins it against. No lexical walk here
-/// can produce a path outside the root; that is what makes rule 6 correct
-/// rather than merely convenient.
-///
-/// `+` is never decoded as a space — that substitution belongs to
+/// An absolute-looking target like `/etc/passwd` is never refused here:
+/// every segment is pushed onto a stack that starts empty, so it resolves
+/// to `["etc", "passwd"]` inside whatever root the caller joins against.
+/// A `".."` with nothing left to pop is a refusal, not a clamp to root.
+/// `+` is never decoded as a space: that belongs to
 /// `application/x-www-form-urlencoded` query strings, not path segments.
 ///
 /// # Errors
 /// See [`Refusal`] for the precise condition behind each variant.
-///
-/// `resolve`'s caller is `serve::worker`, which walks these segments against
-/// the docroot on every request.
 pub fn resolve(target: &str) -> Result<Vec<String>, Refusal> {
     if !target.starts_with('/') {
         return Err(Refusal::NotAbsolute);
@@ -122,14 +91,11 @@ pub fn resolve(target: &str) -> Result<Vec<String>, Refusal> {
     Ok(stack)
 }
 
-/// Whether any segment in a resolved target begins with `.` — `.env` at the
-/// root and `.git/config` two levels down are the same leak, and this
-/// predicate reads as hidden on either.
+/// Whether any segment in a resolved target begins with `.`: `.env` at
+/// the root and `.git/config` two levels down are the same leak.
 ///
-/// The refusal this feeds is the handler's, not this function's: a hidden
-/// path is a 404 unless `--hidden` was given (decision 4). This is the pure
-/// predicate both the handler and the listing renderer (`serve::listing`)
-/// ask, so the two cannot drift.
+/// The refusal is the handler's, not this function's. `serve::listing`
+/// asks the same predicate, so the two cannot drift.
 pub fn is_hidden(segments: &[String]) -> bool {
     segments.iter().any(|segment| segment.starts_with('.'))
 }
@@ -137,10 +103,10 @@ pub fn is_hidden(segments: &[String]) -> bool {
 /// Percent-decodes one already-split segment, byte by byte.
 ///
 /// Operates on bytes rather than `char`s: a `%` escape can produce any byte
-/// 0-255, including the leading byte of a multi-byte UTF-8 sequence that only
-/// becomes valid once every byte in it has been decoded — [`resolve`]
-/// assembles the whole segment's bytes first and validates UTF-8 once, over
-/// the result, rather than per escape.
+/// 0-255, including the leading byte of a multi-byte UTF-8 sequence that
+/// only becomes valid once every byte in it has been decoded. [`resolve`]
+/// assembles the whole segment's bytes first and validates UTF-8 once,
+/// over the result, rather than per escape.
 ///
 /// # Errors
 /// [`Refusal::BadEscape`] if a `%` is not followed by exactly two hex
@@ -187,9 +153,8 @@ fn is_forbidden_byte(byte: u8) -> bool {
 mod tests {
     use super::*;
 
-    /// The five shapes this phase was asked to refuse by name, plus the
-    /// response-splitting one, plus a positive control in the same test so a
-    /// resolver that refuses everything cannot pass.
+    /// The five refused shapes, the response-splitting one, and a
+    /// positive control in the same test.
     #[test]
     fn the_traversal_shapes_are_each_refused_for_their_own_reason() {
         // positive control: an ordinary nested asset resolves, and `..` that
@@ -229,9 +194,8 @@ mod tests {
         assert_eq!(resolve("/a%ff%fe"), Err(Refusal::NotUtf8));
     }
 
-    /// An absolute-looking path is NOT a refusal — it is resolved inside the
-    /// root, which is the whole structural argument. `GET /etc/passwd` looks
-    /// for `<root>/etc/passwd` and 404s; it never reaches `/etc/passwd`.
+    /// An absolute-looking path is not a refusal: it resolves inside the
+    /// root. `GET /etc/passwd` looks for `<root>/etc/passwd` and 404s.
     #[test]
     fn an_absolute_looking_target_resolves_inside_the_root() {
         assert_eq!(resolve("/etc/passwd").unwrap(), vec!["etc", "passwd"]);
@@ -247,9 +211,8 @@ mod tests {
         assert_eq!(resolve("/?../../etc/passwd").unwrap(), Vec::<String>::new());
     }
 
-    /// fails if decoding runs before splitting. `%2f` must stay a byte inside
-    /// one segment, never become a separator — and since `/` is forbidden in
-    /// a segment, it is refused rather than silently renamed.
+    /// fails if decoding runs before splitting: `%2f` must stay a byte
+    /// inside one segment, never become a separator.
     #[test]
     fn decoding_happens_after_splitting_and_never_creates_a_separator() {
         assert_eq!(resolve("/a%2fb"), Err(Refusal::ForbiddenByte));
@@ -258,23 +221,17 @@ mod tests {
         assert_eq!(resolve("/%252e%252e/x").unwrap(), vec!["%2e%2e", "x"]);
     }
 
-    /// A backslash is a separator on Windows and this module compiles there.
-    /// Refusing it costs a filename nobody has and closes a resolver that
-    /// would be wrong the day someone builds the Windows tier. Both forms:
-    /// the percent-encoded one, and the raw one a client can simply type.
+    /// A backslash is a separator on Windows, and this module compiles
+    /// there. Both forms: percent-encoded, and raw.
     #[test]
     fn a_backslash_segment_is_refused_on_every_target() {
         assert_eq!(resolve("/a%5c..%5cetc"), Err(Refusal::ForbiddenByte));
         assert_eq!(resolve("/\\..\\..\\etc"), Err(Refusal::ForbiddenByte));
     }
 
-    /// fails if a drive prefix reaches `PathBuf::push`. On Windows a segment
-    /// carrying `:` REPLACES the base path rather than extending it, so
-    /// `GET /C:/Windows/System32/config/SAM` would resolve entirely outside
-    /// the docroot before any containment check saw a path derived from it.
-    /// Same byte covers the NTFS alternate-data-stream form and the
-    /// drive-relative one. This module compiles on Windows and this test is
-    /// what the cross-check exercises.
+    /// fails if a drive prefix reaches `PathBuf::push`. On Windows, a
+    /// segment carrying `:` replaces the base path rather than extending
+    /// it. Same byte covers the NTFS alternate-data-stream form.
     #[test]
     fn a_windows_drive_prefix_or_a_data_stream_is_refused() {
         assert_eq!(
@@ -291,8 +248,7 @@ mod tests {
     /// not paths at all are refused before anything else runs.
     #[test]
     fn the_decoder_and_the_target_form_have_no_soft_edges() {
-        // Uppercase hex decodes the same as lowercase — a resolver that only
-        // handles one case refuses `%2E%2E` as a filename and serves it.
+        // Uppercase hex decodes the same as lowercase.
         assert_eq!(resolve("/%2E%2E/x"), Err(Refusal::AboveRoot));
         assert_eq!(resolve("/%2e%2E/x"), Err(Refusal::AboveRoot));
         // Overlong UTF-8 for `.` (`%c0%ae`): invalid UTF-8, never a dot.
@@ -303,11 +259,8 @@ mod tests {
         assert_eq!(resolve("*"), Err(Refusal::NotAbsolute));
     }
 
-    /// fails if the hidden-path predicate misses a dot anywhere but the first
-    /// segment. `.env` at the root and `.git/config` two levels down are the
-    /// same leak, and `--hidden` is the only thing that serves either.
-    /// The refusal itself is the handler's (a 404, decision 4); this pins the
-    /// predicate the handler asks.
+    /// fails if the hidden-path predicate misses a dot anywhere but the
+    /// first segment.
     #[test]
     fn a_dot_leading_segment_anywhere_reads_as_hidden() {
         assert!(is_hidden(&resolve("/.env").unwrap()));

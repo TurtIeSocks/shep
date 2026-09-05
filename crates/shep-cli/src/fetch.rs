@@ -1,60 +1,15 @@
-//! A bounded, redirect-refusing GET over `tokio-rustls` — [`get`], plus the
+//! A bounded, redirect-refusing GET over `tokio-rustls`: [`get`], plus the
 //! URL parsing ([`parse_url`]) and TLS setup ([`tls_connector`]) it shares
-//! with `dog::bark::sinks`, the module this one was carved out of.
+//! with `dog::bark::sinks`. An HTTP client, where `crate::http` is a
+//! hand-rolled, TLS-free server. Either scheme is accepted; a caller
+//! wanting only `https://` enforces that itself.
 //!
-//! **This is not `crate::http`.** That module is a hand-rolled HTTP
-//! *server* — deliberately TLS-free, "with no TLS to get wrong because the
-//! metrics endpoint is loopback by default" (its own module doc). This
-//! module is the opposite shape: an HTTP *client* that fetches one document
-//! from wherever an operator points it (`shep dogs --available`'s community
-//! index, served over real TLS, is never loopback). One serves a request;
-//! one fetches a document; only the second needs TLS, which is the whole
-//! reason these are two files rather than one growing past 800 lines with a
-//! client bolted onto a module whose doc comment argues against exactly
-//! that.
-//!
-//! [`tls_connector`], [`Target`] and [`parse_url`] live here rather than in
-//! `dog::bark::sinks`, so a fetch's GET and bark's POST share one
-//! connection path instead of two copies of the same `rustls` wiring;
-//! `sinks.rs` imports them from here. Everything downstream of the
-//! connection stays separate on purpose: bark writes a
-//! POST and reads a status line, this writes a GET and reads a bounded
-//! body, and each has its own error type because forcing those into one
-//! shape would blur both.
-//!
-//! **Both schemes are accepted, deliberately** — the same transport/policy
-//! split `sinks.rs` already draws (`require_secure_scheme` is bark's
-//! config-time policy over a transport that itself speaks either scheme).
-//! [`get`] has no opinion on scheme; a caller that wants only `https://`
-//! enforces that itself, same as bark's config loader does. Without this, a
-//! local plain-HTTP test server could never be exercised.
-//!
-//! **`get` refuses, in this order:** a 3xx naming its `Location`
-//! ([`FetchError::Redirect`]); any other non-2xx ([`FetchError::Status`],
-//! which is also where a 3xx with no `Location` to report ends up — there
-//! is nothing left to name once that's missing); a `Transfer-Encoding`
-//! header at all ([`FetchError::Chunked`] — this client reads exactly
-//! `Content-Length` bytes and nothing else, so a chunked body would be
-//! misparsed rather than decoded); a `Content-Length` that is absent,
-//! not a number, or contradicted by a second `Content-Length` header on the
-//! same response ([`FetchError::Transport`]); and a `Content-Length` above
-//! the caller's `limit` ([`FetchError::TooLarge`]). The size cap is checked
-//! twice — against the declared `Content-Length` before a byte of body is
-//! read, and again as each chunk of the body arrives — so neither a lying
-//! header nor an honest one can make this read forever.
-//!
-//! **The status line and headers are capped too**, at
-//! [`MAX_HEADER_BYTES`] for the block as a whole
-//! ([`FetchError::HeadersTooLarge`]). Everything above bounds the *body*,
-//! and for a while nothing bounded what came before it: a response opening
-//! `HTTP/1.1 200 OK\r\nX-Filler: ` and then never sending another newline
-//! grew a `String` for as long as the peer kept typing — measured at
-//! 10.4 GB in three seconds on loopback, bounded only by `timeout`. A cap
-//! on the body is not a cap on the response.
-//!
-//! No `Accept-Encoding` is ever sent, so there is no `Content-Encoding` to
-//! decode.
-
+//! [`get`] refuses, in this order: a 3xx naming a `Location`; any other
+//! non-2xx; any `Transfer-Encoding`, since it reads exactly
+//! `Content-Length` bytes; a `Content-Length` absent, unparseable, or
+//! contradicted by a second one; and one above the caller's `limit`,
+//! rechecked as the body arrives. The head has its own cap,
+//! [`MAX_HEADER_BYTES`]. No `Accept-Encoding` is sent.
 use core::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -66,27 +21,20 @@ use tokio_rustls::rustls::pki_types::ServerName;
 use crate::terminal_safe;
 
 /// The most this module will read before the blank line that ends a
-/// response's header block — status line included.
+/// response's header block, status line included.
 ///
-/// 64 KiB, which is what nginx, Apache and Go's `net/http` all settle
-/// within an order of magnitude of for the same budget, and far more than
-/// any real response needs: the live index's own answer runs about 300
-/// bytes of headers. It exists because there is no other bound at all on a
-/// peer that never sends a newline — see this module's own doc for the
-/// measurement.
+/// 64 KiB, within an order of magnitude of what nginx, Apache and Go's
+/// `net/http` allow, and far more than any real response needs: the live
+/// index answers in about 300 bytes of headers. Nothing else bounds a peer
+/// that never sends a newline.
 ///
-/// Not the caller's `limit`. That one is a body budget an index sets from
-/// what an index plausibly weighs; this one is a protocol budget and has
-/// nothing to do with the document.
+/// Not the caller's `limit`, which is a body budget.
 pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 
-/// A URL, parsed into what [`get`] needs to reach it — a fetch's own
-/// version of what `dog::bark::sinks` calls a sink's target.
+/// A URL, parsed into what [`get`] needs to reach it.
 ///
-/// `Debug` is derived, unlike [`crate::dog::bark::sinks::Sink`]'s own
-/// hand-written and redacted one: a fetch target is a public document
-/// location (the community dog index, or wherever a 3xx pointed), never a
-/// bearer credential the way a webhook URL is.
+/// `Debug` is derived: a fetch target is a public document location, never
+/// a bearer credential the way a webhook URL is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
     /// `true` for `https://`, `false` for `http://`.
@@ -101,10 +49,8 @@ pub struct Target {
 
 /// Why [`parse_url`] or [`get`] failed.
 ///
-/// `Debug` needs no redaction: every field is a URL this module was
-/// explicitly given or was explicitly redirected to (never a webhook's
-/// bearer credential — that's [`crate::dog::bark::sinks::Sink`]'s own
-/// concern), an HTTP status, a byte count, or an OS error.
+/// `Debug` needs no redaction: every field is a URL this module was given
+/// or redirected to, an HTTP status, a byte count, or an OS error.
 #[derive(Debug)]
 pub enum FetchError {
     /// `url` did not parse as an absolute `http://`/`https://` URL. Carries
@@ -123,9 +69,8 @@ pub enum FetchError {
     /// followed.
     Redirect {
         /// The `Location` header's value, [`crate::terminal_safe::sanitise`]d
-        /// at capture. It is a string the host chose and this `Display`
-        /// prints to a terminal, so it is stripped of anything that could
-        /// drive one before it is ever stored.
+        /// at capture: a string the host chose that this `Display` prints
+        /// to a terminal.
         location: String,
     },
     /// The response carried a `Transfer-Encoding` header. This client reads
@@ -139,9 +84,7 @@ pub enum FetchError {
     },
     /// The status line and header block together ran past
     /// [`MAX_HEADER_BYTES`] without reaching the blank line that ends them.
-    /// Separate from [`Self::TooLarge`] because that one is the caller's
-    /// budget for a *body* and this one is this module's own, fixed budget
-    /// for everything before it.
+    /// Separate from [`Self::TooLarge`], which is the caller's body budget.
     HeadersTooLarge {
         /// [`MAX_HEADER_BYTES`], named here so the message can state it.
         limit: usize,
@@ -210,14 +153,12 @@ impl From<std::io::Error> for FetchError {
 
 /// Parses `url` into a [`Target`] naming where [`get`] should connect.
 ///
-/// Hand-rolled rather than pulled from a `url` crate, same reasoning as
-/// when this lived in `sinks.rs` as `parse_sink_url`: a fetch target is
-/// never more than a scheme, a host, an optional port and a path, which is
-/// narrow enough to parse directly.
+/// Hand-rolled: a fetch target is never more than a scheme, a host, an
+/// optional port and a path.
 ///
 /// # Errors
-/// - [`FetchError::Url`] — `url` does not start with `http://` or
-///   `https://`, names a port that is not a number, or names no host.
+/// - [`FetchError::Url`] if `url` does not start with `http://` or
+///   `https://`, names a non-numeric port, or names no host.
 pub fn parse_url(url: &str) -> Result<Target, FetchError> {
     let (https, rest) = match url.strip_prefix("https://") {
         Some(rest) => (true, rest),
@@ -253,12 +194,9 @@ pub fn parse_url(url: &str) -> Result<Target, FetchError> {
     })
 }
 
-/// The TLS connector every `https://` connection this crate makes shares —
-/// bark's webhook POSTs and `get`'s own fetches alike — built once on first
-/// use rather than per request: `TlsConnector` wraps an
-/// `Arc<rustls::ClientConfig>`, and building a fresh one per connection
-/// would re-walk the root store and re-derive the cipher suite set every
-/// time.
+/// The TLS connector every `https://` connection this crate makes shares,
+/// built once on first use: a fresh one per connection would re-walk the
+/// root store and re-derive the cipher suite set every time.
 pub fn tls_connector() -> &'static tokio_rustls::TlsConnector {
     static CONNECTOR: std::sync::LazyLock<tokio_rustls::TlsConnector> =
         std::sync::LazyLock::new(|| {
@@ -280,9 +218,9 @@ pub fn tls_connector() -> &'static tokio_rustls::TlsConnector {
 /// body no larger than `limit` bytes, bounded end to end by `timeout`.
 ///
 /// # Errors
-/// See this module's own doc comment for the exact refusal order; every
-/// [`FetchError`] variant can come out of this call except
-/// [`FetchError::Url`], which only [`parse_url`] produces.
+/// Every [`FetchError`] variant can come out of this call except
+/// [`FetchError::Url`], which only [`parse_url`] produces. The module doc
+/// lists the refusal order.
 pub async fn get(target: &Target, limit: usize, timeout: Duration) -> Result<Vec<u8>, FetchError> {
     match tokio::time::timeout(timeout, get_inner(target, limit)).await {
         Ok(result) => result,
@@ -291,8 +229,7 @@ pub async fn get(target: &Target, limit: usize, timeout: Duration) -> Result<Vec
 }
 
 /// Connects to `target`, over TLS when `target.https`, and runs the
-/// write/read exchange over whichever stream results — the same shape as
-/// `sinks.rs`'s own `deliver_inner`, aimed at a GET instead of a POST.
+/// write/read exchange over whichever stream results.
 async fn get_inner(target: &Target, limit: usize) -> Result<Vec<u8>, FetchError> {
     let request = build_get_request(target);
     let tcp = TcpStream::connect((target.host.as_str(), target.port)).await?;
@@ -311,22 +248,13 @@ async fn get_inner(target: &Target, limit: usize) -> Result<Vec<u8>, FetchError>
 
 /// A transport failure the peer had a hand in wording, sanitised.
 ///
-/// `TcpStream::connect` and a socket read fail with text the OS wrote, and
-/// the OS is not the threat. A TLS handshake is the exception: rustls's
-/// `CertificateError::NotValidForNameContext` prints the names the peer's
-/// certificate *presented*, which is a string somebody else chose and which
-/// [`FetchError`]'s own `Display` puts in front of an operator.
-///
-/// The channel is narrow in practice — a publicly trusted CA will not sign
-/// a name with an escape in it, and webpki parses the SANs before rustls
-/// ever formats them — but narrow is not the standard the rest of this
-/// module holds itself to, and the `Location` header this now matches
-/// looked narrow too right up until it was reproduced.
+/// The OS writes most of these and is not the threat. A TLS handshake is
+/// the exception: rustls's `CertificateError::NotValidForNameContext`
+/// prints the names the peer's certificate presented, and [`FetchError`]'s
+/// `Display` puts those in front of an operator.
 ///
 /// Keeps the [`std::io::ErrorKind`] and drops the nested source, which
-/// nothing walks: [`FetchError::Transport`]'s `Display` prints one level
-/// and [`FetchError::source`] hands back this error, not what was inside
-/// it.
+/// nothing walks.
 fn peer_transport_error(source: std::io::Error) -> FetchError {
     FetchError::Transport(std::io::Error::new(
         source.kind(),
@@ -334,10 +262,9 @@ fn peer_transport_error(source: std::io::Error) -> FetchError {
     ))
 }
 
-/// The request line and headers [`get_inner`] sends: `Host` names the port
-/// only when it is off the scheme's own default (443/80), and there is
-/// deliberately no `Accept-Encoding` — see this module's own doc comment
-/// for why.
+/// The request line and headers [`get_inner`] sends. `Host` names the port
+/// only when it is off the scheme's own default (443/80), and there is no
+/// `Accept-Encoding`.
 fn build_get_request(target: &Target) -> String {
     let default_port = if target.https { 443 } else { 80 };
     let host = if target.port == default_port {
@@ -351,11 +278,9 @@ fn build_get_request(target: &Target) -> String {
     )
 }
 
-/// Writes `request`, flushes, then reads back the response — the explicit
-/// flush matters on the TLS branch the same way `sinks.rs`'s own
-/// `write_and_read` documents: `tokio-rustls` buffers writes in `rustls`'s
-/// record layer, and skipping the flush can leave a request sitting there
-/// the peer never sees.
+/// Writes `request`, flushes, then reads back the response. The flush
+/// matters on the TLS branch: `tokio-rustls` buffers writes in `rustls`'s
+/// record layer, and skipping it leaves a request the peer never sees.
 async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     request: &str,
@@ -367,17 +292,15 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// Reads the status line, then headers to the blank line that ends them,
-/// then exactly `Content-Length` bytes of body — refusing everything this
-/// module's own doc comment lists, in the order it lists them.
+/// then exactly `Content-Length` bytes of body, refusing in the order the
+/// module doc lists.
 async fn read_response<S: AsyncRead + Unpin>(
     stream: S,
     limit: usize,
 ) -> Result<Vec<u8>, FetchError> {
     // One budget for the status line and every header line together, spent
-    // through a `Take` rather than checked after the fact: `read_line`
-    // itself is what is unbounded, so a check afterwards is a check that
-    // runs once the `String` has already grown. When the budget runs out
-    // `read_line` reports a clean zero, exactly as EOF does, and
+    // through a `Take`: `read_line` itself is what is unbounded. Out of
+    // budget it reports a clean zero, exactly as EOF does, and
     // `headers.limit()` is what tells the two apart below.
     let mut headers = BufReader::new(stream).take(MAX_HEADER_BYTES as u64);
 
@@ -388,11 +311,9 @@ async fn read_response<S: AsyncRead + Unpin>(
     let mut location: Option<String> = None;
     let mut transfer_encoding = false;
     let mut content_length: Option<u64> = None;
-    // Set on an unparseable value or a second `Content-Length` header that
-    // disagrees with the first; the actual refusal is deferred to after the
-    // loop so it takes its place in the documented refusal order rather
-    // than jumping the queue ahead of a `Transfer-Encoding` header that
-    // happens to appear later in the block.
+    // Set on an unparseable value or a second, disagreeing
+    // `Content-Length`; the refusal is deferred to after the loop so it
+    // keeps its place in the documented order.
     let mut content_length_ok = true;
 
     loop {
@@ -418,18 +339,10 @@ async fn read_response<S: AsyncRead + Unpin>(
         };
         let value = value.trim();
         match name.trim().to_ascii_lowercase().as_str() {
-            // Sanitised here, at the one seam where a header value becomes
-            // an owned string this module keeps, rather than at whichever
-            // print site it eventually reaches: `FetchError::Redirect`'s
-            // `Display` lands in `emit_error`'s table arm, which is a bare
-            // `writeln!`, and a print site somebody forgets is another
-            // hole. A seam is one place.
-            //
-            // Not hoisted above the `match` to cover every header at once,
-            // deliberately: `content-length` is *parsed* below, and
-            // sanitising first would silently repair `1\u{200b}2` into a
-            // `12` this client then honoured. A parser must see the raw
-            // bytes; only a string that survives to be shown gets cleaned.
+            // Sanitised at this one seam, where a header value becomes an
+            // owned string this module keeps. Not hoisted over the whole
+            // `match`: `content-length` is parsed below, and cleaning it
+            // first would repair `1\u{200b}2` into a `12` this would honour.
             "location" => location = Some(terminal_safe::sanitise(value).0),
             "transfer-encoding" => transfer_encoding = true,
             "content-length" => match value.parse::<u64>() {
@@ -449,8 +362,7 @@ async fn read_response<S: AsyncRead + Unpin>(
     {
         return Err(FetchError::Redirect { location });
     }
-    // A 3xx with no Location has nothing left to name; it falls through to
-    // the ordinary non-2xx refusal below.
+    // A 3xx with no Location has nothing left to name.
     if !(200..300).contains(&code) {
         return Err(FetchError::Status(code));
     }
@@ -474,10 +386,9 @@ async fn read_response<S: AsyncRead + Unpin>(
     // `usize`, so `content_length` fits in one.
     let expected = content_length as usize;
 
-    // The header budget is spent; the body has its own (`limit`, checked
-    // twice above and below). Anything the `BufReader` read ahead of the
-    // blank line is still sitting in its buffer, so unwrapping the `Take`
-    // resumes exactly where the header loop stopped.
+    // Anything the `BufReader` read past the blank line is still in its
+    // buffer, so unwrapping the `Take` resumes where the header loop
+    // stopped.
     let mut reader = headers.into_inner();
 
     let mut body = vec![0u8; expected];
@@ -491,11 +402,9 @@ async fn read_response<S: AsyncRead + Unpin>(
             });
         }
         filled += read;
-        // The second of the two cap checks this module's doc comment
-        // promises: `expected` was already bounded by `limit` above, and
-        // `body`'s fixed size structurally prevents `filled` from ever
-        // exceeding it, so this is defense against a future change to the
-        // read loop above rather than a path any test can reach today.
+        // The second cap check: `expected` is already bounded by `limit`
+        // and `body`'s fixed size prevents `filled` exceeding it, so this
+        // guards a future change to the loop rather than a reachable path.
         if filled > limit {
             return Err(FetchError::TooLarge { limit });
         }
@@ -504,10 +413,7 @@ async fn read_response<S: AsyncRead + Unpin>(
 }
 
 /// The status code out of `status_line` (`"HTTP/1.1 200 OK\r\n"`), refusing
-/// anything not shaped like an HTTP status line at all — a check
-/// `sinks.rs`'s own `parse_status_code` does not need, since every peer it
-/// talks to (Discord, Slack, a webhook, or this module's own test harness)
-/// always answers in HTTP.
+/// anything not shaped like an HTTP status line at all.
 fn parse_status_line(status_line: &str) -> Result<u16, FetchError> {
     let mut parts = status_line.split_whitespace();
     match parts.next() {
@@ -533,17 +439,15 @@ mod tests {
         serve_owned(response.to_vec()).await
     }
 
-    /// [`serve`] for a response a test builds at run time rather than
-    /// writes as a literal — the header-cap cases, whose responses are tens
-    /// of kilobytes of padding.
+    /// [`serve`] for a response a test builds at run time: the header-cap
+    /// cases, whose responses are tens of kilobytes of padding.
     async fn serve_owned(response: Vec<u8>) -> Target {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut stream, _peer) = listener.accept().await.unwrap();
             // Drains the request so the client's write never stalls on a
-            // full socket buffer; the response is canned and does not
-            // depend on what was asked for.
+            // full socket buffer.
             let mut buf = [0u8; 1024];
             let _ = stream.read(&mut buf).await;
             let _ = stream.write_all(&response).await;
@@ -557,9 +461,8 @@ mod tests {
         }
     }
 
-    /// Serves a response that opens a header and then never ends it, for as
-    /// long as anything is still reading — the shape that swallowed 10.4 GB
-    /// in three seconds before [`MAX_HEADER_BYTES`] existed.
+    /// Serves a response that opens a header and never ends it, for as
+    /// long as anything is still reading.
     async fn serve_endless_header() -> Target {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -574,9 +477,8 @@ mod tests {
             {
                 return;
             }
-            // Ends itself: a client that refuses closes the socket, and the
-            // next write fails. Nothing here is unbounded except the peer's
-            // patience.
+            // Ends itself: a client that refuses closes the socket, and
+            // the next write fails.
             let filler = vec![b'A'; 8 * 1024];
             while stream.write_all(&filler).await.is_ok() {}
         });
@@ -588,17 +490,8 @@ mod tests {
         }
     }
 
-    /// fails if a `Location:` header reaches an operator's terminal carrying
-    /// the bytes the host wrote. This was live on this branch and
-    /// reproduced against the release binary: the response *body* was
-    /// sanitised entry by entry and the response *headers* were not, so a
-    /// 302 naming `\u{1b}[2J\u{1b}]0;pwned\u{7}` cleared the screen and
-    /// rewrote the window title on its way through `emit_error`'s table arm,
-    /// which is a bare `writeln!`.
-    ///
     /// Asserts the exact cleaned string, not merely the absence of an
-    /// escape: the redirect must still *name* where it pointed, or the
-    /// refusal stops being useful.
+    /// escape: the redirect must still name where it pointed.
     #[tokio::test]
     async fn a_hostile_location_header_cannot_drive_the_terminal_it_prints_to() {
         let target = serve(
@@ -619,14 +512,9 @@ mod tests {
         );
     }
 
-    /// fails if ANY refusal can put a character the host chose in front of
-    /// an operator — the class, rather than the one `Location` case above.
-    ///
-    /// Every response here is hostile in a different place (the status line,
-    /// a header name, a header value, the header a variant actually
-    /// captures), and each drives a different refusal. A future variant that
-    /// starts carrying response-derived text and forgets the seam has to
-    /// pass this to ship.
+    /// Every response here is hostile in a different place and drives a
+    /// different refusal, so a future variant that starts carrying
+    /// response-derived text has to pass this to ship.
     #[tokio::test]
     async fn no_refusal_hands_a_terminal_a_character_the_host_chose() {
         let hostile: [(&'static [u8], &str); 6] = [
@@ -668,10 +556,8 @@ mod tests {
         }
     }
 
-    /// fails if a peer that never ends a header can make this read for as
-    /// long as it cares to type. The two-second budget is the forcing
-    /// mechanism: a bounded refusal comes back in milliseconds, and the
-    /// unbounded read this replaced could only ever answer `Timeout`.
+    /// The two-second budget is the forcing mechanism: a bounded refusal
+    /// comes back in milliseconds.
     #[tokio::test]
     async fn a_header_that_never_ends_is_refused_rather_than_read_forever() {
         let target = serve_endless_header().await;
@@ -689,10 +575,6 @@ mod tests {
         );
     }
 
-    /// fails if the header cap refuses a response that fits inside it. The
-    /// boundary is the point of the test: a block just under
-    /// [`MAX_HEADER_BYTES`] is large, legal, and must still be read, body
-    /// and all.
     #[tokio::test]
     async fn a_header_block_just_under_the_cap_is_still_read() {
         let tail = b"\r\nContent-Length: 5\r\n\r\nhello";
@@ -794,10 +676,9 @@ mod tests {
         assert!(matches!(parse_url("not a url"), Err(FetchError::Url(_))));
     }
 
-    /// Extra, beyond the brief's own eight: two disagreeing `Content-Length`
-    /// headers must not silently pick one — a smuggling-style ambiguity a
-    /// proxy in front of the real target could exploit to make this client
-    /// and whatever's downstream of it disagree about where the body ends.
+    /// A smuggling-style ambiguity: picking one would let a proxy make
+    /// this client and whatever is downstream of it disagree about where
+    /// the body ends.
     #[tokio::test]
     async fn two_disagreeing_content_lengths_are_refused() {
         let target =
@@ -805,30 +686,21 @@ mod tests {
         assert!(get(&target, 1 << 20, Duration::from_secs(5)).await.is_err());
     }
 
-    /// Extra: a status line that is not HTTP at all (garbage, or an empty
-    /// line from a peer that closed immediately) must not be silently
-    /// treated as a parse failure that happens to land on `Status`/`Chunked`
-    /// by accident of `split_whitespace` matching something numeric.
     #[tokio::test]
     async fn a_status_line_that_is_not_http_is_refused() {
         let target = serve(b"NOT HTTP AT ALL\r\n\r\n").await;
         assert!(get(&target, 1 << 20, Duration::from_secs(5)).await.is_err());
     }
 
-    /// Extra: a header block that never reaches its terminating blank line
-    /// (the peer closes right after the last header) must not be read as
-    /// "no headers left, body starts here" — that would make an EOF look
-    /// like a zero-length body instead of the malformed response it is.
+    /// An EOF here must not read as a zero-length body.
     #[tokio::test]
     async fn headers_with_no_terminating_blank_line_are_refused() {
         let target = serve(b"HTTP/1.1 200 OK\r\nContent-Length: 5").await;
         assert!(get(&target, 1 << 20, Duration::from_secs(5)).await.is_err());
     }
 
-    /// Extra: a 3xx with no `Location` at all has nowhere documented to
-    /// send a caller, so it must still be refused (as an ordinary
-    /// [`FetchError::Status`]) rather than treated as a success with an
-    /// empty body.
+    /// Refused as an ordinary [`FetchError::Status`], having nowhere to
+    /// point a caller.
     #[tokio::test]
     async fn a_redirect_with_no_location_is_still_refused() {
         let target = serve(b"HTTP/1.1 302 Found\r\nContent-Length: 0\r\n\r\n").await;

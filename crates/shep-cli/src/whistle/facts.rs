@@ -1,24 +1,13 @@
 //! The shapes whistle's tools return.
 //!
-//! Structural twins of `shep_core`'s own types, field for field and value for
-//! value, with `schemars::JsonSchema` derived on top so rmcp can declare each
-//! tool's output schema. [`SheepRow`] and `ProcessInfo` serialize to
-//! byte-identical JSON, pinned by this module's own equality tests.
+//! Structural twins of `shep_core`'s own types, with `schemars::JsonSchema`
+//! derived on top so rmcp can declare each tool's output schema; this
+//! module's equality tests keep a twin and its source serializing
+//! identically.
 //!
-//! **Why twins and not a `schemars` derive on `ProcessInfo` itself.** That
-//! would put a schema-generation dependency into shep-core — a wire-protocol
-//! crate — for a CLI concern, and shep-core's types are the wire contract for
-//! the daemon socket, not for MCP. A twin plus an equality test is the cheaper
-//! half of that trade, and the test is what stops the two drifting.
-//!
-//! **Why the vocabulary is reused when the envelope is not.** MCP carries its
-//! own envelope: `CallToolResult`, with `structuredContent` and a per-tool
-//! output schema. Nesting `output::OutputEnvelope` inside it would make the
-//! declared schema describe `schema_version` and `command`, two fields that
-//! mean everything to a shell script and nothing to an agent — and would
-//! couple `SCHEMA_VERSION`, which is a promise to people running `jq` over
-//! `shep flock --format json`, to whistle's contract. Different consumers,
-//! different envelopes, one vocabulary.
+//! MCP has its own envelope (`CallToolResult`, `structuredContent`), so
+//! these types never nest `output::OutputEnvelope`: its `schema_version`
+//! and `command` fields serve a shell script, not an agent.
 
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -315,11 +304,8 @@ impl From<&HostReading> for HostRow {
         Self {
             memory_total_bytes: host.memory_total_bytes,
             memory_used_bytes: host.memory_used_bytes,
-            // `usize -> u64`: infallible on every target this workspace
-            // ships (macOS/Linux/Windows, all 64-bit) — a live process
-            // count is nowhere near either width's ceiling, so a
-            // `try_from` here would exist to handle a case that cannot
-            // occur on any target in `docs/idiomatic-rust.md`'s matrix.
+            // usize to u64 is infallible: every target this workspace
+            // ships is 64-bit.
             processes: host.processes as u64,
             uptime_seconds: host.uptime_seconds,
         }
@@ -351,26 +337,12 @@ mod tests {
     use shep_core::protocol::{DogSource, Lamb, ProcessInfo};
     use shep_core::status::ProcStatus;
 
-    /// fails the moment whistle's view of a sheep drifts from the CLI's.
+    /// Deep equality of the serialized values, not a key-set check: a field
+    /// that keeps its name but changes shape fails here too.
     ///
-    /// This is DEEP equality of the serialized values, not a key-set check:
-    /// a field that keeps its name and changes its shape (`status` becoming
-    /// a struct, `dog` losing its tag) fails here too. `shep describe
-    /// --format json` and `describe_sheep` describe the same sheep in the
-    /// same words, or this reddens and somebody decides which one is right.
-    ///
-    /// It also catches the additive case, which is the likely one: a
-    /// fourteenth field on `ProcessInfo` makes this fail with a missing key
-    /// until `SheepRow` carries it or a comment here says why it does not.
-    ///
-    /// That claim only holds when every `Option` field on the fixture below
-    /// is `Some`, `pending`/`overridden` included: both carry
-    /// `skip_serializing_if`, the first two `ProcessInfo` fields to, and a
-    /// `None` value omits the key entirely on BOTH sides rather than
-    /// serializing `null` -- which is exactly how the two omitted fields
-    /// stayed invisible to this test for one commit after they were added.
-    /// A missing `SheepRow` field is only caught the moment the source
-    /// value it would carry is actually present to compare.
+    /// Every `Option` field on the fixture is `Some`, since a `None` with
+    /// `skip_serializing_if` omits the key on both sides and would hide a
+    /// missing `SheepRow` field.
     #[test]
     fn a_sheep_row_serializes_exactly_as_process_info_does() {
         let info = ProcessInfo::builder(7, "api", ProcStatus::WaitingRestart)
@@ -397,10 +369,8 @@ mod tests {
         );
     }
 
-    /// fails if the every-field-populated case above is the only one that
-    /// holds. A stopped sheep has `None` in six places, and a twin that
-    /// rendered `null` where `ProcessInfo` renders `null` for a different
-    /// reason would pass the case above and fail here.
+    /// A stopped sheep has `None` in six places; catches a twin that
+    /// renders `null` for a different reason than `ProcessInfo` does.
     #[test]
     fn an_empty_sheep_row_serializes_exactly_as_process_info_does_too() {
         let info = ProcessInfo::builder(1, "idle", ProcStatus::Stopped).build();
@@ -410,17 +380,9 @@ mod tests {
         );
     }
 
-    /// fails if the schema stops describing what the struct emits. rmcp
-    /// hands this schema to the model as the tool's declared output shape;
-    /// a schema missing a field the tool returns teaches the model wrong.
-    ///
-    /// Fully populated, not the all-`None` idle sheep the other tests use
-    /// for a "stopped sheep" case: `emitted`'s keys are what this loop
-    /// checks against the schema, and a `skip_serializing_if` field is
-    /// simply absent from `emitted` when its value is `None` -- an all-`None`
-    /// fixture would never ask whether `pending`/`overridden` are in the
-    /// schema at all, the exact way this guard stayed blind to both for one
-    /// commit.
+    /// Fully populated, since a `skip_serializing_if` field is simply
+    /// absent from `emitted` when `None`, and an all-`None` fixture would
+    /// never test whether `pending`/`overridden` are in the schema.
     #[test]
     fn the_generated_schema_names_every_field_the_row_carries() {
         let schema = serde_json::to_value(schemars::schema_for!(SheepRow)).unwrap();
@@ -450,26 +412,12 @@ mod tests {
         }
     }
 
-    /// fails if a tool's declared shape stops being one MCP will accept.
+    /// `structuredContent` must be an object on the wire. `schema_for_output`
+    /// (rmcp 3.1.2) does not validate the root type, so a `Vec` here would
+    /// pass silently; this test is the only guard against it.
     ///
-    /// Two halves, and they are different rules in rmcp 3.1.2:
-    ///
-    /// - **Output.** `structuredContent` is an OBJECT on the wire (rmcp's
-    ///   own field doc, model.rs:3802-3803), and `Json<T>` puts `T` there
-    ///   verbatim via `CallToolResult::structured` (model.rs:3963-3971).
-    ///   rmcp will not stop a `Vec`: 3.1.2's `schema_for_output`
-    ///   deliberately does not validate the root type (common.rs:109-120,
-    ///   per SEP-2106), so the failure would be a wire-shape violation a
-    ///   strict client rejects and a lenient one silently takes — the worst
-    ///   kind. Hence the wrappers, and hence this test rather than a
-    ///   comment.
-    /// - **Input.** `schema_for_input` DOES validate (common.rs:77-96) and
-    ///   the `#[tool]` macro `panic!`s on the `Err` during router
-    ///   construction (rmcp-macros/tool.rs:200-208) — i.e. inside
-    ///   `Whistle::new`, on every startup and in the first line of every
-    ///   test in Tasks 6-10. Every argument type here is a plain struct so
-    ///   this holds by construction, which is exactly what was said about
-    ///   the output side before it turned out to be wrong.
+    /// Input schemas are validated by the `#[tool]` macro itself, at router
+    /// construction, so they need no equivalent test.
     #[test]
     fn every_declared_tool_shape_is_object_rooted() {
         for (label, schema) in [

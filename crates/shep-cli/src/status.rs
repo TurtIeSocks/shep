@@ -1,14 +1,12 @@
 //! Whether a shepherd is answering, and where this flock lives.
 //!
-//! One probe, two readers. `shep ping` renders it as the command's whole
+//! One probe, two readers: `shep ping` renders it as the command's whole
 //! output, and the quiet verbs (`shep` with no verb, `welcome`, `help`,
-//! `completions`) print a one-line form to stderr — those four produce no
-//! flock data of their own, so a status line there competes with nothing.
+//! `completions`) print a one-line form to stderr, since those four
+//! produce no flock data of their own.
 //!
-//! It is deliberately absent from every other verb. A command that succeeded
-//! has already told you the shepherd is up, and a preamble repeating it on
-//! every invocation is the banner-on-every-command pattern this project
-//! turned down.
+//! Absent from every other verb: a command that succeeded already told
+//! you the shepherd is up.
 
 use std::path::PathBuf;
 
@@ -47,25 +45,15 @@ pub(crate) struct ShepherdStatus {
 impl ShepherdStatus {
     /// Asks the socket whether anyone is home, and makes them answer.
     ///
-    /// Never fails: "nothing answered" is an answer, and the whole point of
-    /// this module is that liveness is information rather than an error.
+    /// Never fails: "nothing answered" is an answer, not an error.
     ///
-    /// Three things must succeed before this reports online: the connect,
-    /// the handshake, and a real [`Request::Ping`] round-trip. The
-    /// round-trip is not ceremony -- a daemon can hold a listening socket
-    /// and complete a handshake while being wedged past the point of
-    /// serving anything, and reporting that as "online" is the failure this
-    /// verb exists to catch. `shep ping`'s own test said so before this
-    /// module existed, and says so still.
+    /// Reports online only after the connect, the handshake, and a real
+    /// [`Request::Ping`] round-trip all succeed: a daemon can hold a
+    /// listening socket and complete a handshake while wedged past the
+    /// point of serving anything.
     ///
-    /// `version` and `pid` come off the handshake rather than the reply
-    /// because `Response::Pong` carries neither -- it is a unit variant
-    /// (`shep-core/src/protocol/request.rs:770`). `query::ping` had a test
-    /// pinning that, written when the verb rendered from a response and
-    /// could plausibly have read them from the wrong place. Here the
-    /// [`Online`] is built from the ack before the request is even sent, so
-    /// the bug is unrepresentable rather than merely untested, and the test
-    /// did not survive the move.
+    /// `version` and `pid` come off the handshake, not the reply, since
+    /// `Response::Pong` carries neither.
     pub(crate) async fn probe(paths: &ShepPaths) -> Self {
         let online = match Client::connect(&paths.socket).await {
             Ok(client) => {
@@ -89,14 +77,11 @@ impl ShepherdStatus {
     }
 }
 
-/// One line for the quiet verbs, naming the home so the flock's location is
-/// discoverable without having to provoke an error message to learn it.
+/// One line for the quiet verbs, naming the home so the flock's location
+/// is discoverable without provoking an error message to learn it.
 ///
 /// Only the four verbs that produce no flock data of their own get this:
-/// `shep` with no verb, `welcome`, `help`, `completions`. On any other
-/// command the fact that it worked already tells you the shepherd is up, and
-/// a preamble repeating that on every invocation is the
-/// banner-on-every-command pattern this project turned down.
+/// `shep` with no verb, `welcome`, `help`, `completions`.
 pub(crate) fn one_line(status: &ShepherdStatus) -> String {
     match &status.online {
         Some(Online { pid, .. }) => format!(
@@ -132,14 +117,11 @@ struct PingStatus {
 
 /// `shep ping`'s own rendering, online or off.
 ///
-/// A verb whose whole job is reporting liveness must not fail because the
-/// answer is "down" -- that turned the one question an operator can ask into
-/// an `error[daemon_unreachable]` line. It reports instead.
+/// A verb whose whole job is reporting liveness must not fail because
+/// the answer is "down": it reports instead of erroring.
 ///
 /// The exit code is unchanged: still [`ExitCode::DaemonUnreachable`] when
-/// nothing answers, because `shep ping && echo up` is a real idiom and making
-/// the verb always succeed would quietly break every script using it. What
-/// changed is what a human reads, not what a script tests.
+/// nothing answers, since `shep ping && echo up` is a real idiom.
 pub(crate) fn render_ping(streams: &mut Streams<'_>, status: &ShepherdStatus) -> ExitCode {
     let online = status.online.as_ref();
     let payload = PingStatus {
@@ -184,10 +166,8 @@ pub(crate) fn render_ping(streams: &mut Streams<'_>, status: &ShepherdStatus) ->
     }
 }
 
-// `unix` because its cases bind a raw `UnixListener` to stand in for a live shepherd.
-// The transport itself is portable (`shep_core::transport`) and its
-// own tests cover both platforms; these fixtures simply predate the
-// seam and were never rewritten onto it.
+// unix only: the cases bind a raw `UnixListener` to stand in for a live
+// shepherd.
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -238,18 +218,14 @@ mod tests {
         }
     }
 
-    /// Reporting online must rest on a real `Request::Ping` round-trip, not
-    /// on the handshake alone: a daemon can hold a listening socket and
-    /// complete a handshake while being wedged past serving anything.
-    /// `render_ping` must then still exit `DaemonUnreachable`, because a
-    /// script testing `shep ping` is asking whether the thing works.
+    /// Reporting online must rest on a real `Request::Ping` round-trip,
+    /// not the handshake alone.
     #[tokio::test]
     async fn a_socket_that_handshakes_but_never_answers_is_not_online() {
         let dir = tempfile::tempdir().unwrap();
         let path = shep_client::testing::control_address(dir.path());
-        // Accepts and completes nothing: the connect succeeds, the
-        // handshake does not, so `Client::connect` itself fails here. The
-        // assertion is that this is reported rather than raised.
+        // Accepts and completes nothing: the connect succeeds but the
+        // handshake does not, so `Client::connect` fails here.
         let _listener = tokio::net::UnixListener::bind(&path).unwrap();
 
         let env =

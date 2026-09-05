@@ -5,22 +5,10 @@
 use shep_core::protocol::RpcErrorCode;
 
 /// A `shep` process exit status.
-///
-/// No `#[non_exhaustive]`: `ExitCode` is not exported from `lib.rs` — the
-/// crate's whole public API is three functions returning
-/// `std::process::ExitCode` from `std`, not this type — so there is no
-/// downstream matcher for it to protect, and IR-20's growth argument does
-/// not apply (contrast shep-client's three error enums, which do carry it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ExitCode {
     /// The command did what it was asked.
-    ///
-    /// Reached from unix `run`'s own dispatch arms — `run_daemon` returning
-    /// `Ok(())` on a clean shutdown (signal or `KillDaemon`), or any verb's
-    /// module completing its request without error. It stays dead on the
-    /// Windows target, where `run`'s own arm refuses before dispatching to
-    /// any verb module at all.
     #[cfg_attr(windows, allow(dead_code))]
     Success = 0,
     /// An error with no more specific code.
@@ -32,11 +20,6 @@ pub enum ExitCode {
     /// A Flockfile or daemon config failed validation.
     InvalidConfig = 4,
     /// No daemon answered, and none could be started.
-    ///
-    /// Never constructed on Windows: the three conversions that produce it
-    /// (`From<&ConnectError>`, `From<&RequestError>`, `From<&SpawnError>`)
-    /// are all `#[cfg(unix)]` — there is no transport for a daemon to be
-    /// unreachable *over* until spec §11's Windows functional tier lands.
     #[cfg_attr(windows, allow(dead_code))]
     DaemonUnreachable = 5,
     /// Client and daemon speak different wire versions.
@@ -51,48 +34,22 @@ pub enum ExitCode {
     /// process boundary by `shep_client::spawn::DAEMON_ALREADY_RUNNING`,
     /// which must stay equal to 10.
     ///
-    /// Constructed by the hidden `daemon` subcommand's own exit-code
-    /// mapping (unix-only) when a boot fails with
-    /// `BootError::AlreadyRunning` — the only channel by which a losing
-    /// child in a cold-start race can tell the probing parent it lost.
-    /// Stays dead on the Windows target, where that dispatch arm does not
-    /// exist.
+    /// How a losing child in a cold-start race tells the probing parent it
+    /// lost.
     #[cfg_attr(windows, allow(dead_code))]
     DaemonAlreadyRunning = 10,
     /// The flock emptied and something in it had failed.
     ///
-    /// `runtime`'s fail-fast status: no sheep is online any more and at least
-    /// one ended `errored` — its restart budget was exhausted, or it never
-    /// spawned. An orchestrator reads this as "restart the container".
-    ///
-    /// **Spec §9 specified code 2 for this and flagged the collision rather
-    /// than resolving it**: 2 is clap's usage code, so a container that exits
-    /// 2 leaves an operator unable to tell a bad flag from a dead app. Codes
-    /// 0-10 were all spoken for, so this is a new row rather than a reused
-    /// one, and the spec's table now carries it.
-    ///
-    /// A flock that emptied *cleanly* — every sheep `stopped`, none `errored`
-    /// — exits `Success` instead. A one-shot job in a container finishing its
-    /// work is not a failure.
-    ///
-    /// Constructed by `commands::foreground::run`, the engine `runtime` and
-    /// `dev` both share, once the empty-flock watcher settles on
-    /// [`crate::commands::empty::Sample::EmptyFailed`].
+    /// `runtime`'s fail-fast status: nothing is online any more and at least
+    /// one sheep ended `errored`. A flock that emptied cleanly, every sheep
+    /// `stopped`, exits `Success` instead.
     FlockEmpty = 11,
     /// This binary and the running shepherd are different versions of shep.
     ///
-    /// Distinct from [`ExitCode::ProtocolMismatch`], and the distinction is
-    /// the whole reason this code exists. That one is the daemon refusing a
-    /// handshake because the two speak different WIRE versions, which is a
-    /// question the wire can ask itself. This one is a handshake that
-    /// SUCCEEDED, against a daemon whose crate version differs — the state
-    /// `cargo install shep` leaves behind, since it replaces the binary and
-    /// never restarts the shepherd. Nothing on the wire has to disagree for
-    /// that to be dangerous, and collapsing the two would leave an operator
-    /// reading "protocol mismatch" about a protocol that matched.
-    ///
-    /// Never returned for `kill`, `daemon reload` or `ping`: those are how
-    /// an operator gets out of the state, so they are exempt.
+    /// The handshake succeeded and only the crate versions differ, the state
+    /// `cargo install shep` leaves behind. A wire disagreement is
+    /// [`ExitCode::ProtocolMismatch`] instead. Never returned for `kill`,
+    /// `daemon reload` or `ping`, which are how an operator gets out of it.
     VersionSkew = 12,
 }
 
@@ -100,10 +57,8 @@ impl ExitCode {
     /// The stable machine-readable spelling of this code, as it appears in
     /// `--format json`'s `error.code` field (`"not_found"`, `"usage"`, …).
     ///
-    /// `emit_error` takes the code as a `&str` so `output/` never has to
-    /// know the CLI's taxonomy; this is the single place those strings are
-    /// written, so call sites read `emit_error(err, fmt, code.code_str(), &msg)`
-    /// and no verb invents its own spelling.
+    /// The single place those strings are written: `emit_error` takes the
+    /// code as a `&str`, so no verb invents its own spelling.
     #[must_use]
     pub const fn code_str(self) -> &'static str {
         match self {
@@ -126,11 +81,8 @@ impl ExitCode {
 
 /// Maps a daemon-reported [`RpcErrorCode`] to the exit code that reports it.
 ///
-/// `RpcErrorCode` is `#[non_exhaustive]`, so this carries a `_` arm; an
-/// unrecognised future variant becomes [`ExitCode::Internal`] rather than
-/// silently defaulting to [`ExitCode::Failure`] — a daemon that started
-/// speaking a code this binary predates is exactly the "unexpected
-/// daemon-side failure" [`ExitCode::Internal`] describes.
+/// `RpcErrorCode` is `#[non_exhaustive]`, so a variant this binary predates
+/// becomes [`ExitCode::Internal`], not [`ExitCode::Failure`].
 impl From<RpcErrorCode> for ExitCode {
     fn from(code: RpcErrorCode) -> Self {
         match code {
@@ -149,12 +101,8 @@ impl From<RpcErrorCode> for ExitCode {
 /// it.
 ///
 /// [`shep_client::ConnectError::ProtocolMismatch`] is the one variant with
-/// its own dedicated code ([`ExitCode::ProtocolMismatch`]); every other
-/// variant means nothing usable answered at the socket, which is
-/// [`ExitCode::DaemonUnreachable`] regardless of which stage of the connect
-/// or handshake failed to complete. `ConnectError` is `#[non_exhaustive]`
-/// (IR-20), so a future variant falls to [`ExitCode::Failure`] rather than
-/// being guessed at.
+/// its own code; every other means nothing usable answered at the socket,
+/// whatever stage failed. A future variant falls to [`ExitCode::Failure`].
 impl From<&shep_client::ConnectError> for ExitCode {
     fn from(err: &shep_client::ConnectError) -> Self {
         use shep_client::ConnectError::{
@@ -173,16 +121,10 @@ impl From<&shep_client::ConnectError> for ExitCode {
 /// Maps a failed request against an already-connected daemon to the exit
 /// code that reports it.
 ///
-/// A daemon-side [`shep_client::RequestError::Rpc`] answer defers to the
-/// [`RpcErrorCode`] conversion above, so the two taxonomies never drift
-/// apart. [`shep_client::RequestError::Closed`] means the daemon went away
-/// mid-request, which is the same "nothing is answering" condition as a
-/// failed connect ([`ExitCode::DaemonUnreachable`]).
-/// [`shep_client::RequestError::Wire`] is this client failing to encode its
-/// own request — a fault in this binary, not the daemon
-/// ([`ExitCode::Internal`]). `RequestError` is `#[non_exhaustive]` (IR-20),
-/// so a future variant falls to [`ExitCode::Failure`] rather than being
-/// guessed at.
+/// `Rpc` defers to the [`RpcErrorCode`] conversion, so the two taxonomies
+/// cannot drift. `Closed` is the same "nothing is answering" condition as a
+/// failed connect. `Wire` is this client failing to encode its own request, a
+/// fault in this binary. A future variant falls to [`ExitCode::Failure`].
 impl From<&shep_client::RequestError> for ExitCode {
     fn from(err: &shep_client::RequestError) -> Self {
         use shep_client::RequestError::{Closed, Rpc, Timeout, Wire};
@@ -199,17 +141,11 @@ impl From<&shep_client::RequestError> for ExitCode {
 /// Maps a failed `connect_or_spawn` attempt to the exit code that reports
 /// it.
 ///
-/// [`shep_client::spawn::SpawnError::Connect`] carries the [`shep_client::ConnectError`]
-/// that caused the first probe (or a later protocol-mismatch probe) to fail,
-/// so it defers to that conversion — a daemon that answers but refuses on
-/// version skew still gets [`ExitCode::ProtocolMismatch`], even reached
-/// through the autostart path. `Launch`, `DaemonExited` and
-/// `DeadlineExpired` are the three ways autostart can end without a daemon
-/// ever answering, matching spec §9's own wording for code 5 ("no daemon
-/// answered, and none could be started"), so all three map to
-/// [`ExitCode::DaemonUnreachable`]. `SpawnError` is `#[non_exhaustive]`
-/// (IR-20), so a future variant falls to [`ExitCode::Failure`] rather than
-/// being guessed at.
+/// `Connect` defers to the [`shep_client::ConnectError`] conversion, so a
+/// version-skew refusal keeps [`ExitCode::ProtocolMismatch`] through the
+/// autostart path. `Launch`, `DaemonExited` and `DeadlineExpired` are the
+/// three ways autostart ends with no daemon answering. A future variant
+/// falls to [`ExitCode::Failure`].
 impl From<&shep_client::spawn::SpawnError> for ExitCode {
     fn from(err: &shep_client::spawn::SpawnError) -> Self {
         use shep_client::spawn::SpawnError::{Connect, DaemonExited, DeadlineExpired, Launch};
@@ -227,14 +163,9 @@ mod tests {
 
     #[test]
     fn every_rpc_error_code_maps_to_a_distinct_nonzero_exit_code() {
-        // `RpcErrorCode` is `#[non_exhaustive]`, so the `From` impl above needs a
-        // `_` arm and the compiler cannot force *this* list to stay complete on
-        // its own. Iterating `RpcErrorCode::ALL` instead of a hand-written array
-        // closes that gap: `ALL` is exhaustive-checked inside shep-core (its
-        // defining crate, where `#[non_exhaustive]` does not apply), so a new
-        // variant there is compiled into `ALL` — and then lands here, where an
-        // unmapped variant collides with `Internal` under the `From` impl's `_`
-        // arm and this test's distinctness assertion below catches it.
+        // `ALL` is exhaustive-checked inside shep-core, so a new variant lands
+        // here, collides with `Internal` under the `From` impl's `_` arm, and
+        // fails the distinctness assertion.
         let codes = shep_core::protocol::RpcErrorCode::ALL;
         let mapped: Vec<u8> = codes.iter().map(|c| ExitCode::from(*c) as u8).collect();
         assert!(
@@ -249,10 +180,8 @@ mod tests {
         );
     }
 
-    /// `emit_error` takes the code as a `&str`, so a copy-pasted `code_str` arm
-    /// returning a neighbour's spelling would put the wrong `error.code` in every
-    /// JSON failure of one command and nothing would notice. Distinctness is the
-    /// property; the exact words are pinned by a later snapshot.
+    /// Distinctness is the property; the exact words are pinned by a later
+    /// snapshot.
     #[test]
     fn every_exit_code_has_its_own_machine_readable_spelling() {
         let all = [
@@ -286,9 +215,8 @@ mod tests {
         );
     }
 
-    /// The one number both crates hard-code. If these ever diverge, the
-    /// cold-start race in `connect_or_spawn` silently becomes a fatal error
-    /// again.
+    /// The one number both crates hard-code. If they diverge, the cold-start
+    /// race in `connect_or_spawn` becomes a fatal error.
     #[cfg(unix)]
     #[test]
     fn the_already_running_exit_code_matches_the_clients_constant() {

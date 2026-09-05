@@ -1,15 +1,12 @@
 //! The four tools that act, and the only ones the gate can withhold.
 //!
 //! Registered only when [`super::gate::Control::Allowed`]; when the gate is
-//! shut this router is never constructed and its tools are absent from
-//! `tools/list` entirely, so `tools/call` on one answers rmcp's own
-//! `-32602 tool not found`. A model cannot be tempted by a tool it cannot see.
+//! shut this router is never constructed, so `tools/list` omits them and
+//! `tools/call` on one answers rmcp's own `-32602 tool not found`.
 //!
-//! **Annotations are decisions here, not defaults.** `ToolAnnotations` is a
-//! wire-visible field an agent host reads to decide whether to ask a human
-//! first, so a mutating tool annotated `readOnlyHint: true` would be a lie
-//! told to a machine. Each value below is argued in the plan's "The nine
-//! tools" section.
+//! `ToolAnnotations` is wire-visible: an agent host reads it to decide
+//! whether to ask a human first, so a mutating tool must never claim
+//! `readOnlyHint: true`.
 
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::CallToolResult;
@@ -22,33 +19,18 @@ use super::facts::{FlockListing, SheepRow};
 use super::read::SheepName;
 use super::shepherd;
 
-// `vis = "pub(crate)"` for the same reason `read.rs` carries it: the macro's
-// generated constructor is private by default and `Whistle::new`
-// (`whistle/mod.rs`) calls it from the PARENT module. See the plan's
-// "Every rmcp API this plan names" section.
+// vis = "pub(crate)": the generated constructor is private by default, but
+// `Whistle::new` in the parent module calls it directly.
 #[tool_router(router = control_router, vis = "pub(crate)")]
 impl Whistle {
-    /// Start a registered sheep that is not currently running.
+    /// Restarts an already-registered sheep by name; cannot start a script
+    /// or Flockfile the flock does not already know, since that would be
+    /// arbitrary code execution handed to a model.
     ///
-    /// Deliberately narrow: this takes the NAME of a sheep the flock already
-    /// has, and cannot introduce a process that was not already registered.
-    /// `shep start` accepts a script path or a Flockfile, and a tool with that
-    /// shape would be arbitrary code execution as the operator, handed to a
-    /// model. No gate makes that acceptable, because the gate is not a
-    /// security boundary. A wider `start` is a different tool with a different
-    /// name and its own approval story, not a widening of this one.
-    ///
-    /// The running check reads the CURRENT state over `Request::Describe`
-    /// and refuses in-process, before `Request::Restart` ever reaches the
-    /// wire, when any matched instance is already `online` or `starting`.
-    /// It is a courtesy, not a guarantee — see the plan's TOCTOU note: the
-    /// check and the restart are two separate connections
-    /// (`shepherd.rs`'s "one connection per call"), and a sheep that comes
-    /// online in the gap is restarted anyway, because `Request::Restart`
-    /// does not re-check.
-    ///
-    /// A multi-instance app refuses the WHOLE call if ANY matched instance
-    /// is running — never "restart the stopped ones and skip the rest".
+    /// The running check is TOCTOU: it reads `Request::Describe` before
+    /// `Request::Restart` ever reaches the wire, across two separate
+    /// connections, so a sheep that comes online in the gap is restarted
+    /// anyway. Refuses the whole call if any matched instance is running.
     #[tool(
         name = "start_sheep",
         description = "Start a registered sheep that is currently stopped. Cannot register new processes — the sheep must already be in the flock. The running check is a courtesy, not a guarantee: a sheep that comes up between the check and the call is restarted. For a multi-instance app, the whole call is refused if any instance is running.",
@@ -77,10 +59,8 @@ impl Whistle {
             .filter(|info| matches!(info.status, ProcStatus::Online | ProcStatus::Starting))
             .count();
         if running > 0 {
-            // Whistle's OWN refusal — nothing reaches the wire past this
-            // point. A single matched instance names the sheep alone; a
-            // multi-instance app names the count too, so a model can tell
-            // "one of one" from "two of four" rather than guessing.
+            // whistle's own refusal: nothing reaches the wire past this
+            // point. Names the count too for a multi-instance app.
             let message = if flock.len() > 1 {
                 format!(
                     "{name}: {running} of {} instances are already running; use restart_sheep",
@@ -176,14 +156,11 @@ impl Whistle {
 }
 
 /// A reply shape none of these four tools asked for. `Response` is
-/// `#[non_exhaustive]` (Global Constraints), so an answer this match does
-/// not recognise — a variant this client predates, or simply the wrong one
-/// for the request just sent — maps here rather than being guessed at.
+/// `#[non_exhaustive]`, so a variant this client predates, or simply the
+/// wrong one for the request sent, maps here instead of being guessed at.
 ///
-/// Module-private and duplicated rather than shared with `read.rs`'s
-/// identical helper: that one is private to its own module too, and a
-/// cross-module reach for four lines of code would couple two files that
-/// otherwise have no reason to know about each other.
+/// Duplicated rather than shared with `read.rs`'s identical helper: each
+/// stays private to its own module.
 fn unexpected_response() -> CallToolResult {
     CallToolResult::structured_error(serde_json::json!({
         "code": "internal",
@@ -191,10 +168,8 @@ fn unexpected_response() -> CallToolResult {
     }))
 }
 
-// `unix` because its cases bind a raw `UnixListener` to stand in for a live shepherd.
-// The transport itself is portable (`shep_core::transport`) and its
-// own tests cover both platforms; these fixtures simply predate the
-// seam and were never rewritten onto it.
+// unix only: these fixtures bind a raw `UnixListener`, though the real
+// transport (`shep_core::transport`) is portable.
 #[cfg(all(test, unix))]
 mod tests {
     use std::path::Path;
@@ -214,14 +189,12 @@ mod tests {
     use super::*;
     use crate::whistle::gate;
 
-    /// How long a test waits before deciding a tool call hung rather than
-    /// failed — IR-46: every await in a test needs a forcing mechanism.
+    /// How long a test waits for a tool call before treating it as hung.
     const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-    /// A [`shep_core::protocol::HelloAck`] this binary's own version guard
-    /// never refuses — `shep_client::testing::sample_ack`'s fixed `"9.9.9"`
-    /// always would, now that every tool call in this file goes through
-    /// `Shepherd::call_with_ack`'s guard.
+    /// A [`shep_core::protocol::HelloAck`] whose version matches this
+    /// binary, since `sample_ack`'s fixed `"9.9.9"` would be refused by
+    /// the guard in `Shepherd::call_with_ack`.
     fn matching_ack() -> shep_core::protocol::HelloAck {
         shep_core::protocol::HelloAck {
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -230,10 +203,8 @@ mod tests {
     }
 
     fn whistle_at(socket: std::path::PathBuf) -> Whistle {
-        // None of these four tools ever reads `barks.jsonl` — that path is
-        // `read::list_barks`' alone — so a nonexistent one is fine here, and
-        // every other `ShepPaths` field beside `socket` is likewise unread
-        // by anything a control tool does.
+        // Only `socket` is read by a control tool; the rest of `ShepPaths`
+        // can be nonexistent, `barks` included.
         let paths = ShepPaths {
             home: std::path::PathBuf::new(),
             daemon_config: std::path::PathBuf::new(),
@@ -275,25 +246,12 @@ mod tests {
         write_frame(stream, &ack).await;
     }
 
-    /// Binds ONE listener and answers each new connection, in order, with
-    /// the next scripted reply — success or error — from `replies`. A
-    /// reply PER CONNECTION, not per request: `shepherd.rs`'s "one
-    /// connection per call" means `start_sheep`'s Describe-then-Restart
-    /// round trip opens two separate connections, and unlike
-    /// `shep_client::testing::fake_daemon_accepting_repeatedly` (which
-    /// answers every connection identically) this needs to hand the SECOND
-    /// one a different reply than the first.
-    ///
-    /// Binding ONCE and looping `accept()` — rather than unbinding and
-    /// rebinding `path` between connections, the way `shepherd.rs`'s own
-    /// `two_calls_survive_a_shepherd_that_restarted_in_between` does when
-    /// the TEST ITSELF drives both calls sequentially — avoids racing the
-    /// tool's own second `connect()` (which nothing here controls the
-    /// scheduling of) against a rebind that has not happened yet.
+    /// Binds one listener and answers each new connection, in order, with
+    /// the next reply from `replies`: one reply per connection, since each
+    /// tool call opens its own.
     ///
     /// Panics if `replies` runs out before connections do, or on any
-    /// accept/handshake/decode/encode failure — test scaffolding, same
-    /// failure mode as `shep_client::testing`'s own fakes.
+    /// accept/handshake/decode/encode failure.
     fn serve_connections_in_sequence(
         path: &Path,
         replies: Vec<Result<Response, (RpcErrorCode, String)>>,
@@ -321,18 +279,9 @@ mod tests {
         })
     }
 
-    /// Binds, accepts one connection, answers the handshake, reads the one
-    /// request that follows (counting it), and then never replies — the
-    /// shape a control tool's client-side deadline exists to catch. Unlike
-    /// `shep_client::testing::fake_client_that_never_replies`, this does not
-    /// connect its own `Client`: the tool under test makes its own
-    /// connection via `Shepherd`, so a fake that dialed first would just be
-    /// a second, unused peer.
-    ///
-    /// Binds exactly once and never loops back to `accept()`, so a retried
-    /// second connection would find nothing listening — proof by
-    /// construction, on top of the counter, that a second request cannot
-    /// silently succeed unnoticed.
+    /// Accepts one connection, answers the handshake, counts the one
+    /// request that follows, then never replies. Binds exactly once, so a
+    /// retried second connection would find nothing listening.
     fn serve_one_request_then_hang(path: &Path) -> (JoinHandle<()>, Arc<AtomicU32>) {
         let listener = UnixListener::bind(path).unwrap();
         let served = Arc::new(AtomicU32::new(0));
@@ -347,18 +296,13 @@ mod tests {
         (handle, served)
     }
 
-    /// fails if `start_sheep` stops refusing a running sheep, or starts
-    /// refusing it with a message that names no way forward. The refusal is
-    /// whistle's OWN — it happens after the `Describe` check but before
-    /// `Request::Restart` reaches the wire, which is why the shared counter
-    /// below reads 1, not 2: a second request WOULD be recorded if one were
-    /// sent, and the assertion is that none was.
+    /// The shared counter reads 1, not 2: the refusal happens before
+    /// `Request::Restart` reaches the wire.
     #[tokio::test]
     async fn start_sheep_refuses_a_running_sheep_and_names_restart_sheep() {
         let dir = tempfile::tempdir().unwrap();
         let socket = shep_client::testing::control_address(dir.path());
-        // sample_info() is already Online, named "web" — exactly the
-        // already-running case this test needs.
+        // sample_info() is already Online, named "web".
         let (daemon, served) = shep_client::testing::fake_daemon_accepting_repeatedly_with_ack(
             &socket,
             matching_ack(),
@@ -400,11 +344,8 @@ mod tests {
         daemon.abort();
     }
 
-    /// fails if `start_sheep` stops working for a sheep that IS stopped.
-    /// This is the tool's whole reason to exist, and it is
-    /// `Request::Restart` on the wire — `supervisor.rs`'s
-    /// `ManualKind::Restart` respawns a sheep that is not running, so
-    /// "start" and "restart" are one daemon path.
+    /// `start_sheep` and `restart_sheep` are one daemon path:
+    /// `Request::Restart` respawns a sheep that is not running.
     #[tokio::test]
     async fn start_sheep_sends_a_restart_for_a_stopped_sheep() {
         let dir = tempfile::tempdir().unwrap();
@@ -452,17 +393,8 @@ mod tests {
         }
     }
 
-    /// fails if a partly-running multi-instance app is partly started. A
-    /// four-instance `api` with two online must refuse the WHOLE call and
-    /// say how many — never "restart the stopped two and skip the rest".
-    /// `supervisor.rs:424-432` is explicit that a partly-accepted selector
-    /// leaves the caller unable to tell which half was taken, and a model
-    /// is the caller least able to work it out.
-    ///
-    /// The fake daemon answers the `Describe` with four rows, two `Online`;
-    /// the assertion is that NO second request arrived (the shared counter
-    /// reads 1, not 2) and that the message carries both the count and
-    /// `restart_sheep`.
+    /// Four instances, two online: refuses the whole call and names the
+    /// count. The shared counter stays at 1; no second request is sent.
     #[tokio::test]
     async fn start_sheep_refuses_the_whole_call_when_any_instance_is_running() {
         let dir = tempfile::tempdir().unwrap();
@@ -518,12 +450,8 @@ mod tests {
         daemon.abort();
     }
 
-    /// fails if a daemon refusal stops reaching the model intact. The
-    /// message asserted here is the shepherd's own, verbatim:
-    /// `supervisor.rs`'s `SupervisorError::ReloadInFlight` renders as
-    /// "<name> is already being reloaded" and arrives as
-    /// `RpcErrorCode::Internal` — a code `rpc.rs` itself documents as
-    /// wrong-but-decodable. whistle passes both through.
+    /// The message and `RpcErrorCode::Internal` pass through verbatim,
+    /// though `rpc.rs` documents that code as wrong but decodable.
     #[tokio::test]
     async fn a_reload_already_in_flight_reaches_the_model_in_the_shepherds_own_words() {
         let dir = tempfile::tempdir().unwrap();
@@ -561,17 +489,9 @@ mod tests {
         served.await.expect("the fake daemon task must not panic");
     }
 
-    /// fails if a mutating call is ever retried. A `restart_sheep` whose
-    /// reply was merely slow, retried, is two outages. The fake daemon here
-    /// answers the handshake, reads the one request that follows, and then
-    /// never replies; the assertion is that exactly ONE request arrived and
-    /// the tool reported a timeout rather than a second attempt.
-    ///
-    /// IR-46: bounded by the client's own deadline (`DEFAULT_DEADLINE` +
-    /// `DEADLINE_GRACE`, 7s) against a paused clock, which auto-advances
-    /// once nothing else is runnable — the same shape
-    /// `request_reply.rs`'s `a_deadline_expires_client_side_when_the_daemon_never_answers`
-    /// already uses, so this never waits seven real seconds.
+    /// A retried mutating call would be two outages, not one. Runs on a
+    /// paused clock, which auto-advances past the client's deadline
+    /// (`DEFAULT_DEADLINE` + `DEADLINE_GRACE`) without a real wait.
     #[tokio::test(start_paused = true)]
     async fn a_timed_out_control_call_is_reported_not_retried() {
         let dir = tempfile::tempdir().unwrap();

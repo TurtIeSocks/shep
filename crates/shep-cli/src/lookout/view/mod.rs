@@ -1,10 +1,9 @@
 //! `draw`: one `App`, one `Frame`, six regions of arithmetic.
 //!
 //! No `Layout`, no `Constraint`, no widget. The upstream surface this whole
-//! phase touches is six items wide — `Frame::area`, `Frame::buffer_mut`,
-//! `Buffer::set_line`, `Line`, `Span`, `Style` — which is what makes the
-//! render path both testable and cheap to keep working across a ratatui
-//! release. See the phase plan's design decision 5b for the argument.
+//! module touches is six items wide: `Frame::area`, `Frame::buffer_mut`,
+//! `Buffer::set_line`, `Line`, `Span`, `Style`, which keeps the render path
+//! both testable and cheap to keep working across a ratatui release.
 
 pub mod bleats;
 pub mod detail;
@@ -13,11 +12,9 @@ pub mod host;
 pub mod settings;
 pub mod status;
 
-// `pub`, not private: Task 8's `a_heartbeat_puts_the_host_strip_on_the_frame`
-// lives in `super::super::mod`'s own `mod tests` (it drives `run_ui`, and
-// that is where `run_ui`'s other tests and `FakeLocal` already are), and it
-// needs `fixtures::sample()` from there. `#[cfg(test)]` still keeps every
-// item out of the ordinary build, the same shape `lookout::frames` uses.
+// `pub`, not private: a test in `super::super`'s own `mod tests` (it drives
+// `run_ui`) needs `fixtures::sample()` from here. `#[cfg(test)]` still keeps
+// every item out of the ordinary build.
 #[cfg(test)]
 pub mod fixtures;
 
@@ -37,15 +34,11 @@ pub const MIN_TERM_WIDTH: u16 = flock::MIN_WIDTH + flock::GUTTER;
 
 /// Rows the chrome always takes: title, column header, rule, status bar.
 ///
-/// The banner is deliberately not in this count — it is one row only when
-/// the link is not live, and every caller that needs the worst case adds it
-/// separately, the way `every_pane_tier_fits_the_height_it_claims` does.
+/// The banner is not in this count: it is one row only when the link is
+/// not live, and callers that need the worst case add it separately.
 ///
-/// `#[cfg(test)]`: `draw` lays the four chrome rows out one `y += 1` at a
-/// time rather than summing them first, so this has no production call
-/// site — its only reader is the test that proves `PANE_TIERS` leaves
-/// enough room for chrome, a banner and a table, the same shape
-/// `lookout::frames` already uses for a module read only by tests.
+/// `#[cfg(test)]`: `draw` lays these out one `y += 1` at a time rather than
+/// summing them, so this constant has no production call site.
 #[cfg(test)]
 const CHROME_ROWS: u16 = 4;
 
@@ -70,8 +63,8 @@ pub struct Panes {
 }
 
 impl Panes {
-    /// The flock table alone — 12a's frame, and what every terminal shorter
-    /// than [`PANE_TIERS`]' last threshold gets.
+    /// The flock table alone, what every terminal shorter than
+    /// [`PANE_TIERS`]' last threshold gets.
     pub const NONE: Self = Self {
         host: false,
         detail: false,
@@ -81,9 +74,8 @@ impl Panes {
     /// How many rows these panes take together.
     ///
     /// `#[cfg(test)]`: `draw` claims each pane's rows off `floor` one
-    /// constant at a time as it lays the bottom stack out, so it never needs
-    /// the sum — only `every_pane_tier_fits_the_height_it_claims` does, to
-    /// check that sum against `PANE_TIERS`' own thresholds.
+    /// constant at a time, so only
+    /// `every_pane_tier_fits_the_height_it_claims` needs the sum.
     #[cfg(test)]
     #[must_use]
     pub const fn rows(self) -> u16 {
@@ -104,11 +96,9 @@ impl Panes {
 /// Height thresholds, tallest first. Each entry is the shortest terminal that
 /// still gets that pane set.
 ///
-/// The drop order is least-diagnostic-first and it is a decision, not an
-/// accident of ordering — see this module's own doc and the phase plan's
-/// design decision 8. 24 is not arbitrary either: it is the classic terminal
-/// height, and the table is chosen so a plain 80×24 gets all three panes with
-/// a flock table worth reading.
+/// The drop order is least-diagnostic first. 24 is the classic terminal
+/// height, chosen so a plain 80x24 gets all three panes with a flock table
+/// worth reading.
 const PANE_TIERS: &[(u16, Panes)] = &[
     (
         24,
@@ -148,26 +138,20 @@ pub fn panes_for(height: u16) -> Panes {
 
 /// Renders the whole dashboard.
 ///
-/// Synchronous and total: every branch below draws something, and the
-/// degenerate cases draw a sentence rather than nothing. A blank pane cannot
-/// tell an operator whether the shepherd has nothing to run or whether the
-/// dashboard is broken — the same reason `output::table::render_table`
-/// prints its header row for an empty payload.
+/// Synchronous and total: every branch draws something, and a degenerate
+/// case draws a sentence rather than nothing, since a blank pane cannot say
+/// whether the shepherd has nothing to run or the dashboard is broken.
 ///
-/// `draw`'s real caller is `super::mod`'s `run_ui`, once per frame.
+/// Real caller: `super::mod`'s `run_ui`, once per frame.
 pub fn draw(app: &App, frame: &mut Frame<'_>) {
     let area = frame.area();
     let (width, height) = (area.width, area.height);
     let palette = app.palette();
 
     if width < MIN_TERM_WIDTH || height < MIN_HEIGHT {
-        // Two nine-character lines, not one 39-character sentence.
-        // `Buffer::set_line` truncates at `max_width` in silence, and this
-        // branch exists for terminals narrower than `MIN_TERM_WIDTH` — so a
-        // refusal that does not fit inside `MIN_TERM_WIDTH` loses its own
-        // numbers at exactly the widths that need them. Nine columns is the
-        // floor at which both lines are still whole, and below that nothing
-        // helps.
+        // Two short lines, not one long sentence: `Buffer::set_line`
+        // truncates at `max_width` in silence, and this branch exists for
+        // terminals narrower than `MIN_TERM_WIDTH`.
         if width == 0 || height == 0 {
             return;
         }
@@ -199,11 +183,9 @@ pub fn draw(app: &App, frame: &mut Frame<'_>) {
     y += 1;
 
     // The settings screen owns the whole body between the title and the
-    // status bar -- decision 1 of the design spec: "the title line and the
-    // status bar stay put". That is a swap, not an overlay: the banner,
-    // the host strip, the flock table and the two bottom panes all belong
-    // to the dashboard body this branch replaces, so none of them draw
-    // while the screen is open.
+    // status bar. That is a swap, not an overlay: the banner, the host
+    // strip, the flock table and the two bottom panes all belong to the
+    // body this branch replaces, so none of them draw while it is open.
     if let Some(settings) = app.settings() {
         let body = Rect {
             x: area.x,
@@ -239,12 +221,12 @@ pub fn draw(app: &App, frame: &mut Frame<'_>) {
         table_width,
     );
     y += 1;
-    // The rule stays full width — it is chrome, and a rule that stopped two
+    // The rule stays full width: it is chrome, and a rule that stopped two
     // columns short of the left edge would look like a rendering bug.
     buffer.set_line(area.x, y, &status::rule_line(palette.muted(), width), width);
     y += 1;
 
-    // The bottom stack, laid out UPWARD from the status bar: whichever of
+    // The bottom stack, laid out upward from the status bar: whichever of
     // the detail pane and the feed are up claim their rows off `bottom`
     // first, and the table gets whatever is left between `y` and `floor`.
     let mut floor = bottom;
@@ -257,8 +239,8 @@ pub fn draw(app: &App, frame: &mut Frame<'_>) {
         floor
     });
 
-    // Everything from `y` up to `floor`, exactly as Task 2 left it, save for
-    // the viewport now stopping at `floor` rather than at the status bar.
+    // Everything from `y` up to `floor`: the viewport stops at `floor`
+    // rather than at the status bar.
     let viewport = usize::from(floor - y);
     let keys = app.visible_rows();
     if keys.is_empty() {
@@ -341,19 +323,11 @@ mod tests {
         crate::lookout::frames::render_text(terminal.backend().buffer())
     }
 
-    /// fails if a terminal too small to hold the pane is drawn into anyway,
-    /// **or if the refusal stops fitting in the terminal it is refusing
-    /// about.** Overlapping garbage in a 20-column terminal reads as a crash,
-    /// and the operator's next move is to kill the process rather than
-    /// resize.
-    ///
-    /// The second half is the one that regresses silently. `Buffer::set_line`
-    /// truncates at `max_width` without complaint, and this branch exists
-    /// for terminals narrower than 33 columns — so a refusal written as one
-    /// 39-character sentence loses `33x6` off the right-hand edge at exactly
-    /// the widths that need to read it. Both assertions below are on the
-    /// WHOLE line, trimmed, rather than on `contains`, because `contains`
-    /// passes on a truncated line as happily as on a whole one.
+    /// The refusal itself must fit the narrow terminal it is refusing
+    /// about: `Buffer::set_line` truncates in silence, so a refusal written
+    /// as one long sentence could lose its own numbers. Asserted on the
+    /// whole line, trimmed, since `contains` passes on a truncated line as
+    /// happily as a whole one.
     #[test]
     fn a_terminal_below_the_floor_says_so_instead_of_drawing() {
         let app = App::new(
@@ -384,11 +358,8 @@ mod tests {
         assert_eq!(single.lines().count(), 1);
     }
 
-    /// fails if an empty flock renders as a blank pane. A bare empty screen
-    /// does not tell an operator whether the shepherd has nothing to run or
-    /// whether the dashboard is broken — the same reason
-    /// `output::table::render_table` prints its header row for an empty
-    /// payload.
+    /// A bare empty screen does not tell an operator whether the shepherd
+    /// has nothing to run or the dashboard is broken.
     #[test]
     fn an_empty_flock_still_prints_the_header_and_says_it_is_empty() {
         let app = App::new(
@@ -402,10 +373,8 @@ mod tests {
         assert!(frame.contains("the flock is empty"));
     }
 
-    /// fails if a filter that matches nothing says the flock is empty. It is
-    /// not empty, and that sentence belongs to the case it describes. Three
-    /// panes say three different things here because there are three different
-    /// reasons, which is the `empty` scene's own principle.
+    /// A filter matching nothing is not the same as an empty flock; that
+    /// sentence belongs to the case it describes.
     #[test]
     fn a_filter_matching_nothing_does_not_say_the_flock_is_empty() {
         let app = fixtures::filtered_app("zzz");
@@ -428,9 +397,8 @@ mod tests {
         );
     }
 
-    /// fails if the genuinely empty flock loses its own sentence. The mirror
-    /// of the test above: one of the two branches getting the other's text is
-    /// the failure, and only asserting both catches it.
+    /// The mirror of the test above: swapped branches would still pass
+    /// either test alone.
     #[test]
     fn an_empty_flock_still_says_the_flock_is_empty() {
         let app = fixtures::filtered_app_of(Vec::new(), "");
@@ -439,10 +407,8 @@ mod tests {
         assert!(!frame.contains("no sheep's name contains"), "got {frame:?}");
     }
 
-    /// fails if the table stops leaving room for the marker, or if the marker
-    /// stops landing on the selected row. Asserted on the WHOLE line rather
-    /// than with `contains`, because a `>` somewhere in a log path would
-    /// satisfy `contains` and prove nothing.
+    /// Asserted on the whole line rather than with `contains`, since a `>`
+    /// somewhere in a log path would satisfy `contains` and prove nothing.
     #[test]
     fn the_marker_sits_in_the_gutter_of_the_selected_row_and_nowhere_else() {
         let mut app = App::new(
@@ -485,9 +451,8 @@ mod tests {
         );
     }
 
-    /// fails if a frozen dashboard does not say so where it cannot be
-    /// missed. This is the whole of the maintainer's ruling made visible: last values
-    /// on screen, and a sentence admitting they are stale.
+    /// Last values stay on screen, with a sentence admitting they are
+    /// stale.
     #[test]
     fn a_frozen_link_puts_the_banner_under_the_title() {
         let mut app = App::new(
@@ -505,9 +470,8 @@ mod tests {
         assert!(banner.contains("2026-08-14 14:32:07"));
     }
 
-    /// fails if the control state stops being visible. An operator who does
-    /// not know whether their dashboard can act is one keystroke from
-    /// finding out the wrong way.
+    /// An operator who does not know the control state is one keystroke
+    /// from finding out the wrong way.
     #[test]
     fn the_status_bar_always_says_which_control_state_is_in_force() {
         let now = Instant::now();
@@ -530,9 +494,8 @@ mod tests {
         assert!(!frame.contains("read-only"));
     }
 
-    /// fails if a draw panics at a degenerate or an enormous size. IR-40's
-    /// boundary sweep: the failure mode this catches is an arithmetic
-    /// underflow on `height - 1` in a one-row terminal.
+    /// The failure mode this catches is an arithmetic underflow on
+    /// `height - 1` in a one-row terminal.
     #[test]
     fn drawing_never_panics_across_the_size_sweep() {
         let mut app = App::new(
@@ -566,36 +529,18 @@ mod tests {
         }
     }
 
-    /// fails if an armed settings candidate ever draws with nothing on
-    /// screen to show it. `view::settings::content_lines`'s own pending
-    /// line used to be the ONLY place this showed, drawn last in the body
-    /// and cut by `draw_settings`'s `.take(area.height)` the moment the
-    /// body ran out of room -- an operator could arm an edit, see no
-    /// change anywhere, and press Enter into it blind. This is the
-    /// mutation that would catch a regression back to that state: at 200x10
-    /// the body alone has nowhere near the ~20 rows `settings_snapshot`'s
-    /// six scalars, two dogs and a two-line pending prompt need, so a body
-    /// with no independent floor would drop the confirm here exactly as it
-    /// used to. Width stays generous (200) so only HEIGHT is under test --
-    /// the confirm sentence itself runs long, and a narrow width would
-    /// truncate it in the status bar too and confound the two properties.
-    /// `status_line`'s own Slot 1 (`view::status`'s doc) is a fixed row
-    /// `draw` always reserves regardless of body height, which is the
-    /// property this pins: the confirm survives on the LAST line even
-    /// though the body above it has plainly been cut.
+    /// The pending confirm must survive even when the body is too short to
+    /// show `content_lines`' own copy of it: `status_line`'s fixed row
+    /// always draws, so an armed edit is never invisible.
     #[test]
     fn an_armed_settings_candidate_survives_a_body_too_short_to_hold_it() {
         let mut app = fixtures::app_in_settings_with_control();
         let _ = app.update(Msg::Key(KeyPress::Cycle));
         let text = app.settings().unwrap().pending().unwrap().text.to_string();
 
-        // 10 rows total, 8 of them body (title and status bar are the other
-        // two): nowhere near the ~20 rows `settings_snapshot`'s six scalars,
-        // two dogs and a two-line pending prompt need, so the body's OWN
-        // echo of this line is not on screen at this height -- confirmed by
-        // `settings_confirm`'s own gallery frame needing (180, 30) to show
-        // it at all. If the status bar slot below were ever removed, this
-        // assertion is what would catch the confirm vanishing again.
+        // 10 rows, 8 of them body: nowhere near the ~20 rows
+        // `settings_snapshot` needs, so the body's own echo of this line is
+        // not on screen at this height.
         let rendered = draw_to(&app, 200, 10);
         let last_line = rendered.lines().last().expect("at least one row");
         assert!(
@@ -604,19 +549,13 @@ mod tests {
         );
     }
 
-    /// fails if a tier can render taller than the terminal it was chosen for.
-    /// The height twin of `every_tier_fits_the_width_it_claims`, and the check
-    /// that makes the tier table a claim rather than a wish: every tier's
-    /// fixed rows, plus a banner, plus a flock table worth having, must fit in
-    /// that tier's own threshold.
     #[test]
     fn every_pane_tier_fits_the_height_it_claims() {
         for height in flock::MIN_HEIGHT..=200 {
             let panes = panes_for(height);
             let fixed = CHROME_ROWS + 1 /* banner */ + panes.rows();
             // A tier that shows a pane must leave the table at least three
-            // rows; the floor tier, which shows none, only has to leave one —
-            // which is what MIN_HEIGHT has always meant.
+            // rows; the floor tier, which shows none, only has to leave one.
             let floor = if panes.rows() == 0 { 1 } else { 3 };
             assert!(
                 fixed + floor <= height,
@@ -626,12 +565,9 @@ mod tests {
         }
     }
 
-    /// fails if the pane grew a line and the tier table did not grow with it.
-    /// `every_pane_tier_fits_the_height_it_claims` picks `DETAIL_ROWS` up
-    /// automatically and should stay green; if it does not, the tier table is
-    /// wrong, not the test. At 24 rows the fixed cost becomes chrome 4, banner
-    /// 1, host 1, detail 5, feed 7, which is 18, leaving 6 for the table
-    /// against the tier test's floor of 3.
+    /// `every_pane_tier_fits_the_height_it_claims` picks up `DETAIL_ROWS`
+    /// automatically, so a failure there means the tier table is wrong, not
+    /// this test.
     #[test]
     fn the_detail_pane_claims_the_rows_it_draws() {
         let app = fixtures::with_selection(fixtures::sheep_with_lambs());
@@ -642,12 +578,9 @@ mod tests {
         );
     }
 
-    /// fails if the drop order changes without someone re-arguing it. The
-    /// DETAIL pane goes first because it is the most redundant thing on the
-    /// screen — every number on it but the log paths is in the row above it.
-    /// The FEED goes second: its content exists nowhere else, but five lines
-    /// of a busy log is thin. The HOST STRIP goes last: one row, and nothing
-    /// else on the dashboard says anything about the machine.
+    /// Detail goes first, the most redundant pane on the screen. Feed goes
+    /// second: its content exists nowhere else, but five lines of a busy
+    /// log is thin. The host strip goes last, at one row.
     #[test]
     fn panes_drop_in_a_fixed_order_as_the_terminal_shortens() {
         assert_eq!(
@@ -706,13 +639,8 @@ mod tests {
         );
     }
 
-    /// fails if a pane ever draws over the status bar, over the flock table,
-    /// or off the bottom of the buffer. `Buffer::set_line` outside the area is
-    /// a panic in debug and a silent no-op otherwise, and the arithmetic here
-    /// has four moving parts.
-    ///
-    /// A live sweep, not a `timeout`: `draw` is synchronous, so a timer around
-    /// it would complete on its first poll and bound nothing.
+    /// `Buffer::set_line` outside the area is a panic in debug and a silent
+    /// no-op otherwise, and the arithmetic here has four moving parts.
     #[test]
     fn every_pane_lands_inside_its_own_rows_across_the_size_sweep() {
         let mut app = fixtures::full_app();
@@ -726,18 +654,9 @@ mod tests {
                 let panes = panes_for(height);
 
                 // The table's own row band, recomputed independently of
-                // `draw` rather than trusted from it — this is what makes
-                // the test's name true. Title (1) + banner (1, always: this
-                // fixture is frozen, so `banner_line` is always `Some`) +
-                // the host strip if it is up + the table's own header and
-                // rule (2) is where the table's rows START; `floor`, walked
-                // up from the status row exactly as `draw` walks it, is
-                // where they STOP. A bottom-stack pane drawn downward from
-                // the table instead of upward from the status bar — the
-                // exact regression a snapshot test caught here before this
-                // check existed — would put its content inside
-                // `table_body_start..table_body_end` and this loop would
-                // catch it on the next line.
+                // `draw`: title (1) + banner (1, this fixture is frozen) +
+                // host strip if up + header/rule (2) is where it starts;
+                // `floor`, walked the same way `draw` does, is where it ends.
                 let table_body_start = 2 + if panes.host { HOST_ROWS } else { 0 } + 2;
                 let mut floor = height - 1;
                 if panes.feed {
@@ -764,21 +683,18 @@ mod tests {
                     );
                 }
 
-                // NOT `lines.len() == height`: `frames::render_text` maps
-                // `(0..area.height)` over `(0..area.width)` by construction,
-                // so that holds for any `draw` whatsoever — including one that
-                // drew nothing at all. It is a property of the renderer, not
-                // of this layout, and asserting it here would be a check that
-                // cannot fail.
+                // Not `lines.len() == height`: `frames::render_text` maps
+                // `(0..area.height)` by construction, so that holds even for
+                // a `draw` that drew nothing. It is a property of the
+                // renderer, not of this layout.
                 let last = lines.last().unwrap();
                 assert!(
                     last.contains("read-only"),
                     "the status bar survived at {width}x{height}: {last:?}"
                 );
-                // The row above the status bar belongs to the bottom-most pane
-                // that is up, so it is never blank — a blank one means the
-                // upward layout left a hole, which is the failure mode the
-                // arithmetic here actually has.
+                // The row above the status bar belongs to the bottom-most
+                // pane that is up, so it is never blank: a blank one means
+                // the upward layout left a hole.
                 if panes.feed || panes.detail {
                     let above = lines[lines.len() - 2];
                     assert!(
@@ -786,10 +702,8 @@ mod tests {
                         "a blank row above the status bar at {width}x{height}"
                     );
                 }
-                // And every pane that is up appears exactly once, AND sits in
-                // its own band, so nothing overlapped anything else and
-                // nothing landed in the wrong place while still appearing
-                // once.
+                // Every pane that is up appears exactly once and sits in
+                // its own band.
                 if panes.host {
                     let positions: Vec<usize> = lines
                         .iter()
@@ -819,10 +733,8 @@ mod tests {
                     );
                 }
                 if panes.detail {
-                    // The PATH prefix, not a bare `out  ` — the feed's own
-                    // body lines are tagged `out  ` too, and counting those
-                    // would make this assertion depend on how many log lines
-                    // the fixture happens to carry.
+                    // The path prefix, not a bare `out  `: the feed's own
+                    // body lines are tagged `out  ` too.
                     let positions: Vec<usize> = lines
                         .iter()
                         .enumerate()
@@ -844,10 +756,9 @@ mod tests {
         }
     }
 
-    /// fails if the flock table stops being the spine. The maintainer's ruling in one
-    /// test: whatever else is on screen, the table gets the remainder, and at
-    /// the tier where all three panes are up it still has room for more than
-    /// a couple of rows.
+    /// Whatever else is on screen, the table gets the remainder, and at the
+    /// tier where all three panes are up it still has room for more than a
+    /// couple of rows.
     #[test]
     fn the_flock_table_keeps_the_middle_of_the_screen() {
         let app = fixtures::full_app(); // twelve sheep

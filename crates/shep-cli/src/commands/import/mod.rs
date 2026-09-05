@@ -1,11 +1,9 @@
 //! `shep import`: reading a pm2 dump into a Flockfile.
 //!
 //! [`dump`] parses a `dump.pm2` document into rows; [`mod@env`] splits a
-//! row's environment into what a Flockfile should carry and what the
-//! operator has to decide about; [`convert`] collapses rows into apps,
-//! wiring `env`'s split into every field this importer knows how to map;
-//! [`render`] serializes the result as Flockfile TOML. [`import`] is the
-//! verb itself, gluing all four together and reporting what happened.
+//! row's environment into what a Flockfile carries and what the operator
+//! must decide about; [`convert`] collapses rows into apps; [`render`]
+//! serializes them as Flockfile TOML. [`import`] glues the four together.
 
 pub(crate) mod convert;
 pub(crate) mod dump;
@@ -22,30 +20,16 @@ use crate::output::{ImportRow, ImportRows, Streams, emit, write_outcome};
 
 /// Reads a pm2 dump into apps and writes them out as a Flockfile.
 ///
-/// Takes no [`shep_client::Client`] and connects to nothing: it reads one
-/// file and writes another, so there is nothing to ask the socket.
-/// `commands::logs::flush_daemon` is the other verb that finishes without a
-/// client, for the same reason.
+/// Connects to nothing: reads one file, writes another.
 ///
-/// # Source
-/// `args.from`, or `$HOME/.pm2/dump.pm2` if `args.from` names nothing.
-/// Neither resolving is [`ExitCode::Usage`], naming both.
+/// Source is `args.from`, or `$HOME/.pm2/dump.pm2`. Output is `args.out`, or
+/// `./Flockfile.toml`, never overwritten without `args.force`. Neither
+/// resolving, and an existing output, are [`ExitCode::Usage`]. `args.dry_run`
+/// prints the Flockfile to stdout with no envelope and writes nothing: the
+/// output must parse back as a Flockfile.
 ///
-/// # Output
-/// `args.out`, or `./Flockfile.toml`. Refuses to overwrite an existing file
-/// unless `args.force` — also [`ExitCode::Usage`]. `args.dry_run` prints
-/// the rendered Flockfile to stdout instead, with no envelope, and writes
-/// nothing (decision 12): `shep import --dry-run > Flockfile.toml` must
-/// produce a file `shep` can read back.
-///
-/// # Notes
-/// Every [`ImportNote`] the conversion produced is written to stderr, one
-/// line each: a clustered app that must set `SO_REUSEPORT` itself, an
-/// ambiguous env key left out, an env value a Flockfile cannot hold, an
-/// instance variable turned into an `env` entry templated with
-/// `{{instance}}`. Both `--dry-run` and normal runs write them, and both
-/// `--format table`/`--format json` (decision 13). The first line is the
-/// read summary: how many instance rows, for how many apps, from where.
+/// Every [`ImportNote`] goes to stderr under both formats, after a read
+/// summary line.
 pub fn import(streams: &mut Streams<'_>, args: &ImportArgs) -> ExitCode {
     let source = match resolve_source(args) {
         Ok(source) => source,
@@ -147,11 +131,8 @@ pub fn import(streams: &mut Streams<'_>, args: &ImportArgs) -> ExitCode {
 /// `args.from`, or `$HOME/.pm2/dump.pm2` if it names nothing.
 ///
 /// # Errors
-/// A message naming both `--from` and `$HOME`, when neither resolves a
-/// path — this is the one case `resolve_paths` (`main.rs`) does not already
-/// catch on this verb's behalf: `--home`/`$SHEP_HOME` can resolve
-/// `ShepPaths` (which this verb never uses) while the real `$HOME` this
-/// function reads is still unset.
+/// A message naming both `--from` and `$HOME` when neither resolves a path.
+/// `--home`/`$SHEP_HOME` can resolve `ShepPaths` while `$HOME` is unset.
 fn resolve_source(args: &ImportArgs) -> Result<PathBuf, String> {
     if let Some(from) = &args.from {
         return Ok(from.clone());
@@ -210,7 +191,6 @@ mod tests {
     use super::*;
     use crate::cli::Format;
 
-    /// Mirrors `commands/trigger.rs`'s own one-line `args(..)` helper.
     fn args(dump: &Path, out: &Path, dry_run: bool, force: bool) -> ImportArgs {
         ImportArgs {
             from: Some(dump.to_path_buf()),
@@ -220,9 +200,6 @@ mod tests {
         }
     }
 
-    /// fails if `import` writes over a Flockfile without being asked. The
-    /// default output path is one an operator is likely to already have, and
-    /// clobbering a hand-written one has nothing to undo it.
     #[test]
     fn an_existing_flockfile_is_not_overwritten_without_force() {
         let dir = tempfile::tempdir().unwrap();
@@ -246,9 +223,6 @@ mod tests {
         assert!(std::fs::read_to_string(&out).unwrap().contains("mine"));
     }
 
-    /// fails if `--dry-run` writes a file, or wraps the Flockfile in an
-    /// envelope. `shep import --dry-run > Flockfile.toml` must produce a
-    /// file shep can parse; an envelope makes it one shep cannot.
     #[test]
     fn dry_run_prints_a_parseable_flockfile_and_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -281,10 +255,6 @@ mod tests {
         );
     }
 
-    /// fails if the cluster warning or an ambiguous env key stops reaching
-    /// the operator. Both are cutover blockers the design names: one
-    /// surfaces as EADDRINUSE at first start otherwise, the other as an
-    /// app missing half its configuration after a reboot.
     #[test]
     fn the_report_names_every_cluster_app_and_every_ambiguous_key() {
         let dir = tempfile::tempdir().unwrap();
@@ -311,8 +281,6 @@ mod tests {
         }
     }
 
-    /// fails if a missing dump exits anything but `Usage`, or the message
-    /// stops naming both the path and `pm2 save`.
     #[test]
     fn a_missing_dump_is_a_named_usage_error() {
         let dir = tempfile::tempdir().unwrap();
@@ -336,8 +304,6 @@ mod tests {
         assert!(report.contains("pm2 save"), "{report}");
     }
 
-    /// fails if a dump that fails to parse exits anything but
-    /// `InvalidConfig`.
     #[test]
     fn a_malformed_dump_is_invalid_config() {
         let dir = tempfile::tempdir().unwrap();

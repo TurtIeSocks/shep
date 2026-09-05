@@ -1,24 +1,19 @@
 //! The versioned output envelope and its two renderings: a JSON envelope
 //! (`--format json`) and a padded table (`--format table`, the default).
 //!
-//! [`Render`] is the single source of truth for both — a payload type
-//! implements it once, in [`rows`], and [`emit`] renders it either way from
-//! that one impl. A field added to `Serialize` and forgotten in `rows()`
-//! fails that type's anti-drift test rather than silently vanishing from the
-//! table; see `rows`'s own test module.
+//! [`Render`] is the single source of truth for both: a payload type
+//! implements it once, in [`rows`], and [`emit`] renders it either way. A
+//! field added to `Serialize` and forgotten in `rows()` fails that type's
+//! anti-drift test rather than silently vanishing from the table.
 //!
-//! `bleats` is the one command that does not go through this module: a
-//! follow has no end, so there is nothing to wrap in an envelope. It emits
-//! its own newline-delimited JSON instead.
+//! `bleats` does not go through this module: a follow has no end, so it
+//! emits its own newline-delimited JSON instead of an envelope.
 //!
-//! Pure tier (spec §11): this module and its submodules name no shep-client
-//! type, compile on every target, and their unit tests run on Windows.
+//! This module names no shep-client type and compiles on every target.
 
-// `pub(crate)`, not private like the other three: `lookout::theme`'s own
-// test module (`#[cfg(unix)]`) calls `paint::style_for` directly, to pin
-// the anstyle and ratatui colour bindings against each other. Neither
-// `lookout` nor `style` is a descendant of `output`, so this name has to be
-// reachable from outside it.
+// `pub(crate)`: `lookout::theme`'s test module calls `paint::style_for`
+// directly to pin the anstyle and ratatui colour bindings against each
+// other, and neither `lookout` nor `style` is a descendant of `output`.
 pub(crate) mod paint;
 mod rows;
 mod table;
@@ -37,12 +32,8 @@ use shep_core::protocol::ProcessInfo;
 use crate::exit::ExitCode;
 
 // Re-exported for `commands/`, which names every one of these at its own
-// crate-root import (`crate::output::{Streams, emit, FlockRows, ...}`).
-// Tasks 7-11 have landed and every one of them is genuinely used there on
-// unix. `commands/` itself is `#[cfg(unix)]`-gated (main.rs), so on Windows
-// none of them is named anywhere and `unused_imports` (a name-resolution
-// lint, unlike `dead_code`'s reachability one) still flags it there —
-// narrowed to that target rather than dropped.
+// crate-root import. `commands/` is `#[cfg(unix)]`-gated, so on Windows
+// nothing names them and `unused_imports` still flags it there.
 #[cfg_attr(windows, allow(unused_imports))]
 pub use rows::{
     AvailableDogRows, BarkRows, DeletedIds, DogAdoptedRow, DogDisabledRow, DogEnabledRow,
@@ -52,18 +43,10 @@ pub use rows::{
 };
 pub use table::{human_bytes, human_duration, local_timestamp, render_table};
 
-// `pub(crate)`, not part of the block above: `exit_cell` is not one of
-// `commands/`'s payload types -- it has exactly one caller outside this
-// module, `lookout::view::flock::cell`'s own EXIT column (task 49), reusing
-// the same code/signal rendering `FlockRows`'s EXIT column already uses
-// rather than a second implementation of the same rule. `#[cfg_attr(windows,
-// ...)]` for the same reason the block above carries it: `lookout` is
-// `#[cfg(unix)]` (`lib.rs`), so nothing names this import on Windows.
-//
-// `cfg_cell` (task 12) rides the same re-export for the same reason: its
-// only caller outside this module is `lookout::view::flock::cell`'s own
-// CFG column, reusing the pending-over-overridden rule rather than a second
-// copy of it.
+// `pub(crate)`, not part of the block above: `exit_cell` and `cfg_cell`
+// have one caller each outside this module, `lookout::view::flock::cell`'s
+// EXIT and CFG columns. `lookout` is `#[cfg(unix)]`, so nothing names
+// these on Windows.
 #[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use rows::{cfg_cell, exit_cell};
 
@@ -76,11 +59,6 @@ pub const SCHEMA_VERSION: u32 = 1;
 
 /// The `--format json` envelope every command renders into, `bleats`
 /// excepted (module docs above).
-///
-/// Not constructed outside `emit` and this module's own tests yet: no verb
-/// has a real success path until Tasks 7-11 land and start calling `emit`
-/// from `commands/`. `#[allow(dead_code)]` says so explicitly rather than
-/// inventing a call site nothing needs yet.
 #[allow(dead_code)]
 #[derive(Debug, Serialize)]
 pub struct OutputEnvelope<'a, T> {
@@ -97,43 +75,33 @@ pub struct OutputEnvelope<'a, T> {
 /// Production wires the process's own; tests wire a pair of `Vec<u8>`, which
 /// is what makes every renderer assertion hermetic and safe under the
 /// parallel `cargo test` gate. `&mut dyn Write` has no `Debug`, so this needs
-/// a manual one — print `Streams { .. }` and nothing else (pinned by this
+/// a manual one: print `Streams { .. }` and nothing else (pinned by this
 /// module's own `streams_debug_is_the_redacted_placeholder` test).
 pub struct Streams<'a> {
-    /// Rendered command output — what `emit` writes to.
+    /// Rendered command output: what `emit` writes to.
     ///
-    /// Read on unix: every real command in `commands/` (Tasks 7-11) passes
-    /// `&mut streams.out` to `emit` for its rendered output. `commands/`
-    /// itself is `#[cfg(unix)]`-gated (main.rs), so on Windows nothing
-    /// reads this field yet and `dead_code` still flags it there —
-    /// narrowed to that target rather than dropped.
+    /// `commands/` is `#[cfg(unix)]`-gated, so on Windows nothing reads
+    /// this field and `dead_code` still flags it there.
     #[cfg_attr(windows, allow(dead_code))]
     pub out: &'a mut dyn io::Write,
-    /// Diagnostics and errors — what `emit_error` writes to.
+    /// Diagnostics and errors: what `emit_error` writes to.
     pub err: &'a mut dyn io::Write,
     /// How much this invocation dresses up its output.
     ///
-    /// Carried here rather than passed to `emit` on its own because
-    /// `Streams` already reaches every command, and a global would break
-    /// this crate's rule that presentation inputs are parameters, never a
-    /// call inside the function that renders (`commands/daemon.rs`'s
-    /// `ansi_enabled` follows the same rule for `NO_COLOR`).
+    /// Carried here rather than as a global: presentation inputs are
+    /// parameters in this crate, never a call inside the rendering
+    /// function (`commands/daemon.rs`'s `ansi_enabled` follows the same
+    /// rule for `NO_COLOR`).
     ///
-    /// `Presentation::BARE` is the field's documented safe value for a
-    /// construction that wants today's plain output — every test fixture in
-    /// the crate uses it — so a construction that reaches for the wrong
-    /// default renders exactly what shep printed before this feature, the
-    /// safe direction to fail. There is no `Default` impl to enforce that
-    /// automatically: `Streams` holds `&mut dyn io::Write`, which is not
-    /// `Default`, so every field is always named at the call site regardless.
+    /// `Presentation::BARE` is the safe default: a construction that
+    /// reaches for the wrong value renders exactly what shep printed
+    /// before this feature existed.
     pub style: Presentation,
     /// How this invocation renders: a table for a person, or JSON for a
     /// script.
     ///
-    /// Carried here for the reason `style` is, one field up: it reaches
-    /// every command already, and all 84 functions that took a `Streams`
-    /// also took a `Format` beside it. Nothing in production ever passed a
-    /// different one, so nothing loses an override it was using.
+    /// Carried here for the same reason as `style`: it reaches every
+    /// command already.
     pub fmt: Format,
 }
 
@@ -146,13 +114,12 @@ impl std::fmt::Debug for Streams<'_> {
 impl Streams<'_> {
     /// Prints `message` as an error, and hands back the code it printed.
     ///
-    /// Returning the code is what lets a caller write
+    /// Returning the code lets a caller write
     /// `return streams.fail(ExitCode::Usage, &message)` rather than naming
-    /// the code twice and risking the two drifting apart.
+    /// the code twice.
     ///
-    /// The write's own failure is discarded, deliberately: a closed stderr
-    /// must not change what shep exits with. That was the decision at all
-    /// 91 call sites this replaces, and it is made once here instead.
+    /// The write's own failure is discarded: a closed stderr must not
+    /// change what shep exits with.
     pub fn fail(&mut self, code: ExitCode, message: &str) -> ExitCode {
         let _ = emit_error(&mut *self.err, self.fmt, code.code_str(), message);
         code
@@ -160,48 +127,41 @@ impl Streams<'_> {
 
     /// Prints `message` as a notice, on stdout.
     ///
-    /// Discards its write's failure for the same reason [`Self::fail`] does.
-    /// Stdout only: a real minority of notices belong on stderr instead (a
-    /// warning beside a separate primary output, like `init`'s shadowed-file
-    /// notice), and those call [`emit_notice`] directly with `streams.err`:
-    /// see that function's own doc for the full rule. This method exists for
-    /// the majority shape, a notice that IS the command's whole answer.
+    /// Discards its write's failure for the same reason [`Self::fail`]
+    /// does. Stdout only: a minority of notices belong on stderr instead
+    /// (a warning beside a separate primary output, like `init`'s
+    /// shadowed-file notice), which call [`emit_notice`] directly with
+    /// `streams.err`. This method is for the majority shape, a notice
+    /// that is the command's whole answer.
     pub fn note(&mut self, code: &str, message: &str) {
         let _ = emit_notice(&mut *self.out, self.fmt, code, message);
     }
 
     /// Prints `message` as a notice, on stderr.
     ///
-    /// The stream is the whole difference from [`Self::note`], and it is a
-    /// decision about the reader rather than about severity. `note` carries
-    /// what the command produced: `shep init` saying which file it wrote.
-    /// This carries what somebody should know about the run without it being
-    /// the answer they asked for: a Flockfile that will be shadowed, entries
-    /// skipped, strings that had control characters stripped out of them.
+    /// The stream is the whole difference from [`Self::note`]: a decision
+    /// about the reader, not severity. `note` carries what the command
+    /// produced; this carries what somebody should know about the run
+    /// without it being the answer they asked for.
     ///
-    /// Keeping those off stdout is what lets `shep dogs --available
-    /// --format json | jq` work while the operator still sees that two
-    /// entries were skipped.
-    ///
-    /// Discards its write's failure for the same reason [`Self::fail`] does.
+    /// Keeping those off stdout lets `shep dogs --available --format json
+    /// | jq` work while the operator still sees that entries were skipped.
+    /// Discards its write's failure for the same reason [`Self::fail`]
+    /// does.
     pub fn aside(&mut self, code: &str, message: &str) {
         let _ = emit_notice(&mut *self.err, self.fmt, code, message);
     }
 }
 
-/// Implemented once per command payload. The two methods are the ONLY place a
-/// field's presence is decided, so a field added to one and forgotten in the
-/// other is a compile error rather than a silent divergence.
+/// Implemented once per command payload. The two methods are the only
+/// place a field's presence is decided, so a field added to one and
+/// forgotten in the other is a compile error rather than a silent
+/// divergence.
 ///
 /// Not object-safe: [`headers`](Render::headers) has no receiver and
 /// `Serialize` cannot be a dyn-compatible supertrait, so `Box<dyn Render>`
 /// does not compile. Every call site knows its payload type statically;
 /// [`emit`] dispatches generically, never dynamically.
-///
-/// Not used outside this module's own tests yet: `commands/` — the code
-/// that will implement it per payload type and call `emit` — is Tasks 7-11.
-/// `#[allow(dead_code)]` says so explicitly rather than inventing a call
-/// site nothing needs yet.
 #[allow(dead_code)]
 pub trait Render: Serialize {
     /// Column headers for table output.
@@ -210,43 +170,16 @@ pub trait Render: Serialize {
     fn rows(&self) -> Vec<Vec<String>>;
     /// The rows as this presentation wants them rendered.
     ///
-    /// Defaults to [`Self::rows`]: a table with nothing to dress up says so
-    /// by not implementing this. An impl that wants colour overrides it and
-    /// calls [`rows::paint`], which keys each cell's treatment on the
-    /// column's NAME.
+    /// Defaults to [`Self::rows`]; an override calls [`rows::paint`],
+    /// which keys each cell on the column's NAME, not its index, so
+    /// reordering columns cannot silently repoint a paint rule. The
+    /// default skips the `-` placeholder rule, which every table that
+    /// can render a `-` reaches through [`rows::Paint::Default`] instead.
     ///
-    /// The default deliberately does NOT apply the `-` placeholder rule, even
-    /// though that rule holds for every table that has a placeholder. It was
-    /// written that way first, and the mutation that deleted it killed no
-    /// test: every table in the crate that can actually render a `-` already
-    /// overrides this and reaches the rule through [`rows::Paint::Default`],
-    /// and the seven that do not override it cannot produce a dash at all. A
-    /// default nothing reaches is a path that rots unwatched, so the rule
-    /// lives in `paint` alone, where it is exercised.
-    ///
-    /// # Why by name, and never by index
-    ///
-    /// Painting by hardcoded index (`row[0]`, `row[4]`, ...) is a fact about
-    /// one table's column ORDER, so reordering its columns would silently
-    /// repoint every one of them: the wrong cells get painted, nothing
-    /// fails to compile, and no test catches it -- a snapshot pins whatever
-    /// was accepted into it, and only a human looking at a rendered table
-    /// would notice RESTARTS had started wearing the memory ramp. Keyed on
-    /// the name instead, one place says RESTARTS is coloured by
-    /// `restarts_role`, and every table
-    /// carrying a RESTARTS column gets it wherever the column sits.
-    ///
-    /// Only ever called from `table_of`'s
-    /// boxed path — the plain path keeps calling [`render_table`], which
-    /// keeps calling [`Self::rows`], and that is what makes `bare` provably
-    /// byte-identical rather than merely intended to be.
-    ///
-    /// `status_word` is a plain parameter rather than a field on
-    /// `Presentation`: it is `table_of`'s own per-attempt retry knob (spec
-    /// §2's word-drops-before-a-column rule), never a fact resolved once at
-    /// the seam the way every `Presentation` field is. Only a STATUS column
-    /// reads it, so the retry `table_of` makes is a harmless no-op for a
-    /// table that has none.
+    /// Only called from `table_of`'s boxed path; the plain path calls
+    /// [`render_table`], keeping `bare` byte-identical. `status_word` is
+    /// a plain parameter, not a `Presentation` field: it is `table_of`'s
+    /// per-attempt retry knob.
     fn rows_for(&self, _presentation: Presentation, _status_word: bool) -> Vec<Vec<String>> {
         self.rows()
     }
@@ -254,66 +187,37 @@ pub trait Render: Serialize {
     /// (`UPTIME` -> `uptime_ms`, and so on).
     ///
     /// # Panics
-    /// If `header` is not one of `Self::headers()`'s own values. Every real
-    /// caller (the anti-drift tests, [`render_table`]) only ever passes a
-    /// value straight from `headers()`, so this is unreachable in practice —
-    /// implementations still document and mark it, per house style for any
-    /// panic reachable from a public signature.
+    /// If `header` is not one of `Self::headers()`'s own values.
     fn json_key_for(header: &str) -> &'static str;
     /// Serialized fields that legitimately have no column, each with a
     /// comment giving the reason. Usually empty.
     ///
     /// This constant is the only thing standing between an unmapped
     /// `Serialize` field and a silently-widened, unreviewed pass of
-    /// `assert_no_drift` (rows.rs) — an entry proves the *count* of covered
-    /// keys matches, never *why* a field belongs here. Every entry an impl
-    /// adds MUST carry its own inline `//` comment stating that reason
-    /// (`"note", // internal only, never shown to a user`); an entry with no
-    /// comment is a review gap, not a pass.
+    /// `assert_no_drift` (rows.rs): an entry proves the count of covered
+    /// keys matches, never why a field belongs here. Every entry an impl
+    /// adds must carry its own inline `//` comment stating that reason
+    /// (`"note", // internal only, never shown to a user`).
     const JSON_ONLY: &'static [&'static str];
 
     /// Per-column drop priority for [`table::render_boxed`], parallel to
-    /// [`Self::headers`]: index `i` here is the priority of column `i` there.
-    /// `0` never drops — [`table::render_boxed`]'s own floor. The default is
-    /// all zeros, kept for a hypothetical future payload with genuinely
-    /// nothing to say about droppability -- leaving a real impl at the
-    /// default silently opts it out of narrowing rather than narrowing in an
-    /// order nobody chose, which is exactly what happened here: every impl
-    /// in [`rows`] but [`rows::FlockRows`] carried the default for a full
-    /// task, until the empirical reviewer caught [`rows::DogRows`] wrapping
-    /// and breaking its own borders under a real terminal, right beneath a
-    /// sheep table narrowing gracefully above it. The other eighteen impls
-    /// carried the same defect, unnoticed because nothing had looked.
+    /// [`Self::headers`]: index `i` here is the priority of column `i`
+    /// there. `0` never drops. The default is all zeros; leaving a real
+    /// impl at the default silently opts it out of narrowing.
     ///
-    /// The one rule every impl in [`rows`] now follows, so a reader who
-    /// learns one table is not surprised by the next:
-    /// - `0`: the columns that identify a row -- what names the record,
-    ///   plus a STATUS/OUTCOME/RESULT-shaped column stating what happened to
-    ///   it, when the table has one ([`rows::FlockRows`]/[`rows::DogRows`]'s
-    ///   own STATUS is the precedent this generalizes).
-    /// - `1`-`5`: reserved for the five columns [`rows::FlockRows`] itself
-    ///   has (`UPTIME` 1, `PID` 2, `MEM` 3, `RESTARTS` 4, `CPU` 5), used only
-    ///   when that exact concept is a column in this table -- never borrowed
-    ///   for an unrelated field just because a number happens to be free,
-    ///   which is what would stop the number meaning one thing crate-wide.
-    /// - `6` and up: every other column, the most droppable of all --
-    ///   assigned per table by how genuinely droppable each one is (a long,
-    ///   unbounded free-text field before a short, glanceable one), with a
-    ///   comment at the array whenever more than one column shares this
-    ///   tier.
-    ///
-    /// `priorities_line_up_with_headers_for_every_render_impl` (`rows.rs`'s
-    /// own test module) is the anti-drift gate: it checks every `Render`
-    /// impl this crate defines against its own expected floor, so a table
-    /// added later without a real `PRIORITIES` fails that test rather than
-    /// shipping unable to narrow.
+    /// The rule every impl in [`rows`] follows: `0` for identity and
+    /// status-shaped columns, `1`-`5` reserved for [`rows::FlockRows`]'s
+    /// own five columns (UPTIME 1, PID 2, MEM 3, RESTARTS 4, CPU 5), `6`
+    /// and up for everything else, ranked per table by how droppable it
+    /// is. `priorities_line_up_with_headers_for_every_render_impl`
+    /// (rows.rs) is the anti-drift gate enforcing it.
     const PRIORITIES: &'static [u8] = &[];
 }
 
 /// Renders `data` to `out` as `fmt` calls for, boxed or plain per `style`.
 ///
 /// Called by every command in `commands/` once it has a real payload to
-/// render — `write_outcome(emit(&mut *streams.out, fmt, "<verb>", data,
+/// render: `write_outcome(emit(&mut *streams.out, fmt, "<verb>", data,
 /// streams.style))` is the shape all of them share.
 ///
 /// # Errors
@@ -339,33 +243,18 @@ pub fn emit<T: Render>(
     }
 }
 
-/// Renders one [`Render`] payload as [`render_table`] or [`table::render_boxed`],
-/// whichever `presentation.level` calls for.
+/// Renders one [`Render`] payload as [`render_table`] or
+/// [`table::render_boxed`], whichever `presentation.level` calls for.
 ///
-/// The one branch [`emit`], [`emit_flock`] and [`emit_described`] all make on
-/// every table they render, factored out here so those five call sites --
-/// `emit` once, `emit_flock` and `emit_described` twice each, one per table
-/// either renders -- stay one decision instead of reimplementing it five
-/// times. [`table::render_boxed`]
-/// needs a terminal width; `presentation.width` is [`terminal_width`] already
-/// resolved once at the seam (`lib.rs`'s `run_argv`) rather than re-measured
-/// by this function itself -- see [`crate::style::Presentation`]'s own doc
-/// for why a value injected here, not a call made here, is what keeps this
-/// function testable at any width a test chooses.
+/// Factored out so `emit`, `emit_flock` and `emit_described` make this
+/// decision once. `presentation.width` is [`terminal_width`] already
+/// resolved at the seam, injected here rather than measured, so this
+/// stays testable at any width.
 ///
-/// The boxed path renders twice when the first pass drops a column. Spec §2:
-/// the STATUS word is the first thing dropped from that column, before any
-/// whole column is — so the first attempt asks [`Render::rows_for`] for
-/// everything, including the word, and only if [`table::render_boxed_ex`]
-/// says it had to hide a column does a second attempt ask again with the
-/// word turned off. Two render passes over one small table is nothing, and
-/// it keeps [`table::render_boxed`] exactly as ignorant of what a STATUS
-/// cell is as it was before this function existed — the retry is a second
-/// call with different row *data*, never a second code path in the
-/// renderer itself. For every payload but [`rows::FlockRows`] the two
-/// passes produce identical rows (the default [`Render::rows_for`] ignores
-/// its `status_word` parameter entirely), so the retry is a
-/// wasted-but-harmless no-op rather than a behaviour change.
+/// Renders twice when the first pass drops a column: the STATUS word
+/// drops first, so a first attempt asks [`Render::rows_for`] with the
+/// word on, and only if [`table::render_boxed_ex`] hid a column does a
+/// second attempt ask again with the word off.
 fn table_of<T: Render>(data: &T, presentation: Presentation) -> String {
     if !presentation.level.boxes() {
         return render_table(data);
@@ -392,20 +281,15 @@ fn table_of<T: Render>(data: &T, presentation: Presentation) -> String {
 
 /// The terminal's width, or 80 when there is not one.
 ///
-/// `crossterm` is a `shep-cli` dependency only inside its `cfg(unix)` block
-/// — deliberately, so a Windows build does not link a terminal stack it can
-/// never use — so the fallback is unconditional rather than an error path.
-/// A width of `0`, which some terminals and CI harnesses report, is treated
-/// the same as absent: `render_boxed` would otherwise read it as "drop every
-/// droppable column," for no reason a real terminal ever gave it.
+/// `crossterm` is a `shep-cli` dependency only inside its `cfg(unix)`
+/// block, so a Windows build does not link a terminal stack it can never
+/// use. A width of `0`, which some terminals and CI harnesses report, is
+/// treated the same as absent: `render_boxed` would otherwise read it as
+/// drop every droppable column.
 ///
-/// `pub(crate)` rather than private: its one real caller is `lib.rs`'s
-/// `run_argv`, which resolves [`crate::style::Presentation::width`] once,
-/// at the same seam that resolves the style level and forces
-/// [`crate::style::StyleLevel::Bare`] for a pipe -- never [`table_of`]
-/// itself. See [`crate::style::Presentation`]'s own doc for why a live call
-/// here instead would read the real controlling terminal on every render,
-/// including under `cargo test`.
+/// `pub(crate)` rather than private: its one caller, `lib.rs`'s
+/// `run_argv`, resolves [`crate::style::Presentation::width`] once at the
+/// seam, never [`table_of`] itself.
 pub(crate) fn terminal_width() -> usize {
     #[cfg(unix)]
     {
@@ -420,36 +304,17 @@ pub(crate) fn terminal_width() -> usize {
     }
 }
 
-/// Renders one flock listing: the sheep table, then the dogs table beneath
-/// it whenever any dog is registered.
+/// Renders one flock listing: the sheep table, then the dogs table
+/// beneath it whenever any dog is registered.
 ///
-/// `Format::Json` renders exactly what [`emit`] would for the whole
-/// listing — one array, every entry, each carrying its own `dog` marker.
-/// The machine surface keeps the single registry the two tables are a
-/// rendering OF, so a consumer never has to reassemble one from two.
-///
-/// `Format::Table` partitions `listing` on [`ProcessInfo::dog`], renders
-/// the sheep half through [`table_of::<FlockRows>`](table_of) as `flock`
-/// always has, and — only when the dogs half is non-empty — appends a blank
-/// line, a `Dogs` caption, and the dogs half through
-/// [`table_of::<DogRows>`](table_of). Nothing about widths, padding,
-/// char-counting, the empty-payload header rule or the boxed/plain choice is
-/// reimplemented here: both calls go through the one [`table_of`] every
-/// other payload uses, sized independently because the two tables share no
-/// columns. A flock with no dogs prints exactly what it printed before this
-/// type existed — no caption, no second table.
-///
-/// Under the dogs table, and only when a dog is silent, [`silence_pointer`]
-/// adds one line naming where that word is explained. A flock whose dogs are
-/// all talking prints nothing extra, which is the same rule the `Dogs`
-/// caption itself follows.
+/// JSON stays one array, every entry carrying its own `dog` marker.
+/// Table partitions on [`ProcessInfo::dog`], rendering sheep and dogs
+/// each through [`table_of`], with a blank line and `Dogs` caption
+/// between them only when a dog exists. [`silence_pointer`] adds one
+/// line under the dogs table when a dog is silent.
 ///
 /// # Errors
 /// The underlying write failed.
-///
-/// Its only caller, `commands::query::flock`, lives in `commands/`, which is
-/// `#[cfg(unix)]`-gated in `main.rs` — same reason [`Streams::out`] and
-/// [`emit_notice`] carry the same attribute.
 #[cfg_attr(windows, allow(dead_code))]
 pub fn emit_flock(
     out: &mut dyn io::Write,
@@ -480,24 +345,15 @@ pub fn emit_flock(
     }
 }
 
-/// The one line under the dogs table that says where `silent` is explained,
-/// or nothing at all when no dog is silent.
+/// The one line under the dogs table that says where `silent` is
+/// explained, or nothing at all when no dog is silent.
 ///
-/// **A pointer and not the explanation.** The explanation runs to a
-/// paragraph per dog (`vocabulary::silence_note`) and this table is the
-/// thing an operator leaves running in a loop — the same argument
-/// `ProcessInfo::lambs` makes for not walking the process tree on every
-/// listing. Three silent dogs would put three paragraphs under a
-/// three-row table on every refresh, which is how a warning stops being
-/// read.
-///
-/// **Outside the table, deliberately.** Nothing here touches a column, a
-/// width or a drop priority: the table is rendered and finished before this
-/// runs, so a long list of names wraps in the terminal rather than
-/// squeezing STATUS off the side of it.
-///
-/// Named rather than counted. "1 dog is silent" would make the operator go
-/// find which, and the names are what they type into the next command.
+/// A pointer, not the explanation: that runs to a paragraph per dog
+/// (`vocabulary::silence_note`), too much for a table an operator leaves
+/// running in a loop. Rendered after the table, outside it, so a long
+/// list of names wraps in the terminal rather than squeezing STATUS off
+/// the side of it. Named rather than counted, since the names are what
+/// the operator types into the next command.
 fn silence_pointer(dogs: &[ProcessInfo]) -> Option<String> {
     let silent: Vec<&str> = dogs
         .iter()
@@ -520,55 +376,17 @@ fn silence_pointer(dogs: &[ProcessInfo]) -> Option<String> {
 }
 
 /// Renders one `describe` answer: the sheep table, then each sheep's lamb
-/// tree beneath it when the reply walked for one and found any.
+/// tree beneath it when the reply walked and found any.
 ///
-/// `Format::Json` renders exactly what [`emit`] would for the whole
-/// listing — one array, every row carrying its own `lambs`. The machine
-/// surface keeps the single listing the tables are a rendering OF, so a
-/// consumer never has to reassemble one; the same rule [`emit_flock`]
-/// follows for dogs.
-///
-/// `Format::Table` renders the sheep through
-/// [`table_of::<FlockRows>`](table_of), exactly as `describe` always has,
-/// then — only for a sheep whose `lambs` is `Some` and non-empty — a blank
-/// line, a caption, and that sheep's lambs through
-/// [`table_of::<LambRows>`](table_of).
-///
-/// A sheep with no lambs, and a sheep whose reply did not walk for any,
-/// both print exactly what `describe` printed before this function
-/// existed: no caption, no second table.
-///
-/// # The silence note
-///
-/// A row whose STATUS reads `silent` also gets a paragraph, between the
-/// table and the lamb trees. This is the per-entity view, so it is where the
-/// long form belongs: `shep flock` points here (see [`silence_pointer`]) and
-/// this is what it points at. [`crate::vocabulary::silence_note`] owns every
-/// word of it, including the part that matters most — whether this shepherd
-/// is still waiting on the dog or has permanently given up on it, which is a
-/// latch no surface reported at all before it was put on the wire.
-/// After the lambs, the same table walk prints a Pending heading and an
-/// Overridden heading per sheep that has either (task 12), each followed by
-/// the field names `ProcessInfo::pending`/`ProcessInfo::overridden` carry.
-/// A sheep with neither prints neither heading, unchanged from before those
-/// fields existed. The Pending heading names `shep reload <name>` as what
-/// promotes it, since that is the one verb that does.
-///
-/// # The caption
-///
-/// It names what was walked and what that is not, in one line, because the
-/// operator reading this output is reading neither [`Lamb`](shep_core::protocol::Lamb)'s
-/// doc nor `--help`. The walk follows parent-pid links; the stop ladder
-/// acts on the process group; the two diverge in both directions. Do not
-/// shorten the caption to "process tree" — that is the claim this wording
-/// exists to avoid.
+/// A silent row also gets a paragraph from
+/// [`crate::vocabulary::silence_note`] (what [`silence_pointer`] points
+/// at). Pending and Overridden headings follow, once per name, naming
+/// `shep reload <name>` as what promotes a parked config. Never shorten
+/// the caption to "process tree": the walk follows parent-pid links
+/// while the stop ladder acts on the process group, and the two diverge.
 ///
 /// # Errors
 /// The underlying write failed.
-///
-/// Its only caller, `commands::query::describe_selector`, lives in
-/// `commands/`, which is `#[cfg(unix)]`-gated in `main.rs` — same reason
-/// [`emit_flock`] carries the same attribute.
 #[cfg_attr(windows, allow(dead_code))]
 pub fn emit_described(
     out: &mut dyn io::Write,
@@ -609,15 +427,10 @@ pub fn emit_described(
                 )?;
                 write!(out, "{}", table_of(&LambRows(lambs.clone()), style))?;
             }
-            // ONCE PER NAME, not once per row, and neither heading names an
-            // id. A parked or overridden config belongs to the app: the
-            // daemon writes the same store entry onto every slot of a name,
-            // so a three-instance app printed three identical blocks, and a
-            // heading naming one slot's id would say the block applied to
-            // that slot alone. The table above already carries the ids.
-            //
-            // The rows themselves stay per instance. This is a claim about
-            // config, which is shared, not about a process, which is not.
+            // Once per name, not once per row: a parked or overridden
+            // config belongs to the app, and the daemon writes the same
+            // entry onto every slot of a name. The rows themselves stay
+            // per instance, since that is a claim about the process.
             let mut said: BTreeSet<&str> = BTreeSet::new();
             for sheep in &flock.0 {
                 if !said.insert(sheep.name.as_str()) {
@@ -666,10 +479,10 @@ struct ErrorBody<'a> {
 
 /// Renders a failure to `err` in `fmt`. `code` is `ExitCode::code_str()`.
 ///
-/// `code` is a string this function only prints — the exit code stays the
-/// caller's — but it prints on both surfaces: JSON already carried it in
-/// `error.code`, and table mode used to drop it silently, which left a
-/// human at a terminal with no name for the failure a script could see.
+/// `code` is a string this function only prints, not the exit code, but
+/// it prints on both surfaces: JSON carries it in `error.code`, and
+/// table mode names it too, so a human at a terminal sees the same
+/// failure name a script would.
 ///
 /// # Errors
 /// The underlying write failed.
@@ -679,24 +492,10 @@ pub fn emit_error(
     code: &str,
     message: &str,
 ) -> io::Result<()> {
-    // Sanitised here rather than at each caller, because here is the only
-    // place every caller passes through: a hostile `Location:` header (see
-    // `terminal_safe`'s own doc) is one example of error text that can
-    // carry somebody else's bytes, and shep emits colour itself, so a
-    // reader cannot tell shep's escapes from an attacker's.
-    //
-    // Both arms, not just the table one. `serde_json` escapes a control byte
-    // into `\u001b` so a terminal never renders it, but a script doing
-    // `shep ... --format json | jq -r .error.message` unescapes it straight
-    // back onto a terminal.
-    //
-    // `code` is deliberately not sanitised: every one is a `&'static str`
-    // from `ExitCode::code_str` or a literal at the call site, so none of
-    // them is ever attacker-supplied.
-    //
-    // Costs one scan of a message shep is about to print anyway.
-    // `terminal_safe::sanitise` returns early when there is nothing
-    // unprintable, which is every message shep writes itself.
+    // Sanitised once here, the only place every caller passes through. Both
+    // formats: `jq -r .error.message` would unescape a hostile message
+    // right back onto a terminal. `code` is never sanitised, since every
+    // caller passes a literal or `ExitCode::code_str()`.
     let (message, _) = crate::terminal_safe::sanitise(message);
     let message = message.as_str();
     match fmt {
@@ -715,21 +514,12 @@ pub fn emit_error(
 /// The `--format json` shape of a non-failure diagnostic: `{"schema_version",
 /// "notice": {"code", "message"}}`.
 ///
-/// A deliberate sibling of [`ErrorEnvelope`], not a reuse of it: `bleats`'
-/// own notices (`log_path_unknown`, `log_unreadable`, `dropped`,
-/// `daemon_shutdown`, `lagged`) used to go out through [`emit_error`], whose
-/// codes are otherwise exactly [`crate::exit::ExitCode::code_str`]'s
-/// taxonomy — a `--format json` consumer parsing stderr had no way to tell
-/// "the daemon is shutting down, informationally" from "this command
-/// failed", even on a clean run that exits 0. `cli_e2e.rs`'s
-/// `assert_json_error` pins the opposite rule for real errors: JSON on
-/// stderr means the command failed. A notice must not read that way, so it
-/// gets its own envelope key instead of a borrowed one.
+/// A sibling of [`ErrorEnvelope`], not a reuse of it: a notice must not
+/// read as a failure on the wire, so it gets its own envelope key.
 ///
-/// Only ever constructed by [`emit_notice`], whose own doc explains the
-/// `#[cfg_attr(windows, allow(dead_code))]` this struct also carries: every
-/// one of its callers lives in `commands/` or in `lib.rs`'s `#[cfg(unix)]`
-/// arms, so nothing on Windows ever reaches this either.
+/// Only ever constructed by [`emit_notice`]. `#[cfg_attr(windows,
+/// allow(dead_code))]`: every caller lives in `commands/` or `lib.rs`'s
+/// `#[cfg(unix)]` arms.
 #[derive(Debug, Serialize)]
 #[cfg_attr(windows, allow(dead_code))]
 struct NoticeEnvelope<'a> {
@@ -745,38 +535,19 @@ struct NoticeBody<'a> {
     message: &'a str,
 }
 
-/// Renders a non-failure diagnostic to whichever stream `out` names, in
-/// `fmt`, with a different envelope key than [`emit_error`] so a
-/// `--format json` consumer can tell a diagnostic from a failure without
-/// also cross-referencing the process exit code.
+/// Renders a non-failure diagnostic to `out` in `fmt`, keyed differently
+/// than [`emit_error`] so a `--format json` consumer can tell a
+/// diagnostic from a failure without checking the exit code.
 ///
-/// `out` is a plain parameter rather than always `streams.err`, because a
-/// notice plays two different roles depending on the verb: `bleats.rs`'s
-/// own follow-mode notices (the daemon shutting down, a lagged read) and
-/// `commands::muster::muster`'s "the roll restored nothing" are diagnostic
-/// asides beside a *separate* primary output (a log stream, a table), and
-/// pass `streams.err` -- the stream [`emit_error`] also uses, since a
-/// notice is not a sheep's line and not that separate output either. But
-/// `Commands::Style`'s no-table report and `start_bare_shepherd`'s (both
-/// `lib.rs`) pass `streams.out`: neither verb renders anything else, so the
-/// notice IS the command's whole answer, and belongs where an operator
-/// piping this command's real output expects to find it.
-///
-/// `code` is caller-defined, unlike `emit_error`'s `ExitCode::code_str()`:
-/// a notice's code is never part of the exit-code taxonomy — that gap is
-/// the whole reason this function exists rather than every notice call site
-/// continuing to borrow [`emit_error`].
-///
-/// Not called outside this module's own tests on Windows: every caller
-/// above -- `bleats.rs`/`muster.rs` in `commands/`, `Commands::Style`/
-/// `start_bare_shepherd` in `lib.rs` -- is `#[cfg(unix)]`-gated, directly or
-/// through `commands/`'s own module-level gate in `main.rs`.
+/// `out` is a plain parameter: a notice beside a separate primary output
+/// passes `streams.err`; one that is the command's whole answer passes
+/// `streams.out`. `code` is caller-defined, never part of
+/// `emit_error`'s exit-code taxonomy. A caller already holding a
+/// [`Streams`] can use [`Streams::note`] instead.
 ///
 /// # Errors
 /// The underlying write failed.
 #[cfg_attr(windows, allow(dead_code))]
-/// A caller that already holds a [`Streams`] and wants stdout can use
-/// [`Streams::note`] instead, which supplies the writer and the format.
 pub fn emit_notice(
     out: &mut dyn io::Write,
     fmt: Format,
@@ -802,16 +573,10 @@ pub fn emit_notice(
 /// Turns the result of an `emit`/`emit_error` write into the exit code that
 /// write earned.
 ///
-/// The one rule, stated once so Tasks 7-11 do not each reinvent it at their
-/// own `emit` call site: a write failure is [`ExitCode::Failure`], except
-/// [`io::ErrorKind::BrokenPipe`], which is [`ExitCode::Success`] —
-/// `shep flock | head` closes the pipe on purpose, and that is not a failed
-/// command.
-///
-/// Not called outside this module's own tests yet: `commands/` — the code
-/// that will call `emit`/`emit_error` and hand this function their `Result`
-/// — is Tasks 7-11. `#[allow(dead_code)]` says so explicitly rather than
-/// inventing a call site nothing needs yet.
+/// A write failure is [`ExitCode::Failure`], except
+/// [`io::ErrorKind::BrokenPipe`], which is [`ExitCode::Success`]:
+/// `shep flock | head` closes the pipe on purpose, and that is not a
+/// failed command.
 #[allow(dead_code)]
 #[must_use]
 pub fn write_outcome(result: io::Result<()>) -> ExitCode {
@@ -838,7 +603,7 @@ mod tests {
         sample_info(1, name, 60_000)
     }
 
-    /// One sheep (`"web"`), one dog (`"bark"`) — the smallest listing that
+    /// One sheep (`"web"`), one dog (`"bark"`): the smallest listing that
     /// exercises `emit_flock`'s split, shared by the three tests below.
     fn mixed_listing() -> Vec<ProcessInfo> {
         vec![sheep_info("web"), dog_info("bark", DogSource::BuiltIn)]
@@ -939,11 +704,9 @@ mod tests {
         );
     }
 
-    /// fails if the two populations are rendered into one table, or if the
-    /// dogs table is hidden behind a flag. Both halves: the sheep table must
-    /// not carry the dog's row, and the dogs table must appear with no flag
-    /// at all — a bark dog that has died is precisely what an operator needs
-    /// to notice, and hiding it means finding out by NOT being paged.
+    /// The dogs table needs no flag: a dead bark dog is what an operator
+    /// needs to notice, and hiding it means finding out by not being
+    /// paged.
     #[test]
     fn a_flock_listing_prints_the_dogs_in_their_own_table() {
         let mut out = Vec::new();
@@ -962,11 +725,8 @@ mod tests {
         assert!(!sheep_table.contains("bark"), "a dog is not a sheep");
         assert!(dogs_table.contains("bark"));
         assert!(!dogs_table.contains("web"));
-        // The dogs table DOES carry an ID column, and its columns line up
-        // with the sheep table's for every header the two share. It used to
-        // lead with NAME and put SOURCE second, so the two tables printed one
-        // under the other disagreed on the position of every column after the
-        // first. `DogRows`' own doc carries the ruling.
+        // The dogs table carries an ID column, and its columns line up
+        // with the sheep table's for every header the two share.
         assert!(
             dogs_table.starts_with("ID"),
             "the dogs table leads with ID, as the sheep table does: {dogs_table}"
@@ -997,7 +757,7 @@ mod tests {
     }
 
     /// A silent dog: process up, and it has never answered this shepherd.
-    /// `given_up` is the latch -- `Some(true)` for a dog the shepherd has
+    /// `given_up` is the latch: `Some(true)` for a dog the shepherd has
     /// stopped restarting, `Some(false)` for one it is still waiting on,
     /// `None` for a shepherd too old to have an opinion.
     fn silent_dog(name: &str, given_up: Option<bool>) -> ProcessInfo {
@@ -1008,14 +768,8 @@ mod tests {
         info
     }
 
-    /// fails if `silent` appears in a flock table with nothing to follow it
-    /// to.
-    ///
-    /// The word is right for the cell and wrong on its own: it names a
-    /// relationship rather than a state of the process, and an operator
-    /// cannot act on it from the table. This one line is the whole of the
-    /// fix at this surface -- the paragraph lives in `describe`, and this
-    /// says so by name.
+    /// `silent` names a relationship, not a state, and an operator cannot
+    /// act on it from this table alone: the paragraph lives in `describe`.
     #[test]
     fn a_silent_dog_is_pointed_at_the_view_that_explains_it() {
         let mut out = Vec::new();
@@ -1036,11 +790,8 @@ mod tests {
         );
     }
 
-    /// fails if the pointer squeezes into the table rather than sitting
-    /// under it. The dogs table's columns are pinned by
-    /// `a_flock_listing_prints_the_dogs_in_their_own_table`; this pins the
-    /// other half of the same rule -- that adding a consequence for `silent`
-    /// added no column and moved no cell.
+    /// Adding a consequence for `silent` must add no column and move no
+    /// cell.
     #[test]
     fn the_silence_pointer_sits_below_the_table_and_changes_no_column() {
         // The SAME dog either way, differing only in whether it has
@@ -1091,10 +842,8 @@ mod tests {
         );
     }
 
-    /// fails if a flock whose dogs are all talking grows a line about
-    /// silence. The same rule the `Dogs` caption itself follows: a listing
-    /// with nothing to report prints exactly what it printed before this
-    /// existed.
+    /// The same rule the `Dogs` caption itself follows: a listing with
+    /// nothing to report prints nothing extra.
     #[test]
     fn a_flock_with_no_silent_dog_says_nothing_about_silence() {
         let mut out = Vec::new();
@@ -1114,16 +863,9 @@ mod tests {
         assert!(!text.contains("shep describe"), "{text}");
     }
 
-    /// fails if `describe` reports a dog the shepherd has given up on the
-    /// same way it reports one it is still waiting for.
-    ///
-    /// This is the whole point of the per-entity view. Both rows read
-    /// `silent` in every table shep prints; the difference between them is
-    /// whether anything further is going to happen, and until `dog_stale`
-    /// reached the wire no surface said. The give-up arm must also NOT name
-    /// a cause -- the shepherd wrote what it actually saw into the dog's own
-    /// log, and inventing a second account here is the exact bug this phase
-    /// was opened for.
+    /// Both rows read `silent` everywhere else; only `dog_stale` says
+    /// whether anything further is going to happen. The give-up arm must
+    /// not name a cause: the shepherd's own account lives in the dog's log.
     #[test]
     fn describe_says_whether_the_shepherd_has_given_up_on_a_silent_dog() {
         let render = |info: ProcessInfo| {
@@ -1170,10 +912,6 @@ mod tests {
         );
     }
 
-    /// fails if a sheep, or a dog that is talking, picks up a paragraph it
-    /// has no use for. `describe` is the verb an operator runs on one
-    /// healthy sheep constantly, and a note under every one of those would
-    /// be the surest way to stop the note being read.
     #[test]
     fn describe_says_nothing_extra_about_a_row_that_is_not_silent() {
         let mut talking = dog_info("bark", DogSource::BuiltIn);
@@ -1195,10 +933,8 @@ mod tests {
         }
     }
 
-    /// fails if the JSON surface is split to match the tables. The machine
-    /// surface IS the single registry — one array, every entry, each
-    /// carrying its own marker — and a consumer that had to reassemble one
-    /// from two would be paying for a rendering decision.
+    /// The machine surface is the single registry: one array, every entry
+    /// carrying its own marker, never split to match the tables.
     #[test]
     fn the_json_surface_stays_one_array_of_every_entry() {
         let mut out = Vec::new();
@@ -1217,10 +953,8 @@ mod tests {
         assert_eq!(json["data"][1]["dog"]["kind"], "built_in");
     }
 
-    /// fails if a flock with no dogs prints an empty second table. An empty
-    /// table still prints its header row (`render_table`'s own rule), so a
-    /// caption and a bare header line would appear under every listing on
-    /// every machine running no dogs at all.
+    /// An empty table still prints its header row, so a caption here
+    /// would surface a bare header line under every dogless listing.
     #[test]
     fn a_flock_with_no_dogs_prints_one_table_and_no_caption() {
         let mut out = Vec::new();
@@ -1236,11 +970,6 @@ mod tests {
         assert!(!text.contains("Dogs"));
     }
 
-    /// fails if the caption stops saying what the list is not. This is the
-    /// whole honesty requirement for the feature: the walk is a parent-pid
-    /// tree and the kill is a process group, they diverge in both
-    /// directions, and the operator reading the table is reading neither
-    /// the type doc nor `--help`.
     #[test]
     fn the_lamb_caption_does_not_promise_the_kill_set() {
         let info = ProcessInfo::builder(3, "web", ProcStatus::Online)
@@ -1269,10 +998,7 @@ mod tests {
         assert!(rendered.contains("node"), "{rendered}");
     }
 
-    /// fails if a sheep with no lambs grows an empty section. `describe`
-    /// printed one table before this task and must print exactly that for
-    /// the overwhelmingly common sheep — the same rule `emit_flock` follows
-    /// for a flock with no dogs.
+    /// The same rule `emit_flock` follows for a flock with no dogs.
     #[test]
     fn a_sheep_with_no_lambs_renders_exactly_what_it_did_before() {
         let bare = ProcessInfo::builder(3, "web", ProcStatus::Online)
@@ -1298,10 +1024,7 @@ mod tests {
         }
     }
 
-    /// fails if the JSON surface changes shape. `--format json` stays one
-    /// array of `ProcessInfo`, each row carrying its own `lambs` — a
-    /// consumer must not have to reassemble a listing out of two payloads,
-    /// which is the same rule `emit_flock`'s own JSON arm follows for dogs.
+    /// The same rule `emit_flock`'s JSON arm follows for dogs.
     #[test]
     fn the_json_surface_stays_one_array_with_lambs_on_each_row() {
         let info = ProcessInfo::builder(3, "web", ProcStatus::Online)
@@ -1323,10 +1046,8 @@ mod tests {
         assert_eq!(rows[0]["lambs"][0]["pid"], 4243);
     }
 
-    /// fails if the Pending/Overridden headings stop naming the field lists
-    /// or stop pointing at `shep reload <name>` as what promotes a parked
-    /// config -- the brief's own requirement, and the one fact an operator
-    /// reading this table cannot get anywhere else.
+    /// `shep reload <name>` is the one fact an operator reading this
+    /// table cannot get anywhere else.
     #[test]
     fn describe_names_pending_and_overridden_fields_and_the_promoting_verb() {
         let info = ProcessInfo::builder(3, "web", ProcStatus::Online)
@@ -1353,19 +1074,15 @@ mod tests {
         assert!(rendered.contains("max_restarts"), "{rendered}");
     }
 
-    /// fails if a sheep with neither a pending config nor an override grows
-    /// either heading. `describe` printed no such section before task 12
-    /// and must print exactly that for the overwhelmingly common sheep --
-    /// the same rule `a_sheep_with_no_lambs_renders_exactly_what_it_did_before`
-    /// follows for lambs.
+    /// The same rule
+    /// `a_sheep_with_no_lambs_renders_exactly_what_it_did_before` follows
+    /// for lambs.
     #[test]
     fn a_sheep_with_neither_list_renders_neither_heading() {
-        // Both spellings of "nothing to say". `None` is a daemon that
-        // carried no list at all; `Some(vec![])` is one that carried an
-        // empty one, which is what the store answers for an app with no
-        // parked config. The empty filter on each `as_deref` is the only
-        // thing standing between the second and a heading over no fields,
-        // so a test that only passed `None` would not notice its removal.
+        // Both spellings of "nothing to say": `None`, and `Some(vec![])`,
+        // which is what the store answers for an app with no parked
+        // config. The `as_deref` filter is what keeps the second from
+        // heading over no fields.
         for (pending, overridden) in [
             (None, None),
             (Some(Vec::new()), Some(Vec::new())),
@@ -1399,10 +1116,8 @@ mod tests {
         }
     }
 
-    /// fails if a clustered app prints its parked config once per instance.
-    /// `apply_one` writes the same store entry onto every slot of a name, so
-    /// three rows carry three identical lists and the operator reads the
-    /// same block three times.
+    /// `apply_one` writes the same store entry onto every slot of a name,
+    /// so three rows carry three identical lists.
     #[test]
     fn a_clustered_app_prints_each_config_section_once() {
         let rows: Vec<ProcessInfo> = (0..3)
@@ -1434,11 +1149,8 @@ mod tests {
         );
     }
 
-    /// fails if the JSON surface changes shape for pending/overridden, the
-    /// same rule `the_json_surface_stays_one_array_with_lambs_on_each_row`
-    /// pins for lambs: one array of `ProcessInfo`, each row carrying its
-    /// own fields, never a second payload the headings above are built
-    /// from.
+    /// The same rule `the_json_surface_stays_one_array_with_lambs_on_each_row`
+    /// pins for lambs.
     #[test]
     fn describes_json_surface_carries_pending_and_overridden_on_each_row() {
         let info = ProcessInfo::builder(3, "web", ProcStatus::Online)
@@ -1464,10 +1176,7 @@ mod tests {
 
     /// `Streams` carries `&mut dyn io::Write`, which has no `Debug` of its
     /// own, so the manual impl is the only thing standing between a future
-    /// refactor and either a compile error or (worse, if someone works
-    /// around it) a `Debug` that leaks whatever the streams happen to hold.
-    /// Precedent: `shep-core/src/config/app.rs`'s `debug_redacts_env_values`
-    /// (IR-41 — exact-string pin so a lazy derive can't slip back in).
+    /// refactor and a `Debug` that leaks whatever the streams hold.
     #[test]
     fn streams_debug_is_the_redacted_placeholder() {
         let mut out = Vec::new();
@@ -1500,10 +1209,9 @@ mod tests {
         assert_eq!(write_outcome(Ok(())), ExitCode::Success);
     }
 
-    /// Item 4 (whole-branch review): a notice's JSON envelope must key on
-    /// `notice`, not `error` — a consumer parsing `--format json` stderr
-    /// needs to tell a diagnostic from a failure without also having to
-    /// know the process exit code.
+    /// A notice's JSON envelope keys on `notice`, not `error`: a consumer
+    /// parsing `--format json` stderr must tell a diagnostic from a
+    /// failure without also reading the process exit code.
     #[test]
     fn a_notice_under_format_json_uses_the_notice_key_not_the_error_key() {
         let mut err = Vec::new();
@@ -1526,10 +1234,8 @@ mod tests {
         );
     }
 
-    /// The table-mode sibling of the JSON test above: `notice[code]:
-    /// message`, not `error[code]: message` — the same visual grammar
-    /// `emit_error` uses, but a different word, so a human at a terminal can
-    /// tell the two apart at a glance too.
+    /// `notice[code]: message`, not `error[code]: message`: the same
+    /// grammar `emit_error` uses, but a different word.
     #[test]
     fn a_notice_under_format_table_is_plain_text_prefixed_notice() {
         let mut err = Vec::new();
@@ -1545,23 +1251,18 @@ mod tests {
         assert!(text.contains("the daemon dropped 3 events"));
     }
 
-    // --- cli-plumbing-ergonomics Task 1: pin the wire bytes -------------
-    //
-    // The refactor in flight (Tasks 2-3 of that plan) touches 91
-    // `emit_error` call sites, 84 signatures and 66 `map_err`s, exactly
-    // the diff shape where a behaviour change hides in the noise. These
-    // three tests snapshot the literal bytes `emit_error`/`emit_notice`
-    // write today, in both formats, so that refactor has something byte-
-    // exact to answer to instead of "the suite is still green."
+    // --- pin the wire bytes ----------------------------------------------
 
-    /// `emit_error`'s two renderings, side by side: `error[code]: message`
-    /// on the table surface, the `ErrorEnvelope` JSON object on the other.
+    // These three tests snapshot the literal bytes `emit_error`/
+    // `emit_notice` write, in both formats, so a refactor across call
+    // sites has something byte-exact to answer to.
+
+    /// Both emitters, both formats: an ESC or BEL in the message must
+    /// never reach the stream.
     #[test]
     fn no_escape_reaches_a_stream_through_either_emitter() {
-        // The class fix. `fetch.rs` sanitises the two error texts that come
-        // off the wire today, but the guarantee has to live where every
-        // caller passes through, or the next one to carry somebody else's
-        // bytes reintroduces the hole silently.
+        // `fetch.rs` sanitises the two error texts that come off the wire,
+        // but the guarantee has to live where every caller passes through.
         let hostile = "cleared\u{1b}[2Jand\u{1b}]0;retitled\u{7}";
         for fmt in [Format::Table, Format::Json] {
             for (what, mut out) in [("error", Vec::new()), ("notice", Vec::new())] {
@@ -1599,10 +1300,6 @@ mod tests {
         }
     }
 
-    /// `emit_notice`'s two renderings: `notice[code]: message` on the table
-    /// surface, the `NoticeEnvelope` JSON object on the other. The
-    /// `notice` key is the whole reason this function exists rather than
-    /// reusing `emit_error`, so its shape belongs in the baseline too.
     #[test]
     fn what_a_notice_looks_like_on_the_wire() {
         for (fmt, name) in [(Format::Table, "table"), (Format::Json, "json")] {
@@ -1634,16 +1331,16 @@ mod tests {
         }
     }
 
-    // --- Task 5b: colour, and the face in the STATUS column ------------
+    // --- Colour, and the face in the STATUS column ------------------------
 
     use std::ffi::OsStr;
 
     use crate::style::StyleLevel;
 
-    /// Spec §5: `NO_COLOR` removes colour at `full`, leaving sheep and
-    /// boxes alone. Asserted on the rendered STRING, not on the resolved
-    /// [`Presentation`]: the struct could fold `NO_COLOR` in correctly and
-    /// a bug in `rows::status_cell` could still emit an escape regardless.
+    /// `NO_COLOR` removes colour at `full`, leaving sheep and boxes alone.
+    /// Asserted on the rendered string, not the resolved [`Presentation`]:
+    /// the struct could fold `NO_COLOR` in correctly and a bug in
+    /// `rows::status_cell` could still emit an escape regardless.
     #[test]
     fn no_color_at_full_keeps_sheep_and_boxes_but_drops_colour() {
         let presentation =
@@ -1686,16 +1383,13 @@ mod tests {
         assert!(!rendered.contains("(x.x)"), "no face at bare: {rendered}");
     }
 
-    /// Spec §2: the face appears at `full`; at `plain` the plain word alone
-    /// does (`plain` is "no sheep", not "no colour" — colour still
-    /// survives); neither survives at `bare`.
+    /// The face appears at `full`; at `plain` the plain word alone does
+    /// (`plain` is "no sheep", not "no colour"); neither survives at
+    /// `bare`.
     ///
-    /// Also the demo this task's brief asks for: run with `-- --nocapture`
-    /// and read what each level actually looks like. An exact-string test
-    /// proves the code matches a string, not that the result is legible —
-    /// `welcome.rs` shipped a silently unaligned sheep past a passing one,
-    /// because the expected value was written with the same mistake this
-    /// printed output lets a human actually catch.
+    /// Run with `-- --nocapture` to read what each level looks like: an
+    /// exact-string test proves the code matches a string, not that the
+    /// result is legible.
     #[test]
     fn the_three_levels_render_the_status_column_differently_and_look_right() {
         let flock = FlockRows(vec![
@@ -1744,25 +1438,14 @@ mod tests {
         assert!(!bare.contains('\u{1b}'), "{bare:?}");
     }
 
-    /// Spec §2: the STATUS word is the first thing dropped from that
-    /// column, before any whole column is. `waiting-restart` (15
-    /// characters) is the longest status word, chosen so face-plus-word
-    /// alone forces a column past a width face-alone comfortably fits —
-    /// exercising `Render::rows_for` and `table::render_boxed_ex` directly,
-    /// the same two calls `table_of`'s own two-pass retry makes -- `table_of`
-    /// could be driven at this same chosen width too now that width is an
-    /// injected `Presentation` field rather than a real-terminal read, but
-    /// this test stays at the lower level anyway, to pin the exact retry
-    /// mechanics rather than `table_of`'s outer wrapping around them.
+    /// The STATUS word drops before any whole column does.
+    /// `waiting-restart` (15 characters) is the longest status word,
+    /// chosen so face-plus-word forces a column past a width face-alone
+    /// fits. Exercises `Render::rows_for` and `table::render_boxed_ex`
+    /// directly, the same two calls `table_of`'s own two-pass retry makes.
     ///
-    /// Width 90, not this module's usual 80: task 7's `SMIT` column, empty
-    /// here and the highest priority number, is what face-alone now needs
-    /// dropped at 80 -- the same seven-column cost `output/table.rs`'s own
-    /// tests record for adding a column nobody's row fills -- and task 12's
-    /// own `CFG` column moved it six columns further still, from 84 to 90,
-    /// for the same reason (`output/table.rs`'s own
-    /// `full_wide_pins_face_word_and_colour_for_a_mixed_flock` has that
-    /// arithmetic).
+    /// Width 90, not this module's usual 80: `SMIT` and `CFG` cost the
+    /// same extra columns `output/table.rs`'s own tests record.
     #[test]
     fn the_word_drops_before_a_whole_column_does() {
         let flock = FlockRows(vec![
@@ -1804,9 +1487,7 @@ mod tests {
     }
 
     /// The JSON arms serialize the payload directly and never call
-    /// `rows`/`rows_for` — asserted rather than trusted, since a future
-    /// refactor that routed JSON through `rows_for` "for consistency" would
-    /// be exactly the byte-identical rule breaking silently.
+    /// `rows`/`rows_for`.
     #[test]
     fn colour_never_reaches_format_json() {
         let flock = FlockRows(vec![

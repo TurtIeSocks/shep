@@ -13,12 +13,8 @@ use crate::{Streams, cli::InitArgs, commands::runtime::get_cwd, exit::ExitCode};
 
 /// Writes a scaffolded Flockfile.
 ///
-/// The extension chooses the language, in all three of the ways a path can
-/// be arrived at: given explicitly, discovered under `--force`, or defaulted
-/// to `Flockfile.toml`. That is the whole reason `--force` is safe now --
-/// it rewrites the file that is there in the language that file already
-/// speaks, rather than dropping TOML into a `.yaml` and leaving something
-/// no parser will accept.
+/// The extension chooses the language however the path was arrived at: given
+/// explicitly, discovered under `--force`, or defaulted to `Flockfile.toml`.
 pub async fn init(streams: &mut Streams<'_>, args: &InitArgs) -> ExitCode {
     let cwd = match get_cwd(streams) {
         Ok(cwd) => cwd,
@@ -37,11 +33,8 @@ pub async fn init(streams: &mut Streams<'_>, args: &InitArgs) -> ExitCode {
         }
     };
 
-    // Truncate in place rather than staging and renaming. `shep style`'s
-    // writer stages, because it edits a file it must not corrupt half way;
-    // this one replaces the whole contents, and truncating keeps the inode
-    // and follows a symlink to whatever the operator pointed it at, which is
-    // what somebody who symlinked their Flockfile meant.
+    // Truncate in place: keeps the inode, and follows a symlink to what the
+    // operator pointed it at.
     let written = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -96,10 +89,8 @@ fn target(
                 ),
             ));
         }
-        // Writing a second Flockfile beside an existing one is legal and
-        // almost never meant: discovery walks a fixed order, so the new file
-        // can be one shep never reads. Said out loud rather than refused,
-        // because an operator naming a path explicitly may well be migrating.
+        // Discovery walks a fixed order, so a second Flockfile beside an
+        // existing one can be one shep never reads. Said, not refused.
         if let Some(existing) = discover(cwd)
             && existing != path
         {
@@ -128,9 +119,7 @@ fn target(
                 ));
             }
             // Every name `discover` returns carries a known extension, so
-            // this cannot be `None` -- but a plain `expect` here would be a
-            // panic on a path an operator can reach, so it degrades to TOML
-            // rather than aborting.
+            // this cannot be `None`. Degrades rather than panicking.
             let format = FlockFormat::from_path(&existing).unwrap_or(FlockFormat::Toml);
             Ok((existing, format))
         }

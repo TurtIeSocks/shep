@@ -1,6 +1,5 @@
-//! The padded table renderer and human-readable duration formatting — the
-//! two pieces of `--format table` that have nothing to do with any one
-//! payload type.
+//! The padded table renderer and human-readable duration formatting, the
+//! two pieces of `--format table` independent of any payload type.
 
 use super::Render;
 use super::width::visible_width;
@@ -8,28 +7,14 @@ use super::width::visible_width;
 /// Renders any payload as the padded table, returned rather than printed so
 /// a test can read it. [`emit`](super::emit) calls this for `Format::Table`.
 ///
-/// Column widths come from the widest cell in each column, header included;
-/// cells are padded and separated by two spaces. No box-drawing characters —
-/// a table a user can `awk` over beats one that looks nice. An empty payload
-/// still prints the header row: a bare blank line would not tell the user
-/// whether the command worked.
-///
-/// Widths are counted in `char`s, not bytes: `{:<w$}` pads by character
-/// count, so measuring in bytes would over-pad any column holding a
-/// multi-byte name (CJK, emoji) relative to `headers()`'s own char-counted
-/// width.
+/// Column widths come from the widest cell in each column, header included,
+/// measured in display columns via [`visible_width`] so a CJK or emoji cell
+/// pads correctly. Cells are separated by two spaces with no box-drawing
+/// characters. An empty payload still prints the header row.
 ///
 /// # Panics
 /// If any row `T::rows()` returns has a different number of cells than
-/// `T::headers()`. Every real `Render` impl keeps the two in lockstep —
-/// rows.rs's own anti-drift tests police that — so this only fires if a
-/// future impl breaks that invariant; better a loud, type-named panic here
-/// than a silent `index out of bounds` two lines down in [`write_row`].
-///
-/// Not called outside this module's own tests yet: `emit`'s `Format::Table`
-/// arm is its only real caller, and `emit` itself has no caller until Tasks
-/// 7-11 land. `#[allow(dead_code)]` says so explicitly rather than
-/// inventing a call site nothing needs yet.
+/// `T::headers()`.
 #[allow(dead_code)]
 #[track_caller]
 pub fn render_table<T: Render>(data: &T) -> String {
@@ -62,15 +47,13 @@ pub fn render_table<T: Render>(data: &T) -> String {
     out
 }
 
-/// Appends one row: every cell but the last padded to its column's width and
-/// followed by two spaces, the last cell unpadded so no line carries
-/// trailing whitespace.
+/// Appends one row: every cell but the last padded to its column's width
+/// and followed by two spaces; the last cell is unpadded so no line
+/// carries trailing whitespace.
 ///
-/// Padded by hand rather than with `{cell:<width$}`, and the difference is
-/// the point: that format spec counts `char`s, so a CJK name gets half the
-/// spaces it needs and every column after it slides left. `boxed_row` below
-/// pads by [`visible_width`] for the same reason — this is the plain
-/// renderer catching up with the boxed one.
+/// Padded by hand via [`visible_width`] rather than `{cell:<width$}`,
+/// which counts chars: a CJK name would get half the spaces it needs and
+/// every column after it would slide left.
 fn write_row<'a>(out: &mut String, cells: impl Iterator<Item = &'a str>, widths: &[usize]) {
     let cells: Vec<&str> = cells.collect();
     let last = cells.len().saturating_sub(1);
@@ -87,12 +70,7 @@ fn write_row<'a>(out: &mut String, cells: impl Iterator<Item = &'a str>, widths:
 
 /// `uptime_ms` as the two largest non-zero units (`1h 2m`, `3m 4s`, `5s`,
 /// `0s`). The table surface is for a human; the JSON surface keeps the raw
-/// `uptime_ms` instead (no formatted duplicate — see `rows`'s own test).
-///
-/// Not called outside this module's own tests and `FlockRows::rows` yet, and
-/// `FlockRows::rows` itself has no real caller until Tasks 7-11 land.
-/// `#[allow(dead_code)]` says so explicitly rather than inventing a call
-/// site nothing needs yet.
+/// `uptime_ms` instead.
 #[allow(dead_code)]
 #[must_use]
 pub fn human_duration(ms: u64) -> String {
@@ -116,27 +94,15 @@ pub fn human_duration(ms: u64) -> String {
     }
 }
 
-/// Renders `at_ms` (unix millis, UTC by construction — [`Bark::at_ms`]'s own
-/// doc) as a local timestamp for a table cell: `shep barks`' `WHEN` column.
+/// Renders `at_ms` (unix millis) as a local timestamp for a table cell:
+/// `shep barks`' `WHEN` column.
 ///
-/// A local rendering, not UTC: `at_ms` is read during an incident, at a
-/// terminal, by an operator who thinks in wall-clock time — the same reason
-/// `human_duration`/`human_bytes` exist instead of a raw `uptime_ms`/
-/// `memory_bytes` echo. The raw millis stay in `--format json`'s `at_ms`
-/// field for a consumer that wants to do its own arithmetic; this is table
-/// output only.
+/// Local, not UTC: read during an incident by an operator who thinks in
+/// wall-clock time. `%Y-%m-%d %H:%M:%S`, not RFC3339: meant to be read at
+/// a glance, not parsed back.
 ///
-/// `%Y-%m-%d %H:%M:%S` rather than RFC3339: no `T`, no offset suffix — this
-/// is a column meant to be read at a glance, not parsed back, and the
-/// operator's own local zone is implied by every other clock in the room.
-///
-/// A millis value too large to fit `i64` (`u64::MAX`, a corrupt or
-/// far-future record) renders as the raw number rather than failing the
-/// whole row: [`shep_core::barks::read`]'s own doc already tolerates a bad
-/// *line*; a good line with one unrenderable field should not be dropped
-/// for a reason narrower than that.
-///
-/// [`Bark::at_ms`]: shep_core::barks::Bark::at_ms
+/// A millis value too large to fit `i64` renders as the raw number rather
+/// than failing the whole row.
 #[must_use]
 pub fn local_timestamp(at_ms: u64) -> String {
     let Ok(millis) = i64::try_from(at_ms) else {
@@ -154,7 +120,7 @@ pub fn local_timestamp(at_ms: u64) -> String {
 /// leaves at least one significant digit, one decimal place under 10.
 ///
 /// Not `MemSize`'s `Display`, which renders the largest unit dividing the
-/// value EXACTLY and so prints a live RSS of 50 462 720 bytes as
+/// value exactly and so prints a live RSS of 50 462 720 bytes as
 /// "50462720". A resident-set reading is never a round number of MiB.
 #[must_use]
 pub fn human_bytes(bytes: u64) -> String {
@@ -175,50 +141,36 @@ pub fn human_bytes(bytes: u64) -> String {
     format!("{bytes}B")
 }
 
-/// Columns that identify a sheep, and so are never dropped -- which three
-/// survive is entirely the caller's own choice (leave them at priority 0);
-/// this is only the floor below which [`render_boxed`] refuses to go.
+/// Columns that identify a sheep, and so are never dropped: which three
+/// survive is the caller's choice (leave them at priority 0). This is only
+/// the floor below which [`render_boxed`] refuses to go.
 const FLOOR_COLUMNS: usize = 3;
 
 /// [`render_boxed`]'s rendered string, paired with exactly which headers it
 /// hid.
 ///
-/// `table_of`'s two-pass STATUS-word retry (spec §2: the word drops before
-/// any whole column does) needs to know whether the first pass hid
-/// anything, without either scraping the footer string for the same answer
-/// or re-deriving this function's own `sum(w + 3) + 1` fit arithmetic a
-/// second time -- both of those are the kind of duplicated knowledge that
-/// drifts silently. [`render_boxed`] itself is a thin wrapper over
-/// [`render_boxed_ex`], kept so its own callers here (the property test and
-/// the unit tests below) see no difference.
+/// `table_of`'s two-pass STATUS-word retry needs to know whether the first
+/// pass hid anything, without re-deriving this function's own fit
+/// arithmetic a second time. [`render_boxed`] is a thin wrapper over
+/// [`render_boxed_ex`] so its callers see no difference.
 pub(crate) struct BoxedTable {
     pub(crate) rendered: String,
-    /// Headers hidden this render, sorted -- the same order the footer
-    /// names them in. Empty when everything fit.
+    /// Headers hidden this render, sorted the same order the footer names
+    /// them in. Empty when everything fit.
     pub(crate) dropped: Vec<String>,
 }
 
 /// Renders `rows` as a box-drawn table that fits `term_width`.
 ///
 /// Columns are dropped by descending priority until the table fits, never
-/// below [`FLOOR_COLUMNS`] -- a table that cannot say which sheep a row is
-/// about has stopped being a table. What was dropped is named in a footer,
-/// because a column that vanishes silently is worse than one that is
-/// missing loudly.
+/// below [`FLOOR_COLUMNS`]: a table that cannot say which sheep a row is
+/// about has stopped being a table. What was dropped is named in a footer.
 ///
 /// Every width is computed with [`crate::output::width::visible_width`], so
-/// a styled cell pads by what it shows rather than by what it stores. This
-/// module's own property test is the real specification: any rows, any
-/// terminal width, any mix of styled and plain cells, every line of the
-/// table the same width, and that width inside the terminal unless the
-/// floor itself does not fit.
+/// a styled cell pads by what it shows rather than by what it stores.
 ///
-/// `output::mod`'s `table_of` -- every real caller in this crate -- reaches
-/// for [`render_boxed_ex`] instead, for the dropped-column list this
-/// function's own footer only renders as prose. Only this module's own
-/// tests call this form directly, so a plain (non-test) build has no
-/// caller at all. `#[allow(dead_code)]` says so explicitly rather than
-/// inventing a call site nothing needs yet.
+/// `output::mod`'s `table_of` reaches for [`render_boxed_ex`] instead, for
+/// the dropped-column list; only this module's own tests call this form.
 #[allow(dead_code)]
 pub(crate) fn render_boxed(
     headers: &[&str],
@@ -234,23 +186,16 @@ pub(crate) fn render_boxed(
 /// [`BoxedTable`] for why a caller would want that.
 ///
 /// Called by [`super::table_of`], which every table-rendering command in
-/// `commands/` goes through — `emit`, `emit_flock` and `emit_described` all
-/// reach it, never `render_boxed`/`render_boxed_ex` directly.
+/// `commands/` goes through.
 pub(crate) fn render_boxed_ex(
     headers: &[&str],
     rows: &[Vec<String>],
     priorities: &[u8],
     term_width: usize,
 ) -> BoxedTable {
-    // Sanitised once, here, rather than inside `column_widths` and
-    // `boxed_row` separately: a cell born from operator-chosen data (a
-    // sheep name, a bark message, an adopted dog's path) reaches this
-    // function raw, and `crate::output::width::visible_width`'s own doc
-    // names this as the box-drawn renderer's job, not its own. Sanitising
-    // once and reusing the result for both the width pass below and the
-    // print pass is also what keeps the two in agreement -- see
-    // `width::sanitize_cell`'s own doc for why sanitising twice risked
-    // drifting.
+    // Sanitised once, here: a cell born from operator-chosen data reaches
+    // this raw, and reusing the result for both the width pass and the
+    // print pass keeps them in agreement.
     let rows: Vec<Vec<String>> = rows
         .iter()
         .map(|row| {
@@ -270,11 +215,9 @@ pub(crate) fn render_boxed_ex(
         if total <= term_width || keep.len() <= FLOOR_COLUMNS {
             break;
         }
-        // The kept column with the highest priority number goes first --
-        // priority 0 is the caller's way of saying "never", so a priority-0
-        // column reaching this point means nothing droppable is left, and
-        // the table stays wider than the terminal rather than losing an
-        // identity column.
+        // The kept column with the highest priority number goes first.
+        // Priority 0 means never drop: reaching one here means nothing
+        // droppable is left, so the table stays wider than the terminal.
         let worst = keep
             .iter()
             .enumerate()
@@ -340,8 +283,8 @@ pub(crate) fn render_boxed_ex(
 
 /// The visible width each kept column needs: the widest of its header and
 /// every cell in it, measured by [`crate::output::width::visible_width`]
-/// rather than by length or byte count -- a styled cell must pad by what it
-/// shows, the same reason [`boxed_row`] measures it the same way.
+/// rather than by length or byte count, so a styled cell pads by what it
+/// shows.
 fn column_widths(headers: &[&str], rows: &[Vec<String>], keep: &[usize]) -> Vec<usize> {
     keep.iter()
         .map(|&col| {
@@ -411,25 +354,18 @@ mod tests {
         assert_eq!(human_duration(0), "0s");
     }
 
-    /// The day arm (`units[0]` in `human_duration`) is otherwise untouched
-    /// by the test above, which never reaches a value >= 24h. Both cases
-    /// also pin the "skip a zero middle unit" rule: 1d 5m has no hours, 1h
-    /// 2s has no minutes, and each still takes exactly its two largest
-    /// nonzero units rather than pairing adjacent slots regardless of value.
+    /// The day arm (`units[0]`) is untouched by the test above. Both cases
+    /// also pin skipping a zero middle unit.
     #[test]
     fn human_duration_day_arm_skips_a_zero_middle_unit() {
         assert_eq!(human_duration(86_700_000), "1d 5m"); // 1 day + 5 minutes, 0 hours
         assert_eq!(human_duration(3_602_000), "1h 2s"); // 1 hour + 2 seconds, 0 minutes
     }
 
-    /// Round-trips a real millis value through [`local_timestamp`] and back,
-    /// rather than pinning a fixed string — this test must pass on any
-    /// machine in any `$TZ`, and `std::env::set_var` is `unsafe` in edition
-    /// 2024 (this crate is `#![forbid(unsafe_code)]`), so there is no way to
-    /// pin the host's own zone from inside the test. Parsing the rendered
-    /// cell back as a *local* naive datetime and converting it back to UTC
-    /// is what actually proves the cell names the same instant `at_ms`
-    /// does, whatever zone rendered it.
+    /// Round-trips through the host's own zone rather than pinning a fixed
+    /// string: `std::env::set_var` is `unsafe` in this
+    /// `#![forbid(unsafe_code)]` crate, so `$TZ` cannot be pinned from
+    /// inside the test.
     #[test]
     fn local_timestamp_round_trips_through_the_hosts_own_zone() {
         let at_ms: u64 = 1_700_000_000_000; // 2023-11-14T22:13:20Z, an arbitrary real moment
@@ -456,12 +392,6 @@ mod tests {
         );
     }
 
-    /// fails if a millis value this crate cannot render (too large for
-    /// `i64`, or in-range for `i64` but outside chrono's representable
-    /// calendar) panics or silently drops the row, rather than falling back
-    /// to the raw number — [`shep_core::barks::read`]'s own doc already
-    /// tolerates a bad *line*; a good line with one unrenderable field
-    /// should not be dropped for a narrower reason than that.
     #[test]
     fn local_timestamp_falls_back_to_the_raw_number_when_it_will_not_render() {
         assert_eq!(
@@ -477,10 +407,8 @@ mod tests {
     }
 
     /// `render_table`'s own defensive check, not `assert_no_drift`'s
-    /// (rows.rs) — that gate polices every real `Render` impl's `rows()`
-    /// against its own `Serialize` output, but says nothing about a `rows()`
-    /// that is simply wrong by construction. This type exists only to
-    /// reach that panic and pin its message.
+    /// (rows.rs): that gate polices `rows()` against `Serialize`, but says
+    /// nothing about a `rows()` that is wrong by construction.
     struct MalformedRow;
 
     impl serde::Serialize for MalformedRow {
@@ -522,10 +450,8 @@ mod tests {
             .build()
     }
 
-    /// fails if `human_bytes` renders a live RSS as raw digits. `MemSize`'s
-    /// own Display only names a unit that divides the value exactly, and a
-    /// resident set is never an exact number of MiB — so a column built on
-    /// it would show "50462720" where an operator expects "48.1M".
+    /// `MemSize`'s own Display only names a unit that divides the value
+    /// exactly, and a resident set is never an exact number of MiB.
     #[test]
     fn bytes_render_with_a_unit_a_reader_can_scan() {
         assert_eq!(human_bytes(0), "0B");
@@ -535,32 +461,14 @@ mod tests {
         assert_eq!(human_bytes(u64::MAX), "16.0E");
     }
 
-    /// "羊" is one character, three bytes in UTF-8, and **two columns** on a
-    /// terminal. All three numbers differ, and only one of them is the width
-    /// of the column it needs.
-    ///
-    /// This test used to assert the middle one — that two names with equal
-    /// *character* counts render to equal-width rows — and that assertion was
-    /// the bug, pinned. A six-character CJK name draws twice as wide as a
-    /// six-character ASCII one, so a table that gives them the same column
-    /// hangs the CJK name over its own border and shoves every column after
-    /// it left. `docs/specs/deferred.md` recorded the same fault in
-    /// `lookout`'s `fit`; both are measured by
-    /// [`crate::output::width::char_columns`] now.
-    ///
-    /// So the property is stated in columns, and on the HEADER line as well
-    /// as the row. The two fixtures differ only in their name, so both lines
-    /// have to widen by exactly what that name draws wider — and only the
-    /// header line proves the *padding* moved, since the row's own NAME cell
-    /// is that name and would widen whatever the column did. Asserting on
-    /// one line alone would leave [`visible_width`] free to return a
-    /// constant.
+    /// "羊" is one character, three bytes, two display columns. Asserts on
+    /// both the header line and the row: only the header line proves the
+    /// padding moved, since the row's own NAME cell is that name and would
+    /// widen regardless.
     ///
     /// Not asserted: that a table's lines are all one width. `write_row`
-    /// leaves the last cell unpadded on purpose so no line carries trailing
-    /// whitespace, so they are not, and the boxed renderer's own
-    /// `every_line_of_a_boxed_table_has_the_same_visible_width` is where
-    /// that property belongs.
+    /// leaves the last cell unpadded, so they are not; that property
+    /// belongs to `every_line_of_a_boxed_table_has_the_same_visible_width`.
     #[test]
     fn column_widths_count_display_columns_not_characters_or_bytes() {
         let ascii_name = "wwwwww".to_string(); // 6 chars, 6 bytes, 6 columns
@@ -592,28 +500,21 @@ mod tests {
         );
     }
 
-    /// The lines that make up the table itself -- top rule, header, the
-    /// separator, each row, bottom rule -- rather than every line
-    /// `render_boxed` returns. The footer's width has nothing to do with
-    /// the table's (it is prose, not a box), so a same-width check over the
-    /// raw output would fail the moment any column drops. Every box-drawn
-    /// line starts with one of these four characters and nothing else does.
+    /// The lines that make up the table itself: top rule, header,
+    /// separator, each row, bottom rule, rather than every line
+    /// `render_boxed` returns. The footer is prose, not a box, so a
+    /// same-width check over the raw output would fail once a column drops.
     fn table_lines(out: &str) -> Vec<&str> {
         out.lines()
             .filter(|l| l.starts_with(['┌', '├', '│', '└']))
             .collect()
     }
 
-    /// One cell's raw text before the `styled` wrapper below decides whether
-    /// to also wrap it in a colour span: plain words most of the time, and
-    /// -- whole-branch review item 3 -- occasionally a control character
-    /// (`\n`/`\r`/`\t`, the exact class `sanitize_cell` exists to escape) or
-    /// an unterminated CSI introducer with no final byte, the exact class it
-    /// exists to drop. Before this task the strategy only ever generated
-    /// `[a-z(). -]`, so this property test could hold even though the
-    /// renderer had never actually been asked to sanitise a cell -- it
-    /// stepped around the reachable case (`normalize()` rejects only `/`,
-    /// `\`, `.` and `..` in a name) rather than covering it.
+    /// One cell's raw text before the `styled` wrapper below decides
+    /// whether to also wrap it in a colour span: plain words most of the
+    /// time, and occasionally a control character (`\n`/`\r`/`\t`, the
+    /// class `sanitize_cell` escapes) or an unterminated CSI introducer
+    /// with no final byte, the class it drops.
     fn dirty_cell_text() -> impl proptest::strategy::Strategy<Value = String> {
         use proptest::prelude::*;
 
@@ -621,22 +522,16 @@ mod tests {
             3 => "[a-z(). -]{0,12}".prop_map(String::from),
             1 => ("[a-z]{0,4}", prop_oneof![Just('\n'), Just('\r'), Just('\t')], "[a-z]{0,4}")
                 .prop_map(|(a, c, b)| format!("{a}{c}{b}")),
-            // Digits and `;` only after the introducer, never a letter --
-            // the same trap `an_unterminated_or_bare_escape_is_dropped_whole`
-            // (`width.rs`'s own test module) avoids for the same reason: a
-            // letter here is itself a valid final byte and would close the
-            // sequence the case means to leave open.
+            // digits and `;` only after the introducer, never a letter: a
+            // letter is itself a valid final byte and would close the
+            // sequence this case means to leave open.
             1 => "[a-z]{0,4}".prop_map(|a| format!("{a}\u{1b}[3;1")),
         ]
     }
 
-    /// The invariant the whole feature rests on. Any rows, any width, any
-    /// mix of styled and plain cells: every line of the table itself is the
-    /// same visible width, and that width is either inside the terminal or
-    /// the table has already been reduced to the floor of three columns --
-    /// below that width the floor wins over fitting (spec assumption 2:
-    /// three columns of worst-case cells cannot always fit a 20-column
-    /// terminal, and dropping an identity column is not the answer).
+    /// Any rows, any width, any mix of styled and plain cells: every line
+    /// of the table is the same visible width, either inside the terminal
+    /// or reduced to the floor of three columns.
     #[test]
     fn every_line_of_a_boxed_table_has_the_same_visible_width() {
         use proptest::prelude::*;
@@ -702,11 +597,9 @@ mod tests {
         assert!(wide.contains("FOLD"), "everything fits at 200:\n{wide}");
 
         let narrow = render_boxed(&headers, &rows, &priorities, 46);
-        // The footer legitimately names a dropped column by its header text
-        // (`the_footer_names_every_column_it_hid` below pins that), so a
-        // `narrow.contains("FOLD")` check over the whole render would fail
-        // on the footer's own announcement. What this assertion needs is
-        // that the *column* is gone from the table itself.
+        // The footer legitimately names a dropped column by header text, so
+        // a whole-render `contains("FOLD")` check would fail on the
+        // footer's own announcement.
         let narrow_table = table_lines(&narrow).join("\n");
         assert!(
             !narrow_table.contains("FOLD"),
@@ -729,12 +622,9 @@ mod tests {
 
     /// A dropped column is named, so nothing vanishes silently.
     ///
-    /// `term_width = 20`, not 30: at 30 the arithmetic (ID 5 + NAME 7 +
-    /// STATUS 9 + CPU 6 + FOLD 7 + 1 = 35) only needs FOLD's drop to fit
-    /// (35 -> 28 <= 30), so CPU would never reach the footer. At 20, FOLD's
-    /// drop (35 -> 28) still does not fit, CPU's drop (28 -> 22) still does
-    /// not fit either, and the floor of three stops the loop there -- both
-    /// names reach the footer.
+    /// `term_width = 20`, not 30: at 30, FOLD's drop alone fits, so CPU
+    /// never reaches the footer. At 20, both drops are needed before the
+    /// floor of three stops the loop, so both names reach the footer.
     #[test]
     fn the_footer_names_every_column_it_hid() {
         let headers = ["ID", "NAME", "STATUS", "CPU", "FOLD"];
@@ -755,10 +645,7 @@ mod tests {
         );
     }
 
-    /// No em dashes in copy a user reads -- the dropped-column footer is
-    /// prose, same discipline `welcome.rs`'s
-    /// `the_welcome_copy_has_no_em_dashes` and `status.rs`'s
-    /// `the_status_lines_have_no_em_dashes` already pin for their own copy.
+    /// The dropped-column footer is prose a user reads.
     #[test]
     fn the_dropped_column_footer_has_no_em_dashes() {
         let headers = ["ID", "NAME", "STATUS", "CPU", "FOLD"];
@@ -775,10 +662,9 @@ mod tests {
         assert!(!footer.contains('\u{2013}'), "en dash in footer: {footer}");
     }
 
-    /// `render_boxed_ex`'s own dropped list matches the footer it renders --
-    /// `table_of`'s two-pass retry (`output/mod.rs`) trusts this list
-    /// instead of re-deriving it, so this pins that the two never disagree.
-    /// `render_boxed` (its thin wrapper) renders the identical string.
+    /// `render_boxed_ex`'s dropped list matches the footer it renders:
+    /// `table_of`'s two-pass retry trusts this list instead of re-deriving
+    /// it. `render_boxed` renders the identical string.
     #[test]
     fn render_boxed_ex_reports_exactly_what_it_dropped() {
         let headers = ["ID", "NAME", "STATUS", "CPU", "FOLD"];
@@ -806,12 +692,9 @@ mod tests {
         );
     }
 
-    /// The concrete bug whole-branch review item 3 named: `shep-core`'s
-    /// `normalize()` rejects only `/`, `\`, `.` and `..` in a name, so a
-    /// name carrying an embedded newline reaches this renderer -- reachable,
-    /// not theoretical. Before `render_boxed_ex` sanitised every cell, a
-    /// literal `\n` inside `boxed_row`'s output split that one row across
-    /// two printed lines and misaligned every border beneath it.
+    /// `shep-core`'s `normalize()` rejects only `/`, `\`, `.` and `..` in a
+    /// name, so an embedded newline reaches this renderer: reachable, not
+    /// theoretical.
     #[test]
     fn a_name_with_an_embedded_newline_does_not_split_its_own_row() {
         let headers = ["ID", "NAME", "STATUS"];
@@ -822,7 +705,7 @@ mod tests {
             .lines()
             .filter(|l| l.starts_with(['┌', '├', '│', '└']))
             .collect();
-        // Top rule, header, separator, exactly one data row, bottom rule --
+        // Top rule, header, separator, exactly one data row, bottom rule:
         // five lines. A literal newline surviving into the cell would have
         // split that one data row into two, making it six.
         assert_eq!(box_lines.len(), 5, "{out}");
@@ -830,17 +713,12 @@ mod tests {
         assert!(!out.contains("web\nworker"), "no literal newline: {out:?}");
     }
 
-    // --- Task 7: pin every level, through the real rendering seam ---------
-    //
-    // Every snapshot below goes through `crate::output::table_of`, the seam
-    // `emit`/`emit_flock`/`emit_described` all call, over a `FlockRows` built
-    // from real `ProcessInfo` values -- never `render_boxed` called on
-    // hand-written cells. That is the whole difference between pinning box
-    // drawing and pinning the feature this branch built: the face comes from
-    // `vocabulary::face`, the colour from `output::paint::style_for` keyed
-    // off `vocabulary::role_of`, and the STATUS-word retry from `table_of`
-    // itself, and a snapshot that hand-writes `"(o.o) online"` walks past all
-    // three.
+    // --- Every level, through the real rendering seam ----------------------
+
+    // Every snapshot below goes through `crate::output::table_of` over a
+    // `FlockRows` built from real `ProcessInfo` values, never `render_boxed`
+    // on hand-written cells: the face, colour and STATUS-word retry all
+    // come from the real rendering path.
 
     use std::ffi::OsStr;
 
@@ -850,45 +728,18 @@ mod tests {
     use crate::output::table_of;
     use crate::style::{Presentation, StyleLevel};
 
-    /// Four sheep, one per role [`crate::vocabulary::role_of`] maps a status
-    /// to -- Meadow (Online), Butter (`butter`), Bark (Errored), Ink3
-    /// (Stopped). Every row the same status would pin one face and say
-    /// nothing about the other three (this task's own brief's Correction 2).
+    /// Four sheep, one per role [`crate::vocabulary::role_of`] maps a
+    /// status to: Meadow (Online), Butter (`butter`), Bark (Errored), Ink3
+    /// (Stopped). Every row the same status would pin one face only.
     ///
-    /// `butter` is a parameter rather than fixed at `Starting`, because the
-    /// two narrower snapshots below need two different Butter-role words at
-    /// the same fallback terminal width: the narrow one wants
-    /// `WaitingRestart` (`"waiting-restart"`, 15) specifically because it is
-    /// the longest status word -- see that test's own doc for the width
-    /// arithmetic this drives -- and the two `full_under_no_color`/`plain`
-    /// snapshots want `Starting` for no reason narrower than "some Butter
-    /// row has to exist and this one's doc comments already describe it".
+    /// `butter` is a parameter: the narrower snapshots below need different
+    /// Butter-role words at the same width, and `WaitingRestart`
+    /// (`"waiting-restart"`, 15 characters) is the longest.
     ///
-    /// Every other column is sized to fit a width of 80 -- the value every
-    /// `Presentation::new` call in this module's narrower tests passes
-    /// explicitly as `width`, injected rather than measured. `table_of`
-    /// reads `presentation.width`, never the process's own controlling
-    /// terminal, so this arithmetic holds on any machine this suite runs
-    /// on, a real developer's tty included (see [`crate::style::Presentation`]'s
-    /// own doc for why the field exists).
-    ///
-    /// One exception: `full_wide_pins_face_word_and_colour_for_a_mixed_flock`
-    /// stopped fitting at 80 the moment task 49 added an `EXIT` column (a
-    /// 4-wide column costs 7 -- its own width plus the renderer's 3-per-column
-    /// padding), and there was no free width left to give it. `EXIT` reads
-    /// `-` on every row here (none of these four sheep carries a real
-    /// `last_exit`), so the column itself is header-bound, not content-bound,
-    /// and there is nothing left to shrink in `NAME`/`PID` that would recover
-    /// seven columns without resorting to cryptic abbreviations. That test
-    /// widens its own `Presentation` instead -- see its own doc for the
-    /// number and the reasoning.
-    ///
-    /// A second exception, the same shape: task 7's `SMIT` column costs
-    /// another seven columns here too (`"SMIT"` is also 4-wide, and none of
-    /// these four sheep carries one, so it reads `-` the same way `EXIT`
-    /// does). `full_narrow_drops_the_status_word_before_a_whole_column`
-    /// moved off 80 for the same reason -- see its own doc for the new
-    /// number.
+    /// Every column is sized to a width of 80, injected as
+    /// `Presentation::new`'s `width` rather than measured. `EXIT`, `SMIT`
+    /// and `CFG` all read `-` here yet still cost columns, so tests that
+    /// add them widen their own `Presentation` past 80.
     fn mixed_flock(butter: ProcStatus) -> FlockRows {
         FlockRows(vec![
             ProcessInfo::builder(0, "web", ProcStatus::Online)
@@ -903,22 +754,19 @@ mod tests {
         ])
     }
 
-    /// Not a behaviour test: a MEASUREMENT, recorded so the two-width tests
+    /// Not a behaviour test: a measurement, recorded so the two-width tests
     /// below rest on a number rather than an assumption. `unicode-width`
     /// classifies these two by East Asian Width, which is ambiguous for
-    /// some symbols and has moved between Unicode revisions, so what shep
-    /// thinks a smit occupies is worth writing down.
+    /// some symbols and has moved between Unicode revisions.
     #[test]
     fn how_wide_the_real_smits_actually_are() {
         assert_eq!(visible_width("\u{25b2} main@a1b2c3"), 13);
         assert_eq!(visible_width("\u{23f8} main@f6e5d4"), 13);
     }
 
-    /// A deep (256-colour) terminal, `xterm-256color` -- the same string
-    /// `output/mod.rs`'s own Task 5b tests use to exercise
-    /// `output::paint::style_for`'s deep tier rather than the 16-colour
-    /// fallback, since a snapshot pinned at the shallow tier would not catch
-    /// a regression in the tier most terminals in the wild actually use.
+    /// A deep (256-colour) terminal: exercises `output::paint::style_for`'s
+    /// deep tier rather than the 16-colour fallback, since most terminals
+    /// in the wild use it.
     fn deep_terminal() -> Option<&'static OsStr> {
         Some(OsStr::new("xterm-256color"))
     }
@@ -930,9 +778,9 @@ mod tests {
     }
 
     /// [`mixed_flock`], with two of its four rows carrying the real smit
-    /// strings a deploy dog paints -- not a hand-built `Some("x")`, since
-    /// the requirement under test is about a real smit at a real terminal
-    /// width. Taken verbatim from `~/GitHub/shep-deploy/src/smit.rs`.
+    /// strings a deploy dog paints, not a hand-built `Some("x")`: the
+    /// requirement under test is about a real smit at a real terminal
+    /// width.
     fn mixed_flock_with_smits() -> FlockRows {
         let mut flock = mixed_flock(ProcStatus::Starting);
         flock.0[0].smit = Some("\u{25b2} main@a1b2c3".to_string());
@@ -943,18 +791,10 @@ mod tests {
     /// `full`, comfortably wide enough: face, word and colour all present,
     /// nothing dropped.
     ///
-    /// Width 103, not this module's usual 80 (`mixed_flock`'s own doc has the
-    /// exception and the arithmetic): the `EXIT` and `SMIT` columns each
-    /// cost the fixture seven columns they had no slack left to give up, and
-    /// task 12's own `CFG` costs it six more (its content is `-` on every
-    /// row of this fixture, so its width is the three columns of its own
-    /// header plus the three-column separator), so 80 no longer fits
-    /// `Starting`'s word (`"starting"`, the second-longest Butter-role word
-    /// after `WaitingRestart`) alongside them. This test's own job was never
-    /// "prove it fits at exactly the realistic fallback" -- that boundary
-    /// belongs to the narrow snapshot below, which moved off 80 for the
-    /// same reason -- it is "prove nothing drops when there is room", and
-    /// 103 is still an ordinary terminal width, comfortably proving that.
+    /// Width 103, not this module's usual 80: `EXIT`, `SMIT` and `CFG` each
+    /// cost extra columns their `-` content never fills, leaving no slack
+    /// for `Starting`'s word. This proves nothing drops when there is room;
+    /// the narrow snapshot below proves the boundary itself.
     #[test]
     fn full_wide_pins_face_word_and_colour_for_a_mixed_flock() {
         let presentation = Presentation::new(StyleLevel::Full, None, deep_terminal(), None, 103);
@@ -970,29 +810,17 @@ mod tests {
         insta::assert_snapshot!(rendered);
     }
 
-    /// `full`, narrow enough that the STATUS word has dropped but no whole
-    /// column has -- spec §2's own ordering, and the one width-driven
-    /// behaviour a hand-written `render_boxed` call cannot exercise, since
-    /// only `table_of`'s two-pass retry knows to ask [`Render::rows_for`]
-    /// again with the word turned off.
+    /// `full`, narrow enough that the STATUS word drops but no whole column
+    /// does: the one width-driven behaviour a hand-written `render_boxed`
+    /// call cannot exercise, since only `table_of`'s two-pass retry asks
+    /// [`Render::rows_for`] again with the word turned off.
     ///
-    /// Swapping `mixed_flock`'s Butter row from `Starting` to
-    /// `WaitingRestart` grows its STATUS content from `"(o~o) starting"`
-    /// (14 columns) to `"(o~o) waiting-restart"` (21) -- seven columns more.
-    /// Width 93, not the module's usual 80: task 7's `SMIT` column (empty
-    /// here, same as `EXIT`) costs the fixture another seven columns it had
-    /// no slack left to give up, the same arithmetic `mixed_flock`'s own
-    /// doc records, and task 12's own `CFG` costs it six more on top of that
-    /// (`full_wide_pins_face_word_and_colour_for_a_mixed_flock`'s own doc
-    /// has that arithmetic). `render_boxed_ex`'s own priority order
-    /// (`FlockRows::PRIORITIES`) drops SMIT first on the word-included
-    /// pass, being the highest priority number, landing back under budget
-    /// without a second column needing to go. The retry itself asks for
-    /// every column again with the word off; every face is exactly 5
-    /// columns regardless of status (`vocabulary::face`'s own invariant),
-    /// so STATUS falls back to its 6-column header width and the whole
-    /// table fits with room for SMIT to return too -- word gone, SMIT and
-    /// FOLD both back, no footer.
+    /// Width 93: `SMIT` and `CFG` cost the fixture extra columns the same
+    /// way they do in `full_wide_pins_face_word_and_colour_for_a_mixed_flock`.
+    /// `render_boxed_ex`'s priority order drops SMIT first on the
+    /// word-included pass; the retry then asks again with the word off,
+    /// every face is a fixed 5 columns, and the table fits with SMIT back
+    /// too.
     #[test]
     fn full_narrow_drops_the_status_word_before_a_whole_column() {
         let presentation = Presentation::new(StyleLevel::Full, None, deep_terminal(), None, 93);
@@ -1009,20 +837,12 @@ mod tests {
     }
 
     /// The narrowest terminal that still shows every column, including the
-    /// smit. Asserted rather than assumed: `table.rs`'s own note at :875
-    /// records that adding EXIT cost 7 columns and forced the wide fixture
-    /// from 80 to 90, and task 12's own CFG moved it again, from 93 to 99
-    /// (six columns, `full_wide_pins_face_word_and_colour_for_a_mixed_flock`'s
-    /// own doc has the arithmetic). When a later column moves it again,
-    /// that is a decision about the maintainer's full-width condition, not a number to
-    /// quietly update.
+    /// smit. A later column that changes this width needs this number
+    /// updated, not left stale.
     const FULL_WIDTH: usize = 99;
 
-    /// fails if a smit is dropped at full width. The maintainer's permission to drop
-    /// it on a narrow terminal was conditional on it being seen regularly
-    /// at a wide one, so a later column that crowded it out here would
-    /// reopen a decision that was already made. This is the half of that
-    /// condition her permission does not state outright.
+    /// Guards the narrow-terminal drop below: dropping the smit there is
+    /// acceptable only if it still shows up regularly at full width.
     #[test]
     fn a_smit_is_never_dropped_at_full_width() {
         let rendered = table_of(&mixed_flock_with_smits(), full_at(FULL_WIDTH));
@@ -1056,10 +876,8 @@ mod tests {
         insta::assert_snapshot!(rendered);
     }
 
-    /// `plain`: boxes and colour survive, the word rides alone -- `plain` is
-    /// "no sheep", not "no colour" (spec §2, and `output/mod.rs`'s own
-    /// `the_three_levels_render_the_status_column_differently_and_look_right`
-    /// asserts the same thing without pinning the exact render).
+    /// `plain`: boxes and colour survive, the word rides alone. `plain` is
+    /// "no sheep", not "no colour".
     #[test]
     fn plain_pins_the_boxed_table_with_words_and_colour_but_no_face() {
         let presentation = Presentation::new(StyleLevel::Plain, None, deep_terminal(), None, 80);
@@ -1068,12 +886,8 @@ mod tests {
         insta::assert_snapshot!(rendered);
     }
 
-    /// `bare`: the hard rule made visible. Byte-identical to what
-    /// `render_table` printed before this whole feature existed -- no box,
-    /// no face, no escape -- so a border or an escape byte reaching this
-    /// file in review is the regression `cli_e2e.rs`'s piped-output assertion
-    /// exists to catch at the process boundary, seen here at the unit level
-    /// instead.
+    /// `bare`: byte-identical to `render_table`'s own output. No box, no
+    /// face, no escape.
     #[test]
     fn bare_pins_the_byte_identical_plain_table() {
         let rendered = table_of(&mixed_flock(ProcStatus::Starting), Presentation::BARE);
@@ -1089,10 +903,7 @@ mod tests {
     }
 
     /// `full` under `NO_COLOR`: sheep and boxes survive, colour alone is
-    /// vetoed -- the gap Correction 2 names explicitly: the spec asks for
-    /// this case and the earlier tasks' plan had no snapshot for it, only
-    /// `output/mod.rs`'s own assertion-based
-    /// `no_color_at_full_keeps_sheep_and_boxes_but_drops_colour`.
+    /// vetoed.
     #[test]
     fn full_under_no_color_pins_sheep_and_boxes_without_colour() {
         let presentation = Presentation::new(

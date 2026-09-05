@@ -9,9 +9,8 @@ license.workspace = true
 readme = "README.md"
 keywords = ["shep", "process-manager", "supervisor", "daemon", "cli"]
 categories = ["command-line-utilities", "os", "development-tools"]
-# The docs site, not docs.rs: this crate ships a CLI, and its three [[bin]]
-# targets are what somebody installs. docs.rs would render the thin library
-# underneath them, which is not what a reader of this package came for.
+# The docs site, not docs.rs: this crate ships a CLI, and docs.rs would
+# render the thin library underneath its three [[bin]] targets instead.
 documentation = "https://shep-pm.com"
 
 [lib]
@@ -34,19 +33,16 @@ name = "shep-dev"
 path = "src/bin/shep-dev.rs"
 
 # The .deb built by `.github/workflows/release-artifacts.yml`, for the
-# download-and-`dpkg -i` path documented in docs/distribution.md. That is not
-# `apt install`, which needs a signed repository nobody hosts yet.
+# download-and-`dpkg -i` path in docs/distribution.md, not `apt install`,
+# which needs a signed repository nobody hosts yet.
 #
-# Built against musl, never glibc. `depends = "$auto"` writes whatever glibc
-# the builder linked against; ubuntu-latest is 24.04, so a glibc build would
-# demand 2.39 and refuse to install on Debian 12 or Ubuntu 22.04. A static
-# musl binary makes the question disappear, and leaves `$auto` with nothing
-# to find.
+# Built against musl, never glibc: `depends = "$auto"` writes whatever glibc
+# the builder linked against, and ubuntu-latest's 2.39 would refuse to
+# install on Debian 12 or Ubuntu 22.04. A static musl binary avoids that.
 #
-# No systemd unit and no maintainer scripts, deliberately. `shep startup`
-# renders and installs the unit when an operator asks for one, and a
-# `postinst` that did it instead would write to a user's systemd state at
-# `dpkg -i` time, before they have written a Flockfile.
+# No systemd unit and no maintainer scripts: `shep startup` renders and
+# installs the unit when an operator asks, so a `postinst` doing it instead
+# would write to a user's systemd state before they have written a Flockfile.
 [package.metadata.deb]
 maintainer = "TurtIeSocks <TurtIeSocks@users.noreply.github.com>"
 copyright = "Copyright (c) TurtIeSocks"
@@ -80,8 +76,8 @@ assets = [
 [dependencies]
 # `features = ["schema"]`: `shep schema` prints `shep_core::config::
 # flockfile_schema_json()`, which only exists behind that feature. This
-# crate names no `schemars` type of its own for it — it calls a shep-core
-# function that returns a `String`.
+# crate names no `schemars` type of its own; it calls a shep-core function
+# that returns a `String`.
 shep-core = { workspace = true, features = ["schema"] }
 # Unconditional even though only its `#[cfg(unix)]` modules (`boot`, `sys`,
 # `tokio_runner`, `server`) are reachable here: the pure tier compiles on
@@ -89,150 +85,95 @@ shep-core = { workspace = true, features = ["schema"] }
 # dependency edge.
 shep-daemon.workspace = true
 shep-client.workspace = true
-# `dog::metrics`'s host reading (`shep_host_*`). Adds zero crates to the
-# tree: shep-daemon already carries `sysinfo` for its own tree sampler
-# (`limits/sample.rs`), and this is the same workspace-pinned version —
-# confirmed with `cargo tree -p shep-cli | grep sysinfo` showing exactly one
-# resolved version, matching `Cargo.lock`'s single `sysinfo` entry both
-# before and after this change.
+# `dog::metrics`'s host reading (`shep_host_*`). Adds zero crates: the same
+# workspace-pinned version shep-daemon already carries for its tree sampler
+# (`limits/sample.rs`).
 sysinfo.workspace = true
-# `serve`'s basic-auth comparison, through `hmac::sign`/`hmac::verify` — see
-# `serve/auth.rs`'s `credentials_match` doc comment for why it is `hmac` and
-# not `constant_time`/`digest` as this phase's plan originally specified:
-# `ring::constant_time` is `deprecated_constant_time` under an alias in the
-# 0.17.14 this workspace resolves, and its own doc comment disclaims side-
-# channel guarantees for external callers. Adds ZERO crates to the tree —
-# `tokio-rustls` above already pulls this exact version in for the bark
-# dog's TLS (Cargo.lock resolves one `ring`), and this crate already pays
-# ring's `cc` build script on every cross-compile. Named directly rather
-# than reached through `tokio_rustls::rustls`: rustls does not re-export
-# ring's hmac, and a crate that uses a dependency says so.
+# `serve`'s basic-auth comparison, through `hmac::sign`/`hmac::verify`, not
+# `ring::constant_time`: that module is `deprecated_constant_time` under an
+# alias in 0.17.14, and its own doc disclaims side-channel guarantees for
+# external callers. Adds zero crates: `tokio-rustls` above already pulls
+# this exact version in for the bark dog's TLS. Named directly since rustls
+# does not re-export ring's hmac.
 ring = { version = "0.17", default-features = false }
-# How many terminal columns a `char` occupies, for `output::width` (which
-# every table cell is padded by) and `lookout`'s own `fit`. Both used to
-# count `char`s, so a CJK name or a log line built from double-width
-# characters overran its column and pushed every border after it -- see
-# `output/width.rs`'s own doc for the two different width questions this
-# crate asks. Adds ZERO crates to the tree: `ratatui-core` already pulls
-# this exact version in for its own grapheme measurement, and `shep-core`
-# reaches it through `serde-saphyr`'s `annotate-snippets` -- `Cargo.lock`
-# resolves one `unicode-width`, both before and after this change. Declared
-# here rather than left to feature unification with either of them, because
-# a crate that uses a dependency says so.
+# How many terminal columns a `char` occupies, for `output::width` (every
+# table cell's padding) and `lookout`'s own `fit`: measuring by char count
+# alone lets a CJK name or double-width log line overrun its column and
+# push every border after it. Adds zero crates: `ratatui-core` and
+# `shep-core` (through `annotate-snippets`) already resolve this version.
 #
-# `default-features = false` drops the `cjk` feature, which exists only to
-# provide `width_cjk` -- the East-Asian *Ambiguous* reading, where `▸` and
-# friends measure two columns instead of one. Plain `width` is the right
-# answer for a terminal nobody has told us is CJK-legacy, and it is the
-# reading `lookout::view::flock::mark`'s own doc already assumes.
+# `default-features = false` drops `cjk`, which provides `width_cjk`, the
+# East-Asian Ambiguous reading where `▸` and friends measure two columns.
+# Plain `width` is right for a terminal nobody has told us is CJK-legacy.
 unicode-width = { version = "0.2", default-features = false }
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions", "env", "wrap_help"] }
-# `default-features = false` is a no-op here — clap_complete's own default
-# feature set is empty — kept for consistency with the workspace rule.
-# `unstable-dynamic` is deliberately not enabled: dynamic completion is out
-# of scope for this phase.
-# Floor 4.6.0, not the crate's actual minimum: `CompletionArgs::shell` names
-# `clap_complete::aot::Shell`, and the `aot` module does not exist before
-# 4.6.0 (verified against the crates.io index by extracting each 4.x.0
-# release's `src/lib.rs` — 4.0.0 through 4.5.0 have no `aot` module at all;
-# `Shell` and `generate` sat at the crate root). `-Z minimal-versions` picks
-# 4.0.0 without this pin and fails with "cannot find `aot` in `clap_complete`".
+# `default-features = false` is a no-op: clap_complete's default feature set
+# is empty, kept for consistency. `unstable-dynamic` not enabled: dynamic
+# completion is out of scope.
+#
+# Floor 4.6.0: `CompletionArgs::shell` names `clap_complete::aot::Shell`, and
+# the `aot` module does not exist before 4.6.0.
 clap_complete = { version = "4.6.0", default-features = false }
-# `io-util` is `crate::http`'s: `BufReader`, `AsyncBufReadExt`/`AsyncReadExt`/
-# `AsyncWriteExt`, and `tokio::io::duplex` for its own tests — the same
-# reason shep-daemon's own hand-rolled HTTP probe (`probes/os.rs`) carries it.
+# `io-util` is `crate::http`'s: `BufReader`, `AsyncBufReadExt`/
+# `AsyncReadExt`/`AsyncWriteExt`, and `tokio::io::duplex` for its tests.
 # `fs` is `serve::worker`'s: `tokio::fs::File` and `tokio::io::copy` for
-# streaming a served file off disk. It adds zero crates — tokio's `fs`
-# feature is `spawn_blocking` over `std::fs` and pulls in no new dependency
-# (confirmed: `cargo tree -p shep-cli` prints the same line count before and
-# after — see Task 6's report).
+# streaming a served file off disk. Adds zero crates: tokio's `fs` feature
+# is `spawn_blocking` over `std::fs`.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync", "io-util", "fs"] }
-# `dog::bark::sinks`'s TLS transport for Discord/Slack webhooks. The maintainer's ruling
-# (2026-08-12): a hand-rolled HTTP/1.1 client over `tokio-rustls`, not
-# `reqwest` — see the root `Cargo.toml` entry for the full accounting,
-# including what ring's own `cc` build dependency costs a cross-compile.
-# `ring`/`tls12` name the crypto provider directly so `tokio-rustls`'s own
-# default features (which pull in `aws_lc_rs`, which needs cmake on top of a
-# C compiler) never apply.
+# `dog::bark::sinks`'s TLS transport for Discord/Slack webhooks, a
+# hand-rolled HTTP/1.1 client over `tokio-rustls` (see the root Cargo.toml
+# entry). `ring`/`tls12` name the crypto provider directly so tokio-rustls's
+# own default features, which pull in `aws_lc_rs` and need cmake, never apply.
 tokio-rustls.workspace = true
 # Mozilla's compiled-in TLS root store, for the same TLS connector.
 webpki-roots.workspace = true
-# The one GLOBAL subscriber install in the workspace, in `commands::daemon`
-# (shep-daemon's own `testing::capture_logs` installs a scoped one per test).
+# The one global subscriber install in the workspace, in `commands::daemon`.
 # Every feature the workspace entry names is live there: `fmt` renders,
 # `env-filter` turns `[daemon] log_level` into a filter, `json` is the
-# `log_json` branch, and `ansi` is colour when stderr is a terminal and
+# `log_json` branch, `ansi` is colour when stderr is a terminal and
 # `NO_COLOR` says nothing to the contrary.
 tracing-subscriber.workspace = true
 # `output::table::local_timestamp`'s rendering of `shep barks`' `WHEN`
-# column: a `Bark::at_ms` (unix millis, UTC by construction) into the
-# operator's own local zone. Adds zero crates to the tree — shep-core and
-# shep-daemon already carry it, at this same workspace-pinned version
-# (`Cargo.lock` resolves exactly one `chrono`), and the workspace entry's
-# `clock` feature is what makes `Local` exist to convert into.
+# column: `Bark::at_ms` (unix millis, UTC by construction) into the
+# operator's own local zone. Adds zero crates: shep-core and shep-daemon
+# already carry it; `clock` is what makes `Local` exist to convert into.
 chrono.workspace = true
-# `bleats.rs`'s `stream.next()` now comes from `EventStream::next`, an
-# inherent method shep-client provides directly — no `StreamExt` import
-# needed here any more. This dependency stays for `FutureExt`: the Ctrl-C
-# wiring (`tokio::signal::ctrl_c().map(|_| ())`) still needs it, and
-# nothing else in this crate's dependency graph exposes it.
+# `bleats.rs`'s `stream.next()` comes from `EventStream::next`, an inherent
+# method shep-client provides; no `StreamExt` import needed. This stays for
+# `FutureExt`: the Ctrl-C wiring (`tokio::signal::ctrl_c().map(|_| ())`)
+# needs it.
 futures-util.workspace = true
 # `Render: Serialize` needs the trait and its derive, not just the
-# serializer — `serde_json` alone does not bring either.
+# serializer: `serde_json` alone does not bring either.
 serde.workspace = true
 serde_json.workspace = true
-# Rendering the Flockfile `shep import` writes. `parse` is unused here — the
-# CLI reads Flockfiles through shep-core — but the workspace entry names both
-# and a per-crate feature narrowing would be the only difference.
+# Rendering the Flockfile `shep import` writes. `parse` is unused here (the
+# CLI reads Flockfiles through shep-core), but the workspace entry names
+# both and a per-crate feature narrowing would be the only difference.
 toml.workspace = true
-# `commands::shep_toml`'s `ShepToml`: the one writer of `$SHEP_HOME/shep.toml`
-# in this binary, edited through `toml_edit::DocumentMut` rather than a plain
-# `toml::Table` so an operator's comments, key order and formatting survive a
-# `shep enable`/`shep disable`. Not a workspace entry (like `clap_complete`
-# above): this crate is its only user. Adds zero crates to the tree —
-# `toml` 0.8 already pulls in `toml_edit` 0.22.27 as its own backing
-# implementation (`Cargo.lock`), and `default-features = false` plus this
-# exact feature pair matches what that pulls in already.
+# `commands::shep_toml`'s `ShepToml`: the one writer of `$SHEP_HOME/shep.toml`,
+# edited through `toml_edit::DocumentMut` rather than a plain `toml::Table`
+# so an operator's comments, key order and formatting survive a
+# `shep enable`/`shep disable`. Not a workspace entry: this crate is its
+# only user. Adds zero crates: `toml` 0.8 already pulls in `toml_edit`
+# 0.22.27 as its backing implementation.
 #
-# Floor 0.22.7, not the bare "0.22" that reads: `DocumentMut` itself (the
-# type this whole dependency exists for) is a 0.22.7 rename of the older
-# `Document` — `-Z minimal-versions` picked 0.22.0 without this and failed
-# `shep_toml.rs`'s import with `no DocumentMut in the root` (CI run
-# 32023586026). The "0.22" in the prose above was never wrong about what
-# ships; it was wrong about what the declared floor let `-Z minimal-versions`
-# pick.
+# Floor 0.22.7: `DocumentMut` is a 0.22.7 rename of the older `Document`.
 toml_edit = { version = "0.22.7", default-features = false, features = ["display", "parse"] }
 # `commands::shep_toml`'s write path: `shep.toml` is staged in a sibling temp
-# file at `0600` (mode at creation, via `Builder::permissions`), `fsync`ed and
-# `rename`d over the original, the same shape shep-core's `barks::write_ring`
-# uses. Promoted from `[dev-dependencies]`, where the test tier already had it:
-# adds zero crates to the tree, since shep-core and shep-daemon both carry this
-# same workspace-pinned version already.
+# file at `0600` (via `Builder::permissions`), `fsync`ed and `rename`d over
+# the original, the same shape shep-core's `barks::write_ring` uses. Adds
+# zero crates: shep-core and shep-daemon already carry this version.
 tempfile.workspace = true
 # `style::StyleLevel::colour()`'s consumer: the boxed renderer picks its ANSI
 # escapes through `anstyle::Style`/`Color` rather than hand-rolled escape
-# sequences. Declared here in the task that adds `style.rs` even though that
-# module's own code does not call it yet — this crate's code starts using it
-# once the renderer that reads `StyleLevel` lands. Adds zero crates to the
-# tree: `Cargo.lock` already resolves exactly one `anstyle` (shep-core pulls
-# it into the lockfile through its own `cfg(any())` floor-forcing block), so
-# this is the first real use of an already-resolved version, not a new one.
+# sequences. Adds zero crates: shep-core already resolves `anstyle` through
+# its own `cfg(any())` floor-forcing block.
 anstyle.workspace = true
 
 # The lookout TUI, the MCP server behind `shep whistle`, and the schema
-# generator beside it. **These four were `[target.'cfg(unix)'.dependencies]`
-# and are now unconditional**, and the comment they replace is worth keeping
-# in mind rather than simply deleting: it argued that declaring them
-# everywhere "would build a terminal stack, `crossterm_winapi` and a second
-# `windows-sys` face into a binary that cannot use any of it".
-#
-# That was correct while the Windows build refused every verb before it could
-# reach either module. It stopped being correct when the Windows tier became
-# real: `src/lookout/` and `src/whistle/` both compile and run there now — a
-# `crossterm_winapi` face is what makes the dashboard work on a Windows
-# terminal, not dead weight — so the cost the comment was avoiding is now the
-# cost of the feature. The `x86_64-pc-windows-gnu` cross-check does get
-# slower, which is the price and is worth naming.
+# generator beside it: unconditional, since `src/lookout/` and `src/whistle/`
+# both compile and run on Windows too.
 ratatui.workspace = true
 crossterm.workspace = true
 # The MCP server behind `shep whistle`.
@@ -247,9 +188,8 @@ time.workspace = true
 instability.workspace = true
 
 [dev-dependencies]
-# `test-util` for `#[tokio::test(start_paused = true)]` — `crate::http`'s own
-# "a peer that says nothing is dropped at the timeout" test, matching how
-# shep-client and shep-daemon each add this feature as a dev-only override.
+# `test-util` for `#[tokio::test(start_paused = true)]`, `crate::http`'s "a
+# peer that says nothing is dropped at the timeout" test.
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }
 # The same shep-client the `[dependencies]` entry above pulls in, asking for
 # the hand-rolled daemon fakes this crate's command tests drive. A
@@ -267,27 +207,17 @@ insta.workspace = true
 # The real-binary e2e tier (`tests/cli_e2e.rs`).
 assert_cmd.workspace = true
 predicates.workspace = true
-# Task 4's property test for `output::table`, that any cell's rendered width
-# matches its declared column width regardless of ANSI styling. Declared here
-# in the task that adds `output::width` even though this crate's own code
-# does not call it yet, same pattern as `anstyle` above.
+# Property test for `output::table`: any cell's rendered width matches its
+# declared column width regardless of ANSI styling.
 proptest.workspace = true
 
 # `geteuid` (the privilege gate `shep startup` refuses on) and
-# `User::from_name`/`User::from_uid` (the target user's own passwd home, which
-# is NOT `$HOME` under sudo). Both are behind nix's `user` feature, which the
-# workspace entry already enables. A cfg(unix) table because nix does not build
-# on Windows and this crate's Windows leg compiles everything outside
+# `User::from_name`/`User::from_uid` (the target user's own passwd home, not
+# `$HOME` under sudo) use nix's `user` feature, already on by workspace
+# default. `fs` adds `nix::fcntl::fcntl`/`FcntlArg::F_SETFD`/`FdFlag`, the
+# inherited-fd sweep in `launch.rs`. `cfg(unix)`: nix does not build on
+# Windows, and this crate's Windows leg compiles everything outside
 # `commands/`.
-#
-# "fs" on top of the workspace defaults is `launch.rs`'s descriptor sweep:
-# `nix::fcntl::fcntl` and `FcntlArg::F_SETFD`/`FdFlag` all live behind it. Named
-# here rather than left to feature unification with shep-daemon (which enables
-# it for `sys.rs`) — a crate that uses a feature says so, or it breaks the day
-# the other crate stops needing it.
-
-# `nix::fcntl::fcntl` and `FcntlArg::F_SETFD`/`FdFlag` — the inherited-fd
-# sweep in `launch.rs`, which has no Windows counterpart to need.
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["fs"] }
 # A process-group assertion and a teardown Drop guard both need to signal a
@@ -300,12 +230,9 @@ nix.workspace = true
 [lints]
 workspace = true
 
-# `cfg(any())` never matches any target, so nothing here is ever compiled into any real
-# build — but Cargo's resolver still walks these entries when computing the dependency
-# graph, including under `-Z minimal-versions`. Same mechanism shep-daemon uses for its
-# own two floor pins. Here it forces `lazy_static` past the versions whose plainly
-# exported `lazy_static!` breaks `sharded-slab`'s path import (root Cargo.toml's comment
-# on the entry has the exact mechanism). Safe to drop once `sharded-slab` corrects its
-# own declared floor.
+# `cfg(any())` never matches, so nothing here compiles into a real build, but
+# Cargo's resolver still walks these entries under `-Z minimal-versions`.
+# Forces `lazy_static` past the floor `sharded-slab`'s path import needs (see
+# root Cargo.toml). Safe to drop once sharded-slab corrects its own floor.
 [target.'cfg(any())'.dependencies]
 lazy_static.workspace = true

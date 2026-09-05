@@ -1,51 +1,20 @@
-//! `$SHEP_HOME/shep.toml`, the daemon's own config file — read and rewritten
+//! `$SHEP_HOME/shep.toml`, the daemon's own config file, read and rewritten
 //! by [`ShepToml`], the one writer this binary has for it.
 //!
-//! Edits go through `toml_edit`'s [`DocumentMut`] rather than round-tripping
-//! through a plain `toml::Table`: `shep.toml` is hand-written far more often
-//! than it is generated, and a `shep enable` that reformatted it — dropping
-//! comments, reordering keys — would be a reason not to run `shep enable`.
-//! [`shep_core::config::DaemonConfig::load`] is still the one place the
-//! SHAPE of the file is decided (what a key means, what a bad value looks
-//! like); this module only ever adds or removes the handful of keys each
-//! verb owns, leaving everything else exactly as it was read.
+//! Edits go through `toml_edit`'s [`DocumentMut`], so an operator's comments
+//! and key order survive. [`shep_core::config::DaemonConfig::load`] decides
+//! what a key means; this module only adds or removes the ones each verb owns.
 //!
-//! Every edit goes through [`ShepToml::edit`] or [`ShepToml::try_edit`] (for
-//! a closure that can itself refuse), which together are the whole write
-//! path: `$SHEP_HOME` created at `0700`, an exclusive advisory lock on a
-//! sibling `shep.toml.lock` held across the read-modify-write, and the new
-//! document staged in a `0600` temp file, `fsync`ed and `rename`d over the
-//! original -- but only when the closure actually produced a value to
-//! save; a `try_edit` closure's own `Err` leaves `path` untouched, not
-//! merely unchanged. Each of the write's three steps is the same shape
-//! `shep-core`'s `barks::append` already uses, for the same reasons and
-//! after the same bug: two writers racing on `barks.jsonl` silently lost
-//! half of each other's records until an advisory lock landed there.
-//!
-//! `commands` itself carries no platform gate -- `mod commands;` at
-//! `lib.rs` is unconditional, and there is no `main.rs` in this crate;
-//! Phase 15 made `shep` a library with three thin `[[bin]]` targets over
-//! it. `flock(2)` and unix mode bits are Unix-only, so each call site that
-//! needs one gates itself individually and carries a real Windows arm
-//! rather than an unimplemented one: [`ConfigLock`] and
-//! [`ConfigLock::acquire`] below are each `#[cfg(unix)]`/`#[cfg(windows)]`
-//! pairs (`flock(2)` against `share_mode(0)`), and [`create_home_dir`]
-//! folds a unix-only `.mode()` call into an otherwise portable
-//! `DirBuilder`.
+//! [`ShepToml::edit`] and [`ShepToml::try_edit`] are the whole write path:
+//! `$SHEP_HOME` at `0700`, an exclusive advisory lock on a sibling
+//! `shep.toml.lock` across the read-modify-write, and the document staged
+//! `0600`, `fsync`ed and `rename`d. A `try_edit` closure's own `Err` leaves
+//! `path` untouched.
 
-// `clippy::result_large_err` fires on every `Result<_, ShepTomlError>`
-// signature in this module on Windows, and on none of them on macOS or
-// Linux. The lint compares the error against a fixed 128-byte threshold, and
-// `ShepTomlError` — a `PathBuf` plus a `toml_edit::TomlError` — sits close
-// enough to it that the platform's own layout decides which side it lands
-// on. Nothing about this module is different on Windows; only the
-// measurement is.
-//
-// Allowed rather than fixed, deliberately. The fix the lint wants is boxing
-// the error, which would change a `pub enum`'s shape for every consumer on
-// every platform to satisfy a perf lint about a path that runs a handful of
-// times per command and always ends in file I/O. Revisit if this type grows
-// a genuinely large variant, which is a different fact from the one here.
+// Fires on every `Result<_, ShepTomlError>` here on Windows and on none of
+// them elsewhere: the lint's fixed 128-byte threshold and the platform's own
+// layout decide which side this type lands on. The fix it wants is boxing a
+// `pub enum` for a path that always ends in file I/O.
 #![allow(clippy::result_large_err)]
 
 use std::collections::BTreeMap;
@@ -61,17 +30,10 @@ use crate::style::StyleLevel;
 /// Extensions [`ShepToml::write_starter_interpreters`] maps, in the order
 /// they land in `shep.toml`.
 ///
-/// `js`/`mjs`/`cjs` cover the three ways a Node script is named; `py` maps
-/// to `python3` rather than bare `python`, which is absent or still points
-/// at Python 2 on plenty of hosts shep runs on; `rb` and `sh` round out the
-/// four families the maintainer named directly. Two more chosen with judgement:
-/// `pl` for Perl and `php` for PHP, both single, unambiguous interpreters
-/// that ship alongside node/python3/ruby/sh on most of the same hosts.
-/// Left out on purpose: `ts` (no single safe default exists; ts-node, tsx
-/// and deno all disagree about how to run one, and picking the wrong one
-/// silently is worse than making the operator say so), and anything
-/// Windows-only such as `ps1`, since shep's Windows tier is 0 percent as
-/// of this writing.
+/// `py` maps to `python3` rather than bare `python`, which is absent or
+/// still points at Python 2 on plenty of hosts shep runs on. `ts` is left
+/// out: ts-node, tsx and deno disagree about how to run one, and guessing
+/// wrong silently is worse than making the operator say so.
 const STARTER_INTERPRETERS: &[(&str, &str)] = &[
     ("js", "node"),
     ("mjs", "node"),
@@ -84,14 +46,10 @@ const STARTER_INTERPRETERS: &[(&str, &str)] = &[
 ];
 
 /// The comment [`ShepToml::write_starter_interpreters`] writes directly
-/// above the `[interpreters]` table it scaffolds, so the mapping reads as
-/// something an operator can see and edit rather than as hidden shep
-/// behaviour.
+/// above the `[interpreters]` table it scaffolds.
 ///
-/// Plain `#` TOML comment lines, not `///` Rust doc syntax: this text
-/// lands inside `shep.toml` itself, for an operator to read there, so the
-/// project's "no dashes in anything a user reads" rule governs it exactly
-/// as it governs `welcome.rs`'s copy.
+/// Plain `#` TOML comment lines: this text lands inside `shep.toml` for an
+/// operator to read, so the same copy rules govern it as `welcome.rs`'s.
 const INTERPRETERS_STARTER_COMMENT: &str = "\
 # Extension -> interpreter mapping. shep applies one of these to a script
 # when nothing more specific already named an interpreter: not this app's
@@ -103,30 +61,22 @@ const INTERPRETERS_STARTER_COMMENT: &str = "\
 
 /// The one writer of `$SHEP_HOME/shep.toml` in this binary.
 ///
-/// A missing file is created (as an empty document — [`Self::edit`] makes
-/// `$SHEP_HOME` too, if needed); a file that will not parse is refused
-/// rather than overwritten, because it may hold every knob a daemon boots
-/// with, credentials included, and there is no undo for losing it to a
-/// typo'd verb.
+/// A missing file is created as an empty document, `$SHEP_HOME` with it; a
+/// file that will not parse is refused rather than overwritten, since it may
+/// hold every knob a daemon boots with, credentials included.
 ///
-/// [`Self::edit`] is the only way to reach one of these, and holds the
-/// document's lock for exactly as long as the closure runs. Reading and
-/// writing are deliberately not separate public steps: a caller that
-/// could read, think, and then write would be the lost update this type
-/// takes a lock to prevent.
+/// [`Self::edit`] and [`Self::try_edit`] are the only paths that write, and
+/// they hold the document's lock for exactly as long as the closure runs.
+/// Reading and writing are not separate public steps: a caller that could
+/// read, think, and then write is the lost update this type takes a lock to
+/// prevent.
 pub struct ShepToml {
     path: PathBuf,
     doc: DocumentMut,
 }
 
-/// Manual, not derived: `doc` is the parsed document, and a `[dog.<name>]`
-/// table routinely holds a webhook URL with a bearer token in its query
-/// string (`SECURITY.md`) — the same exposure `DogSectionToml`
-/// (shep-core's own `protocol::request`) exists to keep out of a
-/// `{:?}`-formatted `Response`. `ShepToml` never crosses that wire, but it
-/// is exactly as capable of being `{:?}`-printed into a log by some future
-/// caller, so it gets the same treatment: only the path, never the parsed
-/// document.
+/// Manual, not derived: `doc` can hold a webhook URL with a bearer token in
+/// an un-migrated `[dog.<name>]` table, so only the path is printed.
 impl std::fmt::Debug for ShepToml {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ShepToml")
@@ -136,32 +86,18 @@ impl std::fmt::Debug for ShepToml {
 }
 
 impl ShepToml {
-    /// Reads `path`, hands the document to `f`, and writes it back — the
-    /// whole read-modify-write under one exclusive advisory lock.
+    /// Reads `path`, hands the document to `f`, and writes it back under
+    /// one exclusive advisory lock on a sibling `shep.toml.lock`
+    /// ([`ConfigLock`]).
     ///
-    /// The one way to write this file. `f` returns whatever the caller
-    /// needed to read while the lock was held — `shep enable` reads a
-    /// dog's source before it edits the same document — and that value
-    /// comes back on success.
-    ///
-    /// Serialised against any other editor, in this process or another,
-    /// by a lock on a sibling `shep.toml.lock` ([`ConfigLock`]). Without
-    /// it, `shep adopt otel ... & shep enable metrics &` from one
-    /// provisioning script has both processes read the pre-edit document
-    /// and write the whole thing back, and the loser's edit is gone with
-    /// no error on either side. That is not theory: `barks.jsonl` lost
-    /// half its records to the identical shape before it grew the same
-    /// lock.
-    ///
-    /// `f` here is infallible; see [`Self::try_edit`] for a closure that
-    /// can itself refuse the edit before anything is written.
+    /// `f`'s return value comes back on success. `f` is infallible;
+    /// [`Self::try_edit`] takes one that can refuse.
     ///
     /// # Errors
-    /// - [`ShepTomlError::Io`] — `$SHEP_HOME` could not be created, the
-    ///   lock beside the file could not be taken, or the file could not
-    ///   be read or replaced.
-    /// - [`ShepTomlError::Parse`] — the file exists and is not valid
-    ///   TOML. Refused rather than overwritten, and `f` never runs.
+    /// - [`ShepTomlError::Io`] if `$SHEP_HOME` could not be created, the
+    ///   lock could not be taken, or the file could not be read or replaced.
+    /// - [`ShepTomlError::Parse`] if the file is not valid TOML. Refused
+    ///   rather than overwritten, and `f` never runs.
     pub fn edit<T>(path: &Path, f: impl FnOnce(&mut Self) -> T) -> Result<T, ShepTomlError> {
         let (mut doc, _lock) = Self::open_locked(path)?;
         let value = f(&mut doc);
@@ -169,32 +105,18 @@ impl ShepToml {
         Ok(value)
     }
 
-    /// Like [`Self::edit`], but for a closure that can itself refuse the
-    /// edit: `f`'s own `Err` skips [`Self::save`] entirely, the same way a
-    /// [`Self::open`] failure already does. A setter whose key can already
-    /// be occupied by a shape it cannot write into (an operator's
-    /// hand-written `style = "full"` where [`Self::set_style_level`] needs
-    /// a table, say) must be able to say so without the read-modify-
-    /// write underneath it staging and renaming a byte-identical copy of
-    /// the file back over itself anyway — that rename still lands a fresh
-    /// inode and forces [`shep_core::atomic_file::OWNER_ONLY_FILE_MODE`]
-    /// on a file that a refused edit
-    /// never actually touched, and for a symlinked `path` it is what
-    /// replaces the link with a plain file. [`Self::edit`]'s `f` cannot
-    /// refuse at all, so that failure mode did not exist before this
-    /// method's first caller needed to fail from inside the closure.
+    /// Like [`Self::edit`], but for a closure that can itself refuse: `f`'s
+    /// own `Err` skips [`Self::save`] entirely. Saving anyway would stage
+    /// and rename a byte-identical copy, and that rename still lands a fresh
+    /// inode, forces [`shep_core::atomic_file::OWNER_ONLY_FILE_MODE`], and
+    /// replaces a symlinked `path` with a plain file.
     ///
-    /// Generic over the closure's own error `E` rather than fixed to
-    /// [`ShepTomlError`], so a caller whose own failure is its own type
-    /// does not have to wrap this module's error a second time;
     /// `E: From<ShepTomlError>` is what lets `?` cover this method's own
-    /// setup failures (home dir, lock, parse) the same way it already
-    /// covers `f`'s.
+    /// setup failures (home dir, lock, parse) as well as `f`'s.
     ///
     /// # Errors
-    /// Everything [`Self::edit`] can fail with, converted through
-    /// `E::from`, plus whatever `f` itself returns as `Err` -- in either
-    /// case, `path` is left exactly as [`Self::open`] found it.
+    /// Everything [`Self::edit`] can fail with, converted through `E::from`,
+    /// plus whatever `f` returns as `Err`. `path` is untouched either way.
     pub fn try_edit<T, E: From<ShepTomlError>>(
         path: &Path,
         f: impl FnOnce(&mut Self) -> Result<T, E>,
@@ -206,15 +128,12 @@ impl ShepToml {
     }
 
     /// Creates `$SHEP_HOME` if missing, takes `path`'s exclusive lock, and
-    /// opens the document -- the setup [`Self::edit`] and [`Self::try_edit`]
-    /// share; only what happens with the open document, and whether a
-    /// failure from it still reaches [`Self::save`], differs between the
-    /// two.
+    /// opens the document: the setup [`Self::edit`] and [`Self::try_edit`]
+    /// share.
     ///
     /// The returned [`ConfigLock`] must outlive every use of the returned
-    /// `Self` -- it is what makes the read this function just did and the
-    /// caller's eventual `save` one transaction as far as any other editor
-    /// is concerned, the same guarantee [`Self::edit`]'s own doc describes.
+    /// `Self`. It is what makes this read and the caller's eventual `save`
+    /// one transaction as far as any other editor is concerned.
     fn open_locked(path: &Path) -> Result<(Self, ConfigLock), ShepTomlError> {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         create_home_dir(parent).map_err(|source| ShepTomlError::Io {
@@ -222,10 +141,6 @@ impl ShepToml {
             source,
         })?;
 
-        // Held until the caller's `Self`/`ConfigLock` pair both drop, so
-        // the read just below and the caller's eventual rename inside
-        // `save` are one transaction as far as any other editor is
-        // concerned.
         let lock = ConfigLock::acquire(path).map_err(|source| ShepTomlError::Io {
             path: path.to_path_buf(),
             source,
@@ -237,14 +152,12 @@ impl ShepToml {
 
     /// Reads `path`, treating a missing file as an empty document.
     ///
-    /// Private. Reached two ways: from [`Self::edit`]/[`Self::try_edit`]
-    /// with the document's lock already held for a write, and from
-    /// [`Self::adopted_dog_path_readonly`] with no lock at all, for a
-    /// caller that only ever reads.
+    /// Reached from [`Self::edit`]/[`Self::try_edit`] with the document's
+    /// lock held, and from the read-only callers with no lock at all.
     ///
     /// # Errors
-    /// - [`ShepTomlError::Io`] — the file exists and could not be read.
-    /// - [`ShepTomlError::Parse`] — the file exists and is not valid TOML.
+    /// - [`ShepTomlError::Io`] if the file exists and could not be read.
+    /// - [`ShepTomlError::Parse`] if the file exists and is not valid TOML.
     fn open(path: &Path) -> Result<Self, ShepTomlError> {
         let doc = match std::fs::read_to_string(path) {
             Ok(text) => text
@@ -267,16 +180,13 @@ impl ShepToml {
         })
     }
 
-    /// Reads `path` for a caller that only wants the answer -- the settings
-    /// screen's own door into this type, and the shape every reader below
-    /// is reached through.
+    /// Reads `path` for a caller that only wants the answer: the settings
+    /// screen's door into this type, and the shape every reader below is
+    /// reached through.
     ///
-    /// Takes no lock, unlike [`Self::edit`]/[`Self::try_edit`]:
-    /// [`Self::save`]'s rename onto `path` is atomic, so a concurrent
-    /// writer can only ever make this read observe the document just
-    /// before or just after that write, never a torn one. The same
-    /// argument [`Self::adopted_dog_path_readonly`] already makes for
-    /// itself.
+    /// Takes no lock. [`Self::save`]'s rename onto `path` is atomic, so a
+    /// concurrent writer can only make this read observe the document just
+    /// before or just after that write, never a torn one.
     ///
     /// # Errors
     /// [`ShepTomlError::Io`] if `path` exists and could not be read.
@@ -288,16 +198,13 @@ impl ShepToml {
     /// Renders the in-memory document exactly as [`Self::save`] would
     /// write it, without touching disk.
     ///
-    /// `commands::settings::apply_setting`'s own validation step: mutate,
-    /// render, and hand the text to [`DaemonConfig::load`](shep_core::config::DaemonConfig::load)
-    /// before ever calling [`Self::save`], so a refusal never stages or
-    /// renames. `pub(crate)` rather than `pub`, and named `rendered`
-    /// rather than implementing `Display`: this document can hold a
-    /// dog's webhook token in an un-migrated `[dog.<name>]` table (see
-    /// this type's own `Debug` impl above), and a `Display` impl is the
-    /// kind of thing a future `format!("{doc}")` reaches for without
-    /// thinking about that -- a named method one caller reaches for on
-    /// purpose is the safer shape for the same text.
+    /// `commands::settings::apply_setting` mutates, renders, and hands the
+    /// text to [`DaemonConfig::load`](shep_core::config::DaemonConfig::load)
+    /// before calling [`Self::save`], so a refusal never stages or renames.
+    ///
+    /// A named method rather than a `Display` impl: this text can carry a
+    /// dog's webhook token, and `format!("{doc}")` is what a future caller
+    /// reaches for without thinking about that.
     #[must_use]
     pub(crate) fn rendered(&self) -> String {
         self.doc.to_string()
@@ -306,26 +213,10 @@ impl ShepToml {
     /// Adds `name` to `[daemon] enabled_dogs` (idempotently), and writes
     /// nothing else anywhere.
     ///
-    /// **It used to scaffold an empty `[dog.<name>]` here, and that is now
-    /// a boot-breaking bug rather than a nicety.** A dog's configuration
-    /// lives in `dogs.toml`, so an operator who enabled a dog and then
-    /// configured it where `docs/dogs.md` says to had that name in both
-    /// files, and `commands::dog_migration` refuses on exactly that: two
-    /// values for one key is a question shep cannot answer. The daemon
-    /// exits 4 and the flock is left unsupervised, over a table nobody
-    /// asked for.
-    ///
-    /// Scaffolding into `dogs.toml` instead would keep the nicety, and is
-    /// the wrong trade. It puts this type, which owns `shep.toml` and only
-    /// that, in the business of writing a second file behind a second lock,
-    /// and every write of that file has to hold the staged-temp, `fsync`
-    /// and `rename` discipline `dog_migration::write_dogs_config` carries
-    /// because webhook credentials live there at `0600`. The nicety it
-    /// buys is thin: `shep-daemon`'s `dog_section` already documents an
-    /// absent section as legitimate and answers an empty string, so a dog
-    /// enabled with no section runs on its defaults, and an empty table
-    /// tells an operator nothing a documented example does not tell them
-    /// better. Writing nothing cannot collide with anything.
+    /// Never scaffold an empty `[dog.<name>]` here. A dog's configuration
+    /// lives in `dogs.toml`, and `commands::dog_migration` refuses to boot
+    /// when one name holds values in both files. An enabled dog with no
+    /// section runs on its defaults, so there is nothing to scaffold.
     pub fn enable_dog(&mut self, name: &str) {
         let daemon = self.daemon_table_mut();
         let enabled_dogs = daemon
@@ -342,12 +233,9 @@ impl ShepToml {
     /// else: an operator who disables a dog to restart it must not lose the
     /// configuration they wrote for it.
     ///
-    /// That configuration lives in `dogs.toml` now, so keeping it is
-    /// something this method achieves by doing nothing at all rather than
-    /// by leaving a `[dog.<name>]` table alone. The behaviour is unchanged;
-    /// only the file the promise is about moved. [`Self::rehome_dog`] is
-    /// the half that forgets a dog for real, and `commands::dogs::rehome`
-    /// is where the other file is reached.
+    /// That configuration lives in `dogs.toml`, so keeping it takes doing
+    /// nothing at all here. [`Self::rehome_dog`] is the half that forgets a
+    /// dog for real.
     pub fn disable_dog(&mut self, name: &str) {
         if let Some(enabled_dogs) = self
             .doc
@@ -362,9 +250,8 @@ impl ShepToml {
 
     /// Records `name`'s binary in `[daemon] adopted_dogs` and enables it.
     ///
-    /// Called by `commands::dogs::adopt`, once `vet_binary` has already
-    /// vetted `exec` — this method itself does no vetting, and never
-    /// truncates anything past the two keys it owns.
+    /// Does no vetting of `exec` itself: `commands::dogs::adopt` has already
+    /// run `vet_binary`.
     pub fn adopt_dog(&mut self, name: &str, exec: &Path) {
         let daemon = self.daemon_table_mut();
         let adopted_dogs = daemon
@@ -379,32 +266,16 @@ impl ShepToml {
         self.enable_dog(name);
     }
 
-    /// Removes the whole `[dog]` table and hands back what was under it.
+    /// Removes the whole `[dog]` table and hands back what was under it,
+    /// keyed by name with the `dog.` prefix dropped.
     ///
-    /// Keyed by dog name with the `dog.` prefix dropped, which is the shape
-    /// `dogs.toml` wants, and handed back as live [`Item`]s rather than
-    /// `toml::Table` values. That is what lets the migration write the
-    /// destination through `toml_edit` as well: an `Item` carries its own
-    /// decor, so a comment an operator wrote above or inside
-    /// `[dog.metrics]` travels with the section instead of being dropped at
-    /// this boundary, and the header re-renders under whatever key the
-    /// section is inserted at, with nothing here rewriting it. Going
-    /// through `toml::Table` used to lose both.
+    /// Handed back as live [`Item`]s: a comment an operator wrote around
+    /// `[dog.metrics]` travels with the section. Only table-like entries
+    /// come back; `[dog] stray = 5` and `[[dog.x]]` are dropped. A document
+    /// with no `[dog]` table yields an empty map, left byte-identical.
     ///
-    /// Only table-like entries come back, which covers `[dog.metrics]`, a
-    /// dotted `metrics.bind = ...` under `[dog]`, and an inline
-    /// `metrics = { .. }` alike. `[dog] stray = 5` and `[[dog.x]]` are
-    /// neither, and are dropped here rather than moved. That is not a
-    /// silent loss: the migration's own guard compares these keys against
-    /// what the source declared under `[dog]` and refuses the whole move
-    /// when one does not come back.
-    ///
-    /// A document with no `[dog]` table yields an empty map and is left
-    /// byte-identical, so a second call after a migration writes nothing.
-    ///
-    /// The one caller is the boot migration. This is not a general editing
-    /// primitive: it takes everything, because a partial move would leave
-    /// the same key readable from two files.
+    /// Takes everything: a partial move would leave one key readable from
+    /// two files.
     pub fn take_dog_sections(&mut self) -> BTreeMap<String, Item> {
         let Some(item) = self.doc.remove("dog") else {
             return BTreeMap::new();
@@ -421,11 +292,7 @@ impl ShepToml {
     }
 
     /// The binary path recorded for `name` in `[daemon] adopted_dogs`, if
-    /// any — `None` for a built-in dog, or a name this document has never
-    /// heard of.
-    ///
-    /// Read by `commands::dogs::rehome` before [`Self::rehome_dog`] removes
-    /// the entry, so the verb can still report what it forgot.
+    /// any. `None` for a built-in dog, or a name this document never heard of.
     #[must_use]
     pub fn adopted_dog_path(&self, name: &str) -> Option<PathBuf> {
         self.doc
@@ -439,11 +306,6 @@ impl ShepToml {
     }
 
     /// Every name `[daemon] adopted_dogs` records, in TOML document order.
-    ///
-    /// Read by `commands::dogs::enable` to name the adopted dogs in its
-    /// refusal of a name that is neither adopted nor built in — a refusal
-    /// that lists the way out is worth the allocation, and this is the
-    /// only caller that wants the whole set rather than one lookup.
     #[must_use]
     pub fn adopted_dog_names(&self) -> Vec<String> {
         self.doc
@@ -455,11 +317,10 @@ impl ShepToml {
             .unwrap_or_default()
     }
 
-    /// The names in `[daemon] enabled_dogs`, in file order -- the flock a
-    /// dog's silence or a boot-time skip can be checked against, and
-    /// distinct from [`Self::adopted_dog_names`]: a dog can be adopted and
-    /// not enabled, or (for one of the six built into the daemon) enabled
-    /// without ever being adopted.
+    /// The names in `[daemon] enabled_dogs`, in file order.
+    ///
+    /// Distinct from [`Self::adopted_dog_names`]: a dog can be adopted and
+    /// not enabled, or built in and enabled without ever being adopted.
     #[must_use]
     pub fn enabled_dog_names(&self) -> Vec<String> {
         self.table("daemon")
@@ -474,18 +335,12 @@ impl ShepToml {
             .unwrap_or_default()
     }
 
-    /// [`Self::adopted_dog_path`] without [`Self::edit`]'s write side --
-    /// for a caller that only wants the answer, such as `lib.rs`'s
-    /// `dispatch_adopted_dog`, which runs on every unrecognized verb, most
-    /// of which are typos rather than dog names.
+    /// [`Self::adopted_dog_path`] without the write side, for `lib.rs`'s
+    /// `dispatch_adopted_dog`, which runs on every unrecognized verb.
     ///
-    /// Creates nothing: a missing `$SHEP_HOME` or a missing `path` is an
-    /// ordinary "no such dog" answer ([`Self::open`] already treats a
-    /// missing file as an empty document), never a reason to create
-    /// either. Takes no lock, unlike [`Self::edit`] -- `Self::save`'s
-    /// rename onto `path` is atomic, so a concurrent writer can only ever
-    /// make this read observe the document just before or just after that
-    /// write, never a torn one.
+    /// Creates nothing: a missing `$SHEP_HOME` or `path` is an ordinary "no
+    /// such dog" answer, never a reason to create either. Takes no lock,
+    /// for the reason [`Self::read_only`] gives.
     ///
     /// # Errors
     /// [`ShepTomlError::Io`] if `path` exists and could not be read.
@@ -499,14 +354,12 @@ impl ShepToml {
 
     /// Forgets `name` in this file: out of `enabled_dogs`, out of
     /// `adopted_dogs`, and `[dog.<name>]` removed if an un-migrated
-    /// `shep.toml` still carries one. The difference between `rehome` and
-    /// `disable`, and the reason they are two verbs.
+    /// `shep.toml` still carries one.
     ///
-    /// **This is half of a rehome.** A dog's configuration lives in
-    /// `dogs.toml` now, and striking it there is
-    /// `commands::dog_migration::forget_dog_section`, called by
-    /// `commands::dogs::rehome` immediately after this: one file per
-    /// writer, since this type owns `shep.toml` and only that.
+    /// Half of a rehome. Striking the dog's configuration in `dogs.toml` is
+    /// `commands::dog_migration::forget_dog_section`, called right after
+    /// this: one file per writer, since this type owns `shep.toml` and only
+    /// that.
     pub fn rehome_dog(&mut self, name: &str) {
         self.disable_dog(name);
         if let Some(adopted_dogs) = self
@@ -523,33 +376,18 @@ impl ShepToml {
         }
     }
 
-    /// Writes `[style] level = "<level>"`, creating the `[style]` table
-    /// when this document has none yet, and replacing the value when one
-    /// is already there.
+    /// Writes `[style] level = "<level>"`, creating the `[style]` table when
+    /// this document has none yet.
     ///
-    /// The value written is `level`'s own `Display` spelling --
-    /// `full`/`plain`/`bare` -- the same string `style_from_config`
-    /// (`lib.rs`) parses back through `clap::ValueEnum::from_str`, so a
-    /// round trip through this setter and back stays one grammar rather
-    /// than a writer and a reader that merely happen to agree today.
-    ///
-    /// Called by `shep style <level>` (`Commands::Style`'s set form).
+    /// The value is `level`'s own `Display` spelling, the same string
+    /// `style_from_config` (`lib.rs`) parses back through
+    /// `clap::ValueEnum::from_str`, so a round trip stays one grammar.
     ///
     /// # Errors
-    /// [`ShepTomlError::WrongShape`] -- `style` is already there as
-    /// something other than a table, e.g. an operator hand-wrote
-    /// `style = "full"` at the top level. Reported rather than forced:
-    /// `.as_table_mut().expect(..)` on `entry().or_insert_with(..)` is
-    /// this module's usual idiom (`enable_dog`/`disable_dog`/`adopt_dog`/
-    /// `rehome_dog` all still use it), but it is sound there only because
-    /// nothing else in this file ever writes those keys as anything but
-    /// a table, so the `expect` never actually fires on real input. This
-    /// setter's key can be hand-written by an operator who reasonably
-    /// guessed `style = "full"` instead of the `[style]` header, so the
-    /// same `expect` here is reachable from data this process does not
-    /// control -- exactly the panicking-constructor shape IR-21 rules
-    /// out. The four sibling setters above still carry the shape this one
-    /// used to; that is a tracked follow-up, not this fix's scope.
+    /// [`ShepTomlError::WrongShape`] if `style` is already there as
+    /// something other than a table, e.g. a hand-written `style = "full"` at
+    /// the top level. Reported rather than `expect`ed, since that shape
+    /// comes from data this process does not control.
     pub fn set_style_level(&mut self, level: StyleLevel) -> Result<(), ShepTomlError> {
         let item = self
             .doc
@@ -569,12 +407,10 @@ impl ShepToml {
     /// `[style] level`, or `None` when the document never wrote it, as the
     /// raw string on disk.
     ///
-    /// The twin of [`Self::daemon_log_level`], and it exists for a sharper
-    /// reason than symmetry: `[style]` is the one field on the settings
-    /// screen whose value in force can come from a layer ABOVE the file
-    /// (`--style`, `$SHEP_STYLE`), so the resolved level and the level the
-    /// document declares are two different facts. Cycling a candidate from
-    /// the resolved one proposes a no-op write whenever they disagree.
+    /// `[style]` is the one settings field whose value in force can come
+    /// from a layer above the file (`--style`, `$SHEP_STYLE`), so the
+    /// resolved level and the level the document declares are two different
+    /// facts.
     #[must_use]
     pub fn style_level(&self) -> Option<String> {
         self.table("style")?
@@ -583,13 +419,11 @@ impl ShepToml {
             .map(String::from)
     }
 
-    /// `[daemon] log_json`, or `None` when the document never wrote it --
-    /// the distinction the whole settings screen rests on. A key written
-    /// to its own default is still `Some`, because [`DaemonConfig::load`]'s
-    /// `#[serde(default)]` on every section makes that fact unrecoverable
-    /// once the file is parsed into a config: only reading the document
-    /// directly, the way this reader and its four siblings below do, can
-    /// still tell "the operator wrote this" from "nobody ever did".
+    /// `[daemon] log_json`, or `None` when the document never wrote it.
+    ///
+    /// A key written to its own default is still `Some`.
+    /// [`DaemonConfig::load`]'s `#[serde(default)]` loses that distinction,
+    /// so this reader and its four siblings below read the document itself.
     #[must_use]
     pub fn daemon_log_json(&self) -> Option<bool> {
         self.table("daemon")?.get("log_json")?.as_bool()
@@ -616,9 +450,9 @@ impl ShepToml {
     }
 
     /// `[daemon] max_cron_sleep`, or `None` when the document never wrote
-    /// it, as the raw string on disk -- not the parsed `UpDuration`. The
-    /// settings screen shows what the file says; parsing it here would
-    /// put a second opinion about the grammar next to `DaemonConfig`'s.
+    /// it, as the raw string on disk rather than a parsed `UpDuration`:
+    /// parsing here would put a second opinion about the grammar next to
+    /// `DaemonConfig`'s.
     #[must_use]
     pub fn daemon_max_cron_sleep(&self) -> Option<String> {
         self.table("daemon")?
@@ -638,9 +472,8 @@ impl ShepToml {
     /// document has none yet.
     ///
     /// # Errors
-    /// [`ShepTomlError::WrongShape`] -- `daemon` is already there as
-    /// something other than a table. See [`Self::set_style_level`], the
-    /// setter this one and its four siblings below are modelled on.
+    /// [`ShepTomlError::WrongShape`] if `daemon` is already there as
+    /// something other than a table.
     pub fn set_daemon_log_json(&mut self, value: bool) -> Result<(), ShepTomlError> {
         self.section_table_mut("daemon")?
             .insert("log_json", Item::Value(value.into()));
@@ -648,12 +481,12 @@ impl ShepToml {
     }
 
     /// Writes `[daemon] log_level = "<value>"`, creating `[daemon]` when
-    /// this document has none yet. `value` is written as given, unchecked
-    /// -- [`DaemonConfig::load`] is what refuses a name that is not a real
+    /// this document has none yet. `value` is written as given, unchecked:
+    /// [`DaemonConfig::load`] is what refuses a name that is not a real
     /// `LogLevel`.
     ///
     /// # Errors
-    /// [`ShepTomlError::WrongShape`] -- `daemon` is already there as
+    /// [`ShepTomlError::WrongShape`] if `daemon` is already there as
     /// something other than a table.
     pub fn set_daemon_log_level(&mut self, value: &str) -> Result<(), ShepTomlError> {
         self.section_table_mut("daemon")?
@@ -665,7 +498,7 @@ impl ShepToml {
     /// document has none yet.
     ///
     /// # Errors
-    /// [`ShepTomlError::WrongShape`] -- `daemon` is already there as
+    /// [`ShepTomlError::WrongShape`] if `daemon` is already there as
     /// something other than a table.
     pub fn set_daemon_socket(&mut self, value: &Path) -> Result<(), ShepTomlError> {
         self.section_table_mut("daemon")?.insert(
@@ -677,11 +510,11 @@ impl ShepToml {
 
     /// Writes `[daemon] max_cron_sleep = "<value>"`, creating `[daemon]`
     /// when this document has none yet. `value` is written as given,
-    /// unchecked -- [`DaemonConfig::load`] is what refuses a duration
-    /// below the floor or one that does not parse at all.
+    /// unchecked: [`DaemonConfig::load`] is what refuses a duration below
+    /// the floor or one that does not parse at all.
     ///
     /// # Errors
-    /// [`ShepTomlError::WrongShape`] -- `daemon` is already there as
+    /// [`ShepTomlError::WrongShape`] if `daemon` is already there as
     /// something other than a table.
     pub fn set_daemon_max_cron_sleep(&mut self, value: &str) -> Result<(), ShepTomlError> {
         self.section_table_mut("daemon")?
@@ -693,7 +526,7 @@ impl ShepToml {
     /// when this document has none yet.
     ///
     /// # Errors
-    /// [`ShepTomlError::WrongShape`] -- `whistle` is already there as
+    /// [`ShepTomlError::WrongShape`] if `whistle` is already there as
     /// something other than a table.
     pub fn set_whistle_allow_control(&mut self, value: bool) -> Result<(), ShepTomlError> {
         self.section_table_mut("whistle")?
@@ -701,42 +534,32 @@ impl ShepToml {
         Ok(())
     }
 
-    /// Removes `[daemon] socket` if it is set, and does nothing --
-    /// neither error nor write -- if `[daemon]` is absent or is not a
-    /// table. Unlike the setters above, there is no shape for this to
-    /// refuse: removing a key from a table that is not a table is already
-    /// a no-op.
+    /// Removes `[daemon] socket` if it is set, and does nothing when
+    /// `[daemon]` is absent or is not a table. No `Result`: removing a key
+    /// from something that is not a table is already a no-op.
     pub fn unset_daemon_socket(&mut self) {
         if let Some(daemon) = self.doc.get_mut("daemon").and_then(Item::as_table_mut) {
             daemon.remove("socket");
         }
     }
 
-    /// Removes `[daemon] max_cron_sleep` if it is set. See
-    /// [`Self::unset_daemon_socket`] for why this has no `Result`.
+    /// Removes `[daemon] max_cron_sleep` if it is set.
     pub fn unset_daemon_max_cron_sleep(&mut self) {
         if let Some(daemon) = self.doc.get_mut("daemon").and_then(Item::as_table_mut) {
             daemon.remove("max_cron_sleep");
         }
     }
 
-    /// Writes the starter `[interpreters]` mapping (task 47) -- a script
-    /// extension to the interpreter shep runs it with, active from the
-    /// moment it lands rather than commented into inertness, with an
-    /// explanatory comment above the table so it reads as something an
-    /// operator wrote and can freely edit rather than as hidden behaviour.
-    /// Active is the point: shep never infers an interpreter on its own,
-    /// but a fresh `$SHEP_HOME` still has to be able to run the
-    /// `shep start server.js` `welcome.rs` and `--help` both advertise as
-    /// the quick start, and a mapping nobody has uncommented yet cannot do
-    /// that.
+    /// Writes the starter `[interpreters]` mapping, a script extension to
+    /// the interpreter shep runs it with, under
+    /// `INTERPRETERS_STARTER_COMMENT`.
     ///
-    /// A no-op when `[interpreters]` already exists. Called once per home
-    /// from `lib.rs`'s first-run scaffold, but idempotent by construction
-    /// rather than by that single call site -- the same reasoning
-    /// [`Self::enable_dog`] gives for its own idempotence -- so a caller
-    /// that runs this twice, or a `shep.toml` an operator has since hand-
-    /// edited, is never clobbered or duplicated.
+    /// Written live rather than commented out: shep never infers an
+    /// interpreter on its own, and a fresh `$SHEP_HOME` still has to run the
+    /// `shep start server.js` that `welcome.rs` and `--help` advertise.
+    ///
+    /// A no-op when `[interpreters]` already exists, so a hand-edited
+    /// `shep.toml` is never clobbered or duplicated.
     pub fn write_starter_interpreters(&mut self) {
         if self.doc.contains_key("interpreters") {
             return;
@@ -751,25 +574,16 @@ impl ShepToml {
 
     /// Writes the document back: staged in a sibling temp file at
     /// [`shep_core::atomic_file::OWNER_ONLY_FILE_MODE`], `fsync`ed,
-    /// `rename`d over `path`, and the directory `fsync`ed in turn so the
-    /// rename itself survives a power cut (see `shep_core::atomic_file`).
+    /// `rename`d over `path`, then the directory `fsync`ed so the rename
+    /// survives a power cut.
     ///
-    /// Private, and reached only from [`Self::edit`] with the lock held.
-    ///
-    /// `std::fs::write` opens `O_TRUNC`, so a crash, a signal or an
-    /// `ENOSPC` between the truncate and the write leaves an operator's
-    /// whole `shep.toml` truncated or empty — the one loss this type's
-    /// own doc says there is no undo for. Staging and renaming is what
-    /// every other file this workspace writes already does
-    /// (`barks::write_ring`, `snapshot::write_atomic`,
-    /// `boot::write_pidfile`), and it is also what re-tightens a
-    /// `shep.toml` that an older shep left at `0644`: the rename
-    /// installs the staging file's inode, mode included.
+    /// Not `std::fs::write`: its `O_TRUNC` would leave an operator's whole
+    /// `shep.toml` empty on a crash between truncate and write. The rename
+    /// also re-tightens a `shep.toml` an older shep left at `0644`.
     ///
     /// # Errors
-    /// - [`ShepTomlError::Io`] — the staging file could not be created or
-    ///   written, the rename over `path` failed, or the directory holding
-    ///   it could not be flushed.
+    /// - [`ShepTomlError::Io`] if the staging file could not be written, the
+    ///   rename over `path` failed, or the directory could not be flushed.
     fn save(&self) -> Result<(), ShepTomlError> {
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
         let mut tmp = create_config_file(parent).map_err(|source| self.io_error(source))?;
@@ -778,20 +592,17 @@ impl ShepToml {
         tmp.as_file()
             .sync_all()
             .map_err(|source| self.io_error(source))?;
-        // `persist` is `rename(2)`. On failure the `NamedTempFile` comes
-        // back inside the error and its `Drop` removes the staging file,
-        // so a failed replace leaves nothing behind in `$SHEP_HOME`.
+        // `persist` is `rename(2)`. On failure the `NamedTempFile` comes back
+        // inside the error and its `Drop` removes the staging file.
         tmp.persist(&self.path)
             .map_err(|err| self.io_error(err.error))?;
 
-        // The `sync_all` above made the CONTENTS durable; this makes the
-        // rename that published them durable. See `shep_core::atomic_file`.
+        // `sync_all` above made the contents durable; this makes the rename
+        // that published them durable.
         shep_core::atomic_file::sync_dir(parent).map_err(|source| self.io_error(source))?;
         Ok(())
     }
 
-    /// This file's [`ShepTomlError::Io`], for the several ways one write
-    /// of it can fail.
     fn io_error(&self, source: std::io::Error) -> ShepTomlError {
         ShepTomlError::Io {
             path: self.path.clone(),
@@ -799,22 +610,17 @@ impl ShepToml {
         }
     }
 
-    /// `section` as a table, or `None` if this document never wrote it, or
+    /// `section` as a table, or `None` if this document never wrote it or
     /// wrote it as something else. The read side every scalar reader above
-    /// shares -- `Item::as_table` already answers `None` for the wrong-
-    /// shape case, which is fine for a reader (there is nothing to refuse,
-    /// only nothing to report) even though a setter cannot let that same
-    /// silence stand.
+    /// shares: a reader has nothing to refuse, unlike a setter.
     fn table(&self, section: &str) -> Option<&Table> {
         self.doc.get(section).and_then(Item::as_table)
     }
 
-    /// `section` as a table, creating it (empty) if this document has none
-    /// yet, and refusing with [`ShepTomlError::WrongShape`] if `section`
-    /// is already occupied by something else -- the write side every
-    /// scalar setter above shares, factored out rather than repeated five
-    /// times. [`Self::set_style_level`] carries this same shape inline,
-    /// for one key rather than five.
+    /// `section` as a table, creating it empty if this document has none
+    /// yet, and refusing with [`ShepTomlError::WrongShape`] if `section` is
+    /// already occupied by something else. The write side every scalar
+    /// setter above shares.
     fn section_table_mut(&mut self, section: &'static str) -> Result<&mut Table, ShepTomlError> {
         let item = self
             .doc
@@ -841,20 +647,14 @@ impl ShepToml {
 /// Creates `dir` (and any missing parent) at `boot::DIR_MODE` directly,
 /// via `DirBuilderExt`, rather than `create_dir_all` and a later `chmod`.
 ///
-/// `$SHEP_HOME` holds the webhook URLs `docs/dogs.md` tells an operator to
-/// paste into `[dog.bark.sinks]`, and on a host that has never booted a
-/// shepherd this call is the one that creates it — `boot::init_dirs`, which
-/// force-chmods it to `DIR_MODE`, does not run until the first `shep
-/// muster`. A `create_dir_all` here would leave it at the ambient umask,
-/// typically `0755`, for every local user to read until that boot. Asking
-/// for the mode at `mkdir` time also leaves no window in which the
-/// directory exists wider, the same TOCTOU discipline
-/// `launch::launch_command` and `boot::create_dir_at_dir_mode` each spell
-/// out at their own call.
+/// `$SHEP_HOME` holds webhook URLs, and on a host that has never booted a
+/// shepherd this call is the one that creates it: `boot::init_dirs`, which
+/// force-chmods it, does not run until the first `shep muster`. A
+/// `create_dir_all` would leave it at the ambient umask, typically `0755`,
+/// until that boot, and asking for the mode at `mkdir` time leaves no window
+/// in which the directory exists wider.
 ///
-/// Reuses `shep_daemon::boot::DIR_MODE` rather than restating `0o700`: one
-/// spelling of the number, so a change to the daemon's posture cannot pass
-/// this by.
+/// Reuses `shep_daemon::boot::DIR_MODE` rather than restating `0o700`.
 fn create_home_dir(dir: &Path) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
@@ -868,46 +668,31 @@ fn create_home_dir(dir: &Path) -> std::io::Result<()> {
 /// Creates the staging file a config is written through, in `parent` so
 /// the later `rename` stays within one filesystem.
 ///
-/// The create-at-mode reasoning lives with
-/// [`shep_core::atomic_file::create_staging_file`], which four stores now
-/// share. What is left here is the pair of names, and this wrapper is
-/// where they stay: `commands::dog_migration` writes `dogs.toml` through
-/// the same staging name as `shep.toml`, and two call sites spelling that
-/// pair out separately is how the two would drift.
+/// The pair of names stays in this wrapper because
+/// `commands::dog_migration` writes `dogs.toml` through the same staging
+/// name as `shep.toml`, and two call sites spelling it out would drift.
 pub(super) fn create_config_file(parent: &Path) -> std::io::Result<tempfile::NamedTempFile> {
     shep_core::atomic_file::create_staging_file(parent, "shep", ".toml.tmp")
 }
 
-/// An exclusive advisory lock over one config file, held for as long as
-/// the value lives and released when it drops (including on an early `?`,
-/// and by the kernel if the process dies holding it).
+/// An exclusive advisory lock over one config file, released on drop or by
+/// the kernel if the process dies holding it.
 ///
-/// Keyed on the path it is given rather than on `shep.toml` specifically:
-/// [`ShepToml::edit`] takes one over `shep.toml`, and
-/// `commands::dog_migration` takes one over `dogs.toml`, which has two
-/// writers of its own. **Whenever both are held at once, `shep.toml`'s is
-/// taken first**, which is the whole of what keeps the two orderings from
-/// deadlocking; `migrate_dog_sections` is the one caller that holds both,
-/// and it says so at the point it nests them.
+/// Keyed on the path it is given: [`ShepToml::edit`] locks `shep.toml`,
+/// `commands::dog_migration` locks `dogs.toml`. `shep.toml`'s is always
+/// taken first, to avoid deadlocking the two orderings.
 ///
-/// The lock is on a sibling `<name>.lock`, never on the config itself,
-/// and that is the whole design decision — the same one `barks::RingLock`
-/// records: [`ShepToml::save`] finishes by `rename`ing a new file over the
-/// config, which replaces the inode. A lock taken on the config would be a
-/// lock on an inode the very next successful save unlinks; the next writer
-/// would open the *new* inode, find it unlocked, and the two would be
-/// excluding nothing. The lock file is never renamed, never rewritten and
-/// never read; it exists only to be an inode with a stable identity, and
-/// it is left on disk between edits on purpose so both writers keep
-/// agreeing on which one it is.
+/// On a sibling `<name>.lock`, never the config itself: [`ShepToml::save`]
+/// renames a new file over the config, so a lock on the config would lock
+/// an inode the next save unlinks. The lock file is never renamed,
+/// rewritten or read, and stays on disk between edits.
 pub(super) struct ConfigLock {
     /// `flock(2)` is released by this handle's `Drop`. Named with a
     /// leading underscore because it is held, never read.
     #[cfg(unix)]
     _flock: nix::fcntl::Flock<std::fs::File>,
-    /// The lock file, opened with `share_mode(0)`. The same primitive and
-    /// the same sibling-file shape [`shep_core::kv`] and
-    /// [`shep_core::barks`] use; see either for the full argument.
+    /// The lock file, opened with `share_mode(0)`: the same primitive
+    /// [`shep_core::kv`] and [`shep_core::barks`] use.
     #[cfg(windows)]
     _handle: std::fs::File,
 }
@@ -958,10 +743,8 @@ impl ConfigLock {
             .mode(shep_core::atomic_file::OWNER_ONLY_FILE_MODE)
             .open(lock_path(path))?;
 
-        // `LockExclusive` blocks; the non-blocking variant would need a
-        // retry loop and a deadline, and a `shep enable` that waits its
-        // turn behind a concurrent `shep adopt` is exactly the behaviour
-        // wanted here.
+        // `LockExclusive` blocks: a `shep enable` waiting its turn behind a
+        // concurrent `shep adopt` is the behaviour wanted here.
         Flock::lock(file, FlockArg::LockExclusive)
             .map(|flock| Self { _flock: flock })
             .map_err(|(_file, errno)| std::io::Error::from(errno))
@@ -980,17 +763,11 @@ fn lock_path(path: &Path) -> PathBuf {
     path.parent().unwrap_or_else(|| Path::new(".")).join(name)
 }
 
-/// What [`ShepToml::edit`] can fail with. Module-scoped per IR-18.
+/// What [`ShepToml::edit`] can fail with.
 ///
-/// Deliberately NOT `#[non_exhaustive]`, and this is the comment IR-20 asks
-/// for in the negative case. shep-cli is `[[bin]]`-only — no `lib.rs`, no
-/// published surface — so nothing outside this binary can match on this enum
-/// and there is no downstream `match` for the attribute to protect. Adding it
-/// would tax only this crate's own exhaustive matches, which are the ones we
-/// WANT the compiler to break when `ShepToml::edit` grows a new failure mode.
-/// Same reasoning as [`CronScheduleError`](shep_core::config::CronScheduleError)'s
-/// own omission, for a different reason: that one is closed, this one is
-/// unexported.
+/// Not `#[non_exhaustive]`: nothing outside this binary can match on it, and
+/// this crate's own exhaustive matches are the ones the compiler should
+/// break when a new failure mode lands.
 pub enum ShepTomlError {
     /// A read or write of `path` itself failed.
     Io {
@@ -1006,37 +783,25 @@ pub enum ShepTomlError {
         /// The parser's own complaint.
         source: toml_edit::TomlError,
     },
-    /// `path` parses, but `key` is already there as something other than
-    /// a table -- e.g. an operator writing `style = "full"` at the top
-    /// level instead of `[style]` / `level = "full"`. Legal TOML, but not
-    /// a shape any setter in this module can write a sub-key into:
-    /// forcing it to a table would silently discard whatever the
-    /// operator actually wrote there.
+    /// `path` parses, but `key` is already there as something other than a
+    /// table, e.g. `style = "full"` at the top level instead of `[style]`.
+    /// Legal TOML, but forcing it to a table would discard what the operator
+    /// wrote there.
     WrongShape {
         /// The file that holds the wrongly-shaped value.
         path: PathBuf,
-        /// The table key that was expected -- `"style"` for
-        /// [`ShepToml::set_style_level`], `"daemon"` or `"whistle"` for
-        /// the settings-screen setters that share [`ShepToml::section_table_mut`].
+        /// The table key that was expected.
         key: &'static str,
-        /// What TOML actually found there ([`Item::type_name`]) --
-        /// `"string"`, `"array"`, and so on; never `"table"`, since that
-        /// is the one shape this variant is never raised for.
+        /// What TOML found there ([`Item::type_name`]); never `"table"`.
         found: &'static str,
     },
 }
 
-/// Manual, not derived: `toml_edit::TomlError` carries the ENTIRE source
-/// document internally (its own `raw` field, kept for `Display`'s
-/// line-and-column rendering) — a `#[derive(Debug)]` here would forward to
-/// that type's own derived `Debug` and print `shep.toml` in full, secrets
-/// included, the exact leak `DaemonConfig`'s own `Debug` already declines
-/// for its `dog` field. `Display` still shows the parser's full
-/// line-of-context message (below): that is the one deliberate surface
-/// meant for the operator who broke their own file to read, same as
-/// `DaemonConfigError::Toml`'s. `Debug` is not that surface — it is what a
-/// log captures — so it is redacted to the path and the parser's short
-/// `message()`, never the line it quotes.
+/// Manual, not derived: `toml_edit::TomlError` keeps the whole source
+/// document for `Display`'s line-and-column rendering, so a derived `Debug`
+/// would print `shep.toml` in full, secrets included. `Debug` is what a log
+/// captures, so it carries the path and the parser's short `message()` only;
+/// `Display` still shows the full message, for the operator to read.
 impl std::fmt::Debug for ShepTomlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1084,11 +849,8 @@ impl core::error::Error for ShepTomlError {
     }
 }
 
-// `unix` because the config-writing cases assert a `0600` mode and an inode preserved across an atomic rename — guarantees the Windows tier
-// deliberately makes differently, each argued at its own call site
-// above. What Windows claims instead is covered by `tests/cli_e2e.rs`
-// and by the real-flock verification in the Windows port's own notes;
-// this module's unix coverage is unchanged.
+// unix only: asserts a `0600` mode and an inode preserved across an atomic
+// rename. Windows differs; `tests/cli_e2e.rs` covers that tier.
 #[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
@@ -1102,10 +864,8 @@ mod tests {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
-    /// fails if the writer round-trips through a plain `toml::Table`. An
-    /// operator's `shep.toml` is hand-written, and a `shep enable` that
-    /// silently dropped their comments and reordered their keys is a reason
-    /// not to run `shep enable`.
+    /// fails if the writer round-trips through a plain `toml::Table`,
+    /// losing comments and key order.
     #[test]
     fn enabling_a_dog_leaves_the_rest_of_the_file_exactly_as_it_was() {
         let dir = tempfile::tempdir().unwrap();
@@ -1132,10 +892,6 @@ mod tests {
         );
     }
 
-    /// fails if `enable` appends a duplicate on the second call, which
-    /// would make the daemon try to start one dog twice at boot, or if
-    /// `disable` takes the dog's configuration with it — the operator who
-    /// disables a dog to restart it must get their rules back.
     #[test]
     fn enable_is_idempotent_and_disable_keeps_the_config_it_did_not_write() {
         let dir = tempfile::tempdir().unwrap();
@@ -1161,9 +917,6 @@ mod tests {
         );
     }
 
-    /// fails if a `shep.toml` that will not parse is overwritten instead of
-    /// refused. That file may hold every knob a daemon boots with; losing
-    /// it to a typo'd `shep enable` is not recoverable.
     #[test]
     fn a_file_that_will_not_parse_is_refused_rather_than_replaced() {
         let dir = tempfile::tempdir().unwrap();
@@ -1179,16 +932,14 @@ mod tests {
         );
     }
 
-    /// fails if `rehome_dog` leaves anything behind: `[daemon] adopted_dogs`,
-    /// `enabled_dogs`, or `[dog.<name>]` itself — the whole point of `rehome`
-    /// over `disable` is that nothing survives it.
+    /// Three places have to be empty afterwards: `[daemon] adopted_dogs`,
+    /// `enabled_dogs`, and `[dog.<name>]`.
     #[test]
     fn rehoming_a_dog_forgets_it_entirely() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shep.toml");
-        // Seeded by hand, since no writer here creates one any more: a
-        // `[dog.<name>]` in `shep.toml` is what an un-migrated file carries,
-        // and striking it is still this method's job.
+        // Seeded by hand: no writer here creates a `[dog.<name>]` any more,
+        // but an un-migrated file carries one.
         std::fs::write(&path, "[dog.otel]\ndebounce = \"30s\"\n").unwrap();
         ShepToml::edit(&path, |doc| {
             doc.adopt_dog("otel", Path::new("/usr/local/bin/shep-otel"));
@@ -1214,10 +965,6 @@ mod tests {
         assert!(!cfg.dog.contains_key("otel"));
     }
 
-    /// fails if `adopted_dog_path` cannot see an entry `adopt_dog` wrote
-    /// (the read `commands::dogs::rehome` needs before `rehome_dog` erases
-    /// it), or if it invents a path for a name it never recorded — a
-    /// built-in dog, or one this document has never heard of.
     #[test]
     fn adopted_dog_path_reads_what_adopt_dog_wrote_and_nothing_else() {
         let dir = tempfile::tempdir().unwrap();
@@ -1236,8 +983,6 @@ mod tests {
         .unwrap();
     }
 
-    /// A missing `shep.toml` is not an error — `edit` opens it as an empty
-    /// document and creates the file (and `$SHEP_HOME` itself).
     #[test]
     fn a_missing_file_opens_empty_and_edit_creates_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -1246,10 +991,6 @@ mod tests {
         assert!(path.exists());
     }
 
-    /// fails if `set_style_level` writes a spelling `DaemonConfig::load`'s
-    /// own `[style]` reader can't parse back for any of the three levels —
-    /// the whole point of writing `level`'s own `Display` string is that
-    /// the round trip needs no hand-written expectation to agree with.
     #[test]
     fn setting_a_style_level_round_trips_through_daemon_config() {
         for level in [StyleLevel::Full, StyleLevel::Plain, StyleLevel::Bare] {
@@ -1262,11 +1003,6 @@ mod tests {
         }
     }
 
-    /// fails if setting a style level round-trips through a plain
-    /// `toml::Table` the way `enabling_a_dog_leaves_the_rest_of_the_file_
-    /// exactly_as_it_was` guards against for dogs — an operator's
-    /// `shep.toml` is hand-written, and `shep style` touching only
-    /// `[style]` is the whole point of `ShepToml` over `toml::to_string`.
     #[test]
     fn setting_a_style_level_leaves_the_rest_of_the_file_exactly_as_it_was() {
         let dir = tempfile::tempdir().unwrap();
@@ -1288,12 +1024,6 @@ mod tests {
         assert_eq!(cfg.style.level.as_deref(), Some("plain"));
     }
 
-    /// fails if a second `shep style` appends a second `level` key rather
-    /// than replacing the first — `toml_edit::Table::insert` on an
-    /// existing key is supposed to do the latter, but nothing pinned that
-    /// this setter actually relies on that rather than, say, always going
-    /// through `entry().or_insert_with()`, which would leave the first
-    /// value in place forever.
     #[test]
     fn setting_a_style_level_twice_replaces_rather_than_appends() {
         let dir = tempfile::tempdir().unwrap();
@@ -1307,10 +1037,6 @@ mod tests {
         assert_eq!(cfg.style.level.as_deref(), Some("bare"));
     }
 
-    /// A `$SHEP_HOME` with no `shep.toml` at all is the common case for a
-    /// first `shep style <level>`, and it must create one rather than
-    /// refusing — the same behaviour `a_missing_file_opens_empty_and_edit_
-    /// creates_it` pins for `enable_dog`.
     #[test]
     fn setting_a_style_level_into_a_home_with_no_shep_toml_creates_one() {
         let dir = tempfile::tempdir().unwrap();
@@ -1325,10 +1051,8 @@ mod tests {
         assert_eq!(cfg.style.level.as_deref(), Some("bare"));
     }
 
-    /// The starter mapping is active, not commented into inertness: task
-    /// 47's whole point is that a fresh `$SHEP_HOME` can run `shep start
-    /// server.js` without any further setup, and a mapping nobody has
-    /// uncommented cannot do that.
+    /// Active, not commented out: a fresh `$SHEP_HOME` has to run
+    /// `shep start server.js` with no further setup.
     #[test]
     fn the_starter_interpreters_are_written_active() {
         let dir = tempfile::tempdir().unwrap();
@@ -1355,9 +1079,6 @@ mod tests {
         assert_eq!(cfg.interpreters.get("sh").map(String::as_str), Some("sh"));
     }
 
-    /// The mapping is visible and editable, not hidden magic: an
-    /// explanatory comment sits right above the table it writes, in the
-    /// same file an operator already has open.
     #[test]
     fn the_starter_interpreters_carry_an_explanatory_comment() {
         let dir = tempfile::tempdir().unwrap();
@@ -1381,10 +1102,6 @@ mod tests {
         );
     }
 
-    /// fails if a second scaffold (a second `ensure_home_at` for whatever
-    /// reason, or a caller re-running the first-run hook) appends a
-    /// duplicate `[interpreters]` table, or overwrites one an operator has
-    /// since edited to their own taste.
     #[test]
     fn writing_the_starter_interpreters_twice_does_not_duplicate_or_clobber() {
         let dir = tempfile::tempdir().unwrap();
@@ -1413,23 +1130,10 @@ mod tests {
         );
     }
 
-    /// fails if `set_style_level` panics instead of reporting when
-    /// `style` already exists as something other than a table: an operator
-    /// writing `style = "full"` at the top level (legal TOML, and a natural
-    /// guess) must get a clean [`ShepTomlError::WrongShape`], not an
-    /// internal assertion aborting the whole process.
-    ///
-    /// Also fails if a refused write still replaces the file. Routing the
-    /// setter through [`ShepToml::edit`], which always calls `save()` after
-    /// the closure runs regardless of what the closure returned, would
-    /// still stage a fresh file and rename it over the original on a
-    /// refusal: identical bytes, but a new inode, and the mode forced to
-    /// [`shep_core::atomic_file::OWNER_ONLY_FILE_MODE`] even though the
-    /// original here is `0644`.
-    /// Content equality alone hides that, which is why this checks the
-    /// file's metadata rather than only what is in it.
-    /// [`ShepToml::try_edit`] is what actually prevents it: it never
-    /// reaches `save` when the closure returns `Err`.
+    /// The inode and mode checks are the point: [`ShepToml::edit`] would
+    /// stage and rename a byte-identical copy on a refusal, which content
+    /// equality alone hides. [`ShepToml::try_edit`] never reaches `save`
+    /// when the closure returns `Err`.
     #[test]
     fn a_style_key_that_is_not_a_table_is_reported_and_the_file_is_never_rewritten() {
         use std::os::unix::fs::MetadataExt as _;
@@ -1533,13 +1237,8 @@ mod tests {
         assert!(text.contains("level = \"full\""), "got: {text}");
         assert!(text.contains("log_level = \"debug\""), "got: {text}");
 
-        // The four checks above are substring checks against the whole file
-        // and cannot tell `log_level = "debug"` landing under `[daemon]`
-        // from the same bytes landing under `[style]` or anywhere else --
-        // reading it back through the section-aware reader is what pins
-        // the section, since `daemon_log_level` walks the `[daemon]` table
-        // specifically and would read `None` if the setter had written
-        // into a different one.
+        // Substring checks can't tell which section `log_level = "debug"`
+        // landed under; `daemon_log_level` reads `[daemon]` specifically.
         let cfg = ShepToml::read_only(&path).unwrap();
         assert_eq!(cfg.daemon_log_level().as_deref(), Some("debug"));
     }
@@ -1567,11 +1266,8 @@ mod tests {
         let path = dir.path().join("shep.toml");
         std::fs::write(&path, "daemon = \"loud\"\n").unwrap();
 
-        // `try_edit`, not `edit`. `edit` runs `save` whatever the closure
-        // returned, so a refusal through it would still stage and rename a
-        // byte-identical copy, landing a fresh inode on a file the refusal never
-        // touched. That is the failure `try_edit` exists for, and it is why
-        // every setter on this screen goes through it.
+        // `try_edit`, not `edit`: `edit` always saves, which would stage a
+        // byte-identical copy despite the refusal.
         let refusal: Result<(), ShepTomlError> =
             ShepToml::try_edit(&path, |cfg| cfg.set_daemon_log_json(true));
 
@@ -1685,16 +1381,9 @@ mod tests {
         assert_eq!(cfg.daemon_log_level().as_deref(), Some("debug"));
     }
 
-    /// fails if the first `shep enable` on a host that has never booted a
-    /// shepherd leaves either the file or `$SHEP_HOME` readable by another
-    /// local user. This is the file `docs/dogs.md` tells an operator to
-    /// paste a Discord webhook URL into, and `boot::init_dirs` — the
-    /// force-chmod that would otherwise narrow the directory — does not run
-    /// until the first `shep muster`, which may be much later or never.
-    ///
     /// Both modes are asserted on a path where neither the directory nor
-    /// the file existed beforehand, because that is the case the ambient
-    /// umask would decide.
+    /// the file existed beforehand: that is the case the ambient umask
+    /// would decide.
     #[test]
     fn a_first_edit_creates_the_home_and_the_file_owner_only() {
         let dir = tempfile::tempdir().unwrap();
@@ -1715,11 +1404,8 @@ mod tests {
         );
     }
 
-    /// fails if an existing `shep.toml` left wide by an older shep (or by
-    /// an operator's own `touch`) stays wide after this writer replaces it.
-    /// The rename installs the staging file's inode, mode included, so the
-    /// narrowing is a property of the write path rather than a chmod pass
-    /// somebody has to remember to run.
+    /// The rename installs the staging file's inode, mode included:
+    /// narrowing is a property of the write path, not a separate chmod.
     #[test]
     fn editing_a_world_readable_config_leaves_it_owner_only() {
         let dir = tempfile::tempdir().unwrap();
@@ -1732,11 +1418,9 @@ mod tests {
         assert_eq!(mode_of(&path), 0o600);
     }
 
-    /// The redaction IR-41 requires: `Debug` on a parse failure carries the
-    /// path and the parser's short message, never the document
-    /// `toml_edit::TomlError` quotes to render its own `Display` — a
-    /// `[dog.bark]` table sitting next to the syntax error would otherwise
-    /// put a webhook token in `{:?}` output.
+    /// `Debug` carries only the path and the parser's short message, never
+    /// the document `Display` quotes: a webhook in `[dog.bark]` must not
+    /// reach `{:?}` output.
     #[test]
     fn parse_error_debug_never_prints_the_document() {
         let path = PathBuf::from("/home/ada/.shep/shep.toml");
@@ -1758,8 +1442,8 @@ mod tests {
              expected `.`, `]`\" }"
         );
 
-        // `Display`, unlike `Debug`, is the deliberate surface an operator
-        // reads to find their own typo — it still shows the offending line.
+        // `Display` is what an operator reads for a typo; it still shows
+        // the offending line.
         let display = err.to_string();
         assert!(display.contains("invalid table header"));
     }
@@ -1779,12 +1463,9 @@ mod tests {
     /// different edits, so a survivor of one cannot stand in for the other.
     const ADOPTING_TAG: &str = "alpha";
 
-    /// Not a test — the child half of
-    /// [`two_writer_processes_do_not_lose_each_other_s_edits`], which
-    /// re-executes this binary with `--ignored --exact` to reach it. It is
-    /// `#[ignore]`d so a normal run never picks it up, and it asserts
-    /// nothing: its job is to hammer [`ShepToml::edit`] from a second OS
-    /// process, and the parent does the judging.
+    /// Child half of [`two_writer_processes_do_not_lose_each_other_s_edits`],
+    /// re-executed with `--ignored --exact`. Hammers [`ShepToml::edit`] from
+    /// a second OS process; asserts nothing itself, the parent judges.
     #[test]
     #[ignore = "child process of two_writer_processes_do_not_lose_each_other_s_edits"]
     fn config_race_child() {
@@ -1807,16 +1488,9 @@ mod tests {
         }
     }
 
-    /// fails if two `shep` processes editing one `shep.toml` lose each
-    /// other's edits — `shep adopt otel ... & shep enable metrics &` out of
-    /// a provisioning script, where both read the pre-edit document and
-    /// both write the whole thing back.
-    ///
-    /// Two OS processes, not two threads: this document is read and written
-    /// by whole `shep` invocations, so any in-process serialisation would
-    /// prove nothing about the bug, which is a read-modify-write across a
-    /// `rename` with no lock between address spaces. `barks.jsonl` had the
-    /// identical shape and lost half its records to it.
+    /// Two OS processes, not threads: the race is a read-modify-write
+    /// across a `rename` with no lock between address spaces, which
+    /// in-process serialisation cannot reproduce.
     #[test]
     fn two_writer_processes_do_not_lose_each_other_s_edits() {
         let dir = tempfile::tempdir().unwrap();
@@ -1907,9 +1581,8 @@ mod tests {
 
         ShepToml::edit(&path, ShepToml::take_dog_sections).expect("edit");
 
-        // Exact string: the whole reason this goes through `toml_edit` rather
-        // than a `toml::Table` round-trip is that a comment or a reordered key
-        // would be a reason not to run the upgrade.
+        // Exact string: a `toml::Table` round-trip would drop the comment
+        // or reorder the key.
         assert_eq!(
             std::fs::read_to_string(&path).expect("read"),
             "# keep me\n[daemon]\nenabled_dogs = [\"metrics\"]\n\n[style]\nlevel = \"full\"\n"
