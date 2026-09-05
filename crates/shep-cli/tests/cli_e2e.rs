@@ -1451,9 +1451,14 @@ fn poll_flock_data_across_a_handover(
 /// other.
 ///
 /// A tolerated attempt costs a retry and nothing else: it does not consult
-/// `done`, and it does not extend `deadline`. It skips the deadline check
-/// too, because there is no observation to return from it, and skipping
-/// cannot spin: the tolerance is spent the first time it is used.
+/// `done`, and it does not extend `deadline` for the observations that
+/// follow. It does not check the deadline either, and that is wanted rather
+/// than an oversight. There is no observation to return from a dropped
+/// reply, and a drop at the deadline's edge that ended the poll instead
+/// would be the flake this exists to close, one window narrower. The one
+/// retry it buys can land after `deadline` by at most one poll interval and
+/// one command, and it cannot spin: the tolerance is spent the first time
+/// it is used.
 fn poll_flock_until(
     home: &Path,
     deadline: Duration,
@@ -9245,20 +9250,31 @@ fn the_control_socket_accepts_throughout_a_handover() {
     // across the exec.
     let (probing, started_probing) = std::sync::mpsc::channel();
     let prober = std::thread::spawn(move || {
+        let mut before_reload = Vec::new();
         let mut dropped = Vec::new();
         let mut pings = 0_usize;
         let mut announced = false;
         while Instant::now() < deadline {
             pings += 1;
-            if !shep(&home).arg("ping").output().unwrap().status.success() {
+            let served = shep(&home).arg("ping").output().unwrap().status.success();
+            if !announced {
+                // The reload waits for a ping the predecessor ANSWERED. A
+                // failure before that has no exec to blame, since none has
+                // been asked for, and it must not spend the one drop the
+                // exec is allowed: it is kept apart and refused below.
+                if served {
+                    announced = true;
+                    let _ = probing.send(());
+                } else {
+                    before_reload.push(pings);
+                }
+                continue;
+            }
+            if !served {
                 dropped.push(pings);
             }
-            if !announced {
-                announced = true;
-                let _ = probing.send(());
-            }
         }
-        (dropped, pings)
+        (before_reload, dropped, pings)
     });
     started_probing
         .recv_timeout(FLOCK_DEADLINE)
@@ -9318,7 +9334,13 @@ fn the_control_socket_accepts_throughout_a_handover() {
     // backlog until it accepts, which is a boot away rather than a
     // `HANDSHAKE_TIMEOUT` away.
     let (refused, dials) = dialer.join().unwrap();
-    let (dropped, pings) = prober.join().unwrap();
+    let (before_reload, dropped, pings) = prober.join().unwrap();
+    assert!(
+        before_reload.is_empty(),
+        "a ping failed before any reload was asked for, at {before_reload:?} of \
+         {pings}: the predecessor was not answering, which is not the handover's \
+         doing"
+    );
     assert!(
         refused.is_empty(),
         "the control address must stay bound across the handover, \
