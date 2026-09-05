@@ -218,8 +218,8 @@ pub(crate) fn install(
             streams,
             ExitCode::Usage,
             &format!(
-                "no directory at {}; run any shep verb as {} first, which creates it, or \
-                 pass --home with the $SHEP_HOME this unit should carry",
+                "no directory at {}; create it first (any shep verb run as {} creates that \
+                 user's own ~/.shep), or pass --home with the $SHEP_HOME this unit should carry",
                 plan.spec.home.display(),
                 plan.spec.user,
             ),
