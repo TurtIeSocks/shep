@@ -267,8 +267,8 @@ pub enum Request {
     /// One sheep's effective config, for a pane that is about to edit it.
     ///
     /// `env` comes back emptied and its key names ride separately, so a
-    /// value never crosses the wire (decision 12 of the overrides design).
-    /// Read-only: nothing about the sheep changes.
+    /// value never crosses the wire. Read-only: nothing about the sheep
+    /// changes.
     ///
     /// Answers [`Response::SheepConfig`], or
     /// [`RpcErrorCode::NotFound`] when no sheep has that name.
@@ -310,15 +310,12 @@ pub enum Request {
     ///
     /// [`Self::SetSheepEnv`]'s twin for everything that is not `env`, and
     /// it exists for the reason that one does rather than by symmetry.
-    /// [`Self::ApplyConfig`] can move a single field -- one
-    /// [`DeclaredApp`] declaring one key, at [`ResetDepth::File`] -- but it
-    /// moves it AS A TEMPLATE: the merge spends the operator's override for
-    /// every key it puts back, on the correct reasoning that a key just
-    /// reset to the file is not a key an operator is still holding a value
-    /// for. A pane's value IS the operator's, so the sheep still differs
-    /// from its file and must keep saying so. Sent through `ApplyConfig`,
-    /// an edit landed and then vanished from `overridden`, the `*` marker
-    /// never appeared, and `shep flock`'s `CFG` column did not count it.
+    /// [`Self::ApplyConfig`] can move a single field (one [`DeclaredApp`]
+    /// declaring one key, at [`ResetDepth::File`]), but it moves it as a
+    /// template and spends the operator's override for it. That reasoning
+    /// does not hold here: a pane's value is the operator's, and the sheep
+    /// still differs from its file. Routed through `ApplyConfig`, the `*`
+    /// marker would never appear for that edit.
     ///
     /// One field, not a map: a pane edits one row at a time, and a request
     /// that took several would need [`Response::Applied`]'s per-field
@@ -346,12 +343,12 @@ pub enum Request {
         /// than ignored.
         key: String,
         /// The new value, in the shape that field serializes as. The daemon
-        /// MUST re-validate the resulting config (peer input is untrusted)
+        /// must re-validate the resulting config (peer input is untrusted)
         /// and refuses with [`RpcErrorCode::InvalidConfig`] when it does not
         /// deserialize or does not normalize; nothing is written in either
         /// case.
         ///
-        /// A bare [`serde_json::Value`] and NOT a redacting newtype, unlike
+        /// A bare [`serde_json::Value`] and not a redacting newtype, unlike
         /// [`Self::SetSheepEnv`]'s [`EnvValue`], and the asymmetry is
         /// deliberate. `env` is the one field [`AppConfig`]'s own manual
         /// `Debug` redacts; `cwd`, `script` and `args` are printed in the
@@ -1088,18 +1085,17 @@ impl fmt::Debug for DogSectionToml {
 /// daemon (a database URL, an API token, a signing key), and a derived
 /// `Debug` on [`Request`] would print it in the clear the moment anything
 /// logs a request. Every other secret-bearing field on this wire is already
-/// protected by its inner type -- [`AppConfig`]'s own manual `Debug` prints
-/// `env: <N vars>` -- and a bare `String` here would have been the first
+/// protected by its inner type ([`AppConfig`]'s own manual `Debug` prints
+/// `env: <N vars>`), and a bare `String` here would have been the first
 /// field in the enum without that protection.
 ///
 /// One direction only. Nothing ever sends one back: [`Request::SheepConfig`]
-/// answers with the env KEYS and no values at all, which is decision 12 of
-/// the overrides design.
+/// answers with the env keys and no values at all.
 ///
 /// [`Self::as_str`] is the only way out, for the reason
-/// [`DogSectionToml`] gives: a `Deref<Target = str>` brought `ToString`
-/// with it, so `.to_string()` returned the value in the clear and defeated
-/// the redacted `Debug` below.
+/// [`DogSectionToml`] gives: a `Deref<Target = str>` would hand the type
+/// `ToString` too, and `.to_string()` would return the value in the clear,
+/// defeating the redacted `Debug` below.
 ///
 /// `#[serde(transparent)]` makes the wire representation identical to a
 /// bare `String`, so this newtype changes nothing about
@@ -1122,7 +1118,7 @@ impl From<String> for EnvValue {
     }
 }
 
-/// Debug prints a length and never the value (IR-41) -- see the type doc for
+/// Debug prints a length and never the value (IR-41); see the type doc for
 /// why. Exact-string-tested below (`env_value_debug_does_not_leak`) so a
 /// future `#[derive(Debug)]` fails that test instead of silently reopening
 /// the leak.
@@ -1222,7 +1218,7 @@ impl SheepApplied {
 ///
 /// The answer to [`Request::SheepConfig`], and the one reply in this module
 /// that carries a whole [`AppConfig`]. [`SheepApplied`] deliberately carries
-/// field NAMES alone, and the difference is what each is for: that one is
+/// field names alone, and the difference is what each is for: that one is
 /// printed at an operator who already has the file, this one feeds a pane
 /// that is about to edit fields it has to be able to show first.
 // wire format: changing field names is a breaking change
@@ -1252,7 +1248,7 @@ pub struct SheepConfigView {
 impl SheepConfigView {
     /// Builds one, clearing `env` and recording its keys.
     ///
-    /// The clearing happens HERE rather than at the one call site, so a
+    /// The clearing happens here rather than at the one call site, so a
     /// second caller cannot forget it: this constructor is the only way to
     /// build the type outside this crate, since `#[non_exhaustive]` blocks
     /// a literal.
@@ -1273,7 +1269,7 @@ impl SheepConfigView {
 /// Redacted (IR-41): `config` carries `args` and `cwd`, which routinely hold
 /// a token or a home directory, and this type is what a `{:?}` on a
 /// [`Response`] would print. The three lists are counted rather than named
-/// for the same reason -- `env_keys` is a key set, which is itself worth
+/// for the same reason: `env_keys` is a key set, which is itself worth
 /// keeping out of a log.
 impl fmt::Debug for SheepConfigView {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1336,7 +1332,7 @@ pub enum Response {
     /// Boxed, and the only variant here that is. This one carries a whole
     /// [`AppConfig`], which is several times the size of anything else in
     /// the enum, and a `Response` is inside a `Reply` which is inside a
-    /// [`ServerFrame`](crate::protocol::ServerFrame) -- so without the box
+    /// [`ServerFrame`](crate::protocol::ServerFrame): without the box,
     /// every frame the daemon sends costs the largest config's worth of
     /// stack for a variant almost none of them use.
     ///
@@ -1364,13 +1360,13 @@ pub enum Response {
     /// Answer to `SetSheepField`: which field moved, and whether the
     /// running child has it.
     ///
-    /// **Not [`Self::Applied`]'s three lists, and the difference is the
-    /// request's own shape.** `applied`, `pending` and `refused` exist
+    /// Not [`Self::Applied`]'s three lists; the difference is the
+    /// request's own shape. `applied`, `pending` and `refused` exist
     /// because `ApplyConfig` carries N apps of M fields, so a caller cannot
     /// otherwise tell which field went where or that one app of eleven was
-    /// refused. This request carries ONE field of ONE sheep, so `refused`
-    /// would be a second way to say no beside the `Err` arm -- a client
-    /// checking only the `Err` would silently swallow the other -- and the
+    /// refused. This request carries one field of one sheep, so `refused`
+    /// would be a second way to say no beside the `Err` arm (a client
+    /// checking only the `Err` would silently swallow the other), and the
     /// two lists collapse to the one bit that is left.
     ///
     /// That bit is not redundant with the field's own
@@ -1962,11 +1958,9 @@ mod tests {
         assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
     }
 
-    /// fails if an env value can be printed by a `{:?}` on a `Request`.
-    /// This is the most secret-dense field on the wire, and the second half
-    /// pins that the newtype protecting it costs the wire nothing: a bare
-    /// string either way, so no fixture and no protocol version moves for
-    /// it.
+    /// Also pins that the newtype protecting this field costs the wire
+    /// nothing: a bare string either way, so no fixture and no protocol
+    /// version moves for it.
     #[test]
     fn env_value_debug_does_not_leak() {
         let request = Request::SetSheepEnv {
@@ -1986,11 +1980,9 @@ mod tests {
         assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
     }
 
-    /// fails if a config pane's answer can carry an env VALUE. The pane
-    /// edits everything else about a sheep, so the config itself has to
-    /// travel; `env` is the one map in it that holds secrets, and decision
-    /// 12 of the overrides design is that the keys travel and the values
-    /// never do (IR-41).
+    /// The pane edits everything else about a sheep, so the config itself
+    /// has to travel; `env` is the one map in it that holds secrets, and
+    /// the keys travel while the values never do (IR-41).
     #[test]
     fn a_sheep_config_view_never_carries_an_env_value() {
         let mut config = AppConfig::minimal("web", "./srv");
@@ -2004,8 +1996,7 @@ mod tests {
         assert!(!json.contains("hunter2"), "{json}");
     }
 
-    /// fails if this type's `Debug` ever prints the config it carries. A
-    /// `{:?}` on a `Response` reaches it, and `config` holds `args` and
+    /// A `{:?}` on a `Response` reaches it, and `config` holds `args` and
     /// `cwd` as well as the env keys (IR-41).
     #[test]
     fn a_sheep_config_views_debug_is_the_exact_redacted_string() {
@@ -2266,12 +2257,11 @@ mod tests {
                 },
             },
             // `value` is pinned as `Some`, because the `None` spelling is
-            // what REMOVES the key and a reader that guessed the two apart
+            // what removes the key, and a reader that guessed the two apart
             // wrongly would delete an operator's env instead of setting it.
             // The value is a placeholder, not a secret: this is the one
             // request in the enum that carries an env value at all, and it
-            // travels in one direction only -- nothing ever reads it back
-            // (decision 12 of the overrides design).
+            // travels in one direction only, nothing ever reads it back.
             Envelope {
                 id: 29,
                 deadline_ms: None,
@@ -2285,7 +2275,7 @@ mod tests {
             // pinned beside it: the two are one letter apart in the tag and
             // a reader that crossed them would write a config field into an
             // env map. `value` is a bare JSON value rather than a string,
-            // which is the half a hand-written reader gets wrong -- an
+            // which is the half a hand-written reader gets wrong: an
             // integer field is an integer here, not `"32"`.
             Envelope {
                 id: 30,
@@ -2649,7 +2639,7 @@ mod tests {
                     key: "DATABASE_URL".to_string(),
                 }),
             },
-            // `pending` pinned TRUE, because `false` is the value a reader
+            // `pending` pinned `true`, because `false` is the value a reader
             // that dropped the field entirely would decode by accident, and
             // the two answers send an operator to different places: one
             // says the change is in force, the other says to reload.

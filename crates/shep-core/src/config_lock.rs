@@ -2,12 +2,11 @@
 //! read-modify-write, and the staging file they write the new value
 //! through.
 //!
-//! Moved here from `shep-cli` (where it was `pub(super)` and reachable only
-//! from that binary) because `dogs.toml` is about to gain a daemon-side
-//! writer: the daemon holds no lock on it today, and a type it cannot name
-//! is a type it cannot hold. `shep-cli`'s three existing writers of
-//! `shep.toml` and `dogs.toml` keep using this one unchanged, imported back
-//! in through a `pub(super) use`.
+//! Lives in `shep-core`, not `shep-cli`, because `dogs.toml` is gaining a
+//! daemon-side writer and a type the daemon cannot name is a type it
+//! cannot hold. `shep-cli`'s three existing writers of `shep.toml` and
+//! `dogs.toml` keep using this one, imported back in through a
+//! `pub(super) use`.
 //!
 //! Deliberately not consolidated with [`crate::overrides`]'s own
 //! `OverridesLock`, which is the same `flock(2)`/`share_mode(0)` shape
@@ -41,8 +40,8 @@ pub fn create_config_file(parent: &Path) -> std::io::Result<tempfile::NamedTempF
 /// Keyed on the path it is given rather than on `shep.toml` specifically:
 /// `shep-cli`'s `ShepToml::edit` takes one over `shep.toml`, and
 /// `commands::dog_migration` takes one over `dogs.toml`, which has two
-/// writers of its own. **Whenever both are held at once, `shep.toml`'s is
-/// taken first**, which is the whole of what keeps the two orderings from
+/// writers of its own. Whenever both are held at once, `shep.toml`'s is
+/// taken first, which is the whole of what keeps the two orderings from
 /// deadlocking; `migrate_dog_sections` is the one caller that holds both,
 /// and it says so at the point it nests them.
 ///
