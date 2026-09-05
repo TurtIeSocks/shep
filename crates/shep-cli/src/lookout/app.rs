@@ -1907,9 +1907,14 @@ impl App {
                     grave: true,
                 });
             }
+            // Unprefixed, unlike every other reply handler in this file.
+            // The shepherd's refusals for this request are whole sentences
+            // that already name the sheep they are about, so a `{name}: `
+            // in front of one says the name twice. A transport error names
+            // nothing, so that arm keeps its prefix.
             Err(RequestError::Rpc(err)) => {
                 self.notice = Some(Notice {
-                    text: format!("{name}: {}", err.message),
+                    text: err.message,
                     grave: true,
                 });
             }
@@ -2117,10 +2122,7 @@ impl App {
             // exactly what `Request::SheepConfig` wants -- and refusing
             // there would make `e` do nothing on the one row a
             // multi-instance app shows by default.
-            KeyPress::Edit => match self.selected_name() {
-                Some(name) => Effect::Send(Sent::SheepConfig { name }),
-                None => Effect::None,
-            },
+            KeyPress::Edit => self.ask_for_config(),
             // Meaningless from the dashboard; the settings screen is the
             // only thing `space` does anything for, and this branch is only
             // reached when that screen is not open.
@@ -2219,6 +2221,38 @@ impl App {
             | KeyPress::TextAbandon => {}
         }
         Effect::None
+    }
+
+    /// `e`'s own handler: refuse a dog here, else ask the shepherd.
+    ///
+    /// The dog check is local because the answer is better local. The
+    /// daemon refuses this request for a dog with a sentence that already
+    /// names it, and this reducer prefixes a refusal with the name it asked
+    /// about, so the round trip produced `log-rotate: log-rotate is a dog,
+    /// and ...`. It also refuses for the wrong reason for this door: the
+    /// daemon is talking about where a dog's config comes from, and what an
+    /// operator pressing `e` needs to know is that this pane is not the
+    /// screen for one.
+    ///
+    /// [`Self::selected_row`] rather than [`Self::selected_name`] for the
+    /// check, and both are right: a dog runs one process, so it is never a
+    /// group row, and a group row is exactly the case `selected_row`
+    /// answers `None` for and `e` still has to work on.
+    fn ask_for_config(&mut self) -> Effect {
+        if let Some(row) = self.selected_row()
+            && row.info.dog.is_some()
+        {
+            let name = row.info.name.clone();
+            self.notice = Some(Notice {
+                text: format!("{name} is a dog, and the config pane is for a sheep"),
+                grave: true,
+            });
+            return Effect::None;
+        }
+        match self.selected_name() {
+            Some(name) => Effect::Send(Sent::SheepConfig { name }),
+            None => Effect::None,
+        }
     }
 
     /// The config pane's own keymap, in force for as long as
@@ -6348,5 +6382,55 @@ mod tests {
         app.note_body_rows(20);
         app.update(Msg::Key(KeyPress::SelectLast));
         assert_eq!(app.config_pane().unwrap().view().offset(), 39 - 19);
+    }
+
+    /// fails if `e` on a dog row asks the shepherd for a config it will
+    /// refuse, or if the refusal names the dog twice.
+    ///
+    /// The round trip produced `log-rotate: log-rotate is a dog, and ...`,
+    /// because the shepherd's own refusal is a whole sentence that already
+    /// names its subject.
+    #[test]
+    fn e_on_a_dog_row_refuses_locally_and_names_the_dog_once() {
+        let mut app = fixtures::with_selection(
+            ProcessInfo::builder(9, "log-rotate", ProcStatus::Online)
+                .dog(Some(shep_core::protocol::DogSource::BuiltIn))
+                .build(),
+        );
+        assert_eq!(
+            app.update(Msg::Key(KeyPress::Edit)),
+            Effect::None,
+            "nothing goes to the shepherd"
+        );
+        let said = app.notice().map(ToString::to_string).unwrap_or_default();
+        assert_eq!(
+            said.matches("log-rotate").count(),
+            1,
+            "the name is said once: {said:?}"
+        );
+        assert!(said.contains("is a dog"), "got {said:?}");
+        assert!(app.config_pane().is_none());
+    }
+
+    /// fails if a refusal that already names its subject gets the name
+    /// pasted in front of it a second time.
+    #[test]
+    fn a_shepherd_refusal_is_shown_in_the_shepherds_own_words() {
+        let mut app = fixtures::app_in_sheep_pane();
+        app.update(Msg::Replied {
+            sent: Sent::SheepConfig {
+                name: "web".to_string(),
+            },
+            result: Err(RequestError::Rpc(RpcError {
+                code: RpcErrorCode::NotFound,
+                message: "web is a dog, and a dog's config comes from `shep adopt`".to_string(),
+                daemon_version: None,
+            })),
+        });
+        let said = app.notice().map(ToString::to_string).unwrap_or_default();
+        assert_eq!(
+            said, "web is a dog, and a dog's config comes from `shep adopt`",
+            "verbatim, no prefix"
+        );
     }
 }
