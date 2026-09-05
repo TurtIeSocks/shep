@@ -257,8 +257,9 @@ pub fn url_carries_credentials(url: &str) -> bool {
 /// of a hostname. `ProbeTarget::parse` refuses the same shape for the same
 /// reason.
 ///
-/// A query or fragment belongs to the path, not the host: the authority
-/// ends at the first `/`, `?` or `#`.
+/// The authority ends at the first `/`, `?` or `#`. A query belongs to
+/// the path from there; a fragment is dropped, being the client's own and
+/// having no place in a request target.
 ///
 /// # Errors
 /// - [`FetchError::Url`] if `url` does not start with `http://` or
@@ -287,12 +288,17 @@ pub fn parse_url(url: &str) -> Result<Target, FetchError> {
         },
     };
     let authority = authority_of(rest);
-    // A query or fragment belongs to the request target, not the host. On
-    // the `?`/`#` arm the remainder has no leading `/` of its own and an
-    // origin-form target needs one, so an absent path is sent as `/`.
-    let path = match rest[authority.len()..].chars().next() {
-        Some('/') => rest[authority.len()..].to_owned(),
-        Some(_) => format!("/{}", &rest[authority.len()..]),
+    let remainder = &rest[authority.len()..];
+    // A fragment is the client's own: RFC 3986 gives it no meaning to a
+    // server and RFC 7230's origin-form target has no field for it, so
+    // carrying it into `path` would put it on the wire in the request
+    // line. A query is the opposite and belongs there.
+    let remainder = remainder.split('#').next().unwrap_or(remainder);
+    // A `?` remainder has no leading `/` of its own and an origin-form
+    // target needs one, as does an absent path.
+    let path = match remainder.chars().next() {
+        Some('/') => remainder.to_owned(),
+        Some(_) => format!("/{remainder}"),
         None => "/".to_owned(),
     };
     let (host, port) = match authority.rsplit_once(':') {
@@ -856,17 +862,22 @@ mod tests {
         }
     }
 
-    /// A query or a fragment is part of the request target, not the host.
-    /// Reading it as authority made an `@` in a query look like a
-    /// credential, so `?contact=alice@example.com` was refused as one.
+    /// Neither a query nor a fragment is part of the host. Reading them as
+    /// authority made an `@` in a query look like a credential, so
+    /// `?contact=alice@example.com` was refused as one.
+    ///
+    /// They part company after that: a query is the request target's, a
+    /// fragment is the client's and is dropped.
     #[test]
-    fn a_query_or_fragment_belongs_to_the_path_not_the_host() {
+    fn a_query_joins_the_path_and_a_fragment_is_dropped() {
         for (url, path) in [
             (
                 "https://example.com?contact=alice@example.com",
                 "/?contact=alice@example.com",
             ),
-            ("https://example.com#a@b", "/#a@b"),
+            ("https://example.com#a@b", "/"),
+            ("https://example.com/hook#frag", "/hook"),
+            ("https://example.com/hook?a=b#frag", "/hook?a=b"),
             ("https://example.com/hook?a=b", "/hook?a=b"),
             ("https://example.com", "/"),
         ] {
@@ -878,6 +889,21 @@ mod tests {
         assert!(!url_carries_credentials(
             "https://example.com?contact=alice@example.com"
         ));
+    }
+
+    /// The door the fragment would have gone out of. `parse_url` dropping
+    /// it is the fix; this is the assertion that nothing downstream puts
+    /// it back.
+    #[test]
+    fn no_fragment_reaches_the_request_line() {
+        let target = parse_url("https://example.com/hook?a=b#sentinelfragment")
+            .expect("a url with a query and a fragment parses");
+        let request = build_get_request(&target);
+        assert!(
+            request.starts_with("GET /hook?a=b HTTP/1.1\r\n"),
+            "{request}"
+        );
+        assert!(!request.contains("sentinelfragment"), "{request}");
     }
 
     /// A Discord webhook URL is a bearer credential and carries its token
