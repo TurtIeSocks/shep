@@ -159,6 +159,32 @@ const FLOCK_DEADLINE: Duration = Duration::from_secs(10);
 /// Gap between [`poll_flock`]'s attempts.
 const FLOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// What a client prints when the image on the other end of a request it had
+/// already sent was replaced by a handover. `RequestError::Closed`, in
+/// `crates/shep-client/src/client.rs`.
+///
+/// A successor inherits the LISTENING descriptor and never an accepted
+/// connection: everything else is `FD_CLOEXEC` and dies at the `execve`.
+/// That is the design rather than a gap, and the handover spec's H2 table
+/// rules on it in one line, "in-flight RPCs | the client sees the connection
+/// drop". So the sentence is a documented, tolerated event for anything
+/// holding a connection across an exec, and asserting it never happens is
+/// asserting that a race was won.
+const DROPPED_REPLY: &str = "the connection closed before a reply arrived";
+
+/// [`DROPPED_REPLY`]'s other half: the same exec, caught between the accept
+/// and the `HelloReply` rather than between the request and its answer.
+/// `ConnectError::HandshakeClosed`, in
+/// `crates/shep-client/src/connection.rs`.
+///
+/// A narrower window, and not the one CI has been seen in. It is tolerated
+/// alongside the other because it is the same event by a shorter road, and a
+/// wait that accepted one and not the other would go red on the same
+/// handover. Neither is reachable from a shepherd that is simply gone: a
+/// failed `connect(2)` prints "could not connect to `<path>`" instead, and
+/// stays fatal.
+const DROPPED_HANDSHAKE: &str = "the daemon closed the connection during the handshake";
+
 /// How long [`poll_metrics`] keeps retrying a scrape of the metrics dog's
 /// `/metrics` endpoint before giving up.
 ///
@@ -1377,12 +1403,65 @@ fn bleats_no_follow_until(home: &Path, args: &[&str], done: impl Fn(&str) -> boo
 ///
 /// Each attempt carries the same [`CMD_TIMEOUT`] every other command here
 /// does, so nothing in the loop can block unbounded.
+///
+/// Every attempt must succeed, which is right for every caller of this one:
+/// each polls either a shepherd nobody is replacing, or one `shep daemon
+/// reload` has already waited out, since `await_successor` returns only once
+/// a request has been ANSWERED by a daemon of the CLI's own version. A
+/// dropped reply anywhere in those is a shepherd that died unasked, and must
+/// stay fatal. The single case that signals a handover itself polls through
+/// [`poll_flock_data_across_a_handover`] instead.
 fn poll_flock_data(
     home: &Path,
     deadline: Duration,
     done: impl Fn(&serde_json::Value) -> bool,
 ) -> serde_json::Value {
+    poll_flock_until(home, deadline, false, done)
+}
+
+/// [`poll_flock_data`], for a case that signals a handover itself and then
+/// polls the shepherd being replaced.
+///
+/// The attempt whose reply is in flight at the successor's `execve` fails
+/// with [`DROPPED_REPLY`], so asserting on it turns a documented, tolerated
+/// event into a panic. That is the whole of a flake CI met three times on
+/// 2026-09-04, on Linux every time, never on macOS and never on a rerun,
+/// always as `expected success, got ExitStatus(unix_wait_status(1280))` with
+/// the `daemon_unreachable` envelope carrying that sentence.
+/// [`the_control_socket_accepts_throughout_a_handover`] tolerates the same
+/// drop for the same reason.
+///
+/// ONE drop, and a second is still fatal. This poll is serial and the exec
+/// happens once, so at most one accepted connection can be open when the
+/// image is replaced. A shepherd dropping every reply is a defect rather
+/// than a handover, and a wait that spun its deadline out over one would
+/// report the caller's own assertion against a value it never read.
+#[cfg(unix)]
+fn poll_flock_data_across_a_handover(
+    home: &Path,
+    deadline: Duration,
+    done: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    poll_flock_until(home, deadline, true, done)
+}
+
+/// The loop the two above share. `tolerate_one_drop` says whether a single
+/// attempt may fail with a connection the shepherd closed after accepting it
+/// (see [`DROPPED_REPLY`]) before the next one is asserted on like any
+/// other.
+///
+/// A tolerated attempt costs a retry and nothing else: it does not consult
+/// `done`, and it does not extend `deadline`. It skips the deadline check
+/// too, because there is no observation to return from it, and skipping
+/// cannot spin: the tolerance is spent the first time it is used.
+fn poll_flock_until(
+    home: &Path,
+    deadline: Duration,
+    tolerate_one_drop: bool,
+    done: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
     let start = Instant::now();
+    let mut tolerance = tolerate_one_drop;
     loop {
         let output = shep(home)
             .arg("--format")
@@ -1390,6 +1469,11 @@ fn poll_flock_data(
             .arg("flock")
             .output()
             .unwrap();
+        if tolerance && !output.status.success() && closed_by_a_handover(&output) {
+            tolerance = false;
+            std::thread::sleep(FLOCK_POLL_INTERVAL);
+            continue;
+        }
         assert_success(&output);
         let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
             .unwrap_or_else(|e| panic!("flock stdout was not JSON: {e}"));
@@ -1399,6 +1483,17 @@ fn poll_flock_data(
         }
         std::thread::sleep(FLOCK_POLL_INTERVAL);
     }
+}
+
+/// Whether `output` is a client whose connection was the one the shepherd
+/// had accepted when it replaced its own image.
+///
+/// The two sentences and nothing else, so a shepherd that is gone, that
+/// refuses the handshake on version skew, or that answers with a refusal
+/// still fails the caller on the attempt that met it.
+fn closed_by_a_handover(output: &Output) -> bool {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stderr.contains(DROPPED_REPLY) || stderr.contains(DROPPED_HANDSHAKE)
 }
 
 /// [`poll_flock_data`] for the single-sheep cases: waits [`FLOCK_DEADLINE`]
@@ -9270,6 +9365,12 @@ fn roll_recording(roll: &Path, want: usize) -> Vec<u8> {
 /// could pass by looking too early. Waiting [`FLOCK_DEADLINE`] for a sheep
 /// to appear and then asserting none did is the version that cannot pass by
 /// being quick.
+///
+/// That wait is [`poll_flock_data_across_a_handover`] and not
+/// [`poll_flock_data`], because the signal above is raw: nothing here waits
+/// for the successor the way `shep daemon reload` does, so the first attempt
+/// can be the request the `execve` drops. Its own doc carries what that
+/// costs and what it still refuses.
 #[cfg(unix)]
 #[test]
 fn a_successor_inheriting_an_empty_flock_does_not_restore_the_roll() {
@@ -9316,7 +9417,7 @@ fn a_successor_inheriting_an_empty_flock_does_not_restore_the_roll() {
 
     nix::sys::signal::kill(shepherd, nix::sys::signal::Signal::SIGHUP).unwrap();
 
-    let after = poll_flock_data(home, FLOCK_DEADLINE, |data| {
+    let after = poll_flock_data_across_a_handover(home, FLOCK_DEADLINE, |data| {
         data.as_array().is_some_and(|rows| !rows.is_empty())
     });
     assert_eq!(
