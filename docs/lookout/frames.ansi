@@ -7,7 +7,7 @@ These are real frames, rendered headlessly through ratatui's TestBackend by
 
 Nothing here is a mockup.
 
-frames.ansi is the same thirty-one frames with colour; read it with `less -R`.
+frames.ansi is the same thirty-two frames with colour; read it with `less -R`.
 
 All four panes are here: the flock table (the spine), the host-usage strip,
 the sheep detail pane and the bleats feed. `>` marks the selected sheep, and
@@ -908,3 +908,22 @@ shep lookout   /home/ada/.shep[0m[38;5;245m 2 in the flock[0m
                                              [0m
                                              [0m
 [0m[38;5;245mesc/s close   j/k select   g/G fir… read-only[0m
+
+
+=== settings_short  (120x14) ===
+The same screen at 14 rows, which is fewer than it has to draw. The cursor is on the last dog, so the view has scrolled to reach it and `... 5 above` says how much is off the top. The scroll is counted in LINES rather than in rows: a section header and the dogs caption cost the same height a row does.
+
+shep lookout   /home/ada/.shep                                                                           [0m[38;5;245m 2 in the flock[0m
+[0m[38;5;245m  ... 5 above[0m                                                                                                           [0m
+                                                                                                                        [0m
+[0m[38;5;245m  [style][0m                                                                                                               [0m
+  level            full                            shep.toml    the next command reads it                               [0m
+                                                                                                                        [0m
+[0m[38;5;245m  [dogs][0m                                                                                                                [0m
+[0m[38;5;245m  space arms, Enter applies; a dog needs no reload                                                                      [0m
+[0m[38;5;245m  NAME                                                                IN FILE  SOURCE                    RUNNING        [0m
+  otel                                                                no       /usr/local/bin/shep-otel  online         [0m
+  ledger                                                              yes      /opt/ledger/bin/dog       not running    [0m
+> bark                                                                yes      built-in                  silent         [0m
+                                                                                                                        [0m
+[0m[38;5;245mesc/s close   j/k select   g/G first/last   r refresh   q quit                                                 read-only[0m

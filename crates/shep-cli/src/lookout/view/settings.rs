@@ -547,24 +547,88 @@ fn section_for(settings: &Settings, field: SettingField) -> &str {
 /// Takes `app` as well as `settings`, unlike every scalar row above it:
 /// [`dog_rows`] is the one read here that needs the live flock, which lives
 /// on `App` and not on `Settings` alone.
+///
+/// `height` is the body's own row count, and no more lines than that ever
+/// come back. [`Viewport`] scrolls in DATA rows while the height it was
+/// given counts LINES, so its offset alone cannot know what the section
+/// headers, the dogs caption, the dog column header and the two markers
+/// cost -- and every one of those used to be pushed uncounted, which is how
+/// the cursor's own row ended up past the height on a short terminal. The
+/// offset it hands over is a starting point here, walked down until the
+/// cursor's row actually fitted. Zero means unlimited, for a test with no
+/// terminal behind it.
+///
+/// [`Viewport`]: crate::lookout::viewport::Viewport
 fn content_lines(
     app: &App,
     settings: &Settings,
     palette: Palette,
     width: u16,
+    height: u16,
 ) -> Vec<Line<'static>> {
+    let total_rows = settings.rows().len();
+    let cursor_row = settings.view().cursor().min(total_rows.saturating_sub(1));
+    let budget = if height == 0 {
+        usize::MAX
+    } else {
+        usize::from(height)
+    };
+    // At most one pass per row, over six scalars and a handful of dogs.
+    let mut offset = settings.view().offset().min(cursor_row);
+    loop {
+        let attempt = body_from(app, settings, palette, width, budget, offset);
+        if attempt.cursor_drawn || offset >= cursor_row {
+            return attempt.lines;
+        }
+        offset += 1;
+    }
+}
+
+/// One attempt at the body, drawn from data row `offset` down.
+///
+/// No `Debug`: it is built and consumed inside [`content_lines`], and a
+/// `Vec<Line>` prints as noise rather than as anything a test would assert
+/// on.
+struct Attempt {
+    /// The body, never longer than the budget it was built against.
+    lines: Vec<Line<'static>>,
+    /// Whether the cursor's own row was one of them. False means the
+    /// chrome ate the budget and the caller must scroll further.
+    cursor_drawn: bool,
+}
+
+/// Lays the body out from data row `offset`, spending at most `budget`
+/// lines.
+///
+/// Every line pushed is counted, including the ones no data row owns. The
+/// `... N above` marker and the `... N below` marker are both reserved for
+/// before a row is admitted rather than appended afterwards, so a height
+/// that binds cuts a row instead of cutting the sentence that says a row
+/// was cut.
+fn body_from(
+    app: &App,
+    settings: &Settings,
+    palette: Palette,
+    width: u16,
+    budget: usize,
+    offset: usize,
+) -> Attempt {
     let snapshot = settings.snapshot();
     let cursor = settings.cursor();
-    let view = settings.view();
-    let offset = view.offset();
-    // Zero means "unlimited" ([`Viewport`]'s own doc): the settings screen
-    // built in every test below has no terminal behind it, so this stays
-    // zero and every row this function ever produced still comes out, in
-    // the same order -- the seven snapshots this task must not move.
-    let visible_rows = view.rows();
-    let total_rows = settings.rows().len();
+    let rows = settings.rows();
+    let total_rows = rows.len();
+    let cursor_row = settings.view().cursor().min(total_rows.saturating_sub(1));
+    // The `... N above` marker is inserted at the top once everything under
+    // it is laid out, so its line is held back from the very first check.
+    let above = usize::from(offset > 0);
+    // Whether a row at `index` still leaves room for `need` more lines. The
+    // `... N below` marker is only owed when a row follows this one: a row
+    // that fills the last line and has nothing under it needs no marker.
+    let room = |taken: usize, need: usize, index: usize| {
+        taken + need + above + usize::from(index + 1 < total_rows) <= budget
+    };
 
-    let mut lines = Vec::new();
+    let mut lines: Vec<Line<'static>> = Vec::new();
     let mut current_section: Option<&str> = None;
     // A section's header (and the blank line ahead of it, for every
     // section after the first) held here rather than pushed straight away.
@@ -574,7 +638,7 @@ fn content_lines(
     // offset and still need its name on screen the moment the view enters
     // it.
     let mut pending_header: Vec<Line<'static>> = Vec::new();
-    let mut emitted = 0usize;
+    let mut drawn = 0usize;
     let mut row_index = 0usize;
     let mut full = false;
 
@@ -582,7 +646,7 @@ fn content_lines(
     // every `SettingsRow::Dog` -- see its own doc -- so this loop's `break`
     // on the first non-scalar row is exactly "stop once the scalars end",
     // never "stop at the first dog that happens to come early".
-    for row in settings.rows() {
+    for row in rows.iter().copied() {
         let SettingsRow::Scalar(field) = row else {
             break;
         };
@@ -601,11 +665,11 @@ fn content_lines(
         if index < offset {
             continue;
         }
-        if visible_rows > 0 && emitted >= visible_rows {
+        if !room(lines.len(), pending_header.len() + 1, index) {
             full = true;
             break;
         }
-        lines.extend(pending_header.drain(..));
+        lines.append(&mut pending_header);
         lines.push(scalar_line(
             settings,
             field,
@@ -613,7 +677,7 @@ fn content_lines(
             cursor == Some(row),
             body_width(width),
         ));
-        emitted += 1;
+        drawn += 1;
     }
 
     // `body_width`, not `width`: every line below draws `mark`'s own two
@@ -640,7 +704,9 @@ fn content_lines(
             // otherwise -- the empty flock still gets to say "[dogs]",
             // the same reason `flock::render_table` prints its header row
             // for an empty payload.
-            lines.extend(dogs_header);
+            if lines.len() + dogs_header.len() + above <= budget {
+                lines.append(&mut dogs_header);
+            }
         } else {
             let mut pending_dogs_header = dogs_header;
             for (index, dog) in dogs.iter().enumerate() {
@@ -648,30 +714,33 @@ fn content_lines(
                 if global_index < offset {
                     continue;
                 }
-                if visible_rows > 0 && emitted >= visible_rows {
+                if !room(lines.len(), pending_dogs_header.len() + 1, global_index) {
                     break;
                 }
-                lines.extend(pending_dogs_header.drain(..));
+                lines.append(&mut pending_dogs_header);
                 let selected = cursor == Some(SettingsRow::Dog(index));
                 lines.push(dog_line(dog, rendered_columns, table_width, selected));
-                emitted += 1;
+                drawn += 1;
             }
         }
     }
 
-    let hidden_above = view.hidden_above();
-    let hidden_below = view.hidden_below(total_rows);
+    // Counted off what this pass actually drew, not off `Viewport`'s own
+    // arithmetic: the viewport hides rows against a line budget it cannot
+    // see spent, so its answer and this one disagree the moment the chrome
+    // costs anything.
+    let hidden_below = total_rows.saturating_sub(offset + drawn);
     if hidden_below > 0 {
         lines.push(Line::from(Span::styled(
             format!("  ... {hidden_below} below"),
             palette.muted(),
         )));
     }
-    if hidden_above > 0 {
+    if offset > 0 {
         lines.insert(
             0,
             Line::from(Span::styled(
-                format!("  ... {hidden_above} above"),
+                format!("  ... {offset} above"),
                 palette.muted(),
             )),
         );
@@ -681,49 +750,55 @@ fn content_lines(
     // (`view::status::status_line`'s own doc): a question styled
     // `attention` while it waits on `Enter`, an in-flight sentence once it
     // has gone out. The status bar is the line of record now -- it is a
-    // fixed row `draw_settings`'s own `.take(area.height)` never reaches,
-    // where this body echo used to be the ONLY place an armed candidate
-    // showed at all, and the first thing a short terminal cut. Kept here
-    // too, for the same reason the free-text editor line below is kept in
-    // both places: when there is room, seeing the confirm sit right under
-    // the row it names is worth the redundancy.
-    if let Some(prompt) = settings.pending() {
-        lines.push(Line::default());
-        let text = if prompt.sent {
-            format!("{}  sent, waiting for the shepherd", prompt.text)
-        } else {
-            format!("{}  enter confirms, any other key cancels", prompt.text)
-        };
-        lines.push(Line::from(Span::styled(
-            format!("  {}", fit(&text, table_width)),
-            palette.attention(),
-        )));
-    } else if let Some((field, buffer)) = settings.typing() {
-        // The free-text editor's own line, in the same slot the prompt
-        // above uses -- the two never coexist ([`Settings::pending`]
-        // returns `None` for `Pending::Typing`), so this is an `else if`
-        // rather than a second, always-checked block. The cursor is a
-        // character rather than a style, the same call the status bar's
-        // own filter box already makes: the ANSI gallery renders
-        // foregrounds only, so a reversed cell would come out unstyled
-        // there.
-        lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
-            format!(
-                "  {}",
-                fit(
-                    &format!(
-                        "editing {}: {buffer}\u{258f}   enter applies   esc cancels",
-                        field_label(settings, *field)
-                    ),
-                    table_width,
-                )
-            ),
-            palette.attention(),
-        )));
+    // fixed row outside this body, where this echo used to be the ONLY
+    // place an armed candidate showed at all, and the first thing a short
+    // terminal cut. Kept here too, for the same reason the free-text editor
+    // line below is kept in both places: when there is room, seeing the
+    // confirm sit right under the row it names is worth the redundancy.
+    // "When there is room" is now literal -- both branches cost two lines
+    // and neither is pushed unless the budget has them.
+    if lines.len() + 2 <= budget {
+        if let Some(prompt) = settings.pending() {
+            lines.push(Line::default());
+            let text = if prompt.sent {
+                format!("{}  sent, waiting for the shepherd", prompt.text)
+            } else {
+                format!("{}  enter confirms, any other key cancels", prompt.text)
+            };
+            lines.push(Line::from(Span::styled(
+                format!("  {}", fit(&text, table_width)),
+                palette.attention(),
+            )));
+        } else if let Some((field, buffer)) = settings.typing() {
+            // The free-text editor's own line, in the same slot the prompt
+            // above uses -- the two never coexist ([`Settings::pending`]
+            // returns `None` for `Pending::Typing`), so this is an `else if`
+            // rather than a second, always-checked block. The cursor is a
+            // character rather than a style, the same call the status bar's
+            // own filter box already makes: the ANSI gallery renders
+            // foregrounds only, so a reversed cell would come out unstyled
+            // there.
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  {}",
+                    fit(
+                        &format!(
+                            "editing {}: {buffer}\u{258f}   enter applies   esc cancels",
+                            field_label(settings, *field)
+                        ),
+                        table_width,
+                    )
+                ),
+                palette.attention(),
+            )));
+        }
     }
 
-    lines
+    Attempt {
+        cursor_drawn: drawn > 0 && (offset..offset + drawn).contains(&cursor_row),
+        lines,
+    }
 }
 
 /// Draws the settings screen into `area`, straight into `buffer`.
@@ -736,7 +811,7 @@ pub fn draw_settings(app: &App, settings: &Settings, area: Rect, buffer: &mut Bu
         return;
     }
     let palette = app.palette();
-    for (offset, line) in content_lines(app, settings, palette, area.width)
+    for (offset, line) in content_lines(app, settings, palette, area.width, area.height)
         .iter()
         .enumerate()
         .take(usize::from(area.height))
@@ -802,7 +877,7 @@ mod tests {
         let settings = app.settings().unwrap();
         let palette = app.palette();
         for width in (DOG_MIN_WIDTH + GUTTER)..=200 {
-            let rendered: Vec<String> = content_lines(&app, settings, palette, width)
+            let rendered: Vec<String> = content_lines(&app, settings, palette, width, 0)
                 .iter()
                 .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
                 .collect();
@@ -862,7 +937,7 @@ mod tests {
         let settings = app.settings().unwrap();
         let palette = app.palette();
         for width in super::super::MIN_TERM_WIDTH..=200 {
-            for line in content_lines(&app, settings, palette, width) {
+            for line in content_lines(&app, settings, palette, width, 0) {
                 let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
                 assert!(
                     visible_width(&rendered) <= usize::from(width),
@@ -891,7 +966,7 @@ mod tests {
         let app = fixtures::app_in_settings();
         let settings = app.settings().unwrap();
         let palette = app.palette();
-        let lines = content_lines(&app, settings, palette, 120);
+        let lines = content_lines(&app, settings, palette, 120, 0);
         let rendered: Vec<String> = lines
             .iter()
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -904,29 +979,81 @@ mod tests {
         );
     }
 
+    /// The body as strings, at the height the terminal really has.
+    fn body_at(app: &App, height: u16) -> Vec<String> {
+        let settings = app.settings().unwrap();
+        content_lines(app, settings, app.palette(), 120, height)
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect()
+    }
+
     /// fails if a terminal shorter than the settings screen either loses
     /// the cursor off the bottom of the drawn window, or draws past
     /// `note_body_rows`' own count without saying anything was cut.
+    ///
+    /// Both halves were live bugs. `Viewport` scrolls in DATA rows, and the
+    /// height it is handed counts LINES, so the section headers, the blank
+    /// separators, the `[dogs]` caption and the dog column header all used
+    /// to be pushed uncounted: at ten rows the body came back thirteen
+    /// lines long, `draw_settings` clipped the tail, and the cursor's own
+    /// row was in the part that got clipped.
     #[test]
     fn a_short_terminal_scrolls_and_says_what_it_hid() {
         let mut app = fixtures::app_in_settings();
-        app.note_body_rows(4);
+        let height = 10;
+        app.note_body_rows(height);
         // Walk to the last row. Six scalars plus however many dogs the
         // fixture carries; `SelectLast` lands on the last one whatever the
         // count.
         app.update(Msg::Key(KeyPress::SelectLast));
-        let settings = app.settings().unwrap();
-        let palette = app.palette();
-        let lines = content_lines(&app, settings, palette, 120);
-        let text: Vec<String> = lines.iter().map(std::string::ToString::to_string).collect();
+        let text = body_at(&app, height);
+        assert!(
+            text.len() <= usize::from(height),
+            "the body fits the height it was given: {text:?}"
+        );
         assert!(text[0].contains("above"), "{text:?}");
         assert!(
             text.iter().any(|l| l.contains("[dogs]")),
             "the visible section is labelled"
         );
-        let last_row = settings.rows().len() - 1;
-        assert_eq!(settings.view().cursor(), last_row);
-        assert!(settings.view().offset() > 0);
+        assert_eq!(
+            text.iter().filter(|l| l.starts_with('>')).count(),
+            1,
+            "the cursor's own row is drawn: {text:?}"
+        );
+        let settings = app.settings().unwrap();
+        assert_eq!(settings.view().cursor(), settings.rows().len() - 1);
+        // `Viewport` sees ten rows of room for nine rows of data and scrolls
+        // nothing. The scroll in the frame above is the renderer's, which is
+        // the only layer that knows what the chrome costs.
+        assert_eq!(settings.view().offset(), 0);
+    }
+
+    /// fails if the marker that says rows were cut is itself the row that
+    /// gets cut. It is pushed last, so it was the first line
+    /// `draw_settings`' own clip dropped -- the screen hid rows and said
+    /// nothing.
+    #[test]
+    fn the_below_marker_survives_the_height_that_made_it_necessary() {
+        let mut app = fixtures::app_in_settings();
+        let height = 6;
+        app.note_body_rows(height);
+        // Cursor left on the first row, so everything hidden is hidden
+        // below it.
+        let text = body_at(&app, height);
+        assert!(
+            text.len() <= usize::from(height),
+            "the body fits the height it was given: {text:?}"
+        );
+        assert!(
+            text.last().is_some_and(|l| l.contains("below")),
+            "the last line says how many rows were cut: {text:?}"
+        );
+        assert!(
+            text.iter().any(|l| l.starts_with("> log_level")),
+            "the cursor's own row is drawn: {text:?}"
+        );
     }
 
     /// fails if `SCALAR_SOURCE_W` stops fitting the widest word this column
@@ -960,7 +1087,7 @@ mod tests {
     fn the_style_cost_cell_stops_promising_the_next_command_when_it_is_outranked() {
         let app = fixtures::app_in_settings_with_shadowed_style(StyleSource::Env);
         let settings = app.settings().unwrap();
-        let lines = content_lines(&app, settings, app.palette(), 120);
+        let lines = content_lines(&app, settings, app.palette(), 120, 0);
         let rendered: Vec<String> = lines
             .iter()
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -987,7 +1114,7 @@ mod tests {
         let _ = app.update(Msg::Key(KeyPress::Confirm));
         let settings = app.settings().unwrap();
         let palette = app.palette();
-        let lines = content_lines(&app, settings, palette, 120);
+        let lines = content_lines(&app, settings, palette, 120, 0);
         let rendered: Vec<String> = lines
             .iter()
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())

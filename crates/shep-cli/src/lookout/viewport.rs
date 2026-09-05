@@ -8,9 +8,15 @@
 //!
 //! A viewport that does not know its height (`rows == 0`) never scrolls,
 //! so a screen built in a test with no terminal behaves exactly as it did
-//! before this existed. That is deliberate: it is what lets the settings
-//! screen's seven snapshots stay byte-identical without every fixture
-//! learning a height.
+//! before this existed. The gallery no longer leans on that: `frames::scene`
+//! hands it the real height, the same call `run_ui` makes before each draw.
+//! Seven settings frames spent a phase rendering at `rows == 0`, which meant
+//! every scrolling guard behind them sat on a branch nothing exercised.
+//!
+//! This counts ROWS. A screen whose chrome costs lines -- a section header,
+//! a caption, a column header -- cannot ask it how much is off screen and
+//! get an answer about its own body, which is why it no longer offers one:
+//! `view::settings` counts what it drew instead.
 
 /// A cursor, an offset, and the number of rows the terminal shows.
 ///
@@ -39,12 +45,6 @@ impl Viewport {
     #[must_use]
     pub fn offset(&self) -> usize {
         self.offset
-    }
-
-    /// How many rows the terminal shows, or zero if nobody has said.
-    #[must_use]
-    pub fn rows(&self) -> usize {
-        self.rows
     }
 
     /// Records the terminal's height, and pulls the cursor back into view
@@ -81,21 +81,6 @@ impl Viewport {
     /// Clamps to a list that may have shrunk since the last move.
     pub fn clamp(&mut self, len: usize) {
         self.move_by(0, len);
-    }
-
-    /// Rows above the first drawn one.
-    #[must_use]
-    pub fn hidden_above(&self) -> usize {
-        self.offset
-    }
-
-    /// Rows below the last drawn one. Zero when the height is unknown.
-    #[must_use]
-    pub fn hidden_below(&self, len: usize) -> usize {
-        if self.rows == 0 {
-            return 0;
-        }
-        len.saturating_sub(self.offset + self.rows)
     }
 
     /// Pulls the offset back to whatever keeps the cursor visible, and caps
@@ -166,16 +151,6 @@ mod tests {
         v.set_rows(10, 100);
         v.move_by(3, 0);
         assert_eq!((v.cursor(), v.offset()), (0, 0));
-    }
-
-    #[test]
-    fn hidden_counts_say_how_much_is_off_screen_either_side() {
-        let mut v = Viewport::new();
-        v.set_rows(10, 100);
-        v.move_to(45, 100);
-        assert_eq!(v.hidden_above(), v.offset());
-        assert_eq!(v.hidden_below(100), 100 - v.offset() - 10);
-        assert_eq!(v.hidden_above() + 10 + v.hidden_below(100), 100);
     }
 
     #[test]

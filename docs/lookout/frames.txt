@@ -7,7 +7,7 @@ These are real frames, rendered headlessly through ratatui's TestBackend by
 
 Nothing here is a mockup.
 
-frames.ansi is the same thirty-one frames with colour; read it with `less -R`.
+frames.ansi is the same thirty-two frames with colour; read it with `less -R`.
 
 All four panes are here: the flock table (the spine), the host-usage strip,
 the sheep detail pane and the bleats feed. `>` marks the selected sheep, and
@@ -878,3 +878,21 @@ shep lookout   /home/ada/.shep 2 in the flock
                                              
                                              
 esc/s close   j/k select   g/G fir… read-only
+
+=== settings_short  (120x14) ===
+The same screen at 14 rows, which is fewer than it has to draw. The cursor is on the last dog, so the view has scrolled to reach it and `... 5 above` says how much is off the top. The scroll is counted in LINES rather than in rows: a section header and the dogs caption cost the same height a row does.
+
+shep lookout   /home/ada/.shep                                                                            2 in the flock
+  ... 5 above                                                                                                           
+                                                                                                                        
+  [style]                                                                                                               
+  level            full                            shep.toml    the next command reads it                               
+                                                                                                                        
+  [dogs]                                                                                                                
+  space arms, Enter applies; a dog needs no reload                                                                      
+  NAME                                                                IN FILE  SOURCE                    RUNNING        
+  otel                                                                no       /usr/local/bin/shep-otel  online         
+  ledger                                                              yes      /opt/ledger/bin/dog       not running    
+> bark                                                                yes      built-in                  silent         
+                                                                                                                        
+esc/s close   j/k select   g/G first/last   r refresh   q quit                                                 read-only

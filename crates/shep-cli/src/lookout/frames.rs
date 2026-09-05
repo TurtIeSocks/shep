@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
 use ratatui::style::Color;
 
 use shep_client::RequestError;
@@ -51,7 +52,7 @@ use super::app::{ActionVerb, App, Control, KeyPress, Msg, RowKey, Sent, Settings
 use super::source::HostSample;
 use super::tail::{Stream, Tail, TailLine};
 use super::theme::Palette;
-use super::view::draw;
+use super::view::{body_rows, draw};
 use crate::commands::settings::{
     DogView, ScalarView, SettingField, SettingsSnapshot, load_settings,
 };
@@ -207,6 +208,9 @@ pub enum Scene {
     /// The settings screen on a narrow terminal, where both of its tables
     /// have dropped a column.
     SettingsNarrow,
+    /// The settings screen on a terminal too short to hold every row, with
+    /// the cursor on the last one, so the view has scrolled.
+    SettingsShort,
 }
 
 impl Scene {
@@ -243,6 +247,7 @@ impl Scene {
         Self::SettingsTyping,
         Self::SettingsDogs,
         Self::SettingsNarrow,
+        Self::SettingsShort,
     ];
 
     /// The snapshot name and the gallery heading.
@@ -280,11 +285,12 @@ impl Scene {
             Self::SettingsTyping => "settings_typing",
             Self::SettingsDogs => "settings_dogs",
             Self::SettingsNarrow => "settings_narrow",
+            Self::SettingsShort => "settings_short",
         }
     }
 
     /// One sentence saying what this frame is for, printed above it in the
-    /// gallery so the maintainer does not have to hold thirty-one of them in her head.
+    /// gallery so the maintainer does not have to hold thirty-two of them in her head.
     ///
     /// Every clause here is pinned by an assertion in
     /// `every_scene_shows_the_thing_it_is_named_for` — a caption may not say
@@ -385,6 +391,9 @@ impl Scene {
             Self::SettingsNarrow => {
                 "The same screen at 45 columns. Both of its tables have dropped a column rather than clipping: the scalar rows have lost the apply cost and kept SOURCE, and the dogs table has lost SOURCE and kept RUNNING. Each keeps whichever half is not said anywhere else."
             }
+            Self::SettingsShort => {
+                "The same screen at 14 rows, which is fewer than it has to draw. The cursor is on the last dog, so the view has scrolled to reach it and `... 5 above` says how much is off the top. The scroll is counted in LINES rather than in rows: a section header and the dogs caption cost the same height a row does."
+            }
         }
     }
 
@@ -444,6 +453,11 @@ impl Scene {
             // this frame is here to show, and the axis every other settings
             // frame (120 and 180) misses.
             Self::SettingsNarrow => (45, 24),
+            // 14 rows: twelve of body, against a screen that wants
+            // eighteen lines. Short enough that the cursor cannot be
+            // reached without scrolling, tall enough that what survives is
+            // a legible section rather than a single row.
+            Self::SettingsShort => (120, 14),
             // HealthyWide, Errored, Grouped, Retrying, Frozen, Refused, FeedGap,
             // FeedMissing, HostUnknown, Lambs, LambsUnknown: every scene that
             // carries all three optional panes at their ordinary rows.
@@ -618,7 +632,7 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
         // `dog_rows`'s own join sees: `otel` up and healthy, `bark` up but
         // never handshook. `ledger` (armed enabled in the snapshot below)
         // has no row here at all, which is what "enabled and absent" means.
-        Scene::SettingsDogs | Scene::SettingsNarrow => vec![
+        Scene::SettingsDogs | Scene::SettingsNarrow | Scene::SettingsShort => vec![
             dog_sheep(90, "otel", None),
             dog_sheep(91, "bark", Some(false)),
         ],
@@ -708,8 +722,8 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
     // moving the cursor in them would change a snapshot for no reason.
     // `Grouped` is excluded for a fifth reason: its cursor belongs on the
     // group header, which is the whole scene, and it goes there below.
-    // `SettingsDogs` and `SettingsNarrow` are excluded for a sixth: their
-    // flock has no id 2 at all -- the dashboard behind them is invisible
+    // The three settings scenes drawing the dog-drift flock are excluded
+    // for a sixth: that flock has no id 2 at all -- the dashboard behind them is invisible
     // once the settings screen draws over the whole body, so there is
     // nothing for a cursor there to do.
     if !matches!(
@@ -721,6 +735,7 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
             | Scene::Grouped
             | Scene::SettingsDogs
             | Scene::SettingsNarrow
+            | Scene::SettingsShort
     ) {
         select_id(&mut app, 2);
     }
@@ -988,10 +1003,25 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
                 result: Ok(settings_snapshot_with_dog_drift()),
             });
         }
+        Scene::SettingsShort => {
+            app.update(Msg::Key(KeyPress::Settings));
+            app.update(Msg::Settings {
+                result: Ok(settings_snapshot_with_dog_drift()),
+            });
+            // Onto the last row, which is the one a body this short cannot
+            // reach without scrolling.
+            app.update(Msg::Key(KeyPress::SelectLast));
+        }
         _ => {}
     }
 
     let (width, height) = which.size();
+    // The same call `run_ui` makes before every draw. Without it a gallery
+    // frame renders with `Viewport::rows` still zero, which means unlimited
+    // -- so every guard on a scrolled screen sat on a branch no snapshot
+    // here exercised, and the settings screen shipped drawing its cursor
+    // off the bottom of a short terminal with seven green frames behind it.
+    app.note_body_rows(body_rows(Rect::new(0, 0, width, height)));
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal.draw(|frame| draw(&app, frame)).unwrap();
     terminal.backend().buffer().clone()
@@ -1350,7 +1380,7 @@ These are real frames, rendered headlessly through ratatui's TestBackend by
 
 Nothing here is a mockup.
 
-frames.ansi is the same thirty-one frames with colour; read it with `less -R`.
+frames.ansi is the same thirty-two frames with colour; read it with `less -R`.
 
 All four panes are here: the flock table (the spine), the host-usage strip,
 the sheep detail pane and the bleats feed. `>` marks the selected sheep, and
@@ -1491,7 +1521,7 @@ mod tests {
     /// in this module runs on both platforms, and the dashboard itself was
     /// exercised against a live Windows flock.
     #[cfg(unix)]
-    #[allow(clippy::too_many_lines)] // thirty-one captions, each pinned clause by clause
+    #[allow(clippy::too_many_lines)] // thirty-two captions, each pinned clause by clause
     fn every_scene_shows_the_thing_it_is_named_for() {
         // "All three panes at 120x30: the host strip under the title, the
         //  detail pane and the bleats feed under the table. `>` marks the
@@ -2041,6 +2071,32 @@ mod tests {
             "the dogs table keeps RUNNING: {narrow:?}"
         );
         assert!(!narrow.contains("built-in"), "and loses SOURCE: {narrow:?}");
+
+        // "The same screen at 14 rows, which is fewer than it has to draw.
+        //  The cursor is on the last dog, so the view has scrolled to reach
+        //  it and `... 5 above` says how much is off the top. The scroll is
+        //  counted in LINES rather than in rows: a section header and the
+        //  dogs caption cost the same height a row does."
+        let short = render_text(&scene(Scene::SettingsShort).1);
+        assert!(
+            short.contains("... 5 above"),
+            "the marker names how many rows are off the top: {short:?}"
+        );
+        assert!(
+            short
+                .lines()
+                .any(|line| line.starts_with("> bark")
+                    || line.starts_with('>') && line.contains("bark")),
+            "the cursor's own row is drawn: {short:?}"
+        );
+        assert!(
+            !short.contains("log_level"),
+            "and the rows above it are the ones that went: {short:?}"
+        );
+        assert!(
+            short.contains("[style]") && short.contains("[dogs]"),
+            "what survives is whole sections, headers and all: {short:?}"
+        );
     }
 
     /// fails if the gallery's cursor walk budgets by SHEEP rather than by
@@ -2109,7 +2165,7 @@ mod tests {
         // above already guarantees it, so it would be a line that cannot
         // fail. The literal can — it is what catches a scene added to the
         // enum and not to `ALL`, or the reverse.
-        assert_eq!(Scene::ALL.len(), 31);
+        assert_eq!(Scene::ALL.len(), 32);
     }
 
     /// fails if a 12b pane introduced a text MODIFIER. `sgr` renders
