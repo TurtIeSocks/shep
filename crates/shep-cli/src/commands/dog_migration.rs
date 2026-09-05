@@ -307,8 +307,6 @@ fn write_dogs_config(path: &Path, rendered: &str) -> std::io::Result<()> {
 /// because [`ShepTomlError`] and [`DogsConfigError`] redact their own
 /// `Debug`, so a new variant wrapping a parse error needs the same check.
 #[derive(Debug)]
-// This module is the one writer of `dogs.toml` and will grow refusals, so a
-// new variant should be additive.
 #[non_exhaustive]
 pub(crate) enum DogMigrationError {
     /// `shep.toml` itself could not be read.

@@ -218,8 +218,8 @@ mod tests {
         }
     }
 
-    /// Reporting online must rest on a real `Request::Ping` round-trip,
-    /// not the handshake alone.
+    /// A handshake that never completes reports not online. `probe` never
+    /// gets far enough to send `Request::Ping`.
     #[tokio::test]
     async fn a_socket_that_handshakes_but_never_answers_is_not_online() {
         let dir = tempfile::tempdir().unwrap();

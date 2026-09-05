@@ -95,9 +95,9 @@ pub enum BusEvent {
     /// message, a dispatched action) are reported elsewhere, by
     /// `process.stop` and `Response::Triggered`.
     ///
-    /// `message` is the app's own text, whole and unredacted. Nothing on
-    /// this wire is a credential, which is what makes a derived `Debug`
-    /// safe here.
+    /// `message` is the app's own text, whole and unredacted. The daemon
+    /// adds nothing of its own; app-provided text must be safe for every
+    /// subscriber, since it is broadcast verbatim.
     Channel {
         /// The sheep that wrote it.
         id: u32,

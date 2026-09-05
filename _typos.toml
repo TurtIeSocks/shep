@@ -43,7 +43,7 @@ retsarts = "retsarts"
 # "Gs" and flags "PN" as a typo of "ON".
 pn = "pn"
 
-# The next five are pm2's own spellings, quoted verbatim in the read-only
+# The next six are pm2's own spellings, quoted verbatim in the read-only
 # trace docs this port's specs are built from; correcting them would misquote
 # the source.
 gracefull = "gracefull" # trace/rpc.md:14, pm2's own `gracefullExit`

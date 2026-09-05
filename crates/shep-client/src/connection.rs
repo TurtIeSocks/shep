@@ -151,7 +151,7 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// - [`ConnectError::Connect`]: nothing is listening at `socket`.
+    /// - [`ConnectError::Connect`]: the initial `connect(2)` call failed.
     /// - [`ConnectError::Wire`]: `Hello` failed to encode, or the reply failed to decode.
     /// - [`ConnectError::Io`]: a framed read or write failed after connect.
     /// - [`ConnectError::HandshakeClosed`]: the peer closed before a `HelloReply`.
@@ -163,8 +163,6 @@ impl Connection {
         dog_name: Option<&str>,
     ) -> Result<Self, ConnectError> {
         // bounds connect(2) together with the handshake, not just the handshake.
-        // barely testable over AF_UNIX: no test below catches a mutant that
-        // moves connect(2) outside this timeout.
         tokio::time::timeout(timeout, Self::open_inner(socket, dog_name))
             .await
             .map_err(|_elapsed| ConnectError::HandshakeTimeout { after: timeout })?

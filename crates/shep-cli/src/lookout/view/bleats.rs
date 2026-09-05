@@ -101,9 +101,10 @@ pub fn feed_lines(app: &App, width: u16, rows: usize) -> Vec<Line<'static>> {
 /// What the header says about what is not on screen, or `None` when
 /// everything is.
 ///
-/// Two separate quantities, not one merged number: `lines` is exact, counted
-/// by the reader and the pane. `bytes` is exact as bytes but unknowable as
-/// lines, since reading them is what the window exists to avoid.
+/// Two separate quantities, not one merged number: `lines` sums the reader's
+/// missed count, off by at most one at a boundary, with the pane's own
+/// hidden rows, which is exact. `bytes` is exact but unknowable as lines,
+/// since reading them is what the window exists to avoid.
 fn gap_notice(lines: usize, bytes: u64) -> Option<String> {
     match (lines, bytes) {
         (0, 0) => None,

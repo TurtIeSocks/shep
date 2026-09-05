@@ -340,9 +340,8 @@ mod tests {
     /// Deep equality of the serialized values, not a key-set check: a field
     /// that keeps its name but changes shape fails here too.
     ///
-    /// Every `Option` field on the fixture is `Some`, since a `None` with
-    /// `skip_serializing_if` omits the key on both sides and would hide a
-    /// missing `SheepRow` field.
+    /// Most `Option` fields are `Some` here, so a mismatched `Some`
+    /// conversion fails; the all-`None` case is the next test's job.
     #[test]
     fn a_sheep_row_serializes_exactly_as_process_info_does() {
         let info = ProcessInfo::builder(7, "api", ProcStatus::WaitingRestart)

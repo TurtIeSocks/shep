@@ -416,9 +416,7 @@ mod tests {
     /// exists.
     ///
     /// It is absent once this crate is extracted on its own, so the drift
-    /// guards below skip rather than fail there. A runtime check, since
-    /// `include_str!` resolves at compile time whichever branch a test
-    /// reaches.
+    /// guards below skip rather than fail there.
     fn workspace_web_dir() -> Option<PathBuf> {
         let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../web"));
         dir.is_dir().then(|| dir.to_path_buf())
@@ -430,6 +428,7 @@ mod tests {
     /// # Panics
     /// Inside the workspace, if `relative` cannot be read: that is real
     /// drift the guard exists to catch.
+    #[track_caller]
     fn read_workspace_web_file(relative: &str) -> Option<String> {
         let dir = workspace_web_dir()?;
         Some(

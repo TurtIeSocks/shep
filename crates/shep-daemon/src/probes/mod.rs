@@ -423,9 +423,7 @@ mod tests {
     }
 
     // Constructs `ProbeConfig` directly, bypassing `shep-core::normalize`'s
-    // rejection, to prove this loop clamps independently. Confirmed by
-    // mutation testing: removing the clamp does not fail this test, it
-    // hangs, caught only by CI's own timeout.
+    // rejection, to prove this loop clamps independently.
     #[tokio::test(start_paused = true)]
     async fn a_zero_interval_is_clamped_instead_of_hot_spinning() {
         let config = ProbeConfig {

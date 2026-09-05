@@ -1,12 +1,13 @@
 //! The bounded log reader behind the bleats feed, and the gap it admits to.
 //!
 //! A window from the end of each log file, a line cap on top of that window,
-//! and an exact count of what the two left out: [`Tail::missed_lines`] for
-//! what the reader saw and discarded, [`Tail::missed_bytes`] for what it never
-//! read. One refresh costs one seek and one [`FEED_WINDOW_BYTES`] read per
-//! file whatever the sheep writes, so the reader is bounded by itself and not
-//! by the writer. [`read`] is pure over the filesystem, which is what lets its
-//! tests drive it with a [`std::collections::BTreeMap`] and a `tempdir`.
+//! and a count of what the two left out: [`Tail::missed_lines`] for what the
+//! reader saw and discarded, off by at most one at a boundary, plus
+//! [`Tail::missed_bytes`] for what it never read, exact. One refresh costs
+//! one seek and one [`FEED_WINDOW_BYTES`] read per file whatever the sheep
+//! writes, so the reader is bounded by itself and not by the writer.
+//! [`read`] is pure over the filesystem, which is what lets its tests drive
+//! it with a [`std::collections::BTreeMap`] and a `tempdir`.
 
 use std::collections::BTreeMap;
 use std::io::{Read as _, Seek as _, SeekFrom};

@@ -298,9 +298,8 @@ fn write_file(path: &Path, file: &KvFile) -> Result<(), KvError> {
 /// - [`KvError::FutureVersion`]: the file's `version` is newer than
 ///   [`KV_VERSION`]. Nothing is read and nothing is written.
 pub fn all(path: &Path) -> Result<BTreeMap<String, String>, KvError> {
-    // Taking the lock here too costs one extra `open`, avoiding the question
-    // of a lock-free reader observing a half-`rename`d file. Do not
-    // "optimize" this away without re-deriving that.
+    // Taking the lock here too costs one extra `open`, but it orders this
+    // read against `set`/`unset`'s read-modify-rename instead of racing it.
     let _lock = KvLock::acquire(path)?;
     Ok(read_file(path)?.entries)
 }

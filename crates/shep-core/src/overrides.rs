@@ -290,9 +290,8 @@ fn write_file(path: &Path, file: &OverridesFile) -> Result<(), OverridesError> {
 /// - [`OverridesError::FutureVersion`]: the file's `version` is newer than
 ///   [`OVERRIDES_VERSION`]. Nothing is read and nothing is written.
 pub fn all(path: &Path) -> Result<BTreeMap<String, AppOverrides>, OverridesError> {
-    // Taking the lock here too costs one extra `open`, avoiding the question
-    // of a lock-free reader observing a half-`rename`d file. Do not
-    // "optimize" this away without re-deriving that.
+    // Taking the lock here too costs one extra `open`, but it orders this
+    // read against a writer's read-modify-rename instead of racing it.
     let _lock = OverridesLock::acquire(path)?;
     Ok(read_file(path)?.apps)
 }

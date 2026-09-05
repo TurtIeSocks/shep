@@ -138,9 +138,10 @@ pub fn panes_for(height: u16) -> Panes {
 
 /// Renders the whole dashboard.
 ///
-/// Synchronous and total: every branch draws something, and a degenerate
-/// case draws a sentence rather than nothing, since a blank pane cannot say
-/// whether the shepherd has nothing to run or the dashboard is broken.
+/// Synchronous, and every branch draws something except a zero-area frame,
+/// which returns without drawing. A degenerate case draws a sentence rather
+/// than nothing, since a blank pane cannot say whether the shepherd has
+/// nothing to run or the dashboard is broken.
 ///
 /// Real caller: `super::mod`'s `run_ui`, once per frame.
 pub fn draw(app: &App, frame: &mut Frame<'_>) {

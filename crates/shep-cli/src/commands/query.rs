@@ -579,8 +579,6 @@ mod tests {
         assert_eq!(json["data"][0]["name"], "web");
     }
 
-    /// Covers `fold`'s wiring too: it delegates to `describe_selector`, so
-    /// the two verbs share one path and one `command` string.
     #[tokio::test]
     async fn describe_response_round_trips_into_rendered_flock_rows() {
         let dir = tempfile::tempdir().unwrap();

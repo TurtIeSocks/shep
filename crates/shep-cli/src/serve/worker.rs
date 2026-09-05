@@ -69,9 +69,9 @@ pub struct ServeConfig {
     /// Credentials every request must satisfy, if any.
     pub auth: Option<Credentials>,
     /// Permit a symlink anywhere in the resolved path, falling back to a
-    /// canonicalize-then-`starts_with` containment check that reopens the
-    /// TOCTOU the default per-component walk closes. Off by default;
-    /// passed straight through to `fs::contain`.
+    /// canonicalize-then-`starts_with` containment check. Off by default;
+    /// passed straight through to `fs::contain`, whose own doc names the
+    /// residual race each mode still leaves open.
     pub follow_symlinks: bool,
     /// How long one connection may live, start to finish.
     ///
@@ -286,9 +286,9 @@ async fn handle_connection(mut stream: TcpStream, cfg: Arc<ServeConfig>) {
             {
                 Ok(()) => log_access(peer, &request.method, &logged_path, 301, 0),
                 Err(_err) => {
-                    // Unreachable in practice: `encode_segment` already
-                    // produces printable ASCII. Defensive rather than a
-                    // half response or a panic.
+                    // A peer disconnect, not a bad header: `encode_segment`
+                    // only ever produces printable ASCII, so `write_head`'s
+                    // control-byte check never fires from this call.
                     let body = b"could not build the redirect\n";
                     send(&mut stream, 500, "text/plain", body, vec![]).await;
                     log_access(peer, &request.method, &logged_path, 500, body.len() as u64);

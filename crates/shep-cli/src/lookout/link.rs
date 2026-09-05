@@ -28,7 +28,8 @@ use super::source::{EventSource, FlockSource, Shepherd};
 /// one frame each way.
 pub const FLOCK_POLL: Duration = Duration::from_secs(2);
 
-/// How many times the link re-dials before it gives up and freezes.
+/// How many delayed re-dials the link announces as `Retrying` before it
+/// gives up and freezes on the next attempt.
 ///
 /// Five, at [`RECONNECT_FIRST_WAIT`] doubling to [`RECONNECT_MAX_WAIT`], is
 /// 7.75 seconds of waiting: long enough to cover a `shep kill` then `shep

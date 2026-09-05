@@ -4,12 +4,12 @@
 //! A crash that leaves raw mode on and the alternate screen entered leaves
 //! the operator with no echo, no line editing and no visible cursor.
 //!
-//! Two mechanisms cover it, since neither reaches the other's case:
-//! [`install_panic_hook`] restores before calling the previous hook, and
-//! [`RestoreGuard`]'s `Drop` covers every `?` and early return, though not
-//! under `panic = "abort"`, which this workspace does not set. [`restore`]
-//! is idempotent, since a panic fires both. Nothing that can panic runs
-//! between the hook and raw mode: hook, then raw mode, then the screen.
+//! Two mechanisms cover it: [`install_panic_hook`] restores before calling
+//! the previous hook, and [`RestoreGuard`]'s `Drop` covers every `?`, early
+//! return and a panic's own unwind, except under `panic = "abort"`, which
+//! this workspace does not set. [`restore`] is idempotent, since a panic
+//! fires both. Nothing that can panic runs between the hook and raw mode:
+//! hook, then raw mode, then the screen.
 
 use std::io::{self, Stdout, Write};
 

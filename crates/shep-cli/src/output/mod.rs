@@ -154,9 +154,10 @@ impl Streams<'_> {
 }
 
 /// Implemented once per command payload. The two methods are the only
-/// place a field's presence is decided, so a field added to one and
-/// forgotten in the other is a compile error rather than a silent
-/// divergence.
+/// place a field's presence is decided; `rows::assert_no_drift` compares
+/// `headers()` against the serialized keys per payload, so a field added
+/// to one and forgotten in the other fails that test rather than passing
+/// silently.
 ///
 /// Not object-safe: [`headers`](Render::headers) has no receiver and
 /// `Serialize` cannot be a dyn-compatible supertrait, so `Box<dyn Render>`

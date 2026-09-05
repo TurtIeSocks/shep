@@ -202,9 +202,9 @@ impl Scaffold {
 
     /// The scaffold's text.
     ///
-    /// Entirely commented out in a format that has comments, parsing as a
-    /// document declaring no apps; a live minimal Flockfile in strict JSON,
-    /// which has no comment to hide behind.
+    /// TOML and YAML come back entirely commented out, parsing as a document
+    /// with no apps. JSON5 has comments too, but a comments-only file refuses
+    /// at the parser. JSON has none, so it comes back live.
     ///
     /// # Errors
     /// - [`ScaffoldError::NoCommentsForAll`]: [`Depth::All`] in a format
@@ -561,8 +561,8 @@ mod tests {
     #[test]
     fn every_field_carries_a_group_and_a_blurb() {
         // A field with no `group` sorts after every grouped one; a field
-        // with no `blurb` silently falls back to its `///` doc, written for
-        // somebody reading the source.
+        // with no `blurb` panics in `blurb()`, which never falls back to
+        // the `///` doc.
         let schema = crate::config::flockfile_schema_json();
         let props = properties(&schema);
 

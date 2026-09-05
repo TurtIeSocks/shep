@@ -6,10 +6,9 @@
 //! like, and they cannot share code: their colour types come from different
 //! crates, and `mod lookout` is `#[cfg(unix)]` while `mod output` is not.
 //!
-//! So this module owns the vocabulary and neither renderer decides any of
-//! it. Each binds [`Role`] to its own colour type: `theme.rs` to
-//! ratatui's `Color`, `output/` to `anstyle::Style`. A face or a mapping
-//! decided anywhere but here is a review defect.
+//! So this module is the only place that defines a face or a mapping.
+//! Each renderer only binds [`Role`] to its own colour type: `theme.rs` to
+//! ratatui's `Color`, `output/` to `anstyle::Style`.
 
 use shep_core::status::ProcStatus;
 
@@ -49,9 +48,8 @@ pub(crate) const fn role_of(status: ProcStatus) -> Role {
 /// tells a `NO_COLOR` reader nothing.
 ///
 /// Read by `output::rows::FlockRows`'s STATUS cell. `lookout`'s flock
-/// pane colours the status word instead of growing its own face. A face
-/// or a status-to-role mapping defined anywhere but here is a review
-/// defect.
+/// pane colours the status word instead of growing its own face; this is
+/// the only place a face or a status-to-role mapping is defined.
 pub(crate) const fn face(status: ProcStatus) -> &'static str {
     match status {
         ProcStatus::Online => "(o.o)",

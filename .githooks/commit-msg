@@ -18,9 +18,9 @@ subject=$(sed -n '1p' "$msg_file")
 # `Revert "..."` is not exempt: it parses as nothing, so retitle it
 # `revert: ...` (revert still needs a parser; see below).
 #
-# Matches only the forms git itself writes (fmt-merge-msg.c), including the
-# plural for an octopus merge, so a hand-written `Merge ...` subject is not
-# exempted.
+# Matches the literal text git's fmt-merge-msg.c produces, plural forms
+# included for an octopus merge. A hand-written subject with the same text
+# is exempted too; this checks the subject string, not its origin.
 if printf '%s' "$subject" | grep -qE "^Merge (branch|branches|remote-tracking branch|remote-tracking branches|tag|tags|commit|commits) |^Merge pull request #"; then
     exit 0
 fi

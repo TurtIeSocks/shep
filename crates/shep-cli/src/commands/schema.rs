@@ -11,8 +11,9 @@ use crate::output::{Streams, write_outcome};
 
 /// Prints the schema. Always succeeds.
 ///
-/// `--format json` is ignored: the output is already JSON, and an envelope
-/// around it would produce a file no editor could read.
+/// `--format json` is ignored: the output is already JSON, and wrapping it
+/// in the envelope would stop schema-aware tools reading it as a Flockfile
+/// JSON Schema.
 pub fn schema(streams: &mut Streams<'_>) -> ExitCode {
     write_outcome(streams.out.write_all(flockfile_schema_string().as_bytes()))
 }

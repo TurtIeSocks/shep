@@ -96,8 +96,8 @@ impl CronSchedule {
     /// The first occurrence strictly after `after`, in UTC.
     ///
     /// Returns `None` when the pattern can never match again, like `0 0 30 2 *`
-    /// (30 February). A DST fall-back hour can return the same wall-clock
-    /// occurrence twice across two calls, croner's own semantics.
+    /// (30 February). A DST fall-back hour resolves to its earlier instant
+    /// only, never the repeated wall-clock hour twice, croner's own semantics.
     ///
     /// # Errors
     /// - [`CronScheduleError::Search`]: the search failed for a reason other than exhaustion.

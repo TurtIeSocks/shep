@@ -125,9 +125,10 @@ impl core::error::Error for TildeError {}
 
 /// Expands a leading `~/` in `value` against `home`
 ///
-/// `~/` only. `~user/` is refused, since resolving it takes a passwd lookup
-/// whose answer depends on who the process runs as. `$VAR` is never
-/// expanded. A value with no leading `~` comes back unchanged.
+/// Accepts `~` alone or `~/...`. `~user/` is refused, since resolving it
+/// takes a passwd lookup whose answer depends on who the process runs as.
+/// `$VAR` is never expanded. A value with no leading `~` comes back
+/// unchanged.
 ///
 /// # Errors
 /// - [`TildeError::OtherUser`] if the value names another user's home.
@@ -201,6 +202,8 @@ fn expand_paths(app: &mut AppConfig, home: Option<&Path>) -> Result<(), Normaliz
 /// - [`NormalizeError::InvalidWatchGlob`]: a `watch_options` or `ignore_watch` pattern globset will not compile.
 /// - [`NormalizeError::BadTemplate`]: an `env`/`args`/log-path value carries an undefined or unclosed `{{...}}` token.
 /// - [`NormalizeError::SharedLogPath`]: `out_file` or `err_file` renders to the same path for two instances.
+/// - [`NormalizeError::TildeUser`]: a path field names another user's `~user` home.
+/// - [`NormalizeError::NoHomeForTilde`]: a path field expands `~/` but no home directory could be found.
 pub fn normalize(app: AppConfig) -> Result<ResolvedApp, NormalizeError> {
     normalize_with_home(app, std::env::home_dir().as_deref())
 }

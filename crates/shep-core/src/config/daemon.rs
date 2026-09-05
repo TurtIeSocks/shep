@@ -156,10 +156,7 @@ pub struct StyleSection {
 /// `#[non_exhaustive]` guards against a breaking struct literal as this
 /// type grows sections, but is not a validation gate: its `pub` fields
 /// can still be mutated after [`Self::load`]/[`Self::load_layered`]
-/// validate, and shep-core cannot detect that. Accepted because nothing
-/// ever holds one for long: every production site consumes a
-/// `DaemonConfig` within a few lines. `docs/specs/deferred.md` records
-/// this as resolved.
+/// validate, and shep-core cannot detect that.
 #[non_exhaustive]
 #[derive(Clone, Default, PartialEq)]
 pub struct DaemonConfig {

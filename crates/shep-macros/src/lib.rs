@@ -97,13 +97,14 @@ const SECRET: &str = "secret";
 ///   with no schema property to mark;
 /// - `#[shep(...)]` on the type or on a variant, neither of which is a field;
 /// - a union, which has no serde representation to build a schema from;
+/// - `#[shep]` with no option in parentheses;
+/// - `#[shep(secret = ...)]`, since `secret` is a flag and takes no value;
 /// - any option other than `secret`, which is the misspelling this crate is
 ///   here to catch.
 ///
-/// Everything else is accepted and carries no marks. That covers a
-/// struct or variant with no fields, an unmarked tuple, and
-/// unit-variant enums. A dog whose config holds no credential still
-/// wants the impl.
+/// A struct or variant with no fields, an unmarked tuple, and a
+/// unit-variant enum are accepted and carry no marks. A dog whose config
+/// holds no credential still wants the impl.
 #[proc_macro_derive(DogConfig, attributes(shep))]
 pub fn derive_dog_config(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -159,12 +160,10 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
 /// Every field the type has, a struct's directly and an enum's
 /// gathered from its variants.
 ///
-/// Shapes that cannot hold a named field are not refused here, only
-/// left empty. A unit variant has nothing to mark. An unmarked tuple
-/// is a config type someone wrote for other reasons. What is refused
-/// is a mark that cannot land. [`expand`] checks that once it knows
-/// which fields carry one. The rule is the same wherever the field
-/// came from.
+/// Unit variants and unmarked tuples have no fields to collect, so they
+/// come back empty. A union is refused outright: it has no serde
+/// representation for a mark to land on. [`expand`] checks each
+/// collected field once it knows which carry a mark.
 fn fields_of(input: &DeriveInput) -> syn::Result<Vec<&Field>> {
     match &input.data {
         Data::Struct(data) => Ok(data.fields.iter().collect()),

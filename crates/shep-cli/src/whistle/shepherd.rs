@@ -6,8 +6,8 @@
 //! restarted between two calls is invisible; there is no stale handle to
 //! notice it.
 //!
-//! One `connect(2)` and one handshake per call, over a local unix socket,
-//! is cheap between calls a model makes seconds apart.
+//! One connection and one handshake per call, over the local control
+//! transport, is cheap between calls a model makes seconds apart.
 
 use std::path::{Path, PathBuf};
 

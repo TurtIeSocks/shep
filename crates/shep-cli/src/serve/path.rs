@@ -5,10 +5,11 @@
 //! reason it refused the target. Compiles on every target this workspace
 //! ships, Windows included.
 //!
-//! Splits on `/` before decoding each segment, so a `%2f` cannot smuggle
-//! a separator past a traversal check already run on the segment before it.
-//! The filesystem half, the containment walk and the open, lives in
-//! `serve::fs`, `#[cfg(unix)]` and `async`.
+//! Splits on `/` before decoding each segment: decoding happens once the
+//! boundaries are fixed, so a `%2f` can only ever produce a literal `/`
+//! byte inside its own segment, which [`Refusal::ForbiddenByte`] then
+//! catches. The filesystem half, the containment walk and the open, lives
+//! in `serve::fs`, portable and `async`.
 
 use core::fmt;
 

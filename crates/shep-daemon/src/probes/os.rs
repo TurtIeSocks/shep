@@ -6,11 +6,6 @@
 //! redirects can pass against a different service. For the same reason a
 //! response counts as healthy only if its status line begins `HTTP/`.
 
-// Rejected: `reqwest` (tower + TLS stack), `hyper`+`hyper-util`+
-// `http-body-util` (three deps and a pool abstraction for one request),
-// `ureq`/`minreq` (blocking, so `tokio::time::timeout` cannot cancel a
-// stuck read).
-
 use core::fmt;
 use core::future::Future;
 use core::pin::Pin;

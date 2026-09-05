@@ -185,7 +185,7 @@ impl ReconnectingClient {
     ///
     /// # Errors
     ///
-    /// - [`ConnectError::Connect`]: nothing is listening at `socket`.
+    /// - [`ConnectError::Connect`]: the initial `connect(2)` call failed.
     /// - [`ConnectError::Wire`]: `Hello` failed to encode, or the reply failed to decode.
     /// - [`ConnectError::Io`]: a framed read or write failed after connect.
     /// - [`ConnectError::HandshakeClosed`]: the peer closed before a `HelloReply`.

@@ -116,7 +116,7 @@ fn dog_source_label(source: &DogSource) -> &'static str {
 ///
 /// Label values are escaped (`\\`, `"`, `\n`). A sheep's name is
 /// operator-supplied and reaches this function verbatim, so an unescaped
-/// quote in one name would corrupt every series after it.
+/// quote in one name would corrupt that series' line.
 #[must_use]
 pub fn render(reading: &Reading) -> String {
     let mut cpu = MetricGroup::new(

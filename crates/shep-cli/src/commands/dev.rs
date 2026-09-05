@@ -108,7 +108,8 @@ pub async fn dev(
         ),
     );
 
-    // Only `$SHEP_DEV_HOME` is read; a real flock's home must not leak in.
+    // `env` only recognizes `SHEP_DEV_HOME`, so a real flock's env can't leak
+    // in here. `$HOME` is read separately below, only for the fallback parent.
     let env = |key: &str| {
         if key == "SHEP_DEV_HOME" {
             std::env::var("SHEP_DEV_HOME").ok()

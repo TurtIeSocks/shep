@@ -536,9 +536,8 @@ mod tests {
         assert_eq!(value["text"], bark.message);
     }
 
-    /// A sheep literally named `{at_ms}` makes `bark.message` contain that
-    /// text; a sequential per-field replace would rewrite it on a later
-    /// pass.
+    /// The literal token `{at_ms}` embedded in `bark.message` must not be
+    /// rewritten by a later per-field substitution pass.
     #[test]
     fn a_placeholder_inside_a_substituted_value_survives_later_passes() {
         let bark = Bark {

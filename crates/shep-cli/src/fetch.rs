@@ -33,8 +33,9 @@ pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 
 /// A URL, parsed into what [`get`] needs to reach it.
 ///
-/// `Debug` is derived: a fetch target is a public document location, never
-/// a bearer credential the way a webhook URL is.
+/// `Debug` is derived and not redacted: `parse_url` does not strip a
+/// `user:pass@host` authority, so `host` can carry credentials from a URL
+/// that has them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
     /// `true` for `https://`, `false` for `http://`.

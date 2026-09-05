@@ -41,16 +41,16 @@ mod unix {
     const HEARTBEAT: Duration = Duration::from_secs(2);
 
     /// Blocks `SIGTERM` on the whole process. A mask set before any
-    /// other thread spawns is inherited by every later thread.
-    /// Starts the heartbeat, then loops forever reporting every
-    /// `SIGTERM` it receives without exiting.
+    /// other thread spawns is inherited by every later thread. Starts
+    /// the heartbeat, then loops forever printing a line each time
+    /// `sigwait` returns, never exiting.
     ///
     /// Blocking (`thread_block`), not installing a handler
     /// (`sigaction`), keeps this file free of `unsafe`.
     /// `sigaction`/`signal` are unsafe in `nix`;
-    /// `pthread_sigmask`/`sigwait` are not. A blocked signal is never
-    /// delivered and stays pending, which is what "refuses to die"
-    /// means.
+    /// `pthread_sigmask`/`sigwait` are not. Standard signals coalesce
+    /// while pending, so a printed line does not count how many
+    /// `SIGTERM`s were sent.
     pub fn run() {
         println!(
             "stubborn pid={} ignoring SIGTERM; stop it with SIGKILL to end it for real",

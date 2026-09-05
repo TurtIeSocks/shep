@@ -268,8 +268,8 @@ async fn reloaded_config<C: ConfigSource>(source: &C) -> Option<(BarkConfig, Rul
             return None;
         }
     };
-    // Empty means the section is gone, a legitimate edit. bark keeps
-    // running with no sinks and no rules.
+    // Empty means the section is gone. The default no-sink rule is
+    // rejected, so bark keeps the current configuration.
     let config = if section.is_empty() {
         BarkConfig::default()
     } else {

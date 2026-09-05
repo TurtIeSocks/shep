@@ -150,9 +150,8 @@ impl ProcScript {
 
     /// Accepts every stdin write and answers none of them.
     ///
-    /// Models an app that stopped reading fd 0: the pipe fills at 64 KiB and
-    /// the write blocks. The request is delivered and recorded; only the
-    /// acknowledgement is withheld.
+    /// Models an app that stopped reading fd 0: the write is delivered and
+    /// recorded, but the `done` acknowledgement is withheld.
     #[must_use]
     pub fn never_reads_its_stdin() -> Self {
         Self {

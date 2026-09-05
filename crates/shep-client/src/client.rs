@@ -125,7 +125,7 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// - [`ConnectError::Connect`]: nothing is listening at `socket`.
+    /// - [`ConnectError::Connect`]: the initial `connect(2)` call failed.
     /// - [`ConnectError::Wire`]: `Hello` failed to encode, or the reply failed to decode.
     /// - [`ConnectError::Io`]: a framed read or write failed after connect.
     /// - [`ConnectError::HandshakeClosed`]: the peer closed before a `HelloReply`.
@@ -203,7 +203,7 @@ impl Client {
     }
 
     /// Sends `body` with `deadline`, or [`DEFAULT_DEADLINE`] if `None`. The
-    /// client waits `deadline + `[`DEADLINE_GRACE`]` for a reply before
+    /// client waits `deadline` plus [`DEADLINE_GRACE`] for a reply before
     /// giving up locally.
     ///
     /// # Errors
@@ -278,9 +278,8 @@ impl Client {
     }
 }
 
-/// Saturating `Duration` to wire milliseconds. Every deadline this crate
-/// sends comes from its own constants or a caller-supplied `Duration`,
-/// none anywhere near `u64::MAX` ms.
+/// Saturating `Duration` to wire milliseconds. A caller-supplied `Duration`
+/// above the wire range saturates at `u64::MAX` ms rather than overflowing.
 fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }

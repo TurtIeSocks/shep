@@ -11,10 +11,8 @@
 //! `0600`, `fsync`ed and `rename`d. A `try_edit` closure's own `Err` leaves
 //! `path` untouched.
 
-// Fires on every `Result<_, ShepTomlError>` here on Windows and on none of
-// them elsewhere: the lint's fixed 128-byte threshold and the platform's own
-// layout decide which side this type lands on. The fix it wants is boxing a
-// `pub enum` for a path that always ends in file I/O.
+// Fires only on Windows: `ShepTomlError` crosses the lint's 128-byte
+// threshold there and stays under it elsewhere.
 #![allow(clippy::result_large_err)]
 
 use std::collections::BTreeMap;

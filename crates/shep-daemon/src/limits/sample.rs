@@ -51,8 +51,9 @@ pub struct ProcessIdentity {
 
 /// Reads the machine's process table.
 ///
-/// Synchronous: it is a bounded `/proc` walk on the enforcer's own task, and
-/// an `async fn` here would make the trait dyn-incompatible for no gain.
+/// Synchronous: it is a bounded process-table walk on the enforcer's own
+/// task, and an `async fn` here would make the trait dyn-incompatible for
+/// no gain.
 pub trait MemorySampler: Send + Sync + 'static {
     /// Every process currently visible to this process's user.
     fn sample(&self) -> Vec<ProcessRss>;

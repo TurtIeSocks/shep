@@ -5,11 +5,10 @@
 //! [`StatsState`] watches every sheep with a pid, off the same
 //! [`TreeIndex`] per polling tick.
 //!
-//! Memory is a level and reads current on demand. CPU is a counter: a
-//! percentage needs the baseline from the last periodic tick, and an
-//! on-demand read subtracts against it without writing one, so its window
-//! is always at most one `MEMORY_POLL_INTERVAL` old. Both totals sum the
-//! whole process tree; see [`limits`](super) for the kill-unit divergence.
+//! Memory is a level and reads current on demand. CPU is a counter: a percentage needs the
+//! last periodic baseline, subtracted without writing one, so its window is usually one
+//! `MEMORY_POLL_INTERVAL` old, longer if a full breaches channel paused the poll loop. Both
+//! sum the whole tree; see [`limits`](super) for the kill-unit divergence.
 
 use core::fmt;
 use std::collections::{HashMap, HashSet};
