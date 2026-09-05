@@ -277,14 +277,23 @@ fn pane_editor(pane: &ConfigPane) -> Option<(String, &str)> {
 /// there: it backs out to the field list rather than closing the pane.
 /// `g`/`G` and `r` are named in both, since they are bound on both
 /// screens in both control states. `h` is a no-op on this sub-screen's
-/// own rows, so it is named only on the field-list forms.
+/// own rows, same as the flag legend below, so both are field-list only.
+///
+/// `* yours` and `! parked` repeat the field list's own flag glyphs
+/// ([`super::pane::field_line`]) so an operator does not have to learn
+/// what they mean from a different screen. The flock table's own `CFG`
+/// column carries the same two glyphs with no legend of its own: this is
+/// the one place a legend was added, chosen over the table because the
+/// pane and the dashboard are never on screen at once, so one hint
+/// covers whichever of the two glyphs an operator is actually looking
+/// at.
 const fn pane_hint(control: Control, env_open: bool) -> &'static str {
     match (control, env_open) {
         (Control::ReadOnly, false) => {
-            "esc close   j/k select   g/G first/last   r refresh   h help   q quit"
+            "esc close   j/k select   g/G first/last   r refresh   h help   * yours   ! parked   q quit"
         }
         (Control::Allowed, false) => {
-            "esc close   j/k select   g/G first/last   r refresh   space cycle   e edit   h help   q quit"
+            "esc close   j/k select   g/G first/last   r refresh   space cycle   e edit   h help   * yours   ! parked   q quit"
         }
         (Control::ReadOnly, true) => "esc back   j/k select   g/G first/last   r refresh   q quit",
         (Control::Allowed, true) => {
@@ -681,6 +690,8 @@ mod tests {
         for both in [&closed, &open] {
             assert!(both.contains("esc close"), "got {both:?}");
             assert!(both.contains("h help"), "got {both:?}");
+            assert!(both.contains("* yours"), "got {both:?}");
+            assert!(both.contains("! parked"), "got {both:?}");
             assert!(both.contains("q quit"), "got {both:?}");
             assert!(!both.contains("x stop"), "got {both:?}");
         }
@@ -713,6 +724,23 @@ mod tests {
                     assert!(hint.contains(key), "{control:?} env={env_open}: {hint:?}");
                 }
             }
+        }
+    }
+
+    /// The legend for the flag glyphs `field_line` draws: `*` an
+    /// operator's own override, `!` parked until the next respawn. Named
+    /// in both control states, since the flags are informational rather
+    /// than something `--allow-control` gates. The env sub-screen has no
+    /// rows of its own to flag, so it carries neither.
+    #[test]
+    fn the_field_lists_hint_carries_a_legend_for_its_own_flag_glyphs() {
+        for control in [Control::ReadOnly, Control::Allowed] {
+            let hint = pane_hint(control, false);
+            assert!(hint.contains("* yours"), "{control:?}: {hint:?}");
+            assert!(hint.contains("! parked"), "{control:?}: {hint:?}");
+            let env_hint = pane_hint(control, true);
+            assert!(!env_hint.contains('*'), "{control:?}: {env_hint:?}");
+            assert!(!env_hint.contains('!'), "{control:?}: {env_hint:?}");
         }
     }
 
