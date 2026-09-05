@@ -6621,7 +6621,7 @@ mod tests {
     /// cannot be crossed. `PanePending::Sent` had no key to match against,
     /// so any reply settled whatever was pending.
     #[test]
-    fn one_replys_arrival_does_not_clear_another_writes_in_flight_line() {
+    fn an_arriving_reply_leaves_the_in_flight_line_of_another_write() {
         let mut app = fixtures::app_in_sheep_pane_with_control();
         pane_to(&mut app, "autorestart");
         let _ = app.update(Msg::Key(KeyPress::Cycle));

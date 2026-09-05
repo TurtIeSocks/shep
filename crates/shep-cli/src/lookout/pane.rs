@@ -262,7 +262,7 @@ pub enum PanePending {
 
 /// Prints the key and never a buffer or a rendered sentence -- see the type
 /// doc for why. Exact-string-tested below
-/// (`a_pane_pendings_debug_names_no_value`).
+/// (`debug_names_no_value_on_a_pane_pending`).
 impl core::fmt::Debug for PanePending {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -1769,7 +1769,7 @@ mod tests {
     /// through typing, and on the env screen that is the secret itself;
     /// the question quotes the value a field edit is setting.
     #[test]
-    fn a_pane_pendings_debug_names_no_value() {
+    fn debug_names_no_value_on_a_pane_pending() {
         let typing = PanePending::Typing {
             key: "cwd".into(),
             buffer: "/home/ada/secret-project".into(),
