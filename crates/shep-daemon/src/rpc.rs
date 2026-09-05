@@ -719,16 +719,46 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                 Err(err) => reply(Err(rpc_error(&err))),
             }
         }
-        // A real arm rather than the wildcard below, deliberately, and the
-        // difference is not cosmetic: the wildcard's message says this
-        // daemon is too old for the request, which would send an operator
-        // to upgrade a daemon that is already current. The handler lands in
-        // task 8 of the config-panes plan.
-        Request::SetDogConfig { name, .. } => reply(Err(RpcError {
-            code: RpcErrorCode::Internal,
-            message: format!("SetDogConfig for {name} lands in task 8"),
-            daemon_version: None,
-        })),
+        // The inverse of every other config door's guard, and deliberately
+        // so: `dogs.toml` holds dogs' sections and nothing else, so what
+        // this one refuses is a SHEEP, and a name nobody registered at all.
+        // Asked before the file is opened, so a mistyped name cannot leave
+        // a table behind for a dog that will never exist.
+        //
+        // Written here rather than through the supervisor: `dogs.toml` is
+        // not supervisor state the way the override store is, and the two
+        // things this needs -- the file's path and the bus -- are both
+        // already in scope. The daemon and not the client writes it because
+        // the daemon is the only publisher of `config.dog.<name>`, and a
+        // section written with nothing publishing that topic leaves a
+        // running dog reading the old one.
+        Request::SetDogConfig { name, toml } => {
+            let known = ctx.supervisor.list().await;
+            if !known
+                .iter()
+                .any(|info| info.name == name && info.dog.is_some())
+            {
+                return reply(Err(RpcError {
+                    code: RpcErrorCode::NotFound,
+                    message: format!("no dog named {name}"),
+                    daemon_version: None,
+                }));
+            }
+            match crate::dogs::set_dog_section(&ctx.dogs_config, &name, toml.as_str()) {
+                Ok(()) => {
+                    crate::bus::publish_dog_config_changed(
+                        &ctx.events,
+                        std::slice::from_ref(&name),
+                    );
+                    reply(Ok(Response::DogConfigSet { name }))
+                }
+                Err(err) => reply(Err(RpcError {
+                    code: RpcErrorCode::InvalidConfig,
+                    message: err.to_string(),
+                    daemon_version: None,
+                })),
+            }
+        }
         // `Request` is #[non_exhaustive]: a verb from a newer client that this
         // daemon has never heard of is an error, not a panic.
         _ => reply(Err(RpcError {
@@ -3721,6 +3751,111 @@ mod tests {
             panic!("expected DogSection, got {:?}", reply.result)
         };
         assert!(toml.contains("30s"));
+    }
+
+    /// fails if the section is written without the topic going out, which
+    /// is the whole difference between this door and a CLI writing the file
+    /// itself: a running dog subscribed to `config.dog.<name>` is the only
+    /// reader that finds out a section moved. Asserted on a SUBSCRIBER
+    /// rather than on the publish call, the way the dog contract's own
+    /// `bark_subscribes_to_its_own_config_topic` does -- a test that the
+    /// publisher ran proves nothing about what a dog hears.
+    #[tokio::test(start_paused = true)]
+    async fn set_dog_config_writes_the_file_and_a_subscriber_hears_about_it() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        enable_dog(&h.ctx, 1, "bark").await;
+        let mut sub = h.ctx.events.subscribe();
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::SetDogConfig {
+                        name: "bark".to_string(),
+                        toml: "poll = \"30s\"\n".to_string().into(),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        assert_eq!(
+            reply.result.unwrap(),
+            Response::DogConfigSet {
+                name: "bark".to_string()
+            }
+        );
+
+        let text = std::fs::read_to_string(&h.ctx.dogs_config).unwrap();
+        assert!(text.contains("poll = \"30s\""), "{text}");
+
+        // The dog's own spawn narrates itself on the same bus, so the
+        // topic wanted here is not necessarily the first frame waiting.
+        let mut topics = Vec::new();
+        while let Ok(Ok(event)) = tokio::time::timeout(Duration::from_secs(5), sub.recv()).await {
+            topics.push(event.to_event().topic().into_owned());
+            if topics
+                .last()
+                .is_some_and(|topic| topic == "config.dog.bark")
+            {
+                break;
+            }
+        }
+        assert!(
+            topics.iter().any(|topic| topic == "config.dog.bark"),
+            "{topics:?}"
+        );
+    }
+
+    /// fails if the guard is the one every other config door carries. This
+    /// is the inverse: `dogs.toml` holds dogs' sections and nothing else,
+    /// so a SHEEP's name is what has to be refused here, and a name nobody
+    /// registered with it. Refused before the file is opened, so a
+    /// mistyped name cannot leave a stray table behind for a dog that will
+    /// never exist.
+    #[tokio::test(start_paused = true)]
+    async fn setting_a_dogs_config_over_a_sheeps_name_is_refused_and_writes_nothing() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        let started = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::Start {
+                        apps: vec![AppConfig::minimal("web", "./srv")],
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        assert!(started.result.is_ok(), "{:?}", started.result);
+        std::fs::write(&h.ctx.dogs_config, "[bark]\npoll = \"60s\"\n").unwrap();
+
+        for (id, name) in [(2, "web"), (3, "ghost")] {
+            let reply = reply_of(
+                dispatch(
+                    envelope(
+                        id,
+                        Request::SetDogConfig {
+                            name: name.to_string(),
+                            toml: "poll = \"30s\"\n".to_string().into(),
+                        },
+                    ),
+                    &h.ctx,
+                )
+                .await,
+            );
+            let Err(err) = reply.result else {
+                panic!("{name} is not a dog and must be refused")
+            };
+            assert_eq!(err.code, RpcErrorCode::NotFound, "{err:?}");
+            assert!(err.message.contains(name), "{err:?}");
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(&h.ctx.dogs_config).unwrap(),
+            "[bark]\npoll = \"60s\"\n"
+        );
     }
 
     /// fails if `describe all` lists a dog, and fails if `describe <dog>`
