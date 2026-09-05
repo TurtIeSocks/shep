@@ -137,10 +137,14 @@ fn title_line(pane: &ConfigPane, palette: Palette, width: u16) -> Line<'static> 
 /// The lock glyph sits in the column between the selection mark and the
 /// flag, which every row already spent on a space, so it costs nothing and
 /// cannot be truncated. It is a glyph rather than a style because a style
-/// says nothing at all in `plain`, and nothing but the mark, the glyph, the
-/// flag and the key is guaranteed to render at `MIN_TERM_WIDTH` -- the cost
-/// cell, which is the only other place either fact appears, is the first
-/// column this pane drops. See [`Lock`].
+/// says nothing at all in `plain`. It is in that column rather than in the
+/// cost cell because the cost cell is the first thing [`widths`] drops, and
+/// it is dropped at `MIN_TERM_WIDTH` -- `body_width(33)` is 31, under
+/// [`FULL_WIDTH`] -- while being the only other place either fact appears.
+/// The KEY and VALUE cells do both still render there (31 clears
+/// [`VALUE_WIDTH`]); VALUE carries the field's value and has no room for a
+/// second subject, and a suffix inside KEY would be the first thing `fit`
+/// truncated on the long names this pane already abbreviates. See [`Lock`].
 fn field_line(
     pane: &ConfigPane,
     index: usize,
