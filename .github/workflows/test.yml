@@ -421,6 +421,14 @@ jobs:
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       - run: "cargo nextest run --profile ci -p shep-daemon --locked --no-default-features -E 'not (test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a))'"
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
+      # This job runs nextest twice under the one `ci` profile, and both
+      # runs write the same junit path, so the second overwrites the first
+      # before anything reads it. One report per run, named for its tier.
+      # Review of this file found the first junit was being lost.
+      - uses: ./.github/actions/nextest-report
+        if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+        with:
+          name: junit-features-${{ matrix.os }}-daemon-no-default-features
       - run: 'cargo test -p shep-daemon --locked --no-default-features --doc'
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       # shep-client's `schema` feature is ON by default and a dog is
@@ -434,11 +442,15 @@ jobs:
       - run: cargo test -p shep-client --locked --no-default-features
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       - run: "cargo nextest run --profile ci --workspace --locked --all-features -E 'not (test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a))'"
+        id: all-features
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       - run: 'cargo test --workspace --locked --all-features --doc'
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
+      # Only once the workspace run has actually run. After a red first tier
+      # it is skipped, and the junit on disk is still the first tier's, which
+      # the step above already reported.
       - uses: ./.github/actions/nextest-report
-        if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+        if: ${{ !cancelled() && steps.all-features.outcome != 'skipped' && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
         with:
           name: junit-features-${{ matrix.os }}
   # Tests that need a quiet machine, run serially in a job of their own.
