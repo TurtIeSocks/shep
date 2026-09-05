@@ -478,6 +478,21 @@ pub(crate) enum Command {
         /// store itself could not be read or written.
         reply: oneshot::Sender<Result<Option<ResolvedApp>, SupervisorError>>,
     },
+    /// See [`Actor::handle_set_sheep_field`].
+    SetSheepField {
+        /// The sheep's name, not a selector, for [`Self::Scale`]'s reason.
+        name: String,
+        /// The `AppConfig` field.
+        key: String,
+        /// The new value, in the shape that field serializes as.
+        value: serde_json::Value,
+        /// Answers what the write did: the config now on the stored spec or
+        /// parked, and whether the running child still lacks it. `None`
+        /// when no sheep has that name. An error only when the request is
+        /// refused or the override store itself could not be read or
+        /// written.
+        reply: oneshot::Sender<Result<Option<FieldSet>, SupervisorError>>,
+    },
     /// Attaches a marker to one sheep by name, or clears it.
     ///
     /// # Last writer wins
@@ -876,6 +891,19 @@ pub enum SupervisorError {
     /// things of the operator: this one is a request to change, and that
     /// one is a store to fix.
     InvalidEnv(String),
+    /// A `SetSheepField` this build will not take; carries the reason.
+    ///
+    /// [`Self::InvalidEnv`]'s twin, separate for the same reason that one
+    /// is separate from [`Self::Overrides`]: the two want opposite things
+    /// of the operator. Four shapes reach it, and all four are the caller's
+    /// own request rather than a fault -- a key [`AppConfig`] has no field
+    /// for, a value that will not deserialize into the field it names, a
+    /// config `normalize` refuses once the value is in, and the three keys
+    /// this door does not own (`env`, which has
+    /// `Handle::set_sheep_env`, and the two Structural ones). Nothing is
+    /// written on any of them: the config is checked before the store is
+    /// touched.
+    InvalidField(String),
     /// The override store at `$SHEP_HOME/overrides.json` could not be read
     /// or written, so an operator's edit was not recorded. Carries
     /// [`OverridesError`](shep_core::overrides::OverridesError)'s own
@@ -904,6 +932,7 @@ impl fmt::Display for SupervisorError {
             Self::FlushFailed(msg) => write!(f, "log flush failed: {msg}"),
             Self::IsADog(msg) => write!(f, "refused: {msg}"),
             Self::InvalidEnv(msg) => write!(f, "cannot set that env key: {msg}"),
+            Self::InvalidField(msg) => write!(f, "cannot set that field: {msg}"),
             Self::Overrides(msg) => write!(f, "overrides store unusable: {msg}"),
             Self::EngineStopped => f.write_str("supervisor engine has shut down"),
         }
@@ -911,6 +940,25 @@ impl fmt::Display for SupervisorError {
 }
 
 impl core::error::Error for SupervisorError {}
+
+/// What a [`Command::SetSheepField`] did.
+///
+/// Two facts, and only the second is a judgement: the config the caller
+/// should record on the muster roll, and whether the running child has the
+/// value yet.
+///
+/// `Debug` is derived (IR-41): [`ResolvedApp`] wraps an [`AppConfig`], whose
+/// own manual `Debug` redacts `env`, and a bool.
+#[derive(Debug, Clone)]
+pub(crate) struct FieldSet {
+    /// The app as it now stands, for `rpc.rs` to hand the registry -- the
+    /// parked config when the field parked, the stored spec's when it
+    /// reached. `Command::SetSheepEnv` answers with the same thing and for
+    /// the same reason: the muster roll is written from the registry.
+    pub(crate) app: ResolvedApp,
+    /// `true` when the running child does not have the value yet.
+    pub(crate) pending: bool,
+}
 
 /// Handle to a running supervisor actor.
 ///
@@ -1119,6 +1167,39 @@ impl SupervisorHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Msg::Command(Command::SetSheepEnv {
+                name,
+                key,
+                value,
+                reply,
+            }))
+            .await
+            .map_err(|_| SupervisorError::EngineStopped)?;
+        rx.await.map_err(|_| SupervisorError::EngineStopped)?
+    }
+
+    /// Sets one config field on one sheep as an operator override.
+    ///
+    /// [`Actor::handle_set_sheep_field`].
+    ///
+    /// # Errors
+    ///
+    /// - [`SupervisorError::IsADog`] - the name is a dog's, and a dog's
+    ///   config is not an operator's to edit through a pane.
+    /// - [`SupervisorError::InvalidField`] - the key, the value, or the
+    ///   resulting config is one this build will not take. Nothing was
+    ///   written.
+    /// - [`SupervisorError::Overrides`] - the override store could not be
+    ///   read or written, so nothing was recorded and nothing parked.
+    /// - [`SupervisorError::EngineStopped`] - the actor is gone.
+    pub(crate) async fn set_sheep_field(
+        &self,
+        name: String,
+        key: String,
+        value: serde_json::Value,
+    ) -> Result<Option<FieldSet>, SupervisorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::Command(Command::SetSheepField {
                 name,
                 key,
                 value,
@@ -3473,6 +3554,15 @@ impl<R: ProcessRunner> Actor<R> {
                 reply,
             } => {
                 let _ = reply.send(self.handle_set_sheep_env(&name, &key, value.as_deref()));
+                false
+            }
+            Command::SetSheepField {
+                name,
+                key,
+                value,
+                reply,
+            } => {
+                let _ = reply.send(self.handle_set_sheep_field(&name, &key, &value));
                 false
             }
             // Neither is rejected while `shutting_down`: a smit registers
@@ -6265,6 +6355,210 @@ impl<R: ProcessRunner> Actor<R> {
             slot.entry.overridden.clone_from(&overridden);
         }
         Ok(Some(parked))
+    }
+
+    /// Records `key` on `name` as an operator override, applies what can
+    /// reach the running process, and parks the rest for its next spawn.
+    ///
+    /// `Ok(None)` when no sheep has that name.
+    ///
+    /// # Why this is not `ApplyConfig`
+    ///
+    /// One [`DeclaredApp`] declaring one key, at [`ResetDepth::File`],
+    /// moves exactly this one field and nothing else -- and then
+    /// [`merge_declared`] spends the override for it, on correct reasoning
+    /// that does not hold here: a key put back to the TEMPLATE is not a key
+    /// an operator is still holding a value for, but a pane's value IS the
+    /// operator's, and the sheep still differs from its file. Routed that
+    /// way, an edit landed and then dropped out of
+    /// [`ProcessEntry::overridden`], so the `*` never rendered and `shep
+    /// flock`'s CFG column did not count it. This writes the override
+    /// directly instead of pretending to be a template.
+    ///
+    /// # Ordering
+    ///
+    /// Validate, then write the store, then apply. Every refusal below is
+    /// raised before [`overrides::update`], so an operator whose value this
+    /// build will not take is left with the config they already had rather
+    /// than a store that disagrees with the flock -- the rule
+    /// [`Self::handle_set_sheep_env`] states and its own test pins.
+    ///
+    /// # Which fields reach a running process
+    ///
+    /// [`apply_group`]'s table, exactly as [`Self::apply_one`] reads it. A
+    /// [`ApplyGroup::Live`] field goes onto the stored spec and is in force
+    /// at the daemon's next decision; a [`ApplyGroup::NextSpawn`] field
+    /// goes onto the stored spec too but is not in force until a spawn
+    /// reads it, so it reports as pending -- except `autostart`, which
+    /// `restorable()` reads at muster rather than at a spawn and so is in
+    /// force the moment it lands, the same carve-out `apply_one` makes. A
+    /// [`ApplyGroup::NeedsRespawn`] field only parks.
+    ///
+    /// # Errors
+    ///
+    /// - [`SupervisorError::IsADog`] - the name is a dog's. Raised before
+    ///   the store is read, so nothing was written.
+    /// - [`SupervisorError::InvalidField`] - the key is one this door does
+    ///   not own or `AppConfig` does not have, the value will not
+    ///   deserialize into it, or `normalize` refuses the result. Nothing
+    ///   was written.
+    /// - [`SupervisorError::Overrides`] - the override store could not be
+    ///   read or written. Nothing was parked.
+    fn handle_set_sheep_field(
+        &mut self,
+        name: &str,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> Result<Option<FieldSet>, SupervisorError> {
+        // `env` has its own request, and it needs one: a whole env map is
+        // never sent (a pane is not told the values), and this door's
+        // wholesale replacement of one field would wipe every key but the
+        // one being set. The two Structural fields are identity and flock
+        // shape rather than runtime knobs -- `handle_scale` owns the count,
+        // and a `name` change is a different sheep.
+        if key == "env" {
+            return Err(SupervisorError::InvalidField(
+                "env is set one key at a time; use `SetSheepEnv`".to_string(),
+            ));
+        }
+        if apply_group(key) == ApplyGroup::Structural {
+            return Err(SupervisorError::InvalidField(format!(
+                "{key} is not a config write; `shep stock` moves an instance count, and a \
+                 name change is a different sheep"
+            )));
+        }
+        let Some(id) = self.representative_id(name) else {
+            return Ok(None);
+        };
+        // BEFORE the store is read and long before it is written, and for
+        // the reason `handle_set_sheep_env`'s own guard gives at length: a
+        // dog runs at the daemon's own trust level, a dog is never in the
+        // override store so nothing further down would catch it, and this
+        // door reaches `script` and `args` directly. `apply_one` and
+        // `handle_scale` refuse a dog with the same sentence.
+        if self
+            .sheep
+            .get(&id)
+            .is_some_and(|slot| slot.entry.dog.is_some())
+        {
+            return Err(SupervisorError::IsADog(dog_config_refusal(name)));
+        }
+        let Some(slot) = self.sheep.get(&id) else {
+            return Ok(None);
+        };
+        // `running` is what the child was spawned from; `intended` is what
+        // the app is meant to be, which is an earlier edit's parked config
+        // when there is one. Building on `running` would drop that edit,
+        // which is `apply_one`'s own reason for the same pair.
+        let running = slot.entry.spec.config().clone();
+        let intended = slot
+            .entry
+            .pending
+            .as_ref()
+            .map_or_else(|| running.clone(), |parked| parked.config().clone());
+
+        let Ok(serde_json::Value::Object(mut object)) = serde_json::to_value(&intended) else {
+            return Err(SupervisorError::InvalidField(
+                "an app config must serialize as an object".to_string(),
+            ));
+        };
+        // Checked rather than inserted blind. `AppConfig` would take an
+        // unknown key without complaint or ignore it outright, either way
+        // reporting a write that changed nothing, and a pane's key comes
+        // off a schema this daemon may not share a version with.
+        if !object.contains_key(key) {
+            return Err(SupervisorError::InvalidField(format!(
+                "no config field named {key}"
+            )));
+        }
+        object.insert(key.to_string(), value.clone());
+        let edited: AppConfig = serde_json::from_value(serde_json::Value::Object(object))
+            .map_err(|err| SupervisorError::InvalidField(format!("{key}: {err}")))?;
+        let merged = normalize(edited)
+            .map_err(|err| SupervisorError::InvalidField(format!("{key}: {err}")))?;
+
+        // The one field that moved, if it moved at all. A value identical
+        // to what is already intended still records the override -- the
+        // operator has spoken for the key, which is the whole point of this
+        // door -- but nothing needs applying or parking for it.
+        let group = apply_group(key);
+        let reaches = matches!(group, ApplyGroup::Live | ApplyGroup::NextSpawn);
+        let reaching: Vec<String> = if reaches {
+            vec![key.to_string()]
+        } else {
+            Vec::new()
+        };
+        // A SUBSET of a valid config can still fail to normalize, because
+        // `normalize` checks fields against each other: `watch` needs a
+        // `cwd`, and a `cwd` left behind as `NeedsRespawn` takes the watch
+        // down with it. `apply_one` treats that as "this app needs a
+        // restart" rather than as an invalid request, and so does this.
+        let next_spec = reached_spec(&running, merged.config(), &reaching, running.instances).ok();
+        let park_all = next_spec.is_none();
+
+        let mut record = overrides::get(&self.paths.overrides, name)
+            .map_err(|err| SupervisorError::Overrides(err.to_string()))?
+            .unwrap_or_default();
+        record.fields.insert(key.to_string(), value.clone());
+        let overridden: Vec<String> = record.fields.keys().cloned().collect();
+        let changes = BTreeMap::from([(name.to_string(), Some(record))]);
+        overrides::update(&self.paths.overrides, &changes)
+            .map_err(|err| SupervisorError::Overrides(err.to_string()))?;
+
+        // Parked whenever the field cannot reach a running child, and also
+        // whenever an earlier edit already left a config parked: that
+        // config predates this one, and promoting it later would put this
+        // field back. `apply_one` recomputes it on the same condition.
+        let parked_wanted = park_all
+            || !reaches
+            || self.ids_of_name(name).iter().any(|id| {
+                self.sheep
+                    .get(id)
+                    .is_some_and(|s| s.entry.pending.is_some())
+            });
+        let parked = parked_wanted.then(|| merged.clone());
+
+        // Every slot of the name, and `ids_of_name` re-read for the reason
+        // `handle_set_sheep_env` gives.
+        for id in self.ids_of_name(name) {
+            let Some(slot) = self.sheep.get_mut(&id) else {
+                continue;
+            };
+            // Against THIS slot's own spec and before it is overwritten,
+            // exactly as `apply_one` does it: instance 0 may already have
+            // promoted while its siblings have not, so a later promotion
+            // diffing `pending` against a shared `next_spec` would conclude
+            // there was nothing to re-resolve. `|=`, never `=`.
+            if let Some(parked) = &parked {
+                let spawned = slot.entry.spec.config();
+                slot.entry.pending_reidentifies |=
+                    spawned.user != parked.config().user || spawned.group != parked.config().group;
+            }
+            if let Some(next_spec) = next_spec.clone() {
+                slot.entry.spec = next_spec;
+            }
+            if let Some(parked) = parked.clone() {
+                slot.entry.pending = Some(parked);
+            }
+            slot.entry.overridden.clone_from(&overridden);
+        }
+
+        // A Live field the extras engine reads is re-armed now rather than
+        // at the next spawn, the same line `apply_one` runs for the same
+        // set of fields.
+        if !park_all && group == ApplyGroup::Live && EXTRAS_FIELDS.contains(&key) {
+            self.rearm_name(name);
+        }
+
+        // In force, or waiting for a respawn. `autostart` is the
+        // `NextSpawn` field that reports as in force, because `restorable()`
+        // reads it at muster or boot rather than at a spawn, and telling an
+        // operator to restart for it would be telling them to do nothing.
+        let in_force = !park_all && (group == ApplyGroup::Live || key == "autostart");
+        Ok(Some(FieldSet {
+            app: parked.unwrap_or_else(|| next_spec.unwrap_or(merged)),
+            pending: !in_force,
+        }))
     }
 
     /// One app's half of [`Self::handle_apply_config`].

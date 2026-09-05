@@ -235,6 +235,7 @@ pub fn spawn_cron_worker(
                         | SupervisorError::CannotStart(_)
                         | SupervisorError::IsADog(_)
                         | SupervisorError::InvalidEnv(_)
+                        | SupervisorError::InvalidField(_)
                         | SupervisorError::Overrides(_)),
                     ) => {
                         // A restart touches no log files, starts no reload,

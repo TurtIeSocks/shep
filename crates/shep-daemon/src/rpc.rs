@@ -691,6 +691,34 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                 Err(err) => reply(Err(rpc_error(&err))),
             }
         }
+        Request::SetSheepField { name, key, value } => {
+            match ctx
+                .supervisor
+                .set_sheep_field(name.clone(), key.clone(), value)
+                .await
+            {
+                // Recorded exactly as `SetSheepEnv` records its own, and
+                // for that arm's reason: the muster roll is written from
+                // the registry and nothing on the restore path reads the
+                // override store, so a field edit that skipped this would
+                // survive a `shep daemon reload` and vanish on a cold
+                // restart.
+                Ok(Some(set)) => {
+                    ctx.registry.record(&[set.app]);
+                    reply(Ok(Response::SheepFieldSet {
+                        name,
+                        key,
+                        pending: set.pending,
+                    }))
+                }
+                Ok(None) => reply(Err(RpcError {
+                    code: RpcErrorCode::NotFound,
+                    message: format!("no sheep named {name}"),
+                    daemon_version: None,
+                })),
+                Err(err) => reply(Err(rpc_error(&err))),
+            }
+        }
         // A real arm rather than the wildcard below, deliberately, and the
         // difference is not cosmetic: the wildcard's message says this
         // daemon is too old for the request, which would send an operator
@@ -1062,6 +1090,16 @@ fn rpc_error(err: &SupervisorError) -> RpcError {
         // place entirely. The bare payload is `normalize`'s own refusal,
         // which already names the key.
         SupervisorError::InvalidEnv(msg) => RpcError {
+            code: RpcErrorCode::InvalidConfig,
+            message: msg.clone(),
+            daemon_version: None,
+        },
+        // `InvalidConfig`, beside `InvalidEnv` above and for its reason:
+        // every shape that reaches it is the caller's own key or value,
+        // which it can ask differently. The bare payload rather than
+        // `err.to_string()`, again like `InvalidEnv`: the message already
+        // names the field.
+        SupervisorError::InvalidField(msg) => RpcError {
             code: RpcErrorCode::InvalidConfig,
             message: msg.clone(),
             daemon_version: None,
@@ -3208,6 +3246,264 @@ mod tests {
         );
     }
 
+    /// Sends one `SetSheepField` and hands back the reply.
+    async fn set_field(
+        ctx: &RpcContext,
+        id: u64,
+        name: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<Response, RpcError> {
+        reply_of(
+            dispatch(
+                envelope(
+                    id,
+                    Request::SetSheepField {
+                        name: name.to_string(),
+                        key: key.to_string(),
+                        value,
+                    },
+                ),
+                ctx,
+            )
+            .await,
+        )
+        .result
+    }
+
+    /// fails if a pane edit stops being visible as an operator override.
+    ///
+    /// **This is the whole reason `SetSheepField` exists.** The same edit
+    /// through `ApplyConfig` at `ResetDepth::File` moved the field and then
+    /// spent the override for it in `merge_declared`, so the key was gone
+    /// from `overridden`, `shep flock`'s CFG column counted nothing, and
+    /// the pane's `*` marker never appeared for a value the operator had
+    /// just set. Asserted end to end -- through `SheepConfig`, which the
+    /// pane reads, and `ListFlock`, which the CFG column reads -- because
+    /// the request in isolation was correct the whole time it was wrong.
+    #[tokio::test(start_paused = true)]
+    async fn a_field_edit_is_reported_as_an_operator_override() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+
+        let view = sheep_config_view(&h.ctx, 2, "web").await;
+        assert!(
+            !view.overridden.contains(&"max_restarts".to_string()),
+            "nothing is overridden before the edit: {:?}",
+            view.overridden
+        );
+
+        let reply = set_field(&h.ctx, 3, "web", "max_restarts", serde_json::json!(40)).await;
+        assert!(
+            matches!(reply, Ok(Response::SheepFieldSet { .. })),
+            "{reply:?}"
+        );
+
+        let stored = shep_core::overrides::get(&h.ctx.paths.overrides, "web")
+            .unwrap()
+            .expect("the edit is recorded");
+        assert_eq!(stored.fields["max_restarts"], 40);
+
+        let view = sheep_config_view(&h.ctx, 4, "web").await;
+        assert_eq!(view.config.max_restarts, 40, "the pane shows the new value");
+        assert!(
+            view.overridden.contains(&"max_restarts".to_string()),
+            "the `*` marker reads this: {:?}",
+            view.overridden
+        );
+
+        // The CFG column's own source, which is a different code path from
+        // the pane's and is the half that was silently wrong.
+        let infos = list_flock(&h.ctx, 5).await;
+        let web = infos
+            .iter()
+            .find(|info| info.name == "web")
+            .expect("web is in the flock");
+        assert!(
+            web.overridden
+                .as_deref()
+                .is_some_and(|fields| fields.contains(&"max_restarts".to_string())),
+            "{:?}",
+            web.overridden
+        );
+    }
+
+    /// fails if the four-way apply classification stops governing this
+    /// door. A `Live` field is in force now, a `NeedsRespawn` field parks
+    /// and says so, and the pane's cost column promises exactly this.
+    #[tokio::test(start_paused = true)]
+    async fn a_live_field_applies_now_and_a_respawn_field_parks() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+
+        let reply = set_field(&h.ctx, 2, "web", "max_restarts", serde_json::json!(40)).await;
+        let Ok(Response::SheepFieldSet { pending, .. }) = reply else {
+            panic!("{reply:?}")
+        };
+        assert!(!pending, "max_restarts is Live and is in force now");
+        let view = sheep_config_view(&h.ctx, 3, "web").await;
+        assert!(
+            !view.pending.contains(&"max_restarts".to_string()),
+            "{:?}",
+            view.pending
+        );
+
+        let reply = set_field(&h.ctx, 4, "web", "script", serde_json::json!("./next")).await;
+        let Ok(Response::SheepFieldSet { pending, .. }) = reply else {
+            panic!("{reply:?}")
+        };
+        assert!(pending, "script needs a respawn");
+        let view = sheep_config_view(&h.ctx, 5, "web").await;
+        assert!(
+            view.pending.contains(&"script".to_string()),
+            "{:?}",
+            view.pending
+        );
+        // And the Live edit is still in force beside the parked one.
+        assert_eq!(view.config.max_restarts, 40);
+        assert_eq!(
+            view.overridden,
+            ["max_restarts", "script"],
+            "both are the operator's"
+        );
+    }
+
+    /// fails if a dog can be handed a config field. The same hole
+    /// `a_dog_is_refused_an_env_override_rather_than_given_one` closes for
+    /// `env`, and sharper: this door reaches `script` and `args` directly,
+    /// and a dog runs at the daemon's own trust level.
+    ///
+    /// Asserts the store as well as the code: a refusal that answered
+    /// `InvalidConfig` after writing would be the same hole with a better
+    /// error message.
+    #[tokio::test(start_paused = true)]
+    async fn a_dog_is_refused_a_config_field_rather_than_given_one() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        let dog = enable_dog(&h.ctx, 1, "bark").await;
+
+        let reply = set_field(&h.ctx, 2, "bark", "script", serde_json::json!("/tmp/evil")).await;
+        let Err(err) = reply else {
+            panic!("a dog was given a config field")
+        };
+        assert_eq!(err.code, RpcErrorCode::InvalidConfig);
+        assert!(err.message.contains("bark is a dog"), "{}", err.message);
+        assert!(
+            shep_core::overrides::get(&h.ctx.paths.overrides, "bark")
+                .unwrap()
+                .is_none(),
+            "the refusal still wrote the store"
+        );
+        drop(dog);
+    }
+
+    /// fails if the three keys this door does not own stop being refused.
+    ///
+    /// `env` would be replaced wholesale by a request that carries one
+    /// value, wiping every other key; `instances` and `name` are
+    /// Structural, and the count moves through `shep stock`.
+    #[tokio::test(start_paused = true)]
+    async fn env_and_the_structural_fields_are_refused_by_this_door() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+
+        for (id, key, value) in [
+            (2, "env", serde_json::json!({ "A": "1" })),
+            (3, "instances", serde_json::json!(4)),
+            (4, "name", serde_json::json!("other")),
+        ] {
+            let reply = set_field(&h.ctx, id, "web", key, value).await;
+            let Err(err) = reply else {
+                panic!("{key} was accepted")
+            };
+            assert_eq!(err.code, RpcErrorCode::InvalidConfig, "{key}");
+            assert!(err.message.contains(key), "{key}: {}", err.message);
+        }
+        assert!(
+            shep_core::overrides::get(&h.ctx.paths.overrides, "web")
+                .unwrap()
+                .is_none(),
+            "a refusal still wrote the store"
+        );
+    }
+
+    /// fails if `SetSheepField` writes the store before it validates, or
+    /// reports a caller's own bad key or value as a daemon fault.
+    ///
+    /// Three shapes, and each is the caller's: a key `AppConfig` has no
+    /// field for, a value that will not deserialize into the field it
+    /// names, and a value that deserializes and then fails `normalize`.
+    #[tokio::test(start_paused = true)]
+    async fn a_field_this_build_refuses_is_invalid_config_and_writes_nothing() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+
+        for (id, key, value) in [
+            (2, "no_such_field", serde_json::json!(1)),
+            (3, "max_restarts", serde_json::json!("forty")),
+            (
+                4,
+                "cron_restart",
+                serde_json::json!("not a cron expression"),
+            ),
+        ] {
+            let reply = set_field(&h.ctx, id, "web", key, value).await;
+            let Err(err) = reply else {
+                panic!("{key} was accepted")
+            };
+            assert_eq!(err.code, RpcErrorCode::InvalidConfig, "{key}");
+            assert!(
+                shep_core::overrides::get(&h.ctx.paths.overrides, "web")
+                    .unwrap()
+                    .is_none(),
+                "{key}: the refusal still wrote the store"
+            );
+        }
+    }
+
+    /// fails if a store fault is reported as the caller's mistake. The
+    /// ordering twin of the test above, and the pair is what
+    /// `SetSheepEnv`'s own two pin for its door.
+    #[tokio::test(start_paused = true)]
+    async fn an_unreadable_store_is_internal_for_a_field_edit_too() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+        std::fs::write(&h.ctx.paths.overrides, "{ this is not json").unwrap();
+
+        let reply = set_field(&h.ctx, 2, "web", "max_restarts", serde_json::json!(40)).await;
+        let Err(err) = reply else {
+            panic!("an unreadable store was reported as success")
+        };
+        assert_eq!(err.code, RpcErrorCode::Internal);
+        assert!(
+            err.message.contains("overrides store unusable"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// fails if a field edit stops reaching the muster roll, which is the
+    /// registry record `rpc.rs` writes rather than anything the supervisor
+    /// does. Nothing on the restore path reads the override store, so an
+    /// edit that skipped it would survive a `shep daemon reload` and vanish
+    /// on a cold restart.
+    #[tokio::test(start_paused = true)]
+    async fn a_field_edit_reaches_the_muster_roll() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+
+        let reply = set_field(&h.ctx, 2, "web", "max_restarts", serde_json::json!(40)).await;
+        assert!(reply.is_ok(), "{reply:?}");
+
+        let infos = list_flock(&h.ctx, 3).await;
+        let roll = h.ctx.registry.roll(&infos, 0);
+        let web = roll
+            .apps
+            .iter()
+            .find(|entry| entry.app.name == "web")
+            .expect("web is in the roll");
+        assert_eq!(web.app.max_restarts, 40);
+    }
+
     /// fails if a variant added to `Request` never gets a dispatch arm.
     ///
     /// The one test here that cannot be replaced by reading the code.
@@ -3238,6 +3534,11 @@ mod tests {
                 name: "ghost".to_string(),
                 key: "K".to_string(),
                 value: None,
+            },
+            Request::SetSheepField {
+                name: "ghost".to_string(),
+                key: "max_restarts".to_string(),
+                value: serde_json::json!(1),
             },
             Request::SetDogConfig {
                 name: "ghost".to_string(),

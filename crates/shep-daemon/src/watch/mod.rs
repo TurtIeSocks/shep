@@ -471,6 +471,7 @@ async fn run_group(
                 | SupervisorError::CannotStart(_)
                 | SupervisorError::IsADog(_)
                 | SupervisorError::InvalidEnv(_)
+                | SupervisorError::InvalidField(_)
                 | SupervisorError::Overrides(_)),
             ) => {
                 // A restart touches no log files, starts no reload, scales
