@@ -642,6 +642,14 @@ git commit -m "feat(lookout): a field model read off a JSON Schema"
       pub fn hidden_below(&self, len: usize) -> usize;
   }
   ```
+
+  **This block is what Task 2 was briefed to build, and three of these no
+  longer exist.** Task 3's fix round deleted `rows`, `hidden_above` and
+  `hidden_below`: they answer in DATA ROWS while the height they derive from
+  counts LINES, and every screen has chrome, so they were wrong for every
+  caller. `set_rows` also gained a `len`. What survives: `new`, `cursor`,
+  `offset`, `set_rows(rows, len)`, `move_by`, `move_to`, `clamp`. Task 5's
+  own correction block says what to do instead.
   On `App`: `pub fn note_body_rows(&mut self, rows: u16)`.
   In `lookout::view`: `pub fn body_rows(area: Rect) -> u16`.
 
@@ -1573,6 +1581,39 @@ git commit -m "feat(core)!: PROTOCOL_VERSION 4, for the three config-pane reques
 Then run the task gate.
 
 ### Task 5: the sheep pane, read-only
+
+> **Correction, written after Tasks 1 to 3 shipped. Where this and the task
+> below disagree, this wins.**
+>
+> **The three `Viewport` methods this task calls were deleted.** `pane_lines`
+> below uses `view.hidden_above()`, `view.rows()` and
+> `view.hidden_below(...)`; none exist. Do not add them back, for the reason
+> Task 2's interface block now records. `set_rows` takes `(rows, len)`, so
+> `ConfigPane::set_rows(rows)` is `self.view.set_rows(rows, self.rows().len())`.
+>
+> **`pane_lines` below also rebuilds a bug that was fixed twice.** It pushes a
+> title, an above-marker, up to four group headers, three blank separators and
+> a two-line dog footer, none counted, against an `end` computed in rows. That
+> is exactly what lost the cursor off the settings screen, and it is worse
+> here: around ten lines of chrome against 39 fields.
+>
+> Copy the pattern `crates/shep-cli/src/lookout/view/settings.rs` now uses.
+> Read `content_lines` and `body_from` there. The entry point takes a
+> `height` and never returns more lines than that, with zero meaning
+> unlimited for a test with no terminal. A helper lays the body out from a
+> given offset and reports whether the cursor's row was drawn. Every pushed
+> line is counted, both markers included, and both are reserved before a row
+> is admitted so a binding height cuts a row rather than the sentence saying a
+> row was cut. The entry point treats the viewport's offset as a starting
+> point, walks it down until the cursor's row fits, and has a last-resort
+> branch that drops the section chrome and draws the bare cursor row when even
+> that will not fit. Share that shape with the settings screen if it can be
+> shared without contorting both, and say which you did.
+>
+> The rendered-frame tests below pass a `height` too. Add one that drives the
+> cursor to the bottom of a short terminal and back to the top a row at a
+> time, asserting exactly one `>` in the body at every step, at the shortest
+> height the pane declares drawable.
 
 **Files:**
 - Create: `crates/shep-cli/src/lookout/pane.rs`
