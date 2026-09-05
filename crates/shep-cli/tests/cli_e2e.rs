@@ -4713,27 +4713,33 @@ fn available_dogs_reports_a_server_error_naming_the_url() {
 /// covers it.
 #[test]
 fn available_dogs_names_no_url_that_carries_credentials() {
-    let home = TempDir::new().unwrap();
+    for url in [
+        "ftp://user:hunter2@example.com/dogs.json",
+        // Scheme-relative, so there is no `://` to split the authority on.
+        "//user:hunter2@example.com/dogs.json",
+    ] {
+        let home = TempDir::new().unwrap();
 
-    let output = shep(home.path())
-        .env("SHEP_DOG_INDEX", "ftp://user:hunter2@example.com/dogs.json")
-        .arg("dogs")
-        .arg("--available")
-        .output()
-        .unwrap();
-    assert!(
-        !output.status.success(),
-        "an unfetchable url must not exit success: {output:?}"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !stderr.contains("hunter2"),
-        "stderr printed the password: {stderr}"
-    );
-    assert!(
-        stderr.contains("a url carrying credentials"),
-        "stderr must say why it withheld the url: {stderr}"
-    );
+        let output = shep(home.path())
+            .env("SHEP_DOG_INDEX", url)
+            .arg("dogs")
+            .arg("--available")
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{url}: an unfetchable url must not exit success: {output:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("hunter2"),
+            "{url}: stderr printed the password: {stderr}"
+        );
+        assert!(
+            stderr.contains("a url carrying credentials"),
+            "{url}: stderr must say why it withheld the url: {stderr}"
+        );
+    }
 }
 
 #[test]

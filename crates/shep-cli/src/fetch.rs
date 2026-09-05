@@ -201,6 +201,10 @@ pub const CREDENTIALS_REFUSAL: &str = concat!(
 /// fetch is cheaper than a right one that prints a password.
 pub fn url_carries_credentials(url: &str) -> bool {
     let rest = url.split_once("://").map_or(url, |(_scheme, rest)| rest);
+    // A scheme-relative url has an authority with no scheme in front of
+    // it, so there is no `://` to split on and the authority would
+    // otherwise read as the empty string before the first `/`.
+    let rest = rest.strip_prefix("//").unwrap_or(rest);
     let authority = rest.split('/').next().unwrap_or(rest);
     authority.contains('@')
 }
@@ -233,6 +237,17 @@ pub fn parse_url(url: &str) -> Result<Target, FetchError> {
         Some(rest) => (true, rest),
         None => match url.strip_prefix("http://") {
             Some(rest) => (false, rest),
+            None if url.contains('@') => {
+                // The credential check above reads an authority, and a url
+                // this far off the grammar is one it can misread. Nothing
+                // holding an `@` is worth quoting to say its scheme is
+                // wrong.
+                return Err(FetchError::Url(
+                    "does not start with http:// or https://, and the url is not echoed, \
+                     since it may carry a credential"
+                        .to_owned(),
+                ));
+            }
             None => {
                 return Err(FetchError::Url(format!(
                     "{url} does not start with http:// or https://"
@@ -758,6 +773,10 @@ mod tests {
             "ftp://user:hunter2@example.com/webhook",
             "HTTPS://user:hunter2@example.com/webhook",
             "user:hunter2@example.com/webhook",
+            // Scheme-relative: an authority with nothing in front of it,
+            // so there is no `://` to find and the leading `//` has to be
+            // stepped over or the authority reads as empty.
+            "//user:hunter2@example.com/webhook",
         ] {
             let err = parse_url(url).unwrap_err();
             assert!(matches!(err, FetchError::Url(_)), "{url}: {err:?}");
@@ -769,6 +788,21 @@ mod tests {
             );
             assert!(!format!("{err} {err:?}").contains("hunter2"), "{url}");
         }
+    }
+
+    /// The backstop under [`url_carries_credentials`]. That predicate
+    /// reads an authority, and a url far enough off the grammar is one it
+    /// can misread: here the `@` is in the path, so the predicate says
+    /// `false` and the scheme refusal is what sees the url. It refuses to
+    /// quote anything holding an `@` rather than trusting the predicate to
+    /// have been right about where the authority ended.
+    #[test]
+    fn a_url_refused_on_its_scheme_is_not_quoted_when_it_holds_an_at_sign() {
+        assert!(!url_carries_credentials("file:///etc/pass@wd"));
+        let err = parse_url("file:///etc/pass@wd").unwrap_err();
+        let rendered = format!("{err} {err:?}");
+        assert!(!rendered.contains("pass@wd"), "{rendered}");
+        assert!(rendered.contains("may carry a credential"), "{rendered}");
     }
 
     /// A Discord webhook URL is a bearer credential and carries its token
