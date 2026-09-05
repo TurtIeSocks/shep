@@ -31,14 +31,15 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use shep_client::RequestError;
-use shep_core::config::LogLevel;
+use shep_core::config::{DeclaredApp, LogLevel, ResetDepth};
 use shep_core::protocol::{
-    BusEvent, DogSource, Lamb, ProcessEventKind, ProcessInfo, Request, Response, SelectorSpec,
+    BusEvent, DogSource, EnvValue, Lamb, ProcessEventKind, ProcessInfo, Request, Response,
+    SelectorSpec, SheepApplied,
 };
 use shep_core::status::ProcStatus;
 
-use super::field::FieldSet;
-use super::pane::ConfigPane;
+use super::field::{FieldKind, FieldSet};
+use super::pane::{ConfigPane, Lock, PanePending, PaneTarget};
 use super::theme::Palette;
 use super::viewport::Viewport;
 use crate::commands::settings::{SettingEdit, SettingField, SettingsSnapshot, settings_field_set};
@@ -519,6 +520,50 @@ pub enum Sent {
         /// Which sheep was asked about.
         name: String,
     },
+    /// One field of one sheep's config, off the config pane's own `Enter`.
+    ///
+    /// Carries the [`DeclaredApp`] built at confirm time rather than the
+    /// pane's edit, so the request cannot disagree with the pane the
+    /// operator answered: the cursor, and what is armed, can both move
+    /// while the write is in flight. `key` rides along for the report,
+    /// which is the one thing the reply does not name.
+    ///
+    /// Boxed for the reason `Response::SheepConfig`'s own doc gives: an
+    /// [`AppConfig`](shep_core::config::AppConfig) is several hundred bytes
+    /// and every other variant of this enum is a name or two.
+    ///
+    /// The [`WriteAuthority`] is not decoration, for exactly the reason
+    /// [`Effect::WriteSetting`]'s own doc gives: this variant cannot be
+    /// named without having passed the gate, so a fifth door added
+    /// tomorrow cannot walk around it.
+    ApplyField {
+        /// The sheep.
+        name: String,
+        /// The field that moves. Exactly the one name in
+        /// [`DeclaredApp::declared`].
+        key: String,
+        /// The one-app merge, ready to send.
+        app: Box<DeclaredApp>,
+        /// Proof the control gate was open.
+        authority: WriteAuthority,
+    },
+    /// One env key of one sheep, off the env sub-screen's own `Enter`.
+    ///
+    /// Its own variant rather than a [`Self::ApplyField`] value, because
+    /// env does not travel through `ApplyConfig` at all: no
+    /// [`ResetDepth`] expresses "one key", and a pane that is never told a
+    /// value could not send the whole map back even if one did.
+    SetEnv {
+        /// The sheep.
+        name: String,
+        /// The env key.
+        key: String,
+        /// The value, or `None` to remove the key. [`EnvValue`] rather than
+        /// a `String` so a `{:?}` of this enum cannot print it (IR-41).
+        value: Option<EnvValue>,
+        /// Proof the control gate was open.
+        authority: WriteAuthority,
+    },
 }
 
 impl Sent {
@@ -554,6 +599,23 @@ impl Sent {
                 ..
             } => Request::DisableDog { name: name.clone() },
             Self::SheepConfig { name } => Request::SheepConfig { name: name.clone() },
+            // `ResetDepth::File`, and the whole write path rides on it: a
+            // key the declaration names is reset, a key it does not name is
+            // kept, and `declared` holds exactly the edited key. At the
+            // default `ResetDepth::None` this same request would be ignored
+            // for every key an operator has ever touched, so the pane would
+            // look like it worked and change nothing.
+            Self::ApplyField { app, .. } => Request::ApplyConfig {
+                apps: vec![(**app).clone()],
+                reset: ResetDepth::File,
+            },
+            Self::SetEnv {
+                name, key, value, ..
+            } => Request::SetSheepEnv {
+                name: name.clone(),
+                key: key.clone(),
+                value: value.clone(),
+            },
         }
     }
 }
@@ -1459,6 +1521,19 @@ impl App {
                         settings.pending = None;
                     }
                 }
+                // The pane's own expiry, and it sits OUTSIDE the link guard
+                // for a different reason than the settings screen's: the
+                // question describes the shepherd, which a lost link froze,
+                // but an armed edit that can never be sent is not a
+                // question worth leaving on screen either. `now` rather
+                // than `self.now`, which that guard stops advancing.
+                if let Some(pane) = self.config_pane.as_mut()
+                    && pane
+                        .armed_at()
+                        .is_some_and(|at| now.saturating_duration_since(at) >= CONFIRM_EXPIRY)
+                {
+                    pane.cancel();
+                }
                 Effect::None
             }
             Msg::Resize => Effect::None,
@@ -1503,6 +1578,10 @@ impl App {
                 }
                 Sent::Dog { name, enable, .. } => self.on_dog_reply(name, enable, result),
                 Sent::SheepConfig { name } => self.on_sheep_config(&name, result),
+                Sent::ApplyField { name, key, .. } => self.on_field_applied(&name, &key, result),
+                Sent::SetEnv {
+                    name, key, value, ..
+                } => self.on_env_set(&name, &key, value.is_some(), result),
             },
             Msg::Unsent { sent } => match sent {
                 Sent::Action { verb, target, name } => {
@@ -1533,6 +1612,27 @@ impl App {
                 Sent::SheepConfig { name } => {
                     self.notice = Some(Notice {
                         text: format!("{name}: its config was not asked for"),
+                        grave: true,
+                    });
+                    Effect::None
+                }
+                // Both write arms clear the pane's own `Sent` line, the
+                // same shape `Sent::Action`'s arm above uses: a bar still
+                // saying "sent, waiting for the shepherd" about a request
+                // nobody has is the failure `Msg::Unsent` exists for.
+                Sent::ApplyField { name, key, .. } => {
+                    if let Some(pane) = self.config_pane.as_mut() {
+                        pane.settle();
+                    }
+                    self.notice = Some(Notice {
+                        text: format!("{name}: {key} was not sent"),
+                        grave: true,
+                    });
+                    Effect::None
+                }
+                Sent::SetEnv { name, key, .. } => {
+                    self.notice = Some(Notice {
+                        text: format!("{name}: env {key} was not sent"),
                         grave: true,
                     });
                     Effect::None
@@ -1912,9 +2012,21 @@ impl App {
         match result {
             Ok(Response::SheepConfig(view)) => {
                 let carried = self.config_pane.as_ref().map(|pane| pane.view().clone());
+                // The env sub-screen is carried too, and it has to be: a
+                // set re-reads the whole config, so without this the
+                // sub-screen would close on the operator's own keystroke --
+                // on the one screen where that keystroke ADDS a row.
+                let carried_env = self
+                    .config_pane
+                    .as_ref()
+                    .and_then(ConfigPane::env)
+                    .map(|env| env.view().clone());
                 let mut pane = ConfigPane::sheep(*view);
                 if let Some(carried) = carried {
                     pane.adopt_view(carried);
+                }
+                if let Some(carried) = carried_env {
+                    pane.adopt_env_view(carried);
                 }
                 self.config_pane = Some(pane);
             }
@@ -2030,6 +2142,151 @@ impl App {
             // as anything. `Dropped` and `DaemonShutdown` are NOT in this arm
             // — both are named variants this binary understands.
             _ => Effect::None,
+        }
+    }
+
+    /// One `Request::ApplyConfig` reply for one edited field.
+    ///
+    /// The pane settles either way -- a question that has been answered is
+    /// not still in flight -- and a success re-reads the config so the
+    /// screen shows what the shepherd now holds rather than what the
+    /// operator asked for. `Effect::Send` rather than a second effect kind,
+    /// so the re-read gets `Msg::Unsent` handling for free like every other
+    /// request this reducer raises.
+    ///
+    /// [`SheepApplied::refused`] is reported rather than swallowed: it is
+    /// the one field that says a request the daemon accepted did not
+    /// wholly land, and it arrives beside lists that carry whatever did.
+    fn on_field_applied(
+        &mut self,
+        name: &str,
+        key: &str,
+        result: Result<Response, RequestError>,
+    ) -> Effect {
+        if let Some(pane) = self.config_pane.as_mut() {
+            pane.settle();
+        }
+        match result {
+            Ok(Response::Applied(reports)) => {
+                let report = reports.into_iter().next();
+                let (text, grave) = Self::applied_notice(name, key, report.as_ref());
+                self.notice = Some(Notice { text, grave });
+                if grave {
+                    return Effect::None;
+                }
+                Effect::Send(Sent::SheepConfig {
+                    name: name.to_owned(),
+                })
+            }
+            Ok(_unrecognised) => {
+                self.notice = Some(Notice {
+                    text: format!(
+                        "{name}: the shepherd answered something this lookout does not understand"
+                    ),
+                    grave: true,
+                });
+                Effect::None
+            }
+            Err(RequestError::Rpc(err)) => {
+                self.notice = Some(Notice {
+                    text: format!("{name}: {}", err.message),
+                    grave: true,
+                });
+                Effect::None
+            }
+            Err(other) => {
+                self.notice = Some(Notice {
+                    text: format!("{name}: {other}"),
+                    grave: true,
+                });
+                Effect::None
+            }
+        }
+    }
+
+    /// What one field's report reads as, and whether it is grave.
+    ///
+    /// Four answers, and the fourth is not a failure: `ResetDepth::File`
+    /// resets a declared key to the value the request carried, so an edit
+    /// that proposes what is already in force lands with both lists empty
+    /// and nothing refused. Saying "set" about that would be a claim the
+    /// screen cannot back up.
+    fn applied_notice(name: &str, key: &str, report: Option<&SheepApplied>) -> (String, bool) {
+        let Some(report) = report else {
+            return (
+                format!("{name}: the shepherd reported nothing about {key}"),
+                true,
+            );
+        };
+        if let Some(refused) = &report.refused {
+            return (format!("{name}: {refused}"), true);
+        }
+        let named = |list: &[String]| list.iter().any(|field| field == key);
+        if named(&report.applied) {
+            (format!("{name}: {key} is set"), false)
+        } else if named(&report.pending) {
+            (
+                format!("{name}: {key} is set, and waits for `shep reload {name}`"),
+                false,
+            )
+        } else {
+            (
+                format!("{name}: {key} was already what you asked for"),
+                false,
+            )
+        }
+    }
+
+    /// One `Request::SetSheepEnv` reply.
+    ///
+    /// `was_set` comes off the request rather than the reply: the answer
+    /// names the key and deliberately never the value, so it cannot say
+    /// which of the two things happened.
+    ///
+    /// Env is spawn-time in every case (`AppConfig::env` is
+    /// `ApplyGroup::NeedsRespawn`), so the sentence says so unconditionally
+    /// rather than reading a list that this reply does not carry.
+    fn on_env_set(
+        &mut self,
+        name: &str,
+        key: &str,
+        was_set: bool,
+        result: Result<Response, RequestError>,
+    ) -> Effect {
+        match result {
+            Ok(Response::SheepEnvSet { .. }) => {
+                let verb = if was_set { "set" } else { "removed" };
+                self.notice = Some(Notice {
+                    text: format!("{name}: env {key} {verb}, and waits for `shep reload {name}`"),
+                    grave: false,
+                });
+                Effect::Send(Sent::SheepConfig {
+                    name: name.to_owned(),
+                })
+            }
+            Ok(_unrecognised) => {
+                self.notice = Some(Notice {
+                    text: format!(
+                        "{name}: the shepherd answered something this lookout does not understand"
+                    ),
+                    grave: true,
+                });
+                Effect::None
+            }
+            Err(RequestError::Rpc(err)) => {
+                self.notice = Some(Notice {
+                    text: format!("{name}: {}", err.message),
+                    grave: true,
+                });
+                Effect::None
+            }
+            Err(other) => {
+                self.notice = Some(Notice {
+                    text: format!("{name}: {other}"),
+                    grave: true,
+                });
+                Effect::None
+            }
         }
     }
 
@@ -2296,14 +2553,49 @@ impl App {
     /// The config pane's own keymap, in force for as long as
     /// [`Self::config_pane`] is `Some`.
     ///
-    /// Read-only: nothing here writes, and nothing here arms. The movement
-    /// keys walk the field list, `r` re-reads the same config, and `e` or
-    /// `Escape` closes. Everything else is ignored, named rather than
-    /// wildcarded so a future variant does not fall silently into an arm
-    /// that ignores it -- an action key in particular must never be
-    /// mistaken for one this pane answers.
+    /// The movement keys walk the field list, `r` re-reads the same config,
+    /// `space` arms a cycle, `Enter` opens an editor or sends what is
+    /// armed, and `e` or `Escape` closes. Everything else is ignored, named
+    /// rather than wildcarded so a future variant does not fall silently
+    /// into an arm that ignores it -- an action key in particular must
+    /// never be mistaken for one this pane answers.
+    ///
+    /// The env sub-screen owns the keyboard ahead of all of it while it is
+    /// open ([`Self::on_env_key`]), the same nesting the pane itself has
+    /// over the dashboard.
+    ///
+    /// An armed edit eats the FIRST movement key, `Escape`, `e` and `r`
+    /// rather than also doing their ordinary job -- the same
+    /// cancel-before-act rule the dashboard and the settings screen already
+    /// follow, and for the same reason: otherwise the operator sees the
+    /// question vanish and the cursor move on one keypress, and the next
+    /// reflexive `Enter` applies an edit to a row they have lost track of.
     fn on_pane_key(&mut self, key: KeyPress) -> Effect {
         self.notice = None;
+        if self
+            .config_pane
+            .as_ref()
+            .is_some_and(|pane| pane.env().is_some())
+        {
+            return self.on_env_key(key);
+        }
+        if key == KeyPress::Quit {
+            return Effect::Quit;
+        }
+        // Checked before the dispatch below and CONSUMED, save for the two
+        // keys the question is actually waiting for: `Enter` answers it,
+        // and `space` walks it one step further along its own cycle -- the
+        // same carve-out `on_settings_key` makes, and for the same reason.
+        // Without it a bool could be flipped once and a choice could never
+        // reach its third value without a cancel in between.
+        if self.config_pane.as_ref().is_some_and(ConfigPane::is_armed)
+            && !matches!(key, KeyPress::Confirm | KeyPress::Cycle)
+        {
+            if let Some(pane) = self.config_pane.as_mut() {
+                pane.cancel();
+            }
+            return Effect::None;
+        }
         match key {
             KeyPress::Quit => return Effect::Quit,
             // Both close. `Escape` closes rather than cascading to a filter
@@ -2337,8 +2629,210 @@ impl App {
                     return Effect::Send(Sent::SheepConfig { name });
                 }
             }
+            KeyPress::Cycle => return self.cycle_field(),
+            KeyPress::Confirm => return self.confirm_field(),
             KeyPress::Action(_)
-            | KeyPress::Confirm
+            | KeyPress::Settings
+            | KeyPress::FilterStart
+            | KeyPress::TextChar(_)
+            | KeyPress::TextBackspace
+            | KeyPress::TextApply
+            | KeyPress::TextAbandon => {}
+        }
+        Effect::None
+    }
+
+    /// The refusal a locked row gets, in that row's own words.
+    ///
+    /// Two sentences for two facts, and never one for both: shep refusing a
+    /// config write is not the same as this pane having no widget for a
+    /// shape a Flockfile writes perfectly well. A generic third sentence
+    /// would put the pane back where it was before [`Lock`] existed.
+    fn lock_refusal(key: &str, lock: Lock) -> String {
+        match lock {
+            Lock::Refused => {
+                format!("{key} is not something a config write changes, from here or anywhere")
+            }
+            Lock::NoWidget => {
+                format!("{key} has no editor in this pane; a Flockfile still sets it")
+            }
+        }
+    }
+
+    /// `space` on the config pane. Arms the next value for the row under
+    /// the cursor, or refuses and says why.
+    ///
+    /// The gate is [`Self::authorize_write`], the same one every settings
+    /// write passes and for the same reason: a keystroke that changes a
+    /// running flock's config needs the fat-finger catch a keystroke that
+    /// stops a sheep has.
+    fn cycle_field(&mut self) -> Effect {
+        if self.authorize_write().is_none() {
+            return Effect::None;
+        }
+        if let Some((key, lock)) = self
+            .config_pane
+            .as_ref()
+            .and_then(ConfigPane::cursor_lock)
+            .map(|(key, lock)| (key.to_owned(), lock))
+        {
+            self.notice = Some(Notice {
+                text: Self::lock_refusal(&key, lock),
+                grave: true,
+            });
+            return Effect::None;
+        }
+        let now = self.now;
+        if let Some(pane) = self.config_pane.as_mut() {
+            pane.cycle(now);
+        }
+        Effect::None
+    }
+
+    /// The operator's `Enter` on the config pane. Three meanings, picked in
+    /// this order, mirroring [`Self::confirm_setting`]:
+    ///
+    /// - Something is armed: sends it and marks it sent.
+    /// - The cursor is on `env`: opens the env sub-screen.
+    /// - The cursor is on a typed field: opens the editor and switches
+    ///   [`InputMode::Text`] on.
+    ///
+    /// All three go through [`Self::authorize_write`], the editor included,
+    /// for the reason [`Self::confirm_setting`]'s own doc gives: an editor
+    /// a read-only operator can type a whole path into before being told no
+    /// is a worse refusal than one that arrives on the keypress that asked.
+    /// The env sub-screen is gated too -- it exists only to write, since
+    /// the shepherd never sends a value back for it to show.
+    fn confirm_field(&mut self) -> Effect {
+        let Some(pane) = self.config_pane.as_ref() else {
+            return Effect::None;
+        };
+        if pane.is_armed() {
+            let Some(authority) = self.authorize_write() else {
+                return Effect::None;
+            };
+            let Some(pane) = self.config_pane.as_mut() else {
+                return Effect::None;
+            };
+            let Some(edit) = pane.take_armed() else {
+                return Effect::None;
+            };
+            let PaneTarget::Sheep { name } = pane.target().clone();
+            let key = edit.key().to_owned();
+            let Some(app) = pane.declared_app(&edit) else {
+                // The one shape a typed edit can take that `AppConfig`
+                // refuses: an empty buffer on a field that is not nullable
+                // arms `null`. Settled above by `take_armed`, so the pane
+                // is left with nothing in flight rather than with a `Sent`
+                // line about a request that never existed.
+                pane.settle();
+                self.notice = Some(Notice {
+                    text: format!("{name}: {key} cannot take that value"),
+                    grave: true,
+                });
+                return Effect::None;
+            };
+            return Effect::Send(Sent::ApplyField {
+                name,
+                key,
+                app: Box::new(app),
+                authority,
+            });
+        }
+        let Some(kind) = pane.cursor_kind().cloned() else {
+            return Effect::None;
+        };
+        let locked = pane.cursor_lock().map(|(key, lock)| (key.to_owned(), lock));
+        let opens = matches!(kind, FieldKind::Map | FieldKind::Text | FieldKind::Integer);
+        // A row `Enter` was never going to open raises nothing at all --
+        // `confirm_setting`'s own third case, for its reason: a refusal
+        // about a key that was never going to act trains an operator to
+        // ignore the status bar. A bool and a choice are `space`'s job, and
+        // `space` works.
+        if !opens && locked.is_none() {
+            return Effect::None;
+        }
+        // The lock is checked AHEAD of the control gate, and it is the more
+        // specific of the two answers: `--allow-control` would not help.
+        // Each lock says its own thing -- see [`Self::lock_refusal`].
+        if let Some((key, lock)) = locked {
+            self.notice = Some(Notice {
+                text: Self::lock_refusal(&key, lock),
+                grave: true,
+            });
+            return Effect::None;
+        }
+        if self.authorize_write().is_none() {
+            return Effect::None;
+        }
+        let Some(pane) = self.config_pane.as_mut() else {
+            return Effect::None;
+        };
+        if kind == FieldKind::Map {
+            pane.open_env();
+        } else {
+            pane.begin_typing();
+            self.mode = InputMode::Text;
+        }
+        Effect::None
+    }
+
+    /// The env sub-screen's own keymap, in force for as long as the pane
+    /// holds one.
+    ///
+    /// `Escape` closes the sub-screen and NOT the pane: the cascade backs
+    /// out of the innermost thing first, the same rule
+    /// [`KeyPress::Escape`]'s own doc states. `e` closes the whole pane,
+    /// because that is the key that opened it.
+    ///
+    /// `Enter` opens the editor on the row under the cursor. There is no
+    /// arm-then-confirm step here, unlike every other write in lookout: an
+    /// env change is parked for the next spawn in every case, so nothing
+    /// the operator types takes effect until they reload, and a second
+    /// keystroke would be a question about a change that has not happened
+    /// yet.
+    fn on_env_key(&mut self, key: KeyPress) -> Effect {
+        match key {
+            KeyPress::Quit => return Effect::Quit,
+            KeyPress::Escape => {
+                if let Some(pane) = self.config_pane.as_mut() {
+                    pane.close_env();
+                }
+            }
+            KeyPress::Edit => {
+                self.config_pane = None;
+                self.config_target = None;
+            }
+            KeyPress::SelectUp
+            | KeyPress::SelectDown
+            | KeyPress::SelectFirst
+            | KeyPress::SelectLast => {
+                if let Some(env) = self.config_pane.as_mut().and_then(ConfigPane::env_mut) {
+                    match key {
+                        KeyPress::SelectUp => env.move_by(-1),
+                        KeyPress::SelectDown => env.move_by(1),
+                        KeyPress::SelectFirst => env.move_to_first(),
+                        KeyPress::SelectLast => env.move_to_last(),
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            KeyPress::Refresh => {
+                if let Some(pane) = self.config_pane.as_ref() {
+                    let name = pane.target().name().to_owned();
+                    return Effect::Send(Sent::SheepConfig { name });
+                }
+            }
+            KeyPress::Confirm => {
+                if self.authorize_write().is_none() {
+                    return Effect::None;
+                }
+                if let Some(env) = self.config_pane.as_mut().and_then(ConfigPane::env_mut) {
+                    env.begin_typing();
+                    self.mode = InputMode::Text;
+                }
+            }
+            KeyPress::Action(_)
             | KeyPress::Cycle
             | KeyPress::Settings
             | KeyPress::FilterStart
@@ -2346,6 +2840,93 @@ impl App {
             | KeyPress::TextBackspace
             | KeyPress::TextApply
             | KeyPress::TextAbandon => {}
+        }
+        Effect::None
+    }
+
+    /// The config pane's own text keymap, in force for as long as one of
+    /// its two editors owns [`InputMode::Text`].
+    ///
+    /// Does not trim the buffer, for the reason
+    /// [`Self::on_settings_text_key`]'s own doc gives: this repository does
+    /// not widen an accepted input grammar without a basis in the spec.
+    ///
+    /// The two editors differ in what `TextApply` does, and deliberately.
+    /// A field edit ARMS -- the operator's next `Enter`, on the now-closed
+    /// editor, is what sends it. An env edit SENDS, for the reason
+    /// [`Self::on_env_key`] gives.
+    fn on_pane_text_key(&mut self, key: KeyPress) -> Effect {
+        if key == KeyPress::Quit {
+            return Effect::Quit;
+        }
+        if self
+            .config_pane
+            .as_ref()
+            .is_some_and(|pane| pane.env().is_some())
+        {
+            return self.on_env_text_key(key);
+        }
+        let now = self.now;
+        let Some(pane) = self.config_pane.as_mut() else {
+            return Effect::None;
+        };
+        match key {
+            KeyPress::TextChar(typed) => pane.type_char(typed),
+            KeyPress::TextBackspace => pane.type_backspace(),
+            KeyPress::TextApply => {
+                pane.apply_typing(now);
+                // `apply_typing` keeps the editor open on an integer buffer
+                // that does not parse, so the mode follows what the pane
+                // actually did rather than what the key asked for.
+                if !matches!(pane.pending_edit(), Some(PanePending::Typing { .. })) {
+                    self.mode = InputMode::Normal;
+                }
+            }
+            KeyPress::TextAbandon => {
+                pane.abandon_typing();
+                self.mode = InputMode::Normal;
+            }
+            _ => {}
+        }
+        Effect::None
+    }
+
+    /// The env sub-screen's own text keymap. `TextApply` sends.
+    fn on_env_text_key(&mut self, key: KeyPress) -> Effect {
+        let Some(pane) = self.config_pane.as_mut() else {
+            return Effect::None;
+        };
+        let name = pane.target().name().to_owned();
+        let Some(env) = pane.env_mut() else {
+            return Effect::None;
+        };
+        match key {
+            KeyPress::TextChar(typed) => env.type_char(typed),
+            KeyPress::TextBackspace => env.type_backspace(),
+            KeyPress::TextApply => {
+                let applied = env.apply_typing();
+                self.mode = InputMode::Normal;
+                let Some((key, value)) = applied else {
+                    return Effect::None;
+                };
+                // Re-minted here rather than carried from the keypress that
+                // opened the editor: the gate is a property of this send,
+                // and `--allow-control` is read off the app either way.
+                let Some(authority) = self.authorize_write() else {
+                    return Effect::None;
+                };
+                return Effect::Send(Sent::SetEnv {
+                    name,
+                    key,
+                    value: value.map(EnvValue::from),
+                    authority,
+                });
+            }
+            KeyPress::TextAbandon => {
+                env.abandon_typing();
+                self.mode = InputMode::Normal;
+            }
+            _ => {}
         }
         Effect::None
     }
@@ -2674,6 +3255,14 @@ impl App {
     /// own arm -- so this split is total: exactly one of the two ever
     /// answers a given keypress.
     fn on_text_key(&mut self, key: KeyPress) -> Effect {
+        // Three now, and the split is still total: the config pane and the
+        // settings screen cannot both be open (`e` reaches the dashboard
+        // only from the dashboard, and `s` only from there too), and
+        // neither can coexist with the filter box, which `Msg::Settings`'s
+        // own arm closed the window on.
+        if self.config_pane.is_some() {
+            return self.on_pane_text_key(key);
+        }
         if self.settings.is_some() {
             return self.on_settings_text_key(key);
         }
@@ -3286,7 +3875,13 @@ impl App {
             // One less than the settings screen gets: the pane spends its
             // first line on a title naming the sheep, which
             // `view::pane::pane_lines` draws before any row.
-            pane.set_rows(usize::from(rows.saturating_sub(1)));
+            let body = usize::from(rows.saturating_sub(1));
+            pane.set_rows(body);
+            if let Some(env) = pane.env_mut() {
+                // The sub-screen draws its own title over the pane's, so
+                // it pays the same one line and no more.
+                env.set_rows(body);
+            }
         }
     }
 
@@ -6425,6 +7020,298 @@ mod tests {
         app.note_body_rows(20);
         app.update(Msg::Key(KeyPress::SelectLast));
         assert_eq!(app.config_pane().unwrap().view().offset(), 39 - 19);
+    }
+
+    /// Walks the pane's cursor onto `key`. The pane is a public type with
+    /// no public "go to this field" key, so the cursor is driven the way
+    /// an operator drives it.
+    fn pane_to(app: &mut App, key: &str) {
+        let index = app
+            .config_pane()
+            .expect("the pane is open")
+            .fields()
+            .fields()
+            .iter()
+            .position(|field| field.key == key)
+            .unwrap_or_else(|| panic!("no field named {key}"));
+        let _ = app.update(Msg::Key(KeyPress::SelectFirst));
+        for _ in 0..index {
+            let _ = app.update(Msg::Key(KeyPress::SelectDown));
+        }
+    }
+
+    /// The request an effect would put on the wire, or a panic naming what
+    /// came back instead. The seam this test module cares about: the
+    /// reducer's own `Sent` is an echo tag, and `Sent::request` is what the
+    /// link task actually sends.
+    fn wire(effect: Effect) -> Request {
+        match effect {
+            Effect::Send(sent) => sent.request(),
+            other => panic!("expected a request, got {other:?}"),
+        }
+    }
+
+    /// fails if a single-field write stops going out at `ResetDepth::File`,
+    /// or stops declaring exactly the key that was edited.
+    ///
+    /// **The whole write path rides on this pair.** Under `File` a declared
+    /// key is reset and an undeclared key is kept, so one name in
+    /// `declared` is one field moved. At the default `ResetDepth::None` the
+    /// same request is ignored for every key an operator has ever touched,
+    /// which is the failure that makes the pane look like it works and
+    /// change nothing.
+    ///
+    /// One field from each of the four groups the pane draws, because the
+    /// classification the daemon routes on is per field.
+    #[test]
+    fn one_edit_reaches_the_wire_as_a_file_reset_declaring_only_that_key() {
+        for (key, presses) in [
+            ("autorestart", 1usize), // control
+            ("watch", 1),            // process
+            ("merge_logs", 1),       // inputs
+            ("autorestart", 2),      // twice: a second cycle re-arms
+        ] {
+            let mut app = fixtures::app_in_sheep_pane_with_control();
+            pane_to(&mut app, key);
+            for _ in 0..presses {
+                let _ = app.update(Msg::Key(KeyPress::Cycle));
+            }
+            assert!(
+                app.config_pane().unwrap().is_armed(),
+                "{key}: space must arm before Enter means anything"
+            );
+            let request = wire(app.update(Msg::Key(KeyPress::Confirm)));
+            let Request::ApplyConfig { apps, reset } = request else {
+                panic!("{key}: expected ApplyConfig, got {request:?}");
+            };
+            assert_eq!(reset, ResetDepth::File, "{key}");
+            assert_eq!(apps.len(), 1, "{key}");
+            assert_eq!(
+                apps[0].declared,
+                [key.to_owned()].into_iter().collect(),
+                "{key}"
+            );
+            assert!(apps[0].declared_env.is_empty(), "{key}");
+            assert_eq!(apps[0].config.name, "web", "{key}");
+        }
+    }
+
+    /// fails if a typed field stops reaching the wire as the value that was
+    /// typed, or stops declaring only itself. `cwd` and `max_restarts`
+    /// between them cover both text and integer, which arm differently.
+    #[test]
+    fn a_typed_field_reaches_the_wire_as_the_value_that_was_typed() {
+        for (key, typed, check) in [("cwd", "/srv/web", 0u32), ("max_restarts", "40", 40)] {
+            let mut app = fixtures::app_in_sheep_pane_with_control();
+            pane_to(&mut app, key);
+            let _ = app.update(Msg::Key(KeyPress::Confirm));
+            assert_eq!(app.mode(), InputMode::Text, "{key}: the editor opens");
+            for _ in 0..40 {
+                let _ = app.update(Msg::Key(KeyPress::TextBackspace));
+            }
+            for typed in typed.chars() {
+                let _ = app.update(Msg::Key(KeyPress::TextChar(typed)));
+            }
+            let _ = app.update(Msg::Key(KeyPress::TextApply));
+            assert_eq!(app.mode(), InputMode::Normal, "{key}: the editor closes");
+            let request = wire(app.update(Msg::Key(KeyPress::Confirm)));
+            let Request::ApplyConfig { apps, reset } = request else {
+                panic!("{key}: expected ApplyConfig, got {request:?}");
+            };
+            assert_eq!(reset, ResetDepth::File, "{key}");
+            assert_eq!(
+                apps[0].declared,
+                [key.to_owned()].into_iter().collect(),
+                "{key}"
+            );
+            if key == "cwd" {
+                assert_eq!(apps[0].config.cwd.as_deref(), Some("/srv/web"));
+            } else {
+                assert_eq!(apps[0].config.max_restarts, check);
+            }
+        }
+    }
+
+    /// fails if the env sub-screen stops sending one key at a time, or
+    /// starts routing env through `ApplyConfig`, where no `ResetDepth`
+    /// expresses one key.
+    #[test]
+    fn the_env_sub_screen_sets_one_key_and_removes_another() {
+        let mut app = fixtures::app_in_sheep_pane_with_control();
+        pane_to(&mut app, "env");
+        let _ = app.update(Msg::Key(KeyPress::Confirm));
+        assert!(
+            app.config_pane().unwrap().env().is_some(),
+            "enter on the env row opens the sub-screen"
+        );
+        // The `+ new` row, under the two keys the fixture's sheep has.
+        let _ = app.update(Msg::Key(KeyPress::SelectLast));
+        let _ = app.update(Msg::Key(KeyPress::Confirm));
+        assert_eq!(app.mode(), InputMode::Text);
+        for typed in "API_TOKEN=hunter2".chars() {
+            let _ = app.update(Msg::Key(KeyPress::TextChar(typed)));
+        }
+        let request = wire(app.update(Msg::Key(KeyPress::TextApply)));
+        assert_eq!(
+            request,
+            Request::SetSheepEnv {
+                name: "web".to_owned(),
+                key: "API_TOKEN".to_owned(),
+                value: Some("hunter2".to_owned().into()),
+            }
+        );
+        assert_eq!(app.mode(), InputMode::Normal);
+
+        // An existing key with an empty buffer removes it.
+        let _ = app.update(Msg::Key(KeyPress::SelectFirst));
+        let _ = app.update(Msg::Key(KeyPress::Confirm));
+        let request = wire(app.update(Msg::Key(KeyPress::TextApply)));
+        assert_eq!(
+            request,
+            Request::SetSheepEnv {
+                name: "web".to_owned(),
+                key: "DB_HOST".to_owned(),
+                value: None,
+            }
+        );
+    }
+
+    /// fails if either kind of locked row starts arming an edit, or if the
+    /// two stop refusing for their own reasons.
+    ///
+    /// `instances` is `Lock::Refused` -- shep takes no config write for it
+    /// at all -- and `args` is `Lock::NoWidget`, which is only this pane
+    /// having no editor for the shape. A single sentence for both is what
+    /// `Lock` exists to stop.
+    #[test]
+    fn a_refused_field_and_one_with_no_widget_refuse_for_different_reasons() {
+        let mut app = fixtures::app_in_sheep_pane_with_control();
+        pane_to(&mut app, "instances");
+        assert_eq!(app.update(Msg::Key(KeyPress::Cycle)), Effect::None);
+        assert!(app.config_pane().unwrap().pending_edit().is_none());
+        let refused = app.notice().expect("a refusal is raised").to_string();
+        assert!(refused.contains("instances"), "{refused}");
+        assert!(
+            !refused.contains("no editor in this pane"),
+            "a field shep refuses is not a field this pane merely lacks a widget for: {refused}"
+        );
+
+        pane_to(&mut app, "args");
+        assert_eq!(app.update(Msg::Key(KeyPress::Confirm)), Effect::None);
+        assert!(app.config_pane().unwrap().pending_edit().is_none());
+        let no_widget = app.notice().expect("a refusal is raised").to_string();
+        assert!(no_widget.contains("args"), "{no_widget}");
+        assert!(
+            no_widget.contains("Flockfile"),
+            "a shape with no widget is still one a Flockfile writes: {no_widget}"
+        );
+        assert_ne!(refused, no_widget, "two facts, two sentences");
+    }
+
+    /// fails if a read-only lookout can arm or send a config write, or open
+    /// either editor. The gate is the same fat-finger catch `x` gets: an
+    /// editor a read-only operator can type a whole path into before being
+    /// told no is a worse refusal than one that arrives on the keypress.
+    #[test]
+    fn a_read_only_pane_refuses_every_door_that_writes() {
+        // One pair per door: `space` arms a cycle, `Enter` opens the text
+        // editor, `Enter` on `env` opens the sub-screen.
+        for (key, press) in [
+            ("autorestart", KeyPress::Cycle),
+            ("cwd", KeyPress::Confirm),
+            ("env", KeyPress::Confirm),
+        ] {
+            let mut app = fixtures::app_in_sheep_pane();
+            pane_to(&mut app, key);
+            assert_eq!(app.update(Msg::Key(press)), Effect::None, "{key}");
+            assert!(app.config_pane().unwrap().pending_edit().is_none(), "{key}");
+            assert!(app.config_pane().unwrap().env().is_none(), "{key}");
+            assert_eq!(app.mode(), InputMode::Normal, "{key}");
+            assert_eq!(
+                app.notice().map(ToString::to_string),
+                Some(READ_ONLY_REFUSAL.to_string()),
+                "{key}"
+            );
+        }
+    }
+
+    /// fails if an armed edit survives a stray key, or if that key also
+    /// does its ordinary job -- the cancel-before-act rule the dashboard
+    /// and the settings screen already follow.
+    #[test]
+    fn a_stray_key_cancels_an_armed_pane_edit_and_does_nothing_else() {
+        let mut app = fixtures::app_in_sheep_pane_with_control();
+        pane_to(&mut app, "autorestart");
+        let before = app.config_pane().unwrap().view().cursor();
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        assert!(app.config_pane().unwrap().is_armed());
+        assert_eq!(app.update(Msg::Key(KeyPress::SelectDown)), Effect::None);
+        assert!(!app.config_pane().unwrap().is_armed());
+        assert_eq!(app.config_pane().unwrap().view().cursor(), before);
+        assert!(
+            app.config_pane().is_some(),
+            "the cancel must not also close the pane"
+        );
+    }
+
+    /// fails if an armed pane edit stops expiring, which would leave a
+    /// question about the shepherd on screen indefinitely.
+    #[test]
+    fn an_armed_pane_edit_expires_with_the_confirm_budget() {
+        let mut app = fixtures::app_in_sheep_pane_with_control();
+        pane_to(&mut app, "autorestart");
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        assert!(app.config_pane().unwrap().is_armed());
+        let _ = app.update(Msg::Tick {
+            now: Instant::now() + CONFIRM_EXPIRY,
+        });
+        assert!(!app.config_pane().unwrap().is_armed());
+    }
+
+    /// fails if a landed write stops re-reading the config, or if the
+    /// shepherd's own `refused` is swallowed.
+    #[test]
+    fn a_landed_write_re_reads_the_config_and_a_refusal_is_reported() {
+        let mut app = fixtures::app_in_sheep_pane_with_control();
+        pane_to(&mut app, "autorestart");
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let Effect::Send(sent) = app.update(Msg::Key(KeyPress::Confirm)) else {
+            panic!("the confirm sends");
+        };
+        let effect = app.update(Msg::Replied {
+            sent: sent.clone(),
+            result: Ok(Response::Applied(vec![SheepApplied::new(
+                "web",
+                vec!["autorestart".to_owned()],
+                Vec::new(),
+                None,
+            )])),
+        });
+        assert_eq!(
+            effect,
+            Effect::Send(Sent::SheepConfig {
+                name: "web".to_owned()
+            }),
+            "a landed write re-reads what the shepherd now holds"
+        );
+        assert!(app.config_pane().unwrap().pending_edit().is_none());
+
+        let effect = app.update(Msg::Replied {
+            sent,
+            result: Ok(Response::Applied(vec![SheepApplied::new(
+                "web",
+                Vec::new(),
+                Vec::new(),
+                Some("the store is locked by another shep".to_owned()),
+            )])),
+        });
+        assert_eq!(effect, Effect::None, "a refusal does not re-read");
+        let notice = app.notice().expect("the refusal is reported");
+        assert!(notice.is_grave());
+        assert!(
+            notice.to_string().contains("the store is locked"),
+            "{notice:?}"
+        );
     }
 
     /// fails if `e` on a dog row asks the shepherd for a config it will

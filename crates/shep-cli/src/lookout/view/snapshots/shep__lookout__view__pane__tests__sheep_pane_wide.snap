@@ -2,7 +2,7 @@
 source: crates/shep-cli/src/lookout/view/pane.rs
 expression: "text_of(&lines).join(\"\\n\")"
 ---
-  web  (sheep config, read-only)                                                                                        
+  web  (sheep config)                                                                                                   
   process
 >  cwd                        (unset)                                                                         respawn   
    err_file                   (unset)                                                                         respawn   

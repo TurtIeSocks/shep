@@ -1,0 +1,8 @@
+---
+source: crates/shep-cli/src/lookout/view/pane.rs
+expression: "text_of(&lines).join(\"\\n\")"
+---
+  web  env (write-only)                                                                                                 
+> DB_HOST                     <set>                                                                         
+  LOG_LEVEL                   <set>                                                                         
+  + new

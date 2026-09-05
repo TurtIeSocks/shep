@@ -21,7 +21,7 @@ use ratatui::text::{Line, Span};
 use shep_core::config::ApplyGroup;
 
 use super::super::app::App;
-use super::super::pane::{ConfigPane, Lock, PaneRow, PaneTarget};
+use super::super::pane::{ConfigPane, EnvPane, EnvRow, Lock, PanePending, PaneRow, PaneTarget};
 use super::super::theme::Palette;
 use super::flock::{fit, mark};
 use super::scroll::Attempt;
@@ -104,12 +104,18 @@ fn section_header(label: &str, palette: Palette) -> Line<'static> {
     Line::from(Span::styled(format!("  {label}"), palette.muted()))
 }
 
-/// The pane's own title: which sheep or dog is being edited, and that it is
-/// read-only.
+/// The pane's own title: which sheep or dog is being edited.
 ///
 /// The dashboard's title line above this one names `$SHEP_HOME` and nothing
 /// else, so without this the operator would be reading 39 fields with
 /// nothing on screen saying whose they are.
+///
+/// It used to say `read-only` too, and that stopped being true the moment
+/// `space` and `Enter` started writing. It is NOT replaced by a
+/// control-dependent word here: what the keys do belongs in the key hint,
+/// which reads the gate already (`view::status::PANE_HINT`), and a title
+/// that needed a footnote about `--allow-control` is exactly the asterisk
+/// that file's standing rule forbids.
 fn title_line(pane: &ConfigPane, palette: Palette, width: u16) -> Line<'static> {
     let kind = match pane.target() {
         PaneTarget::Sheep { .. } => "sheep config",
@@ -118,7 +124,7 @@ fn title_line(pane: &ConfigPane, palette: Palette, width: u16) -> Line<'static> 
         format!(
             "  {}",
             fit(
-                &format!("{}  ({kind}, read-only)", pane.target().name()),
+                &format!("{}  ({kind})", pane.target().name()),
                 body_width(width)
             )
         ),
@@ -165,10 +171,19 @@ fn field_line(
     // Flockfile schema marks nothing secret today; a dog's own schema can,
     // and this pane draws both.
     let raw = pane.value(&field.key);
-    let value = if field.secret && raw != "(unset)" {
-        "<set>".to_owned()
-    } else {
-        raw
+    // An editor open on THIS field replaces the cell with what is being
+    // typed, cursor included. The same `\u{258f}` every other text box in
+    // lookout draws, and a character rather than a reversed cell for the
+    // reason `view::status` gives: the ANSI gallery renders foregrounds
+    // only.
+    let typing = match pane.pending_edit() {
+        Some(PanePending::Typing { key, buffer }) if *key == field.key => Some(buffer),
+        _ => None,
+    };
+    let value = match typing {
+        Some(buffer) => format!("{buffer}\u{258f}"),
+        None if field.secret && raw != "(unset)" => "<set>".to_owned(),
+        None => raw,
     };
 
     let lock = match pane.lock(&field.key) {
@@ -204,6 +219,149 @@ fn field_line(
     }
 }
 
+/// The question an armed edit reads as, or the one already sent. [`None`]
+/// while nothing is in flight and while an editor is open -- an editor
+/// draws in its own field's row instead ([`field_line`]).
+fn confirm_text(pane: &ConfigPane) -> Option<&str> {
+    match pane.pending_edit()? {
+        PanePending::Armed { text, .. } | PanePending::Sent { text } => Some(text),
+        PanePending::Typing { .. } => None,
+    }
+}
+
+/// The env sub-screen: the sheep's env key names, and a row to add one on.
+///
+/// Values are never drawn, because they never arrive: `Request::SheepConfig`
+/// answers with the keys alone (decision 12 of the overrides design), so
+/// every key reads `<set>` and the pane could not say otherwise if it
+/// wanted to. That is a property of the wire, not a truncation, and the
+/// title says so rather than leaving an operator to wonder which of their
+/// keys the pane failed to read.
+///
+/// Laid out through [`super::scroll::to_cursor`], the same walk the field
+/// list uses, so the cursor is drawn at every height this pane claims to
+/// support. The layout is simpler -- one uniform row, no group headers --
+/// but the invariants are identical: nothing is pushed uncounted, both
+/// markers are reserved before a row is admitted, and the last resort draws
+/// the cursor's row alone.
+fn env_lines(
+    pane: &ConfigPane,
+    env: &EnvPane,
+    palette: Palette,
+    width: u16,
+    budget: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled(
+        format!(
+            "  {}",
+            fit(
+                &format!("{}  env (write-only)", pane.target().name()),
+                body_width(width)
+            )
+        ),
+        palette.muted(),
+    ))];
+    let body_budget = budget - 1;
+    if body_budget == 0 {
+        return lines;
+    }
+    let rows = env.rows();
+    let cursor_row = env.view().cursor().min(rows.len() - 1);
+    lines.extend(super::scroll::to_cursor(
+        cursor_row,
+        env.view().offset(),
+        |offset| env_body_from(env, palette, width, body_budget, offset),
+        || vec![env_line(env, cursor_row, true, width, palette)],
+    ));
+    lines
+}
+
+/// One row of the env sub-screen: the selection mark, the key, and `<set>`.
+///
+/// The `+ new` row carries no value cell: there is no key yet for one to
+/// belong to.
+fn env_line(
+    env: &EnvPane,
+    index: usize,
+    selected: bool,
+    width: u16,
+    palette: Palette,
+) -> Line<'static> {
+    let (key_w, value_w, _) = widths(body_width(width));
+    let typed = selected
+        .then(|| env.typing())
+        .flatten()
+        .map(|(_, buffer)| buffer);
+    let (key, value) = match env.rows().get(index).copied() {
+        Some(EnvRow::Key(key_index)) => (
+            env.keys().get(key_index).cloned().unwrap_or_default(),
+            typed.map_or_else(|| "<set>".to_owned(), |buffer| format!("{buffer}\u{258f}")),
+        ),
+        // On `+ new` the buffer is the whole `KEY=value`, so it replaces
+        // the key cell rather than the value cell.
+        Some(EnvRow::New) => match typed {
+            Some(buffer) => (format!("{buffer}\u{258f}"), String::new()),
+            None => ("+ new".to_owned(), String::new()),
+        },
+        None => return Line::default(),
+    };
+    let mut text = format!("{} ", mark(selected));
+    text.push_str(&fit(&key, key_w));
+    if value_w > 0 && !value.is_empty() {
+        text.push_str("  ");
+        text.push_str(&fit(&value, value_w));
+    }
+    if matches!(env.rows().get(index), Some(EnvRow::New)) {
+        return Line::from(Span::styled(text, palette.muted()));
+    }
+    Line::from(Span::raw(text))
+}
+
+/// Lays the sub-screen's body out from row `offset`, spending at most
+/// `budget` lines. Both markers are reserved before a row is admitted, the
+/// same rule [`body_from`] follows.
+fn env_body_from(
+    env: &EnvPane,
+    palette: Palette,
+    width: u16,
+    budget: usize,
+    offset: usize,
+) -> Attempt {
+    let rows = env.rows();
+    let total = rows.len();
+    let cursor_row = env.view().cursor().min(total.saturating_sub(1));
+    let above = usize::from(offset > 0);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut drawn = 0usize;
+    for index in offset..total {
+        if lines.len() + 1 + above + usize::from(index + 1 < total) > budget {
+            break;
+        }
+        lines.push(env_line(env, index, index == cursor_row, width, palette));
+        drawn += 1;
+    }
+    let hidden_below = total.saturating_sub(offset + drawn);
+    if hidden_below > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  ... {hidden_below} below"),
+            palette.muted(),
+        )));
+    }
+    if offset > 0 {
+        lines.insert(
+            0,
+            Line::from(Span::styled(
+                format!("  ... {offset} above"),
+                palette.muted(),
+            )),
+        );
+    }
+    Attempt {
+        cursor_drawn: drawn > 0 && (offset..offset + drawn).contains(&cursor_row),
+        lines,
+    }
+}
+
 /// Every line of the pane, top to bottom, laid out for a terminal `height`
 /// rows tall.
 ///
@@ -226,12 +384,30 @@ pub fn pane_lines(
     if budget == 0 {
         return Vec::new();
     }
+    if let Some(env) = pane.env() {
+        return env_lines(pane, env, palette, width, budget);
+    }
     let mut lines = vec![title_line(pane, palette, width)];
     // The title is unconditional, so the body is laid out against what is
     // left after it. An empty form -- unreachable for a sheep, whose schema
     // is a committed file with 39 properties, but a dog answers `--schema`
     // for itself -- leaves the title as the whole pane.
-    let body_budget = budget - 1;
+    let mut body_budget = budget - 1;
+    // The confirm echoed under the title, exactly the redundancy the
+    // settings screen has: `view::status` draws the same sentence on a
+    // fixed row the layout never cuts, and this is the belt, not a second
+    // source of truth -- both read `ConfigPane::pending_edit`. It costs a
+    // body line, so it is subtracted rather than appended, for the reason
+    // `body_from`'s own doc gives about markers.
+    if let Some(text) = confirm_text(pane)
+        && body_budget > 0
+    {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", fit(text, body_width(width))),
+            palette.attention(),
+        )));
+        body_budget -= 1;
+    }
     if pane.fields().is_empty() || body_budget == 0 {
         return lines;
     }
@@ -404,6 +580,8 @@ pub fn draw_pane(app: &App, pane: &ConfigPane, area: Rect, buffer: &mut Buffer) 
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -685,17 +863,169 @@ mod tests {
         }
     }
 
-    /// fails if the title stops naming the sheep the pane is about. The
-    /// dashboard's own title line above it names `$SHEP_HOME` and nothing
-    /// else.
+    /// fails if an armed edit stops being echoed under the title, or if a
+    /// sent one stops being echoed while it is in flight.
+    ///
+    /// `view::status` draws the same sentence on a fixed row the layout
+    /// never cuts; this is the belt beside that brace, and both read
+    /// `ConfigPane::pending_edit` rather than one reading the other.
     #[test]
-    fn the_title_names_the_target_and_says_it_is_read_only() {
+    fn an_armed_edit_is_echoed_under_the_title() {
+        let mut pane = web_pane();
+        pane.move_to_key("autorestart");
+        pane.cycle(Instant::now());
+        let text = text_of(&pane_lines(&pane, fixtures::plain(), 120, 0));
+        assert!(text[1].contains("set autorestart = false"), "{:?}", text[1]);
+        assert!(text[1].contains("web"), "{:?}", text[1]);
+
+        pane.take_armed();
+        let sent = text_of(&pane_lines(&pane, fixtures::plain(), 120, 0));
+        assert_eq!(
+            sent[1], text[1],
+            "the wording must not change between the question and its answer"
+        );
+    }
+
+    /// fails if an open editor stops drawing what is being typed in the
+    /// field's own row, which is the only place on screen that says which
+    /// field the buffer belongs to.
+    #[test]
+    fn an_open_editor_draws_its_buffer_in_the_fields_own_row() {
+        let mut pane = web_pane();
+        pane.move_to_key("cwd");
+        pane.begin_typing();
+        for typed in "/srv".chars() {
+            pane.type_char(typed);
+        }
+        let text = text_of(&pane_lines(&pane, fixtures::plain(), 120, 0));
+        let row = text
+            .iter()
+            .find(|line| line.contains(" cwd"))
+            .expect("cwd is drawn at 120 columns");
+        assert!(row.contains("/srv\u{258f}"), "{row:?}");
+        assert!(
+            !text.iter().any(|line| line.contains("set cwd")),
+            "an editor is not a confirm: {text:?}"
+        );
+    }
+
+    /// The env sub-screen at a comfortable width. The snapshot is the
+    /// assertion: the title says write-only, both of the fixture's keys are
+    /// listed with `<set>` rather than a value, and the `+ new` row is last.
+    #[test]
+    fn the_env_sub_screen_at_a_comfortable_width() {
+        let mut pane = web_pane();
+        pane.open_env();
+        let lines = pane_lines(&pane, fixtures::plain(), 120, 0);
+        insta::assert_snapshot!("env_sub_screen", text_of(&lines).join("\n"));
+    }
+
+    /// fails if the sub-screen ever renders a value. The shepherd sends the
+    /// keys and no values at all (decision 12), so a value on this screen
+    /// could only have been invented.
+    #[test]
+    fn the_env_sub_screen_never_renders_a_value() {
+        let mut pane = ConfigPane::sheep({
+            let mut config = shep_core::config::AppConfig {
+                name: "web".to_string(),
+                ..Default::default()
+            };
+            config
+                .env
+                .insert("DB_PASSWORD".to_string(), "hunter2".to_string());
+            shep_core::protocol::SheepConfigView::new(config, Vec::new(), Vec::new())
+        });
+        pane.open_env();
+        let text = text_of(&pane_lines(&pane, fixtures::plain(), 120, 0)).join("\n");
+        assert!(text.contains("DB_PASSWORD"), "{text}");
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(text.contains("<set>"), "{text}");
+    }
+
+    /// fails if any single step of a walk down the env sub-screen and back
+    /// loses the cursor, at any height this pane says it can draw -- the
+    /// same claim the field list makes, made for the second layout that
+    /// rides `super::scroll::to_cursor`.
+    #[test]
+    fn the_env_cursor_survives_every_step_of_a_walk_down_and_back_up() {
+        let mut pane = ConfigPane::sheep({
+            let mut config = shep_core::config::AppConfig {
+                name: "web".to_string(),
+                ..Default::default()
+            };
+            for index in 0..20 {
+                config
+                    .env
+                    .insert(format!("KEY_{index:02}"), "x".to_string());
+            }
+            shep_core::protocol::SheepConfigView::new(config, Vec::new(), Vec::new())
+        });
+        pane.open_env();
+        for height in [1u16, 2, 3, 6, 8, 14, 30] {
+            pane.env_mut().unwrap().move_to_first();
+            let body = usize::from(height.saturating_sub(1));
+            pane.env_mut().unwrap().set_rows(body);
+            let total = pane.env().unwrap().rows().len();
+            for step in 0..=total {
+                let text = text_of(&pane_lines(&pane, fixtures::plain(), 120, height));
+                assert!(
+                    text.len() <= usize::from(height),
+                    "height {height}, step {step}: {text:?}"
+                );
+                if height > 1 {
+                    assert_eq!(
+                        text.iter().filter(|line| line.starts_with('>')).count(),
+                        1,
+                        "height {height}, step {step}: {text:?}"
+                    );
+                }
+                pane.env_mut().unwrap().move_by(1);
+            }
+            for step in 0..=total {
+                let text = text_of(&pane_lines(&pane, fixtures::plain(), 120, height));
+                if height > 1 {
+                    assert_eq!(
+                        text.iter().filter(|line| line.starts_with('>')).count(),
+                        1,
+                        "height {height}, step {step} up: {text:?}"
+                    );
+                }
+                pane.env_mut().unwrap().move_by(-1);
+            }
+        }
+    }
+
+    /// fails if any line of the env sub-screen renders wider than the
+    /// terminal it was drawn for -- `Buffer::set_line` clips in silence,
+    /// the same reason the field list pins this.
+    #[test]
+    fn every_env_line_fits_the_width_it_was_drawn_for() {
+        let mut pane = web_pane();
+        pane.open_env();
+        pane.env_mut().unwrap().begin_typing();
+        for typed in "A_VERY_LONG_ENV_KEY_NAME=and a value longer still".chars() {
+            pane.env_mut().unwrap().type_char(typed);
+        }
+        for width in super::super::MIN_TERM_WIDTH..=200 {
+            for line in text_of(&pane_lines(&pane, fixtures::plain(), width, 0)) {
+                assert!(
+                    visible_width(&line) <= usize::from(width),
+                    "width {width} drew {}: {line:?}",
+                    visible_width(&line)
+                );
+            }
+        }
+    }
+
+    /// fails if the title stops naming the sheep the pane is about, or
+    /// goes back to calling the pane read-only. The dashboard's own title
+    /// line above it names `$SHEP_HOME` and nothing else, and `space` and
+    /// `Enter` write from here now.
+    #[test]
+    fn the_title_names_the_target_and_no_longer_calls_it_read_only() {
         let text = text_of(&pane_lines(&web_pane(), fixtures::plain(), 120, 0));
         assert!(text[0].contains("web"), "{:?}", text[0]);
-        assert!(
-            text[0].contains("(sheep config, read-only)"),
-            "{:?}",
-            text[0]
-        );
+        assert!(text[0].contains("(sheep config)"), "{:?}", text[0]);
+        assert!(!text[0].contains("read-only"), "{:?}", text[0]);
     }
 }

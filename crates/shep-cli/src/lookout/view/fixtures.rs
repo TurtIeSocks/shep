@@ -660,6 +660,28 @@ pub fn sheep_config_view() -> SheepConfigView {
     )
 }
 
+/// [`app_in_sheep_pane`] with the control gate open: the pane can write.
+///
+/// The gate is set BEFORE the pane opens, so nothing about how it opened
+/// depends on it, which is what makes a read-only refusal and a permitted
+/// write comparable frames.
+pub fn app_in_sheep_pane_with_control() -> App {
+    let mut app = with_selection(
+        ProcessInfo::builder(9, "web", ProcStatus::Online)
+            .pid(Some(48_000))
+            .build(),
+    );
+    app.set_control_for_tests(Control::Allowed);
+    app.update(Msg::Key(KeyPress::Edit));
+    app.update(Msg::Replied {
+        sent: Sent::SheepConfig {
+            name: "web".to_string(),
+        },
+        result: Ok(Response::SheepConfig(Box::new(sheep_config_view()))),
+    });
+    app
+}
+
 /// A dashboard with `web` selected and its config pane open, opened the way
 /// the event loop opens it: `e`, then the shepherd's own reply.
 pub fn app_in_sheep_pane() -> App {
