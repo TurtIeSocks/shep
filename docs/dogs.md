@@ -680,9 +680,9 @@ settings do live:
 pydog publishes no schema; edit dogs.toml with $EDITOR
 ```
 
-The schema is asked for when the pane opens rather than at adopt time, and
-the dog does not have to be running. Configure then enable is the order an
-operator wants, and it works.
+The schema is asked for again when the pane opens rather than cached from
+adopt time, so the dog does not have to be running. Configure then enable is
+the order an operator wants, and it works.
 
 **Asking runs it.** Opening the pane on an adopted dog spawns that binary
 with `--schema`, waits a second for an answer, then kills it, on the same
