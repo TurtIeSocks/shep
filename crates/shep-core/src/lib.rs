@@ -28,6 +28,11 @@
 pub mod atomic_file;
 pub mod barks;
 pub mod config;
+// The lock a config file's writers hold across their read-modify-write, and
+// the staging file they write through. Lives here rather than in shep-cli
+// (where it was born) so shep-daemon can hold it too, once it starts writing
+// `dogs.toml`.
+pub mod config_lock;
 // The probe contract both sides of a dog's `--version`/`--schema` answer
 // parse: flag names, the answer grammar, the schema's secret marker key.
 pub mod dogs;
