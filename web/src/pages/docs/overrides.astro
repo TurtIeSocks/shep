@@ -232,8 +232,9 @@ const store = `$ cat $SHEP_HOME/overrides.json
     <h2>The CFG column</h2>
     <p>
       <code>!1</code> in <code>CFG</code> means one field is parked on this
-      sheep. <code>*1</code> means one field an operator set that the
-      current Flockfile does not declare, and <code>-</code> means neither.
+      sheep. <code>*1</code> means one field an operator has taken ownership
+      of, whether or not the current Flockfile declares it, and
+      <code>-</code> means neither.
       It is a count rather than a list because the cell is three characters
       wide; <code>shep describe</code> is where the names are:
     </p>
@@ -443,8 +444,9 @@ const store = `$ cat $SHEP_HOME/overrides.json
       They are the record of what the Flockfile has established, kept so a
       later load can tell "the file used to say this and no longer does"
       apart from "the file never mentioned it". <code>fields</code> is the
-      other half: settings an operator has that the current file does not
-      declare, which is what a <code>*N</code> in <code>CFG</code> counts.
+      other half: settings an operator has taken ownership of, whether or
+      not the current file declares them, which is what a <code>*N</code> in
+      <code>CFG</code> counts.
     </p>
     <p>
       The door that writes <code>fields</code> is
