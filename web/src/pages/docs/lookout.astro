@@ -692,6 +692,49 @@ esc/s close   j/k select   g/G fir… read-only`;
       whichever instance the cursor was over.
     </p>
 
+    <h2>The dog config pane</h2>
+    <p>
+      <code>e</code> on a dog row of the settings screen opens the same pane
+      over that dog's <code>[&lt;name&gt;]</code> section in
+      <code>dogs.toml</code>. <code>e</code> on the dashboard does not: a dog
+      is not a sheep, and the row there says so instead.
+    </p>
+    <p>
+      The form comes from the dog. Shep asks the binary for its schema when
+      the pane opens rather than reading one it stored, because
+      <code>cargo install</code> replaces a dog with nothing watching and a
+      stale schema mislabels which field is a credential. A built-in dog
+      answers without being spawned at all. A dog that publishes no schema
+      gets no pane, and a line saying where its settings do live:
+    </p>
+    <CodeBlock>{`pydog publishes no schema; edit dogs.toml with $EDITOR`}</CodeBlock>
+    <p>
+      The pane is flat, with no section headers: a dog's schema carries no
+      groups, and inventing some would be shep deciding how somebody else's
+      config reads. The cost column is empty on every row, because shep does
+      not know what a dog's field costs. The foot of the pane says so once:
+    </p>
+    <CodeBlock>{`shep publishes the change; bark decides what to reload`}</CodeBlock>
+    <p>
+      A field the dog marks as a credential reads <code>&lt;set&gt;</code>
+      and never its value, and the editor on it opens empty. Typing a new one
+      replaces it; nothing here can show you what it replaced. A table or a
+      list gets <code>~</code>, the same glyph a sheep's
+      <code>args</code> gets and for the same reason.
+    </p>
+    <p>
+      A write sends the section whole, so the comments and key order in
+      <code>dogs.toml</code> survive it. Applying an empty value removes the
+      key, which puts the dog back on its own default. Neither
+      <code>*</code> nor <code>!</code> appears: a dog has no Flockfile to
+      differ from, and <code>dogs.toml</code> is the one copy of its
+      settings.
+    </p>
+    <p class="fine">
+      <code>r</code> re-reads the section and not the schema, so a keystroke
+      whose job is to re-read a file never respawns somebody else's binary.
+    </p>
+
     <h2>Where to go next</h2>
 
     <div class="next-grid">

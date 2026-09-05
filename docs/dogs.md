@@ -117,8 +117,10 @@ subscription re-asks with `Request::DogConfig` and decides what the change
 means: swap the values, rebind a listener, or ask for its own restart. The
 frame says that the section changed and nothing about what is in it. Bark
 subscribes and swaps in place, since sinks and rules are pure data with no
-OS resource attached. One thing publishes today, the boot that moves a
-section out of `shep.toml`, so a hand edit still needs the stop/start above.
+OS resource attached. Two things publish today: the boot that moves a
+section out of `shep.toml`, and a write from lookout's own dog config pane,
+which is why an edit made there reaches a running bark without bouncing it.
+A hand edit still needs the stop/start above.
 
 **A dog that restarts itself on a config change has to say so in its own
 log.** Nothing else can tell that apart from a crash loop, and the restart
@@ -648,9 +650,36 @@ whole for this reason, and every sink in it carries a webhook URL.
 
 **Answering is optional, exactly as `--version` is.** A dog that says
 nothing is adopted, recorded as having no schema, and refused nothing, which
-is every dog written before this contract. What it gives up is a description
-of itself: a settings pane needs a schema to render, so its section stays a
-file an operator hand-edits. Nothing else changes.
+is every dog written before this contract. What it gives up is the pane
+below: with no schema to render a form from, its section stays a file an
+operator hand-edits. Nothing else changes.
+
+## What a schema buys: the settings pane
+
+`s` in `shep lookout`, then `e` on the dog's row, opens a form over its
+`[<name>]` section. One row per property, the value in force beside it, and
+`<set>` where a field is marked as a credential. It writes as well, behind
+`--allow-control`, and it writes the section whole, so the comments in
+`dogs.toml` survive an edit shep made.
+
+The pane is flat, with no section headers, and its cost column is empty on
+every row. shep does not know what a dog's field costs; the dog does. The
+foot of the pane says so once rather than guessing per row:
+
+```
+shep publishes the change; bark decides what to reload
+```
+
+A dog that publishes no schema gets no pane, and a line saying where its
+settings do live:
+
+```
+pydog publishes no schema; edit dogs.toml with $EDITOR
+```
+
+The schema is asked for when the pane opens rather than at adopt time, and
+the dog does not have to be running: it is spawned with the flag and killed.
+Configure then enable is the order an operator wants, and it works.
 
 A dog that answers something that is not JSON gets one line, and is adopted
 anyway:
@@ -684,7 +713,7 @@ Shep now writes its own account into the dog's log as well, marked
 
 ```
 2026-09-02T14:22:31.412+02:00 [shep] shep started this dog; its process is pid 5512
-2026-09-02T14:22:31.480+02:00 [shep] shep accepted this dog's handshake; it is registered with this shepherd as `log-rotate`, on protocol 3
+2026-09-02T14:22:31.480+02:00 [shep] shep accepted this dog's handshake; it is registered with this shepherd as `log-rotate`, on protocol 4
 2026-09-02T14:22:31.492+02:00 rotating web-0-out.log (12.4 MiB)
 ```
 

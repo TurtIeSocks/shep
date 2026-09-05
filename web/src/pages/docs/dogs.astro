@@ -41,7 +41,7 @@ hand-edited section. The dog is adopted and runs normally; this is a bug to
 report to whoever wrote it`;
 
 const dogLogDemo = `2026-09-02T14:22:31.412+02:00 [shep] shep started this dog; its process is pid 5512
-2026-09-02T14:22:31.480+02:00 [shep] shep accepted this dog's handshake; it is registered with this shepherd as \`log-rotate\`, on protocol 3
+2026-09-02T14:22:31.480+02:00 [shep] shep accepted this dog's handshake; it is registered with this shepherd as \`log-rotate\`, on protocol 4
 2026-09-02T14:22:31.492+02:00 rotating web-0-out.log (12.4 MiB)`;
 ---
 
@@ -204,9 +204,11 @@ $ shep disable metrics`}</CodeBlock>
       listener, or ask for its own restart. The frame says that the section
       changed and nothing about what is in it. Bark subscribes and swaps in
       place, since sinks and rules are pure data with no OS resource
-      attached. One thing publishes today, the boot that moves a section out
-      of <code>shep.toml</code>, so a hand edit still needs the stop and
-      start above.
+      attached. Two things publish today: the boot that moves a section out
+      of <code>shep.toml</code>, and a write from{" "}
+      <a href="/docs/lookout">the dog config pane</a>, which is why an edit
+      made there reaches a running bark without bouncing it. A hand edit
+      still needs the stop and start above.
     </p>
     <Callout variant="careful">
       A dog that restarts itself on a config change has to say so in its own
@@ -824,9 +826,26 @@ shep-dog 0.1.24`}</CodeBlock>
       Answering is optional, exactly as <code>--version</code> is. A dog
       that says nothing is adopted, recorded as having no schema, and
       refused nothing, which is every dog written before this contract. What
-      it gives up is a description of itself: a settings pane needs a schema
-      to render, so its section stays a file an operator hand-edits.
+      it gives up is the pane below: with no schema to render a form from,
+      its section stays a file an operator hand-edits.
     </Callout>
+    <p>
+      What answering buys is a settings pane. <code>s</code> in{" "}
+      <code>shep lookout</code>, then <code>e</code> on the dog's row, opens
+      a form over its <code>[&lt;name&gt;]</code> section: one row per
+      property, the value in force beside it, and{" "}
+      <code>&lt;set&gt;</code> where a field is marked as a credential. It
+      writes too, behind <code>--allow-control</code>, and it writes the
+      section whole, so the comments in <code>dogs.toml</code> survive an
+      edit shep made. <a href="/docs/lookout">The lookout page</a> has the
+      keys and the rest of the rules.
+    </p>
+    <p class="fine">
+      The schema is asked for when the pane opens, not when the dog is
+      adopted, and the dog does not have to be running: it is spawned with
+      the flag and killed. Configure then enable is the order an operator
+      wants, and it works.
+    </p>
     <p>
       A dog that answers something that isn't JSON gets one line, and is
       adopted anyway:
