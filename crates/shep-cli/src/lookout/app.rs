@@ -1926,14 +1926,30 @@ impl App {
                     grave: true,
                 });
             }
-            // Unprefixed, unlike every other reply handler in this file.
-            // The shepherd's refusals for this request are whole sentences
-            // that already name the sheep they are about, so a `{name}: `
-            // in front of one says the name twice. A transport error names
-            // nothing, so that arm keeps its prefix.
+            // Prefixed, like every other reply handler in this file, and
+            // NOT stripped on the theory that the shepherd's refusals name
+            // their own subject. Two of the three do -- `no sheep named
+            // {name}` and the `IsADog` sentence -- and the third,
+            // `EngineStopped`, renders as `the supervisor engine has
+            // stopped`, which names neither the sheep nor the screen it
+            // came from. Stripping unconditionally traded a doubled name in
+            // two cases for an unattributable notice in the third.
+            //
+            // The doubling that motivated the strip is fixed in the right
+            // place instead: `Self::ask_for_config` refuses a dog off the
+            // local row and never sends, so `IsADog` no longer reaches this
+            // arm by the door an operator actually uses. It is not
+            // structurally unreachable -- that guard reads a flock snapshot
+            // up to two seconds old, and `r` from inside the pane re-sends
+            // by name without re-checking -- so a sheep deleted and a dog
+            // adopted under the same name in between would still land here
+            // and read `web: web is a dog, ...`. That is a cosmetic double
+            // in a case needing a name collision across a delete; the
+            // alternative was silence about which sheep every time the
+            // engine stops.
             Err(RequestError::Rpc(err)) => {
                 self.notice = Some(Notice {
-                    text: err.message,
+                    text: format!("{name}: {}", err.message),
                     grave: true,
                 });
             }
@@ -6439,26 +6455,30 @@ mod tests {
         assert!(app.config_pane().is_none());
     }
 
-    /// fails if a refusal that already names its subject gets the name
-    /// pasted in front of it a second time.
+    /// fails if a refusal that names nothing reaches an operator naming
+    /// nothing.
+    ///
+    /// `EngineStopped` is the one of this request's three refusals that
+    /// carries no subject of its own: `rpc_error` renders it as `the
+    /// supervisor engine has stopped`, full stop. A notice saying only that
+    /// identifies neither the sheep nor the screen it came from, which is
+    /// what stripping the prefix unconditionally produced.
     #[test]
-    fn a_shepherd_refusal_is_shown_in_the_shepherds_own_words() {
+    fn a_refusal_that_names_nothing_still_reaches_the_operator_named() {
         let mut app = fixtures::app_in_sheep_pane();
         app.update(Msg::Replied {
             sent: Sent::SheepConfig {
                 name: "web".to_string(),
             },
             result: Err(RequestError::Rpc(RpcError {
-                code: RpcErrorCode::NotFound,
-                message: "web is a dog, and a dog's config comes from `shep adopt`".to_string(),
+                code: RpcErrorCode::Internal,
+                message: "the supervisor engine has stopped".to_string(),
                 daemon_version: None,
             })),
         });
         let said = app.notice().map(ToString::to_string).unwrap_or_default();
-        assert_eq!(
-            said, "web is a dog, and a dog's config comes from `shep adopt`",
-            "verbatim, no prefix"
-        );
+        assert_eq!(said, "web: the supervisor engine has stopped");
+        assert!(app.notice().unwrap().is_grave());
     }
 
     /// fails if a config reply re-opens a pane the operator has closed.
