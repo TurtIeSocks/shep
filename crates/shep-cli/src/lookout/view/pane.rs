@@ -224,7 +224,7 @@ fn field_line(
 /// draws in its own field's row instead ([`field_line`]).
 fn confirm_text(pane: &ConfigPane) -> Option<&str> {
     match pane.pending_edit()? {
-        PanePending::Armed { text, .. } | PanePending::Sent { text } => Some(text),
+        PanePending::Armed { text, .. } | PanePending::Sent { text, .. } => Some(text),
         PanePending::Typing { .. } => None,
     }
 }
@@ -261,7 +261,20 @@ fn env_lines(
         ),
         palette.muted(),
     ))];
-    let body_budget = budget - 1;
+    let mut body_budget = budget - 1;
+    // The same echo the field list draws under its own title, and the same
+    // belt-not-a-second-source-of-truth argument: `view::status` puts this
+    // sentence on a row the layout never cuts, and both read
+    // `ConfigPane::pending_edit`.
+    if let Some(text) = confirm_text(pane)
+        && body_budget > 0
+    {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", fit(text, body_width(width))),
+            palette.attention(),
+        )));
+        body_budget -= 1;
+    }
     if body_budget == 0 {
         return lines;
     }
@@ -918,6 +931,23 @@ mod tests {
         pane.open_env();
         let lines = pane_lines(&pane, fixtures::plain(), 120, 0);
         insta::assert_snapshot!("env_sub_screen", text_of(&lines).join("\n"));
+    }
+
+    /// fails if an armed env write stops being echoed on the sub-screen,
+    /// or if the echo ever quotes the value.
+    #[test]
+    fn an_armed_env_write_is_echoed_and_never_quotes_the_value() {
+        let mut pane = web_pane();
+        pane.open_env();
+        pane.env_mut().unwrap().begin_typing();
+        for typed in "hunter2".chars() {
+            pane.env_mut().unwrap().type_char(typed);
+        }
+        let (key, value) = pane.env_mut().unwrap().apply_typing().unwrap();
+        pane.arm_env(key, value.map(Into::into), Instant::now());
+        let text = text_of(&pane_lines(&pane, fixtures::plain(), 120, 0));
+        assert!(text[1].contains("set env DB_HOST"), "{:?}", text[1]);
+        assert!(!text.join("\n").contains("hunter2"), "{text:?}");
     }
 
     /// fails if the sub-screen ever renders a value. The shepherd sends the

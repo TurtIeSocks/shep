@@ -311,7 +311,7 @@ fn in_flight_text(action: &ActionState<'_>) -> String {
 fn pane_prompt(pane: &ConfigPane) -> Option<SettingsPrompt<'_>> {
     match pane.pending_edit()? {
         PanePending::Armed { text, .. } => Some(SettingsPrompt { text, sent: false }),
-        PanePending::Sent { text } => Some(SettingsPrompt { text, sent: true }),
+        PanePending::Sent { text, .. } => Some(SettingsPrompt { text, sent: true }),
         PanePending::Typing { .. } => None,
     }
 }
@@ -343,9 +343,15 @@ fn pane_editor(pane: &ConfigPane) -> Option<(String, &str)> {
 /// refuse -- the same reason `hint_for` omits `x`, `R` and `L` from the
 /// dashboard's read-only form.
 ///
-/// The env sub-screen gets its own pair because its keys are a different
-/// set: `esc` backs out to the field list rather than closing the pane, and
-/// `g/G` and `r` drop out to make room for what `enter` does there.
+/// The env sub-screen gets its own pair because two of its keys mean
+/// something else there: `esc` backs out to the field list rather than
+/// closing the pane, so `e close` is named separately, and `enter` sets a
+/// value rather than opening a field editor. Everything the sub-screen
+/// shares with the field list is named in both, `g/G` and `r` included --
+/// they are bound on both screens, in both control states, and a form that
+/// quietly dropped them would be the same asterisk in the other direction.
+/// This doc used to claim they HAD been dropped to make room, and the claim
+/// was false in three of the four forms.
 ///
 /// The read-only field-list form is byte-identical to what shipped before
 /// the pane could write, so nothing that measured it has moved.
@@ -355,11 +361,13 @@ const fn pane_hint(control: Control, env_open: bool) -> &'static str {
             "esc/e close   j/k select   g/G first/last   r refresh   q quit"
         }
         (Control::Allowed, false) => {
-            "esc/e close   j/k select   r refresh   space cycle   enter edit   q quit"
+            "esc/e close   j/k select   g/G first/last   r refresh   space cycle   enter edit   q quit"
         }
-        (Control::ReadOnly, true) => "esc back   e close   j/k select   r refresh   q quit",
+        (Control::ReadOnly, true) => {
+            "esc back   e close   j/k select   g/G first/last   r refresh   q quit"
+        }
         (Control::Allowed, true) => {
-            "esc back   e close   j/k select   r refresh   enter set   q quit"
+            "esc back   e close   j/k select   g/G first/last   r refresh   enter set   q quit"
         }
     }
 }
@@ -867,8 +875,45 @@ mod tests {
         app.update(Msg::Key(KeyPress::Confirm));
         let bar = rendered(&status_line(&app, 200));
         assert!(bar.contains("esc back"), "got {bar:?}");
+        assert!(bar.contains("e close"), "got {bar:?}");
         assert!(!bar.contains("esc/e close"), "got {bar:?}");
         assert!(bar.contains("enter set"), "got {bar:?}");
+    }
+
+    /// fails if any of the four pane forms hides a key that screen binds.
+    ///
+    /// `g`/`G` and `r` are bound on the field list and on the env
+    /// sub-screen, in both control states, and three of the four forms used
+    /// to name neither while the doc claimed they had been dropped to make
+    /// room. A hint that needs a footnote is an asterisk in both
+    /// directions.
+    #[test]
+    fn every_pane_hint_names_the_movement_and_refresh_keys_it_binds() {
+        for env_open in [false, true] {
+            for control in [Control::ReadOnly, Control::Allowed] {
+                let hint = pane_hint(control, env_open);
+                for key in ["j/k select", "g/G first/last", "r refresh", "q quit"] {
+                    assert!(hint.contains(key), "{control:?} env={env_open}: {hint:?}");
+                }
+            }
+        }
+    }
+
+    /// fails if the env sub-screen's own keys stop working, which is what
+    /// would make the hint above a lie rather than merely a gap.
+    #[test]
+    fn the_env_sub_screens_movement_and_refresh_keys_do_what_the_hint_says() {
+        let mut app = super::super::fixtures::app_in_sheep_pane_with_control();
+        pane_to(&mut app, "env");
+        app.update(Msg::Key(KeyPress::Confirm));
+        app.update(Msg::Key(KeyPress::SelectLast));
+        assert_eq!(app.config_pane().unwrap().env().unwrap().view().cursor(), 2);
+        app.update(Msg::Key(KeyPress::SelectFirst));
+        assert_eq!(app.config_pane().unwrap().env().unwrap().view().cursor(), 0);
+        assert!(matches!(
+            app.update(Msg::Key(KeyPress::Refresh)),
+            crate::lookout::app::Effect::Send(_)
+        ));
     }
 
     /// fails if an armed config write stops reaching the one row the layout

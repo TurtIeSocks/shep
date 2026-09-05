@@ -14,7 +14,7 @@ use serde_json::{Map, Value};
 use shep_core::config::{
     AppConfig, ApplyGroup, DeclaredApp, GROUP_ORDER, apply_group, flockfile_schema_json,
 };
-use shep_core::protocol::SheepConfigView;
+use shep_core::protocol::{EnvValue, SheepConfigView};
 
 use super::field::{FieldKind, FieldSet};
 use super::viewport::Viewport;
@@ -84,32 +84,60 @@ pub enum PaneRow {
 
 /// One edit, ready to send.
 ///
-/// One variant today, and named rather than left as a bare pair for
-/// [`PaneRow`]'s reason: an unset is a second thing an edit will mean, and
-/// a tuple that silently changes meaning is the failure that would cause.
+/// Two variants, and they leave by different doors: a [`Self::Set`] goes out
+/// as a one-app `Request::ApplyConfig` at `ResetDepth::File`, and a
+/// [`Self::SetEnv`] as a `Request::SetSheepEnv`, because no reset depth
+/// expresses one env key.
 ///
-/// `Debug` is derived (IR-41): a field name and a candidate value the
-/// operator is looking at on screen. A secret field never reaches here --
-/// [`ConfigPane::begin_typing`] seeds one empty and the Flockfile schema
-/// marks none secret at all -- and `env`, which is where a sheep's secrets
-/// actually live, does not travel through this type. See [`EnvPane`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Debug` is MANUAL and redacted (IR-41), exact-string-tested below. It
+/// prints the field name and never the value. `value` on a [`Self::Set`] is
+/// a live config value -- `cwd` and `script` routinely carry a home
+/// directory, `args` a token -- which is the same reasoning
+/// [`ConfigPane`]'s own `Debug` already gives for the map this is lifted
+/// out of. [`Self::SetEnv`] is stricter still: the type carries an
+/// [`EnvValue`], so even a derived `Debug` would have redacted it, and this
+/// one does not print it at all.
+#[derive(Clone, PartialEq, Eq)]
 pub enum PaneEdit {
-    /// Set `key` to `value`.
+    /// Set the config field `key` to `value`.
     Set {
         /// The field.
         key: String,
         /// The new value, already typed to the field's kind.
         value: Value,
     },
+    /// Set the env key `key`, or with [`None`] remove it.
+    SetEnv {
+        /// The env key.
+        key: String,
+        /// The value, or [`None`] to remove the key.
+        value: Option<EnvValue>,
+    },
+}
+
+/// Prints the key and never the value -- see the type doc for why.
+/// Exact-string-tested below (`a_pane_edits_debug_names_no_value`) so a
+/// future `#[derive(Debug)]` fails that test instead of silently reopening
+/// the leak.
+impl core::fmt::Debug for PaneEdit {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Set { key, .. } => write!(f, "PaneEdit::Set {{ key: {key:?} }}"),
+            Self::SetEnv { key, value } => write!(
+                f,
+                "PaneEdit::SetEnv {{ key: {key:?}, removes: {} }}",
+                value.is_none()
+            ),
+        }
+    }
 }
 
 impl PaneEdit {
-    /// Which field this edit moves.
+    /// Which field or env key this edit moves.
     #[must_use]
     pub fn key(&self) -> &str {
         match self {
-            Self::Set { key, .. } => key,
+            Self::Set { key, .. } | Self::SetEnv { key, .. } => key,
         }
     }
 }
@@ -120,9 +148,19 @@ impl PaneEdit {
 /// reason the settings screen's own `Pending` gives: typing, armed and sent
 /// cannot overlap, and saying so in the type beats saying so in a guard.
 ///
-/// `Debug` is derived (IR-41): the same subjects [`PaneEdit`]'s own doc
-/// accounts for, plus a buffer the operator is watching themselves type.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Shared by the field list and the env sub-screen. Both arm, and neither
+/// needed a mechanism of its own: `view::status` renders whatever is here,
+/// `Msg::Tick` expires whatever is armed, and the only thing that differs
+/// is the [`PaneEdit`] variant inside.
+///
+/// `Debug` is MANUAL and redacted (IR-41), exact-string-tested below. Two
+/// of the three variants would otherwise print a value: `Typing`'s buffer
+/// is what the operator is halfway through typing, which on the env screen
+/// is a secret, and `Armed`/`Sent`'s `text` is a rendered sentence that
+/// quotes a config value verbatim. The env sentence deliberately does not
+/// quote its own value ([`ConfigPane::confirm_text`]), but the field
+/// sentence does, so the whole field is withheld rather than one arm of it.
+#[derive(Clone, PartialEq, Eq)]
 pub enum PanePending {
     /// A text edit under construction. Owns [`super::app::InputMode::Text`]
     /// for as long as it exists.
@@ -141,13 +179,37 @@ pub enum PanePending {
         /// When it was armed. Only an armed edit expires.
         at: Instant,
     },
-    /// Gone out, awaiting the shepherd's reply. Carries the rendered
-    /// question only, so the prompt line does not change wording between
-    /// the question and its own answer.
+    /// Gone out, awaiting the shepherd's reply.
+    ///
+    /// `key` is what a landing reply is matched against
+    /// ([`ConfigPane::settle`]). Without it any reply settled whatever was
+    /// pending, so a second write's "sent, waiting" line vanished the
+    /// moment the FIRST write's reply landed, while the second was still
+    /// outstanding.
     Sent {
-        /// The same rendered question.
+        /// Which field or env key is in flight.
+        key: String,
+        /// The rendered question, so the prompt line does not change
+        /// wording between the question and its own answer.
         text: String,
     },
+}
+
+/// Prints the key and never a buffer or a rendered sentence -- see the type
+/// doc for why. Exact-string-tested below
+/// (`a_pane_pendings_debug_names_no_value`).
+impl core::fmt::Debug for PanePending {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Typing { key, buffer } => write!(
+                f,
+                "PanePending::Typing {{ key: {key:?}, buffer: <{} chars> }}",
+                buffer.chars().count()
+            ),
+            Self::Armed { edit, .. } => write!(f, "PanePending::Armed {{ edit: {edit:?} }}"),
+            Self::Sent { key, .. } => write!(f, "PanePending::Sent {{ key: {key:?} }}"),
+        }
+    }
 }
 
 /// One row of the env sub-screen.
@@ -169,13 +231,14 @@ pub enum EnvRow {
 /// screen has nothing to seed an editor with and never asks for one. A
 /// value goes out through `Request::SetSheepEnv`, one key at a time.
 ///
-/// `Debug` is derived (IR-41): key NAMES, which never left the daemon as
-/// values, and a buffer the operator is watching themselves type. The
-/// typed value does live in that buffer, which is why nothing in this
-/// crate prints an [`EnvPane`] outside a test -- and why the value's own
-/// wire type (`shep_core::protocol::EnvValue`) redacts itself the moment
-/// it leaves here.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Debug` is MANUAL and redacted (IR-41), exact-string-tested below. The
+/// key names are withheld for the reason [`ConfigPane`]'s own `Debug`
+/// withholds `env_keys`, and the buffer because on this screen it IS the
+/// secret: an operator typing `DB_PASSWORD=hunter2` has the whole of it in
+/// there. A convention that nothing prints an `EnvPane` would not survive
+/// the first `{:?}` somebody adds to a diagnostic, which is why this is a
+/// test rather than a comment.
+#[derive(Clone, PartialEq, Eq)]
 pub struct EnvPane {
     keys: Vec<String>,
     view: Viewport,
@@ -183,6 +246,20 @@ pub struct EnvPane {
     /// `KEY=value`; `Some((Some(key), buffer))` on an existing key, where
     /// it is the value alone.
     typing: Option<(Option<String>, String)>,
+}
+
+/// Prints counts and never a key or a buffer -- see the type doc for why.
+/// Exact-string-tested below (`an_env_panes_debug_names_no_key_and_no_value`).
+impl core::fmt::Debug for EnvPane {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "EnvPane {{ keys: {}, cursor: {}, typing: {} }}",
+            self.keys.len(),
+            self.view.cursor(),
+            self.typing.is_some()
+        )
+    }
 }
 
 impl EnvPane {
@@ -216,6 +293,20 @@ impl EnvPane {
     #[must_use]
     pub fn keys(&self) -> &[String] {
         &self.keys
+    }
+
+    /// The key the cursor is on, or [`None`] on the `+ new` row.
+    ///
+    /// What a refresh carries across instead of the cursor's INDEX. A
+    /// removal shortens the list, so an index that survived would name a
+    /// DIFFERENT key afterwards and a reflexive second `Enter` would arm a
+    /// write against the neighbour.
+    #[must_use]
+    pub fn cursor_key(&self) -> Option<&str> {
+        match self.cursor()? {
+            EnvRow::Key(index) => self.keys.get(index).map(String::as_str),
+            EnvRow::New => None,
+        }
     }
 
     /// The cursor and offset.
@@ -255,13 +346,33 @@ impl EnvPane {
         self.view.move_to(len.saturating_sub(1), len);
     }
 
-    /// Adopts a previous sub-screen's cursor and offset, clamped. What a
-    /// refresh after a set rides on, so the operator is not thrown back to
-    /// the first key by their own keystroke.
-    pub(super) fn adopt_view(&mut self, view: Viewport) {
+    /// Adopts a previous sub-screen's offset, and puts the cursor back on
+    /// `cursor_key` BY NAME.
+    ///
+    /// A set re-reads the whole config, so without this the operator would
+    /// be thrown back to the first key by their own keystroke. Carrying the
+    /// cursor's INDEX instead is worse than either: a removal shortens the
+    /// list under it, so the same index names the NEXT key afterwards and a
+    /// reflexive second `Enter` arms a write against a neighbour nobody
+    /// chose.
+    ///
+    /// A key that is gone -- which is exactly the removal case -- puts the
+    /// cursor on the `+ new` row rather than on whatever took its place.
+    /// That is the one row where `Enter` cannot destroy anything, which is
+    /// the property being bought; landing on the neighbour would be the
+    /// silent retarget this exists to prevent, one row further down.
+    pub(super) fn adopt_view(&mut self, view: Viewport, cursor_key: Option<&str>) {
         self.view = view;
         let len = self.rows().len();
-        self.view.clamp(len);
+        let index = match cursor_key {
+            Some(key) => self
+                .keys
+                .iter()
+                .position(|name| name == key)
+                .unwrap_or(len - 1),
+            None => len - 1,
+        };
+        self.view.move_to(index, len);
     }
 
     /// Opens the editor on the row under the cursor.
@@ -634,7 +745,10 @@ impl ConfigPane {
     pub fn take_armed(&mut self) -> Option<PaneEdit> {
         match self.pending_edit.take() {
             Some(PanePending::Armed { edit, text, .. }) => {
-                self.pending_edit = Some(PanePending::Sent { text });
+                self.pending_edit = Some(PanePending::Sent {
+                    key: edit.key().to_owned(),
+                    text,
+                });
                 Some(edit)
             }
             other => {
@@ -644,20 +758,78 @@ impl ConfigPane {
         }
     }
 
-    /// Clears whatever is in flight, once the shepherd has answered.
-    pub fn settle(&mut self) {
-        self.pending_edit = None;
+    /// Clears the in-flight line for `key`, once the shepherd has answered
+    /// about `key` and not about anything else.
+    ///
+    /// Guarded twice, and both guards were bugs before they were guards.
+    ///
+    /// It only clears [`PanePending::Sent`], the way [`Self::cancel`] only
+    /// clears `Armed`. Unguarded it cleared every variant, so a reply
+    /// landing while the operator had an editor open threw the buffer away
+    /// with no notice -- and, since nothing reset the input mode, left
+    /// every subsequent keystroke dead until `Esc`. On the env screen that
+    /// discarded buffer is a secret the operator cannot read back.
+    ///
+    /// It only clears a `Sent` whose own key matches. Two writes can be in
+    /// flight at once (send one, arm another, send that), and without the
+    /// match the FIRST reply cleared the SECOND's "sent, waiting" line
+    /// while the second was still outstanding. The requests themselves
+    /// never confused each other -- each declares exactly its own key, so
+    /// neither can carry the other's value -- but the line on screen did.
+    pub fn settle(&mut self, key: &str) {
+        if matches!(&self.pending_edit, Some(PanePending::Sent { key: sent, .. }) if sent == key) {
+            self.pending_edit = None;
+        }
+    }
+
+    /// Arms an env write from the sub-screen's own editor.
+    ///
+    /// Env arms like everything else, and the brief's argument for sending
+    /// straight from the editor did not survive review: it said an env
+    /// change parks until the next spawn, which is about when the change
+    /// takes EFFECT. The old value is LOST on the reply, because the
+    /// daemon writes the override store on the same call. Under a
+    /// write-only screen an overwritten value is exactly as unrecoverable
+    /// as a deleted one, so a set arms too, not only a removal.
+    pub(super) fn arm_env(&mut self, key: String, value: Option<EnvValue>, now: Instant) {
+        let edit = PaneEdit::SetEnv { key, value };
+        let text = self.confirm_text(&edit);
+        self.pending_edit = Some(PanePending::Armed {
+            edit,
+            text,
+            at: now,
+        });
     }
 
     /// The question an armed edit reads as, in what it costs.
+    ///
+    /// An env sentence names its key and NEVER its value, unlike a field
+    /// sentence, which quotes what it is setting. The value has just been
+    /// typed, so echoing it tells the operator nothing they cannot see, and
+    /// it would put a secret into a string that outlives the editor, sits
+    /// on the status bar, and rides inside [`PanePending`].
     fn confirm_text(&self, edit: &PaneEdit) -> String {
-        let PaneEdit::Set { key, value } = edit;
+        let name = self.target.name();
+        let (key, value) = match edit {
+            PaneEdit::SetEnv {
+                key,
+                value: Some(_),
+            } => {
+                return format!("set env {key}? {name} is respawned to pick it up");
+            }
+            PaneEdit::SetEnv { key, value: None } => {
+                return format!(
+                    "remove env {key}? {name} is respawned, and lookout cannot read the value \
+                     back to put it there again"
+                );
+            }
+            PaneEdit::Set { key, value } => (key, value),
+        };
         let shown = match value {
             Value::Null => "(unset)".to_owned(),
             Value::String(text) => text.clone(),
             other => other.to_string(),
         };
-        let name = self.target.name();
         // `ApplyGroup` is `#[non_exhaustive]`, so the wildcard is required
         // rather than chosen, and it answers `respawn` for the reason
         // `view::pane::cost_label` gives: a group this binary has not been
@@ -690,7 +862,12 @@ impl ConfigPane {
     /// sending a config the daemon would refuse.
     #[must_use]
     pub fn declared_app(&self, edit: &PaneEdit) -> Option<DeclaredApp> {
-        let PaneEdit::Set { key, value } = edit;
+        // An env edit has no `DeclaredApp` and must not acquire one by
+        // accident: no `ResetDepth` expresses a single env key, and this
+        // pane is never told a value it could put back into a whole map.
+        let PaneEdit::Set { key, value } = edit else {
+            return None;
+        };
         let mut values = self.values.clone();
         values.insert(key.clone(), value.clone());
         // `env` is absent from `values` in all but name: the shepherd
@@ -834,9 +1011,9 @@ impl ConfigPane {
     /// and offset it had. Setting a key re-reads the whole config, and
     /// without this the sub-screen would slam shut on the operator's own
     /// keystroke -- and on the one screen where the keystroke ADDS a row.
-    pub(super) fn adopt_env_view(&mut self, view: Viewport) {
+    pub(super) fn adopt_env_view(&mut self, view: Viewport, cursor_key: Option<&str>) {
         let mut env = EnvPane::new(self.env_keys.clone());
-        env.adopt_view(view);
+        env.adopt_view(view, cursor_key);
         self.env = Some(env);
     }
 
@@ -976,6 +1153,28 @@ mod tests {
         assert!(text.contains("autorestart"), "{text}");
     }
 
+    /// fails if a confirm starts promising a respawn a `Live` field does
+    /// not cost, which is the same claim the test below makes in the
+    /// opposite direction. Pinning only the positive left `confirm_text`
+    /// free to answer `respawn` to everything and stay green.
+    #[test]
+    fn a_live_field_arms_a_confirm_that_promises_no_death() {
+        let mut pane = ConfigPane::sheep(web());
+        pane.move_to_key("autorestart");
+        pane.cycle(Instant::now());
+        let Some(PanePending::Armed { text, .. }) = pane.pending_edit() else {
+            panic!("{:?}", pane.pending_edit());
+        };
+        assert_eq!(
+            pane.cost("autorestart"),
+            Some(ApplyGroup::Live),
+            "the fixture must keep this field Live or the test means nothing"
+        );
+        assert!(text.contains("takes it now"), "{text}");
+        assert!(!text.contains("respawn"), "{text}");
+        assert!(!text.contains("next start"), "{text}");
+    }
+
     /// fails if a field that costs a respawn stops saying so, or stops
     /// naming the sheep that pays for it.
     #[test]
@@ -1072,6 +1271,85 @@ mod tests {
         env.move_to_first();
         env.begin_typing();
         assert_eq!(env.apply_typing(), Some(("A".to_owned(), None)));
+    }
+
+    /// fails if [`PaneEdit`] starts printing the value it is about to set
+    /// (IR-41). A `Set` carries a live config value -- `cwd` and `script`
+    /// routinely hold a home directory, `args` a token -- and a `SetEnv`
+    /// carries the most secret-dense thing this client sends.
+    #[test]
+    fn a_pane_edits_debug_names_no_value() {
+        let set = PaneEdit::Set {
+            key: "cwd".into(),
+            value: serde_json::json!("/home/ada/secret-project"),
+        };
+        assert_eq!(format!("{set:?}"), r#"PaneEdit::Set { key: "cwd" }"#);
+        let env = PaneEdit::SetEnv {
+            key: "DB_PASSWORD".into(),
+            value: Some("hunter2".to_owned().into()),
+        };
+        assert_eq!(
+            format!("{env:?}"),
+            r#"PaneEdit::SetEnv { key: "DB_PASSWORD", removes: false }"#
+        );
+        let removal = PaneEdit::SetEnv {
+            key: "DB_PASSWORD".into(),
+            value: None,
+        };
+        assert_eq!(
+            format!("{removal:?}"),
+            r#"PaneEdit::SetEnv { key: "DB_PASSWORD", removes: true }"#
+        );
+    }
+
+    /// fails if [`PanePending`] starts printing a buffer or a rendered
+    /// question (IR-41). The buffer is what the operator is halfway
+    /// through typing, and on the env screen that is the secret itself;
+    /// the question quotes the value a field edit is setting.
+    #[test]
+    fn a_pane_pendings_debug_names_no_value() {
+        let typing = PanePending::Typing {
+            key: "cwd".into(),
+            buffer: "/home/ada/secret-project".into(),
+        };
+        assert_eq!(
+            format!("{typing:?}"),
+            r#"PanePending::Typing { key: "cwd", buffer: <24 chars> }"#
+        );
+        let armed = PanePending::Armed {
+            edit: PaneEdit::Set {
+                key: "cwd".into(),
+                value: serde_json::json!("/home/ada/secret-project"),
+            },
+            text: "set cwd = /home/ada/secret-project? web takes it now".into(),
+            at: Instant::now(),
+        };
+        assert_eq!(
+            format!("{armed:?}"),
+            r#"PanePending::Armed { edit: PaneEdit::Set { key: "cwd" } }"#
+        );
+        let sent = PanePending::Sent {
+            key: "cwd".into(),
+            text: "set cwd = /home/ada/secret-project? web takes it now".into(),
+        };
+        assert_eq!(format!("{sent:?}"), r#"PanePending::Sent { key: "cwd" }"#);
+    }
+
+    /// fails if [`EnvPane`] starts printing a key name or the buffer
+    /// (IR-41). The buffer on the `+ new` row is the whole
+    /// `KEY=value`, secret included.
+    #[test]
+    fn an_env_panes_debug_names_no_key_and_no_value() {
+        let mut env = EnvPane::new(vec!["DB_PASSWORD".into(), "API_TOKEN".into()]);
+        env.move_to_last();
+        env.begin_typing();
+        for typed in "STRIPE_KEY=sk_live_1".chars() {
+            env.type_char(typed);
+        }
+        assert_eq!(
+            format!("{env:?}"),
+            "EnvPane { keys: 2, cursor: 2, typing: true }"
+        );
     }
 
     /// fails if the pane's own `Debug` starts printing the config it holds.
