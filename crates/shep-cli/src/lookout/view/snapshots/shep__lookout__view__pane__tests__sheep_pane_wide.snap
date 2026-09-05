@@ -8,18 +8,18 @@ expression: "text_of(&lines).join(\"\\n\")"
    err_file                   (unset)                                                                         respawn   
    fold                       (unset)                                                                         now       
    group                      (unset)                                                                         respawn   
-  *instances                  3                                                                               read-only 
+ =*instances                  3                                                                               read-only 
    interpreter                (unset)                                                                         respawn   
   !kill_signal                (unset)                                                                         next start
    merge_logs                 false                                                                           respawn   
-   name                       web                                                                             read-only 
+ = name                       web                                                                             read-only 
    out_file                   (unset)                                                                         respawn   
    reuse_port                 false                                                                           now       
    script                     ./srv                                                                           respawn   
    user                       (unset)                                                                         respawn   
 
   inputs
-   args                       ["--port","8080"]                                                               respawn   
+ ~ args                       ["--port","8080"]                                                               respawn   
    channel                    false                                                                           respawn   
    env                        2 keys                                                                          respawn   
    stdin                      false                                                                           respawn   
@@ -30,21 +30,21 @@ expression: "text_of(&lines).join(\"\\n\")"
    autostart                  true                                                                            next start
    exp_backoff_restart_delay  100                                                                             now       
    graceful_timeout           8s                                                                              now       
-   ignore_watch               []                                                                              now       
+ ~ ignore_watch               []                                                                              now       
    kill_timeout               1600                                                                            now       
    listen_timeout             3s                                                                              next start
-   liveness_probe             (unset)                                                                         now       
+ ~ liveness_probe             (unset)                                                                         now       
    max_memory                 (unset)                                                                         now       
   *max_restarts               32                                                                              now       
    min_uptime                 1s                                                                              now       
-   readiness_probe            (unset)                                                                         next start
+ ~ readiness_probe            (unset)                                                                         next start
    restart_delay              (unset)                                                                         now       
    shutdown_with_message      false                                                                           respawn   
-   stop_exit_codes            []                                                                              now       
+ ~ stop_exit_codes            []                                                                              now       
    wait_ready                 false                                                                           respawn   
    watch                      false                                                                           now       
    watch_delay                (unset)                                                                         now       
-   watch_options              []                                                                              now       
+ ~ watch_options              []                                                                              now       
 
   cron
    cron_restart               (unset)                                                                         now       

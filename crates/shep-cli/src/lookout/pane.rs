@@ -41,6 +41,27 @@ impl PaneTarget {
     }
 }
 
+/// Why a row cannot be edited from the pane.
+///
+/// Two different facts, and an operator has to be able to tell them apart:
+/// one says the field is beyond editing anywhere, the other says only that
+/// this screen has no widget for its shape and a Flockfile still can.
+/// Collapsing them into `Field::editable` alone is what made six rows claim
+/// the wrong one.
+///
+/// `Debug` is derived (IR-41): a bare variant name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lock {
+    /// shep itself refuses a config write. Identity or flock shape rather
+    /// than a runtime knob, so no surface changes it: `name` and
+    /// `instances`, whose count moves through `shep stock` instead.
+    Refused,
+    /// The pane has no widget for this shape, and nothing more than that.
+    /// `shep start <Flockfile>` writes these perfectly well, and
+    /// [`ConfigPane::cost`] still reports what doing so would cost.
+    NoWidget,
+}
+
 /// One row of the pane.
 ///
 /// One variant today. Named rather than left as a bare index because the
@@ -186,6 +207,22 @@ impl ConfigPane {
     pub fn cost(&self, key: &str) -> Option<ApplyGroup> {
         match self.target {
             PaneTarget::Sheep { .. } => Some(apply_group(key)),
+        }
+    }
+
+    /// Why the pane will not edit `key`, or [`None`] when it will.
+    ///
+    /// [`Lock::Refused`] outranks [`Lock::NoWidget`]: a Structural field
+    /// that also happened to have no widget is still refused by shep, which
+    /// is the fact that survives the pane gaining every widget it lacks.
+    #[must_use]
+    pub fn lock(&self, key: &str) -> Option<Lock> {
+        if self.cost(key) == Some(ApplyGroup::Structural) {
+            return Some(Lock::Refused);
+        }
+        match self.fields.by_key(key) {
+            Some(field) if !field.editable => Some(Lock::NoWidget),
+            _ => None,
         }
     }
 

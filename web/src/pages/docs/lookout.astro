@@ -583,6 +583,28 @@ esc/s close   j/k select   g/G fir… read-only`;
         child is not holding it yet
       </li>
     </ul>
+    <p>And one in the column before those, when the pane won't edit a field:</p>
+    <ul>
+      <li>
+        <code>=</code> shep refuses a config write to it anywhere, not just
+        here. That is <code>name</code> and <code>instances</code>, and the
+        cost column says <code>read-only</code> to match.
+      </li>
+      <li>
+        <code>~</code> the pane has no widget for the shape, and nothing
+        more. A Flockfile writes these the usual way, so the cost column
+        beside them reports a real cost rather than <code>read-only</code>.
+        Six fields: <code>args</code>, <code>ignore_watch</code>,
+        <code>liveness_probe</code>, <code>readiness_probe</code>,
+        <code>stop_exit_codes</code> and <code>watch_options</code>.
+      </li>
+    </ul>
+    <p class="fine">
+      Both are glyphs rather than a colour on purpose. The narrowest terminal
+      the pane draws into has already dropped the cost column, and
+      <code>plain</code> style has no colour to read, so a greyed-out row
+      would be the only signal left in the case where it says least.
+    </p>
     <p>The last column is what a change would cost:</p>
     <ul>
       <li><code>now</code> the shepherd re-reads it at the next decision</li>

@@ -21,7 +21,7 @@ use ratatui::text::{Line, Span};
 use shep_core::config::ApplyGroup;
 
 use super::super::app::App;
-use super::super::pane::{ConfigPane, PaneRow, PaneTarget};
+use super::super::pane::{ConfigPane, Lock, PaneRow, PaneTarget};
 use super::super::theme::Palette;
 use super::flock::{fit, mark};
 use super::scroll::Attempt;
@@ -126,13 +126,21 @@ fn title_line(pane: &ConfigPane, palette: Palette, width: u16) -> Line<'static> 
     ))
 }
 
-/// One field's row: the selection mark, a flag, the key, the value and what
-/// changing it costs.
+/// One field's row: the selection mark, a lock glyph, a flag, the key, the
+/// value and what changing it costs.
 ///
 /// The flag is the same pair `shep flock`'s own CFG column prints: `!` for a
 /// field parked until a respawn, `*` for one an operator has overridden.
 /// Pending wins when a field is both, because it is the sharper fact -- the
 /// value on screen is not the value the running child holds.
+///
+/// The lock glyph sits in the column between the selection mark and the
+/// flag, which every row already spent on a space, so it costs nothing and
+/// cannot be truncated. It is a glyph rather than a style because a style
+/// says nothing at all in `plain`, and nothing but the mark, the glyph, the
+/// flag and the key is guaranteed to render at `MIN_TERM_WIDTH` -- the cost
+/// cell, which is the only other place either fact appears, is the first
+/// column this pane drops. See [`Lock`].
 fn field_line(
     pane: &ConfigPane,
     index: usize,
@@ -159,7 +167,15 @@ fn field_line(
         raw
     };
 
-    let mut text = format!("{} ", mark(selected));
+    let lock = match pane.lock(&field.key) {
+        // Fixed: no surface edits this one, not just this pane.
+        Some(Lock::Refused) => '=',
+        // Shown only. A Flockfile still writes it, and the cost cell beside
+        // it reports what doing so would cost.
+        Some(Lock::NoWidget) => '~',
+        None => ' ',
+    };
+    let mut text = format!("{}{lock}", mark(selected));
     text.push_str(&fit(&format!("{flag}{}", field.key), key_w));
     if value_w > 0 {
         text.push_str("  ");
@@ -170,11 +186,13 @@ fn field_line(
         let cost = pane.cost(&field.key).map_or("", cost_label);
         text.push_str(&fit(cost, cost_w));
     }
-    // Muted for a field the pane will not let an operator change, so
-    // read-only reads as read-only before the cost column is even reached
-    // -- and at the widths where that column has been dropped, this is the
-    // only thing left saying so. An editable row is unstyled, the same as
-    // every scalar row on the settings screen: the `>` is the selection.
+    // Muting reinforces the glyph and never carries a fact on its own. It
+    // used to be the whole signal, and it said "read-only" about six fields
+    // shep writes happily -- `args`, `ignore_watch`, `liveness_probe`,
+    // `readiness_probe`, `stop_exit_codes` and `watch_options`, every one of
+    // them merely a shape this pane has no widget for. A `plain` palette
+    // renders muted as nothing, so a style could not have told those six
+    // apart from `name` and `instances` even in principle.
     if field.editable {
         Line::from(Span::raw(text))
     } else {
@@ -456,9 +474,12 @@ mod tests {
     }
 
     /// fails if the cost column stops saying why a Structural field cannot
-    /// be edited, or if that row stops being drawn muted -- at the widths
-    /// where the cost column has been dropped, the styling is all that is
-    /// left saying so.
+    /// be edited, or if either kind of locked row stops being drawn muted.
+    ///
+    /// Muting reinforces the glyph on both kinds and carries no fact of its
+    /// own, so `args` -- which shep writes happily -- is checked here too,
+    /// against a cost cell that must keep saying `respawn` rather than
+    /// `read-only`.
     #[test]
     fn a_structural_field_renders_muted_and_the_cost_column_says_why() {
         let pane = web_pane();
@@ -474,8 +495,51 @@ mod tests {
         assert_eq!(
             instances.spans[0].style,
             fixtures::coloured().muted(),
-            "a read-only row is muted"
+            "a refused row is muted"
         );
+
+        let args = lines
+            .iter()
+            .find(|line| text_of(core::slice::from_ref(line))[0].contains("~ args"))
+            .expect("a field with no widget is drawn too");
+        let rendered = text_of(core::slice::from_ref(args))[0].clone();
+        assert!(
+            rendered.contains("respawn") && !rendered.contains("read-only"),
+            "shep writes `args`, so its cost is a real cost: {rendered:?}"
+        );
+        assert_eq!(
+            args.spans[0].style,
+            fixtures::coloured().muted(),
+            "muting says `not from here`, which is true of both kinds"
+        );
+    }
+
+    /// A field row split into its four fixed leading parts: the selection
+    /// mark, the lock glyph, the flag and the key. Positional rather than a
+    /// `starts_with`, which only ever matched UNSELECTED rows and so could
+    /// not see a glyph on the one row the cursor was on.
+    fn parts(line: &str) -> Option<(char, char, char, String)> {
+        let mut chars = line.chars();
+        let mark = chars.next()?;
+        let lock = chars.next()?;
+        let flag = chars.next()?;
+        let key = chars.as_str().split_whitespace().next()?.to_string();
+        (mark == '>' || mark == ' ').then_some((mark, lock, flag, key))
+    }
+
+    /// Every field row, as its four leading parts. Headers, markers, blanks
+    /// and the title are dropped: none of them names a field.
+    fn rows_of(text: &[String]) -> Vec<(char, char, char, String)> {
+        let keys: Vec<String> = web_pane()
+            .fields()
+            .fields()
+            .iter()
+            .map(|field| field.key.clone())
+            .collect();
+        text.iter()
+            .filter_map(|line| parts(line))
+            .filter(|(_, _, _, key)| keys.contains(key))
+            .collect()
     }
 
     /// fails if the two flags stop marking the fields the shepherd reported,
@@ -483,15 +547,76 @@ mod tests {
     #[test]
     fn the_flags_mark_exactly_the_overridden_and_pending_fields() {
         let text = text_of(&pane_lines(&web_pane(), fixtures::plain(), 120, 0));
-        let flagged = |flag: char| -> Vec<String> {
-            text.iter()
-                .filter(|line| line.starts_with(&format!("  {flag}")))
-                .map(|line| line.trim().trim_start_matches(flag).to_string())
-                .map(|line| line.split_whitespace().next().unwrap_or("").to_string())
+        let flagged = |wanted: char| -> Vec<String> {
+            rows_of(&text)
+                .into_iter()
+                .filter(|(_, _, flag, _)| *flag == wanted)
+                .map(|(_, _, _, key)| key)
                 .collect()
         };
         assert_eq!(flagged('*'), ["instances", "max_restarts"]);
         assert_eq!(flagged('!'), ["kill_signal"]);
+        assert_eq!(rows_of(&text).len(), 39, "every field is drawn at 120");
+    }
+
+    /// fails if the pane goes back to saying one thing about two different
+    /// facts.
+    ///
+    /// `=` is shep refusing a config write to the field at all. `~` is only
+    /// this pane having no widget for the shape, which is true of six fields
+    /// `shep start <Flockfile>` writes happily -- and the cost cell beside
+    /// each of them says `respawn` or `now`, not `read-only`, so a row
+    /// carrying `=` there would be the pane contradicting itself.
+    #[test]
+    fn a_refused_field_and_one_the_pane_has_no_widget_for_get_different_glyphs() {
+        let text = text_of(&pane_lines(&web_pane(), fixtures::plain(), 120, 0));
+        let glyphed = |wanted: char| -> Vec<String> {
+            rows_of(&text)
+                .into_iter()
+                .filter(|(_, lock, _, _)| *lock == wanted)
+                .map(|(_, _, _, key)| key)
+                .collect()
+        };
+        assert_eq!(glyphed('='), ["instances", "name"]);
+        assert_eq!(
+            glyphed('~'),
+            [
+                "args",
+                "ignore_watch",
+                "liveness_probe",
+                "readiness_probe",
+                "stop_exit_codes",
+                "watch_options"
+            ]
+        );
+        assert_eq!(glyphed(' ').len(), 39 - 2 - 6);
+    }
+
+    /// fails if the distinction above survives only at a comfortable width
+    /// or only in colour.
+    ///
+    /// `MIN_TERM_WIDTH` drops the cost cell, which is the only other place
+    /// either fact is written, and `plain` renders muted as nothing at all.
+    /// So the glyph is the whole signal in exactly the case an operator is
+    /// most likely to be in, and this is the test that says it survives
+    /// there.
+    #[test]
+    fn the_two_glyphs_survive_the_narrowest_width_and_a_palette_with_no_colour() {
+        let mut pane = web_pane();
+        pane.move_to_last();
+        let width = super::super::MIN_TERM_WIDTH;
+        let text = text_of(&pane_lines(&pane, fixtures::plain(), width, 0));
+        let rows = rows_of(&text);
+        assert!(
+            !text[1..]
+                .iter()
+                .any(|line| parts(line).is_some() && line.contains("read-only")),
+            "no field row can afford the cost cell at {width}: {text:?}"
+        );
+        let glyph = |key: &str| rows.iter().find(|(_, _, _, k)| k == key).map(|r| r.1);
+        assert_eq!(glyph("instances"), Some('='));
+        assert_eq!(glyph("args"), Some('~'));
+        assert_eq!(glyph("watch"), Some(' '));
     }
 
     /// The whole frame at `height`, through the same `note_body_rows` and
