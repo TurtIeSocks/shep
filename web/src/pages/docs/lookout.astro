@@ -573,7 +573,8 @@ esc/s close   j/k select   g/G fir… read-only`;
     <p>
       <code>e</code> on a selected sheep opens its config over the dashboard:
       every Flockfile field, the value in force, and what changing it would
-      cost. Read-only so far.
+      cost. It writes as well, behind <code>--allow-control</code>. Without
+      the flag every edit key refuses the same way <code>x</code> does.
     </p>
     <p>Two markers can sit in front of a key:</p>
     <ul>
@@ -629,8 +630,39 @@ esc/s close   j/k select   g/G fir… read-only`;
       <li>
         <code>r</code> re-reads the config and leaves the cursor where it was
       </li>
+      <li>
+        <code>space</code> proposes the other value for a bool, or the next
+        one for a choice. Press it again to walk another step.
+      </li>
+      <li>
+        <code>Enter</code> opens the editor on a text or number field, and
+        sends whatever is armed. Two keystrokes to change a field, never one.
+      </li>
       <li><code>Esc</code> closes the pane; it never quits lookout</li>
     </ul>
+    <p>
+      One edit changes one field. shep is sent the app with exactly that key
+      declared and nothing else, so no other value moves,
+      <code>instances</code> included.
+    </p>
+    <p class="fine">
+      A field the running child already holds parks until the next spawn. The
+      status bar says which of the two happened, and
+      <code>shep reload &lt;sheep&gt;</code> is what promotes a parked one.
+    </p>
+    <p>
+      <code>Enter</code> on the <code>env</code> row opens a sub-screen of
+      that sheep's env key names. No value ever appears there, because the
+      shepherd never sends one: every key reads <code>&lt;set&gt;</code>.
+      <code>Enter</code> on a key types a new value for it, and applying an
+      empty one removes the key. <code>Enter</code> on the
+      <code>+ new</code> row takes <code>KEY=value</code>.
+      <code>Esc</code> goes back to the field list.
+    </p>
+    <p class="fine">
+      env is spawn-time in every case, so nothing set here reaches the running
+      child until that child is replaced.
+    </p>
     <p class="fine">
       A group row opens one too. Every instance of a multi-instance app
       shares one stored spec, so the pane is about the app rather than about
