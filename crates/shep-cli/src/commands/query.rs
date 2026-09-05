@@ -261,23 +261,25 @@ fn matches_filter(filter: &str, haystacks: &[&str]) -> bool {
 /// [`ExitCode::Failure`]: [`dog_index::IndexError`] carries it on one
 /// variant only.
 ///
-/// The one URL not named is one carrying credentials. A dog index URL is
-/// a public location, which is why this quotes it at all, but
+/// The one URL not named is one holding an `@`. A dog index URL is a
+/// public location, which is why this quotes it at all, but
 /// `SHEP_DOG_INDEX` is an operator's own string and nothing stops a
 /// password reaching it. This message is built here rather than by
-/// [`dog_index::IndexError`], so the refusal inside [`crate::fetch`] does
-/// not cover it.
+/// [`dog_index::IndexError`], so the refusals inside [`crate::fetch`] do
+/// not cover it, and it asks
+/// [`fetch::url_for_message`](crate::fetch::url_for_message) rather than
+/// deciding for itself: an earlier version asked
+/// `url_carries_credentials` instead and printed urls that `parse_url`
+/// had just withheld.
 pub async fn available_dogs(streams: &mut Streams<'_>, args: &DogsArgs) -> ExitCode {
     let url = dog_index::index_url();
     let index = match dog_index::fetch_index(&url).await {
         Ok(index) => index,
         Err(err) => {
-            let named = if fetch::url_carries_credentials(&url) {
-                "a url carrying credentials".to_owned()
-            } else {
-                url.clone()
-            };
-            let message = format!("reading the dog index from {named}: {err}");
+            let message = format!(
+                "reading the dog index from {}: {err}",
+                fetch::url_for_message(&url)
+            );
             return streams.fail(ExitCode::Failure, &message);
         }
     };

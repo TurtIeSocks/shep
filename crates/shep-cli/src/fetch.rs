@@ -77,12 +77,12 @@ pub enum FetchError {
     /// `url` did not parse as an absolute `http://`/`https://` URL. Carries
     /// a human-readable reason, never the raw bytes of a malformed input.
     ///
-    /// The reason usually quotes `url`, and does not in the two cases
-    /// where the text itself may be the secret: an authority carrying
-    /// `user@` or `user:pass@`, and a url refused on its scheme while
-    /// holding an `@` anywhere. The second is the backstop for the first,
-    /// since [`url_carries_credentials`] reads an authority and a url far
-    /// enough off the grammar is one it can misread.
+    /// The reason quotes `url` only through [`url_for_message`], which
+    /// withholds anything holding an `@`. That is the backstop under
+    /// [`url_carries_credentials`], which reads an authority and so can
+    /// misread a url far enough off the grammar. An authority that really
+    /// does carry `user@` or `user:pass@` gets its own reason,
+    /// [`CREDENTIALS_REFUSAL`].
     Url(String),
     /// The connection failed, the TLS handshake failed, or the response
     /// was not well-formed HTTP: no parseable status line, a header block
@@ -187,6 +187,40 @@ pub const CREDENTIALS_REFUSAL: &str = concat!(
     "the url is not echoed, since it carries one"
 );
 
+/// How `url` may be named in a message: itself, or a fixed placeholder.
+///
+/// Deliberately blunter than [`url_carries_credentials`], and deliberately
+/// the only rule any message consults. That predicate reads an authority,
+/// so it can say precisely why a sink was refused; this one asks only
+/// whether printing the text might print a secret, and an `@` anywhere is
+/// enough to decline.
+///
+/// Two rules for one question drift, and did: [`parse_url`] withheld
+/// `file:///etc/user:pw@host` on its own `@` test while
+/// [`available_dogs`](crate::commands::query::available_dogs) printed that
+/// same url in the sentence around it, because it asked the predicate
+/// instead.
+pub fn url_for_message(url: &str) -> &str {
+    if url.contains('@') {
+        "a url that may carry credentials"
+    } else {
+        url
+    }
+}
+
+/// Where `rest`, an authority followed by whatever came after it, stops
+/// being the authority.
+///
+/// `/`, `?` and `#` all end it. Splitting on `/` alone reads
+/// `example.com?contact=alice@example.com` as one authority, which makes
+/// [`url_carries_credentials`] call an `@` in a query a credential.
+fn authority_of(rest: &str) -> &str {
+    match rest.find(['/', '?', '#']) {
+        Some(i) => &rest[..i],
+        None => rest,
+    }
+}
+
 /// Whether `url`'s authority carries a `user@` or `user:pass@` prefix.
 ///
 /// The rule [`parse_url`] refuses on, separated out so a caller holding a
@@ -209,8 +243,7 @@ pub fn url_carries_credentials(url: &str) -> bool {
     // it, so there is no `://` to split on and the authority would
     // otherwise read as the empty string before the first `/`.
     let rest = rest.strip_prefix("//").unwrap_or(rest);
-    let authority = rest.split('/').next().unwrap_or(rest);
-    authority.contains('@')
+    authority_of(rest).contains('@')
 }
 
 /// Parses `url` into a [`Target`] naming where [`get`] should connect.
@@ -224,10 +257,14 @@ pub fn url_carries_credentials(url: &str) -> bool {
 /// of a hostname. `ProbeTarget::parse` refuses the same shape for the same
 /// reason.
 ///
+/// A query or fragment belongs to the path, not the host: the authority
+/// ends at the first `/`, `?` or `#`.
+///
 /// # Errors
 /// - [`FetchError::Url`] if `url` does not start with `http://` or
 ///   `https://`, carries a `user@` or `user:pass@` authority, names a
-///   non-numeric port, or names no host.
+///   non-numeric port, or names no host. No such message quotes a `url`
+///   holding an `@`; see [`url_for_message`].
 pub fn parse_url(url: &str) -> Result<Target, FetchError> {
     // Ahead of the host/port split, which trusts the last colon: without
     // this, `user:pass@host:8443` parses to the host `user:pass@host` and
@@ -241,44 +278,43 @@ pub fn parse_url(url: &str) -> Result<Target, FetchError> {
         Some(rest) => (true, rest),
         None => match url.strip_prefix("http://") {
             Some(rest) => (false, rest),
-            None if url.contains('@') => {
-                // The credential check above reads an authority, and a url
-                // this far off the grammar is one it can misread. Nothing
-                // holding an `@` is worth quoting to say its scheme is
-                // wrong.
-                return Err(FetchError::Url(
-                    "does not start with http:// or https://, and the url is not echoed, \
-                     since it may carry a credential"
-                        .to_owned(),
-                ));
-            }
             None => {
                 return Err(FetchError::Url(format!(
-                    "{url} does not start with http:// or https://"
+                    "{} does not start with http:// or https://",
+                    url_for_message(url)
                 )));
             }
         },
     };
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
+    let authority = authority_of(rest);
+    // A query or fragment belongs to the request target, not the host. On
+    // the `?`/`#` arm the remainder has no leading `/` of its own and an
+    // origin-form target needs one, so an absent path is sent as `/`.
+    let path = match rest[authority.len()..].chars().next() {
+        Some('/') => rest[authority.len()..].to_owned(),
+        Some(_) => format!("/{}", &rest[authority.len()..]),
+        None => "/".to_owned(),
     };
     let (host, port) = match authority.rsplit_once(':') {
         Some((h, p)) => (
             h,
-            p.parse()
-                .map_err(|_err| FetchError::Url(format!("{url} has a non-numeric port")))?,
+            p.parse().map_err(|_err| {
+                FetchError::Url(format!("{} has a non-numeric port", url_for_message(url)))
+            })?,
         ),
         None => (authority, if https { 443 } else { 80 }),
     };
     if host.is_empty() {
-        return Err(FetchError::Url(format!("{url} has no host")));
+        return Err(FetchError::Url(format!(
+            "{} has no host",
+            url_for_message(url)
+        )));
     }
     Ok(Target {
         https,
         host: host.to_string(),
         port,
-        path: path.to_string(),
+        path,
     })
 }
 
@@ -796,17 +832,52 @@ mod tests {
 
     /// The backstop under [`url_carries_credentials`]. That predicate
     /// reads an authority, and a url far enough off the grammar is one it
-    /// can misread: here the `@` is in the path, so the predicate says
-    /// `false` and the scheme refusal is what sees the url. It refuses to
-    /// quote anything holding an `@` rather than trusting the predicate to
-    /// have been right about where the authority ended.
+    /// can misread: in each of these the `@` is in a path, so the
+    /// predicate says `false` and some other refusal is what sees the url.
+    /// Every refusal names the url through [`url_for_message`] rather than
+    /// trusting the predicate to have been right about where the authority
+    /// ended.
     #[test]
-    fn a_url_refused_on_its_scheme_is_not_quoted_when_it_holds_an_at_sign() {
-        assert!(!url_carries_credentials("file:///etc/pass@wd"));
-        let err = parse_url("file:///etc/pass@wd").unwrap_err();
-        let rendered = format!("{err} {err:?}");
-        assert!(!rendered.contains("pass@wd"), "{rendered}");
-        assert!(rendered.contains("may carry a credential"), "{rendered}");
+    fn no_refusal_quotes_a_url_holding_an_at_sign() {
+        for url in [
+            // Refused on the scheme.
+            "file:///etc/pass@wd",
+            // Refused on the port, with the `@` off in the path.
+            "https://example.com:notaport/etc/pass@wd",
+        ] {
+            assert!(!url_carries_credentials(url), "{url}");
+            let err = parse_url(url).unwrap_err();
+            let rendered = format!("{err} {err:?}");
+            assert!(!rendered.contains("pass@wd"), "{url}: {rendered}");
+            assert!(
+                rendered.contains("a url that may carry credentials"),
+                "{url}: {rendered}"
+            );
+        }
+    }
+
+    /// A query or a fragment is part of the request target, not the host.
+    /// Reading it as authority made an `@` in a query look like a
+    /// credential, so `?contact=alice@example.com` was refused as one.
+    #[test]
+    fn a_query_or_fragment_belongs_to_the_path_not_the_host() {
+        for (url, path) in [
+            (
+                "https://example.com?contact=alice@example.com",
+                "/?contact=alice@example.com",
+            ),
+            ("https://example.com#a@b", "/#a@b"),
+            ("https://example.com/hook?a=b", "/hook?a=b"),
+            ("https://example.com", "/"),
+        ] {
+            let target = parse_url(url).unwrap_or_else(|err| panic!("{url}: {err}"));
+            assert_eq!(target.host, "example.com", "{url}");
+            assert_eq!(target.port, 443, "{url}");
+            assert_eq!(target.path, path, "{url}");
+        }
+        assert!(!url_carries_credentials(
+            "https://example.com?contact=alice@example.com"
+        ));
     }
 
     /// A Discord webhook URL is a bearer credential and carries its token
