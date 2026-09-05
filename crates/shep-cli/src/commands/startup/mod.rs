@@ -18,6 +18,7 @@ pub(crate) mod unit;
 
 use std::path::{Path, PathBuf};
 
+use shep_core::paths::ShepPaths;
 use unit::UnitSpec;
 
 use crate::cli::{Init, StartupArgs};
@@ -120,6 +121,15 @@ pub(crate) struct StartupPlan {
     /// without `std::env::set_var` — `unsafe` in edition 2024, and this
     /// crate is `#![forbid(unsafe_code)]`.
     pub sudo_user: Option<String>,
+    /// The layout to create before installing: `<passwd home>/.shep` of the
+    /// very user running shep, and only with no `--home`/`$SHEP_HOME`. A
+    /// named home is never created (`ensure_home_at`'s rule in `lib.rs`),
+    /// and another user's default is not this process's to make: under
+    /// `sudo` that process is root, a directory root makes in the target
+    /// user's home is root's at 0700, and the daemon started as that user
+    /// could not open it. [`install`] refuses a missing one instead.
+    /// [`remove`] never reads this.
+    pub own_default_home: Option<ShepPaths>,
 }
 
 /// A refusal that never got as far as a step: the exit code to return, and
@@ -132,19 +142,28 @@ struct Refusal {
 
 /// Installs the init unit that starts the shepherd at boot.
 ///
-/// `explicit_home` is `--home`/`$SHEP_HOME` as clap already folded it. When
-/// it names nothing the unit carries the **target user's** own
-/// `<passwd home>/.shep`, never this process's `$HOME` — under `sudo` that
-/// is root's, and a unit built from it restores nothing after a reboot.
+/// `explicit_home` is `--home`/`$SHEP_HOME` as clap already folded it, and
+/// `run` has already refused one that is not there. When it names nothing
+/// the unit carries the **target user's** own `<passwd home>/.shep`, never
+/// this process's `$HOME` — under `sudo` that is root's, and a unit built
+/// from it restores nothing after a reboot. A default that is this
+/// process's own is created first, first-run scaffold included; see
+/// [`StartupPlan::own_default_home`].
 pub fn startup(
     streams: &mut Streams<'_>,
     explicit_home: Option<&Path>,
     args: &StartupArgs,
 ) -> ExitCode {
-    match plan(explicit_home, args) {
-        Ok(plan) => install(streams, &plan, privilege()),
-        Err(refusal) => refuse(streams, refusal.code, &refusal.message),
+    let plan = match plan(explicit_home, args) {
+        Ok(plan) => plan,
+        Err(refusal) => return refuse(streams, refusal.code, &refusal.message),
+    };
+    if let Some(paths) = plan.own_default_home.clone()
+        && let Err(refusal) = crate::create_default_home(streams, paths)
+    {
+        return refuse(streams, refusal.code(), &refusal.to_string());
     }
+    install(streams, &plan, privilege())
 }
 
 /// Disables and removes the unit [`startup`] installed.
@@ -185,15 +204,26 @@ pub(crate) fn target_home(explicit: Option<&Path>, user_home: &Path) -> PathBuf 
     explicit.map_or_else(|| user_home.join(DEFAULT_HOME_DIR), Path::to_path_buf)
 }
 
+/// Whether the `$SHEP_HOME` a unit carries is this process's own default to
+/// create: no `--home`/`$SHEP_HOME` was given, and the target user is the
+/// user running shep. [`StartupPlan::own_default_home`] says why the other
+/// two cases are nobody's.
+pub(crate) fn default_home_is_own(explicit: Option<&Path>, target: &str, invoking: &str) -> bool {
+    explicit.is_none() && target == invoking
+}
+
 /// Writes and enables the unit, or prints the command that would.
 ///
 /// Every refusal is decided before anything is written or run, and in this
 /// order:
 ///
 /// 1. A `$SHEP_HOME` that is not a directory is [`ExitCode::Usage`], naming
-///    the path and `--home`. The overwhelmingly likely cause is the sudo
-///    trap [`target_home`] describes, and a unit pointing at a home that is
-///    not there is a reboot that restores nothing.
+///    the path, the user whose default it is, and `--home`. By the time
+///    this runs, `run` has refused a named home that is missing and
+///    [`startup`] has created this process's own default, so what reaches
+///    it is another user's default under `sudo`: the trap [`target_home`]
+///    describes, and a unit pointing at a home that is not there is a
+///    reboot that restores nothing.
 /// 2. A unit that already exists is [`ExitCode::Usage`] too, naming the path
 ///    and `unstartup`. An operator who edited the unit in place has to be
 ///    told rather than have the edits replaced — and on both init systems
@@ -227,8 +257,10 @@ pub(crate) fn install(
             streams,
             ExitCode::Usage,
             &format!(
-                "no directory at {}; pass --home with the $SHEP_HOME this unit should carry",
-                plan.spec.home.display()
+                "no directory at {}; run any shep verb as {} first, which creates it, or \
+                 pass --home with the $SHEP_HOME this unit should carry",
+                plan.spec.home.display(),
+                plan.spec.user,
             ),
         );
     }
@@ -649,11 +681,8 @@ fn plan(explicit_home: Option<&Path>, args: &StartupArgs) -> Result<StartupPlan,
     let sudo_user = std::env::var("SUDO_USER")
         .ok()
         .filter(|name| !name.is_empty());
-    let user = target_user(
-        args.user.as_deref(),
-        sudo_user.as_deref(),
-        &invoking_user()?,
-    );
+    let invoking = invoking_user()?;
+    let user = target_user(args.user.as_deref(), sudo_user.as_deref(), &invoking);
     if matches!(init, Init::FreebsdRc | Init::OpenbsdRc) && !is_rc_safe_user(&user) {
         return Err(Refusal {
             code: ExitCode::Usage,
@@ -666,6 +695,11 @@ fn plan(explicit_home: Option<&Path>, args: &StartupArgs) -> Result<StartupPlan,
     }
     let passwd_home = passwd_home(&user)?;
     let unit_path = unit_path_for(init, &user);
+    // Spelled by `ShepPaths` because creating it needs the whole layout;
+    // `the_default_home_and_the_layout_created_for_it_agree` pins it to
+    // `target_home`'s `.shep` below.
+    let own_default_home = default_home_is_own(explicit_home, &user, &invoking)
+        .then(|| ShepPaths::resolve(&|_| None, &passwd_home));
     Ok(StartupPlan {
         init,
         label: unit::launchd_label(&user),
@@ -683,6 +717,7 @@ fn plan(explicit_home: Option<&Path>, args: &StartupArgs) -> Result<StartupPlan,
         },
         unit_path,
         sudo_user,
+        own_default_home,
     })
 }
 
@@ -746,6 +781,7 @@ mod tests {
             unit_path: home.with_file_name("shep-deploy.service"),
             label: unit::launchd_label("deploy"),
             sudo_user: None,
+            own_default_home: None,
         }
     }
 
@@ -773,6 +809,34 @@ mod tests {
         assert_eq!(
             target_home(Some(Path::new("/srv/shep")), Path::new("/home/ada")),
             Path::new("/srv/shep")
+        );
+    }
+
+    /// fails if a default home is created for anyone but the user running
+    /// shep. Under `sudo shep startup` that user is root, and a directory
+    /// root makes inside the target user's home is root's, mode 0700: the
+    /// daemon this unit starts as that user could not open it. A named home
+    /// is never created by anyone; that is `ensure_home_at`'s rule in
+    /// `lib.rs`, and this one must not undercut it.
+    #[test]
+    fn a_default_home_is_created_only_for_the_user_running_shep() {
+        assert!(default_home_is_own(None, "ada", "ada"));
+        assert!(!default_home_is_own(None, "ada", "root"));
+        assert!(
+            !default_home_is_own(Some(Path::new("/srv/shep")), "ada", "ada"),
+            "a named home is never created, by anyone"
+        );
+    }
+
+    /// fails if the home `target_home` puts in the unit and the layout
+    /// `plan` hands `run` to create ever spell `.shep` differently: the
+    /// unit would then point beside the directory that was made for it.
+    #[test]
+    fn the_default_home_and_the_layout_created_for_it_agree() {
+        let passwd_home = Path::new("/home/ada");
+        assert_eq!(
+            shep_core::paths::ShepPaths::resolve(&|_| None, passwd_home).home,
+            target_home(None, passwd_home)
         );
     }
 

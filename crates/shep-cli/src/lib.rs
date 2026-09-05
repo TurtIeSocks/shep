@@ -619,7 +619,7 @@ fn must_render_bare(stdout_is_terminal: bool, fmt: cli::Format) -> bool {
 /// path they are about, and an operator cannot act on a refusal that does not
 /// name it.
 #[derive(Debug)]
-enum HomeRefusal {
+pub(crate) enum HomeRefusal {
     /// None of `--home`, `$SHEP_HOME` or `$HOME` resolved a root directory.
     Unresolved,
     /// `--home`/`$SHEP_HOME` named a directory that is not there. Never
@@ -673,7 +673,7 @@ impl HomeRefusal {
     /// `Internal` rather than `Usage` for the io case: the operator asked for
     /// something reasonable and shep failed to do it, which is not a usage
     /// error however it reads at the terminal.
-    fn code(&self) -> ExitCode {
+    pub(crate) fn code(&self) -> ExitCode {
         match self {
             Self::Unresolved | Self::Missing(_) => ExitCode::Usage,
             Self::Io { .. } => ExitCode::Internal,
@@ -792,6 +792,30 @@ fn scaffold_first_run_interpreters(paths: &ShepPaths) {
     }
 }
 
+/// Creates `paths.home` if it is not there, with the first-run scaffold the
+/// shared gate in [`run`] gives every other verb's fresh home.
+///
+/// `startup` is the caller, for its own default home: the target user's
+/// `<passwd home>/.shep`, which [`ensure_home`] cannot resolve since it
+/// reads this process's environment. A named home never reaches this;
+/// `run` sends one through the shared gate, which refuses a missing one.
+///
+/// # Errors
+///
+/// [`HomeRefusal::Io`] when the directory could not be created.
+#[cfg(unix)]
+pub(crate) fn create_default_home(
+    streams: &mut Streams<'_>,
+    paths: ShepPaths,
+) -> Result<(), HomeRefusal> {
+    let (paths, home_is_new) = ensure_home_at(paths, false)?;
+    if home_is_new {
+        scaffold_first_run_interpreters(&paths);
+        welcome::on_first_run(streams, &paths.home, std::io::stderr().is_terminal());
+    }
+    Ok(())
+}
+
 /// Parses, resolves `$SHEP_HOME` for the verbs that need it, and dispatches
 /// to the verb's own module.
 ///
@@ -816,10 +840,13 @@ fn scaffold_first_run_interpreters(paths: &ShepPaths) {
 /// a resolvable home for either was a bug, not a deliberate restriction.
 ///
 /// `Startup` and `Unstartup` are dispatched from the same early block, for
-/// a different reason: they resolve their own `$SHEP_HOME` from the TARGET
-/// user's passwd entry rather than from this process's environment, so the
-/// shared gate would both impose a requirement they do not have and hand
-/// them the wrong answer under `sudo`, which resets `$HOME` to root's.
+/// a different reason: with no `--home`/`$SHEP_HOME` they resolve the
+/// unit's `$SHEP_HOME` from the TARGET user's passwd entry rather than from
+/// this process's environment, so the shared gate would both impose a
+/// requirement they do not have and hand them the wrong answer under
+/// `sudo`, which resets `$HOME` to root's. A named home still goes through
+/// [`ensure_home`], from inside the `Startup` arm, so a typo is refused the
+/// same way everywhere.
 ///
 /// `Dog` DOES go through this shared gate, unlike `Completions`/`Daemon`: a
 /// dog resolves `$SHEP_HOME` exactly the way every ordinary verb does (the
@@ -941,36 +968,33 @@ async fn run(
             }
             return run_daemon_command(fmt, &cli.global, args).await;
         }
-        // Routed through `ensure_home` rather than reading `--home` raw:
-        // this is the verb that installs a unit without starting anything,
-        // so it is the one that needs `$SHEP_HOME` to exist beforehand, and
-        // for three phases it was the only command that refused instead of
-        // creating it. `install` keeps its own check as well -- see
-        // `a_shep_home_that_does_not_exist_is_refused` for the trap that
-        // guards -- but this gate fires first and says more.
+        // A named home (`--home`/`$SHEP_HOME`) goes through the shared gate:
+        // refused if missing, never created. With neither, `None` goes down
+        // and the startup module resolves the TARGET user's own
+        // `<passwd home>/.shep`, creating it only when that user is this
+        // one. `ensure_home` would resolve this process's `$HOME`, root's
+        // under `sudo`, and from 2026-08-17 to 2026-09-04 this arm did
+        // exactly that and passed the result down as if typed, which put
+        // `/root/.shep` in the unit. `cli_e2e.rs`'s
+        // `a_sudo_startup_without_home_carries_the_target_users_home_not_this_processes`
+        // drives the binary through this arm now.
         Commands::Startup(ref args) => {
             #[cfg(windows)]
             let _ = args;
-            let (paths, home_is_new) = match ensure_home(&cli.global) {
-                Ok(resolved) => resolved,
-                Err(refusal) => {
-                    let code = refusal.code();
-                    emit_error_locked(fmt, code, &refusal.to_string());
-                    return code;
+            let named_home = if cli.global.home.is_some() {
+                match ensure_home(&cli.global) {
+                    Ok((paths, _)) => Some(paths.home),
+                    Err(refusal) => {
+                        let code = refusal.code();
+                        emit_error_locked(fmt, code, &refusal.to_string());
+                        return code;
+                    }
                 }
+            } else {
+                None
             };
-            if home_is_new {
-                scaffold_first_run_interpreters(&paths);
-                let mut err = std::io::stderr();
-                let mut sink = std::io::sink();
-                let mut streams = Streams {
-                    out: &mut sink,
-                    err: &mut err,
-                    style,
-                    fmt,
-                };
-                welcome::on_first_run(&mut streams, &paths.home, std::io::stderr().is_terminal());
-            }
+            #[cfg(windows)]
+            let _ = named_home;
             let mut out = std::io::stdout().lock();
             let mut err = std::io::stderr().lock();
             let mut streams = Streams {
@@ -980,7 +1004,7 @@ async fn run(
                 fmt,
             };
             #[cfg(unix)]
-            return startup::startup(&mut streams, Some(paths.home.as_path()), args);
+            return startup::startup(&mut streams, named_home.as_deref(), args);
             #[cfg(windows)]
             return streams.fail(ExitCode::Failure, WINDOWS_NO_SERVICE);
         }
@@ -1985,6 +2009,33 @@ mod tests {
             !created_again,
             "a home that was already there is not newly created"
         );
+    }
+
+    /// fails if `startup`'s own default-home creation skips the first-run
+    /// scaffold the shared gate gives every other verb's fresh home. The
+    /// starter `[interpreters]` mapping is what lets the `shep start
+    /// server.js` the welcome advertises work on a box where `shep startup`
+    /// was the first command typed, which is the pm2 habit.
+    #[cfg(unix)]
+    #[test]
+    fn creating_startups_default_home_scaffolds_it_like_the_shared_gate() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = paths_at(root.path());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut streams = Streams {
+            out: &mut out,
+            err: &mut err,
+            style: style::Presentation::BARE,
+            fmt: cli::Format::Table,
+        };
+
+        create_default_home(&mut streams, paths.clone()).expect("a default home is created");
+        assert!(paths.home.is_dir());
+        let written = std::fs::read_to_string(&paths.daemon_config).unwrap();
+        assert!(written.contains("[interpreters]"), "{written}");
+
+        create_default_home(&mut streams, paths).expect("a home already there is left alone");
     }
 
     /// A path the operator typed is not a path shep may invent. The likeliest

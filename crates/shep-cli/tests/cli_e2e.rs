@@ -9393,3 +9393,59 @@ fn add_with_nothing_to_add_is_a_usage_error() {
         "and no shepherd was started to answer a request nobody made"
     );
 }
+
+/// `sudo shep startup` with no `--home` builds the unit for the target
+/// user's own `~/.shep`, never for this process's `$HOME`, which `sudo`
+/// sets to root's. Driven without root: `$SUDO_USER` names `nobody`,
+/// whose passwd home is `/var/empty` on macOS and `/nonexistent` on
+/// Linux, and `$HOME` is a temporary directory standing in for root's.
+/// The run refuses, since nobody's `~/.shep` is not there and is not this
+/// process's to create, and the path it names is the point.
+///
+/// What a broken implementation this catches: `run`'s `Startup` arm
+/// resolving `$HOME/.shep`, creating it, and passing it down as if the
+/// operator had typed `--home`, which it did from 2026-08-17 to
+/// 2026-09-04. Skipped as root, like
+/// `startup_and_unstartup_reach_their_own_verbs` in `lib.rs`: with the
+/// bug present a root run would really install a unit.
+#[cfg(unix)]
+#[test]
+fn a_sudo_startup_without_home_carries_the_target_users_home_not_this_processes() {
+    if nix::unistd::geteuid().is_root() {
+        eprintln!("skipping: as root this would really install a unit if the gate were broken");
+        return;
+    }
+    let Ok(Some(nobody)) = nix::unistd::User::from_name("nobody") else {
+        eprintln!("skipping: no `nobody` user to stand in for $SUDO_USER");
+        return;
+    };
+    let fake_root_home = TempDir::new().unwrap();
+
+    let output = Command::cargo_bin("shep")
+        .unwrap()
+        .env("HOME", fake_root_home.path())
+        .env("SUDO_USER", "nobody")
+        .env_remove("SHEP_HOME")
+        .arg("startup")
+        .arg("--init")
+        .arg("systemd")
+        .timeout(CMD_TIMEOUT)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let target_home = nobody.dir.join(".shep");
+    assert!(
+        stderr.contains(target_home.to_str().unwrap()),
+        "the unit's home is nobody's own: {stderr}"
+    );
+    assert!(
+        !stderr.contains(fake_root_home.path().to_str().unwrap()),
+        "and never this process's $HOME: {stderr}"
+    );
+    assert!(
+        !fake_root_home.path().join(".shep").exists(),
+        "nothing is created under a $HOME that is not the target user's"
+    );
+}
