@@ -4656,11 +4656,15 @@ mod tests {
     /// the coverage job) while passing every local run: node took longer than
     /// that to come up, so the run hit the deadline still running and shep
     /// reported the kill it really had performed. The tier exists for exactly
-    /// this, and the budget here is 20s: a stalled read waits out whatever
-    /// is left of it, so the budget IS what the test costs. Raised from 5s
-    /// on 2026-08-31 after four CI failures, and the twenty seconds it now
-    /// spends every run is the price of a red board that means something.
-    /// See `HELD_PIPE_BUDGET` below for both ends of the number.
+    /// this.
+    ///
+    /// A stalled read waits out whatever is left of the budget, so the budget
+    /// IS what that case costs -- which is why it no longer holds a single
+    /// number. A constant big enough for the worst runner would be charged to
+    /// every green run, and 20s was neither big enough nor cheap: nine CI
+    /// failures in the 19 days to 2026-09-04, all `slow (windows-latest)`, at
+    /// 20-29s a run. It climbs a ladder of budgets instead, and only a
+    /// machine that needs the headroom pays for it. See `BUDGETS` below.
     mod slow {
         /// A probe budget no contention can exhaust.
         ///
@@ -5024,6 +5028,33 @@ mod tests {
             );
         }
 
+        /// The `.js` Flockfile the held-pipe case runs: a module that exports
+        /// its config and leaves one detached process holding the pipes shep
+        /// reads.
+        ///
+        /// The holder outlives `budget` threefold, and that ratio is the
+        /// invariant the case turns on: a holder that exited first would let
+        /// the reads finish, and the case would pass for the wrong reason. It
+        /// is derived from the budget here rather than written beside it as a
+        /// second literal, because the two were independent numbers until
+        /// 2026-09-04 and nothing stopped an edit moving one without the
+        /// other.
+        ///
+        /// The holder is a second node, not `sleep`: node exists wherever
+        /// this test runs (its caller gated on `node_available`), while
+        /// `sleep` on a Windows runner is Git Bash's, and twice on CI the
+        /// parent node sat out the whole budget with it.
+        fn held_pipe_module(budget: Duration) -> String {
+            format!(
+                "require('child_process')\
+                 .spawn(process.execPath, ['-e', 'setTimeout(()=>{{}},{})'], \
+                 {{ detached: true, stdio: 'inherit' }})\
+                 .unref(); \
+                 module.exports = {{ app: [] }};",
+                (budget * 3).as_millis()
+            )
+        }
+
         /// fails if a module that leaves a process on node's stdout is
         /// reported as a module shep killed. node itself exits here:
         /// `detached` plus `unref` takes the child off node's event loop, and
@@ -5036,47 +5067,60 @@ mod tests {
             }
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("flock.js");
-            std::fs::write(
-                &path,
-                // The pipe-holder is a second node, not `sleep`: node exists
-                // wherever this test runs (it gated on node_available above),
-                // while `sleep` on a Windows runner is Git Bash's, and twice
-                // on CI the parent node sat out the whole 5s budget with it.
-                "require('child_process')\
-                 .spawn(process.execPath, ['-e', 'setTimeout(()=>{},30000)'], \
-                 { detached: true, stdio: 'inherit' })\
-                 .unref(); \
-                 module.exports = { app: [] };",
-            )
-            .unwrap();
 
-            // Twenty seconds, and both ends of that are load-bearing.
+            // A ladder, not a number, and the reason is that one budget is
+            // being asked two questions with opposite costs.
             //
-            // The floor: five seconds was the budget until 2026-08-31 and it
-            // failed on CI four times, twice noted in the comment above and
-            // twice more on `slow (windows-latest)`. The slowest observed
-            // run took 11.41s. This is not a claim about shep, it is a claim
-            // about how long a shared runner takes to start a node process
-            // and notice a held pipe, so it wants headroom rather than
-            // precision.
+            // `run_bounded` spends the budget twice over: first waiting for
+            // node to exit, then waiting for the held pipe. Node's exit is
+            // free when it is quick, but the pipe wait always runs the
+            // remainder down to zero, so the budget IS this case's runtime.
+            // A single number therefore cannot be raised for headroom
+            // without every green run paying for it. At 20s it was the most
+            // frequent red job on CI for a month (nine failures, all
+            // `slow (windows-latest)`, the last on 2026-09-03), while thirty
+            // green runs here cost 20.26s to 29.18s each.
             //
-            // The ceiling: the pipe-holder above lives 30 seconds. A budget
-            // at or past that would let the child exit on its own, and the
-            // case would pass for the wrong reason.
-            const HELD_PIPE_BUDGET: Duration = Duration::from_secs(20);
+            // So: start small, and treat a `Killed` verdict as a statement
+            // about the machine rather than about shep. Node's parent exits
+            // in a median of 47ms on a real Windows box (30 runs, idle and
+            // again under two cold cargo builds, max 63ms), so 5s is already
+            // eighty times the slowest honest run and a machine that misses
+            // it is not one a bigger constant would have saved. The runner
+            // that failed on 2026-09-03 spent 100.42s on this case.
+            //
+            // Each rung abandons its own pipe-holder, which lives three
+            // times that rung's budget and then exits on its own.
+            const BUDGETS: [Duration; 3] = [
+                Duration::from_secs(5),
+                Duration::from_secs(20),
+                Duration::from_secs(80),
+            ];
 
-            let err = evaluate_js_flockfile(&path, HELD_PIPE_BUDGET).unwrap_err();
+            for (attempt, budget) in BUDGETS.iter().copied().enumerate() {
+                std::fs::write(&path, held_pipe_module(budget)).unwrap();
+                let err = evaluate_js_flockfile(&path, budget).unwrap_err();
+                let message = err.to_string();
 
-            assert_eq!(target_exit_code(&err), ExitCode::InvalidConfig);
-            let message = err.to_string();
-            assert!(
-                message.contains("left behind still holds the output"),
-                "got: {message}"
-            );
-            assert!(
-                !message.contains("killed"),
-                "node exited on its own, so nothing was killed: {message}"
-            );
+                // node never got as far as exiting, so there was nothing
+                // holding a pipe yet to say anything about. Give it more
+                // room. The last rung falls through instead, so a machine
+                // that cannot do it in 80s fails with the message it earned.
+                if message.contains("still running") && attempt + 1 < BUDGETS.len() {
+                    continue;
+                }
+
+                assert_eq!(target_exit_code(&err), ExitCode::InvalidConfig);
+                assert!(
+                    message.contains("left behind still holds the output"),
+                    "got: {message}"
+                );
+                assert!(
+                    !message.contains("killed"),
+                    "node exited on its own, so nothing was killed: {message}"
+                );
+                return;
+            }
         }
     }
 }
