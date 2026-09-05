@@ -34,6 +34,14 @@ shep-macros = { path = "crates/shep-macros", version = "0.2.4" }
 serde = { version = "1", default-features = false, features = ["derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
+# The read-modify-write behind `shep.toml` and `dogs.toml`: `shep-cli`'s
+# `ShepToml` and `shep-daemon`'s `dogs::set_dog_section` both edit the
+# document they parsed rather than rendering a map back out, so a comment or
+# a key order an operator chose survives. Adds zero crates: `toml` 0.8 above
+# already pulls `toml_edit` in as its own backing implementation.
+#
+# Floor 0.22.7: `DocumentMut` is that release's rename of the older `Document`.
+toml_edit = { version = "0.22.7", default-features = false, features = ["display", "parse"] }
 serde-saphyr = { version = "1", default-features = false, features = ["deserialize"] }
 # Transitive floor pins: -Z minimal-versions picks a version below what a
 # dependency's own code actually needs.

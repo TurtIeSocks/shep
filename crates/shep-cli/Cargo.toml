@@ -154,12 +154,8 @@ toml.workspace = true
 # `commands::shep_toml`'s `ShepToml`: the one writer of `$SHEP_HOME/shep.toml`,
 # edited through `toml_edit::DocumentMut` rather than a plain `toml::Table`
 # so an operator's comments, key order and formatting survive a
-# `shep enable`/`shep disable`. Not a workspace entry: this crate is its
-# only user. Adds zero crates: `toml` 0.8 already pulls in `toml_edit`
-# 0.22.27 as its backing implementation.
-#
-# Floor 0.22.7: `DocumentMut` is a 0.22.7 rename of the older `Document`.
-toml_edit = { version = "0.22.7", default-features = false, features = ["display", "parse"] }
+# `shep enable`/`shep disable`.
+toml_edit.workspace = true
 # `commands::shep_toml`'s write path: `shep.toml` is staged in a sibling temp
 # file at `0600` (via `Builder::permissions`), `fsync`ed and `rename`d over
 # the original, the same shape shep-core's `barks::write_ring` uses. Adds
