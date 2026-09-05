@@ -1,17 +1,13 @@
-//! `Client` request/reply routing, error surfacing and deadlines, driven
-//! against the hand-rolled daemon fakes in [`shep_client::testing`].
+//! `Client` request/reply routing, error surfacing and deadlines,
+//! driven against the hand-rolled daemon fakes in
+//! [`shep_client::testing`].
 //!
-//! An integration test rather than a `#[cfg(test)] mod tests` block inside
-//! `client.rs`, by preference rather than necessity: every assertion here
-//! reaches only for the published surface, and linking `shep-client` the way
-//! a real embedder does is the honest way to prove that. Nothing stops these
-//! from being unit tests — the fakes are a module of this very crate — so
-//! anything that genuinely needs a crate internal belongs back in `client.rs`
-//! rather than pushing a `pub(crate)` item public to reach it from here.
+//! An integration test rather than a unit test in `client.rs`. Every
+//! assertion reaches only the published surface, linking `shep-client`
+//! the way a real embedder does.
 //!
-//! Needs `--features test-support`; `Cargo.toml`'s `[[test]]` entry says so,
-//! and a bare `cargo test -p shep-client` skips this target rather than
-//! failing to build it.
+//! Needs `--features test-support`. A bare `cargo test -p shep-client`
+//! skips this target rather than failing to build it.
 
 use std::time::Duration;
 
@@ -27,8 +23,8 @@ use shep_core::protocol::{Request, Response, RpcErrorCode};
 async fn two_concurrent_requests_each_get_their_own_reply() {
     let dir = tempfile::tempdir().unwrap();
     let path = shep_client::testing::control_address(dir.path());
-    // Fake daemon replies to id 1 with Pong and id 2 with Flock(vec![]) — DELIBERATELY
-    // out of order (2 first) to prove routing is by id, not by arrival order.
+    // Replies out of order (id 2 first) to prove routing is by id, not
+    // arrival order.
     let (client, _served) = fake_client_out_of_order(&path).await;
     let (a, b) = tokio::join!(
         client.request(Request::Ping),
@@ -42,8 +38,8 @@ async fn two_concurrent_requests_each_get_their_own_reply() {
 async fn an_event_arriving_before_its_own_reply_does_not_break_the_request() {
     let dir = tempfile::tempdir().unwrap();
     let path = shep_client::testing::control_address(dir.path());
-    // Fake daemon sends BusEvent::Process{..} FIRST, then Reply{id:1}. This is the real
-    // supervisor's ordering, not a contrived one — see daemon_e2e.rs:161-174.
+    // Sends BusEvent::Process before Reply{id:1}: the real supervisor's
+    // ordering, not a contrived one.
     let (client, _served) = fake_client_event_then_reply(&path).await;
     assert!(matches!(
         client.request(Request::Ping).await.unwrap(),
@@ -75,11 +71,10 @@ async fn a_dropped_connection_fails_pending_requests_instead_of_hanging() {
     ));
 }
 
-/// Unlike the test above, the request here is genuinely in the actor's
-/// `pending` map when the connection dies — the fake daemon reads it (proving
-/// the write already succeeded) before dropping the connection, rather than
-/// dropping before any request is ever sent. This is the path `actor.rs`'s
-/// drain-on-close loop exists for.
+/// Unlike the test above, the request is already in the actor's
+/// `pending` map. The connection dies only after the fake daemon reads
+/// it, proving the write succeeded. Exercises `actor.rs`'s
+/// drain-on-close loop.
 #[tokio::test]
 async fn a_connection_dying_mid_request_fails_the_pending_request_instead_of_hanging() {
     let dir = tempfile::tempdir().unwrap();
@@ -106,9 +101,9 @@ async fn a_deadline_expires_client_side_when_the_daemon_never_answers() {
     assert_eq!(after, Duration::from_millis(250) + DEADLINE_GRACE);
 }
 
-/// A `kill` that polled the wrong path would wait out its whole teardown
-/// budget and report "still tearing down" against a daemon that shut down
-/// cleanly — and no other test here reads `socket()` at all.
+/// A `kill` polling the wrong path would wait out its teardown budget
+/// and report "still tearing down" against a daemon that already shut
+/// down cleanly.
 #[tokio::test]
 async fn a_client_remembers_the_path_it_connected_through() {
     let dir = tempfile::tempdir().unwrap();
@@ -117,9 +112,9 @@ async fn a_client_remembers_the_path_it_connected_through() {
     assert_eq!(client.socket(), path);
 }
 
-/// Nothing else here reads the envelope the client actually sent, so an
-/// implementation that always sends `deadline_ms: None` would pass every test
-/// above while silently inheriting the daemon's default for every verb.
+/// Nothing else here reads the envelope the client sent. An
+/// implementation that always sends `deadline_ms: None` would pass
+/// every test here. It would silently inherit the daemon's default.
 #[tokio::test]
 async fn every_request_carries_an_explicit_deadline_on_the_wire() {
     let dir = tempfile::tempdir().unwrap();
@@ -146,17 +141,13 @@ async fn every_request_carries_an_explicit_deadline_on_the_wire() {
     );
 }
 
-/// fails if a caller has to drain the envelope channel to keep getting
+/// Fails if a caller must drain the envelope channel to keep getting
 /// replies.
 ///
-/// `fake_client_answering` exists for a caller that sends several requests and
-/// reads the record of them afterwards, which is every test of a CLI verb that
-/// lists the flock and then acts on what it found. Nothing drains the channel
-/// while that exchange is in flight, so a bounded one of
-/// `SCRIPT_CHANNEL_CAPACITY` stops the fake at the ninth request: the send
-/// blocks, its reply is never written, and the caller waits for a deadline
-/// that has nothing behind it. Ten requests here against a capacity of eight,
-/// so a bounded channel hangs this test rather than failing it.
+/// `fake_client_answering` exists for a caller that sends several
+/// requests and reads the record afterwards. Ten requests here against
+/// `SCRIPT_CHANNEL_CAPACITY` of eight. An undrained bounded channel
+/// would hang this test rather than fail it.
 #[tokio::test]
 async fn a_run_of_requests_is_answered_without_the_receiver_being_read() {
     let dir = tempfile::tempdir().unwrap();

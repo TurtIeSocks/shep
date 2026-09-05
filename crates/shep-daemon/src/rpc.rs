@@ -1,19 +1,14 @@
 //! Portable RPC dispatch: verb routing, typed errors, per-call deadlines
 //!
-//! `dispatch` is the one function the connection layer (the unix-socket /
-//! named-pipe server in this crate's private `server` module) calls per
-//! request envelope. Everything here
-//! compiles and tests on every platform — no `cfg(unix)`, no sockets, no
-//! bytes on a wire. [`RpcContext`] bundles the daemon-wide handles a request
-//! handler may touch; `Outcome` tells the caller what to do next (reply,
-//! start forwarding bus events, or begin shutdown).
+//! `dispatch` is the one function the connection layer calls per request
+//! envelope. Everything here compiles and tests on every platform: no
+//! `cfg(unix)`, no sockets, no bytes on a wire. [`RpcContext`] bundles the
+//! daemon-wide handles a request handler may touch; `Outcome` tells the
+//! caller what to do next (reply, forward bus events, or begin shutdown).
 //!
-//! ## Deadlines
-//!
-//! Every envelope gets a `budget`: its own `deadline_ms` (clamped to
-//! `MAX_DEADLINE_MS` — a peer cannot pin a daemon task open forever), or
-//! `DEFAULT_DEADLINE_MS` if it sent none. `dispatch`'s own doc explains
-//! exactly what expiring a budget does and does not undo.
+//! Every envelope gets a `budget`: its own `deadline_ms`, clamped to
+//! `MAX_DEADLINE_MS` so a peer cannot pin a daemon task open, or
+//! `DEFAULT_DEADLINE_MS` when it sent none.
 
 use core::future::Future;
 use core::time::Duration;
@@ -41,19 +36,18 @@ use crate::supervisor::{Applied, ConnId, SupervisorError, SupervisorHandle};
 
 /// Deadline applied when a client sends none (spec §6: 5s default).
 pub(crate) const DEFAULT_DEADLINE_MS: u64 = 5_000;
-/// Ceiling on a client-supplied deadline — a peer cannot pin a daemon task open.
+/// Ceiling on a client-supplied deadline: a peer cannot pin a daemon task open.
 pub(crate) const MAX_DEADLINE_MS: u64 = 60_000;
 
-/// Everything a request handler may touch — one clone per connection.
+/// Everything a request handler may touch; one clone per connection.
 ///
 /// Every clone shares the same supervisor engine, event bus sender, flock
-/// registry, and shutdown signal; the connection layer builds one from the
+/// registry, and shutdown signal. The connection layer builds one from the
 /// daemon's shared state and hands it to `dispatch` once per envelope.
 ///
-/// The type is public because `tests/daemon_e2e.rs` holds one to drive
-/// [`Self::shutdown`] and [`Self::snapshot_now`] without going through the
-/// socket. Its fields are not: every one of them is filled in by `boot` and
-/// read by `dispatch`, both in this crate.
+/// Public because `tests/daemon_e2e.rs` holds one to drive [`Self::shutdown`]
+/// and [`Self::snapshot_now`] without going through the socket. Its fields
+/// are not.
 #[derive(Clone, Debug)]
 pub struct RpcContext {
     /// The supervisor engine this daemon is running.
@@ -62,16 +56,15 @@ pub struct RpcContext {
     /// connection layer hands to [`crate::bus::spawn_forwarder`] alongside a
     /// receiver off this sender.
     pub(crate) events: Bus,
-    /// The muster roll's in-memory app registry — `Start` records into it.
+    /// The muster roll's in-memory app registry; `Start` records into it.
     pub(crate) registry: FlockRegistry,
     /// Where [`Self::snapshot_now`] writes the muster roll.
     pub(crate) snapshot_path: PathBuf,
     /// Where `DogConfig` reads a dog's `[<name>]` section from: this home's
-    /// `dogs.toml`, not `shep.toml`. The key carries no prefix, and the
-    /// boot-time migration is what put it there.
+    /// `dogs.toml`, not `shep.toml`. The key carries no prefix.
     ///
-    /// Re-read per request rather than held as parsed config: that is what
-    /// makes `shep disable X && shep enable X` pick up an edited section
+    /// Re-read per request rather than held as parsed config, so `shep
+    /// disable X && shep enable X` picks up an edited section
     /// (`crate::dogs::dog_section`).
     pub(crate) dogs_config: PathBuf,
     /// This daemon's `$SHEP_HOME` layout, for assembling a dog's app config.
@@ -80,19 +73,16 @@ pub struct RpcContext {
     pub(crate) daemon_version: String,
     /// Which dogs this daemon has refused at the handshake, and how often.
     ///
-    /// Written by the connection layer's handshake — the one place that
-    /// knows a refusal happened — and read by it to decide whether a
-    /// refused dog earns its one restart from disk or has already had it
-    /// (the handover design's G8; [`crate::dogs::DogRefusals`]).
+    /// Written and read by the connection layer's handshake, to decide
+    /// whether a refused dog earns its one restart from disk or has already
+    /// had it ([`crate::dogs::DogRefusals`]).
     pub(crate) dog_refusals: crate::dogs::DogRefusals,
     /// What has connected to this daemon's socket, by peer pid.
     ///
-    /// Written by the connection layer — the one place that can see a
-    /// peer's credentials — and read by [`crate::dogs::record_silent_dog`],
-    /// which is the only thing that asks. It is what lets a dog that never
-    /// reached the socket be told apart from one that reached it and did
-    /// not name itself: two silences with opposite fixes, which this daemon
-    /// used to report as one.
+    /// Written by the connection layer, the one place that can see a peer's
+    /// credentials, and read by [`crate::dogs::record_silent_dog`]. It tells
+    /// a dog that never reached the socket apart from one that reached it and
+    /// did not name itself: two silences with opposite fixes.
     pub(crate) peer_contacts: crate::dogs::PeerContacts,
     /// This daemon's OS pid, echoed in the handshake.
     pub(crate) pid: u32,
@@ -118,27 +108,23 @@ pub struct SavedRoll {
 impl RpcContext {
     /// Asks the daemon to begin graceful shutdown.
     ///
-    /// Only flips the watch signal — the connection/server layer is what
-    /// actually runs the kill ladder and closes listeners once it observes
-    /// this go `true`. `dispatch` never calls this itself: `KillDaemon`
-    /// only reports the intent via `Outcome::Shutdown`, leaving the caller
-    /// to trigger it after the reply is on the wire.
+    /// Only flips the watch signal; the connection layer runs the kill
+    /// ladder and closes listeners once it observes this go `true`.
+    /// `dispatch` never calls it: `KillDaemon` reports the intent through
+    /// `Outcome::Shutdown`, so the caller triggers it after the reply is on
+    /// the wire.
     pub fn shutdown(&self) {
         let _ = self.shutdown.send(true);
     }
 
     /// Announces that these dogs' `dogs.toml` sections changed.
     ///
-    /// The daemon's own half of the dog-config contract, and the ONE place
-    /// a `config.dog.<name>` frame comes from. The publisher has to be
-    /// inside the daemon process, because that is where the bus is: the
-    /// CLI's other two writers of `dogs.toml` run in an operator's
-    /// short-lived process and say nothing (see their own call sites for
-    /// which and why).
+    /// The one place a `config.dog.<name>` frame comes from: the publisher
+    /// has to be inside the daemon process, because that is where the bus
+    /// is. The CLI's other two writers of `dogs.toml` say nothing.
     ///
     /// Public because the caller is `shep`'s own boot, which runs the
-    /// migration before this daemon exists and hands the names over once
-    /// it does.
+    /// migration before this daemon exists.
     pub fn announce_dog_config(&self, dogs: &[String]) {
         crate::bus::publish_dog_config_changed(&self.events, dogs);
     }
@@ -150,7 +136,7 @@ impl RpcContext {
     /// final roll.
     ///
     /// # Errors
-    /// - [`SnapshotError`] — as `write_atomic`.
+    /// - [`SnapshotError`] as `write_atomic` reports it.
     pub async fn save_roll_now(&self) -> Result<Option<SavedRoll>, SnapshotError> {
         let Ok(infos) = self.supervisor.list_checked().await else {
             return Ok(None);
@@ -168,7 +154,7 @@ impl RpcContext {
     /// Writes the muster roll now, discarding what it recorded.
     ///
     /// # Errors
-    /// - [`SnapshotError`] — as `write_atomic`.
+    /// - [`SnapshotError`] as `write_atomic` reports it.
     pub async fn snapshot_now(&self) -> Result<(), SnapshotError> {
         self.save_roll_now().await.map(|_| ())
     }
@@ -205,16 +191,12 @@ pub(crate) fn budget(deadline_ms: Option<u64>) -> Duration {
 /// Dispatches one request envelope against `ctx`, returning what the
 /// connection layer must do with the result.
 ///
-/// The deadline [`budget`] computes bounds *the reply*, not the actor's
-/// work: dropping the work future (via `with_deadline`'s timeout) only
-/// stops the daemon waiting on the supervisor — the command already handed
-/// to a sheep-owning task keeps running to completion. So a
-/// `DeadlineExceeded` reply to `Start` means "no answer within your
-/// budget," not "nothing happened"; a client that retries must reconcile
-/// with `ListFlock` rather than assume its request never landed. Anything
-/// stronger would need per-command cancellation inside the actor, which the
-/// supervisor's locked `Command` surface (Phase 2a) deliberately does not
-/// have.
+/// The deadline [`budget`] computes bounds the reply, not the actor's work:
+/// dropping the work future only stops the daemon waiting on the supervisor,
+/// and a command already handed to a sheep-owning task runs to completion.
+/// So a `DeadlineExceeded` reply to `Start` means no answer within the
+/// budget, not that nothing happened; a client that retries must reconcile
+/// with `ListFlock`.
 pub(crate) async fn dispatch(envelope: Envelope, conn: ConnId, ctx: &RpcContext) -> Outcome {
     let id = envelope.id;
     with_deadline(
@@ -225,8 +207,8 @@ pub(crate) async fn dispatch(envelope: Envelope, conn: ConnId, ctx: &RpcContext)
     .await
 }
 
-// `+ Send`: this future is awaited inside the per-connection tokio::spawn, so
-// the bound is stated rather than inferred (Global Constraints).
+// `+ Send`: awaited inside the per-connection `tokio::spawn`, so the bound is
+// stated rather than inferred.
 async fn with_deadline<F: Future<Output = Outcome> + Send>(
     id: u64,
     budget: Duration,
@@ -252,9 +234,8 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
     let reply = |result| Outcome::Reply(Reply { id, result });
     match request {
         Request::Ping => reply(Ok(Response::Pong)),
-        // One of the two verbs that pays for a live reading — see
-        // [`with_live_stats`] for what that costs and why every lifecycle
-        // verb below goes without.
+        // One of the two verbs that pays for a live reading; `with_live_stats`
+        // says why every lifecycle verb below goes without.
         Request::ListFlock => match ctx.supervisor.list_checked().await {
             Ok(infos) => reply(Ok(Response::Flock(with_dog_contact(
                 &ctx.dog_refusals,
@@ -263,21 +244,16 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
             Err(err) => reply(Err(rpc_error(&err))),
         },
         // The other one. Sampled after the selector has narrowed the
-        // listing, not before: the walk itself costs the same either way,
-        // but the join below then runs over the matched rows alone.
+        // listing, so the join below runs over the matched rows alone.
         Request::Describe { selector } => match selector_of(selector) {
             Err(err) => reply(Err(err)),
             Ok(selector) => match ctx.supervisor.list_checked().await {
                 Err(err) => reply(Err(rpc_error(&err))),
                 Ok(infos) => {
-                    // The same rule `Actor::matching_ids` applies to every
-                    // lifecycle verb, applied here because this filter is
-                    // over `ProcessInfo`s and cannot share that code: a dog
-                    // is a process an operator installed rather than a
-                    // member of the flock, so a sweep passes it by while
-                    // `shep describe metrics` still reaches it. `ListFlock`
-                    // is deliberately NOT filtered — it is the one registry
-                    // both the flock table and the dogs table render from.
+                    // The rule `Actor::matching_ids` applies to every
+                    // lifecycle verb, repeated here because this filter is
+                    // over `ProcessInfo`s: a dog is not a flock member, so a
+                    // sweep passes it by and an exact selector reaches it.
                     let exact = selector.is_exact();
                     let hits: Vec<_> = infos
                         .into_iter()
@@ -313,14 +289,9 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
             }
         },
         // The membership half of `Start` with none of the spawning, and the
-        // same untrusted-peer rule: re-normalize before anything is
-        // registered.
-        //
-        // Recorded in the registry exactly as `Start` is. An added app is a
-        // flock member that happens to be stopped, so a `shep save` after a
-        // `shep add` has to write it -- without this the roll would forget an
-        // app that was registered and never started, which is the whole
-        // sequence this request exists to make possible.
+        // same untrusted-peer rule. Recorded in the registry as `Start` is:
+        // an added app is a flock member that happens to be stopped, so a
+        // `shep save` after a `shep add` has to write it.
         Request::Add { apps } => match normalize_all(apps) {
             Err(err) => reply(Err(RpcError {
                 code: RpcErrorCode::InvalidConfig,
@@ -336,14 +307,9 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
             }
         },
         // Re-normalized for the reason `Start` is, plus one of its own: an
-        // unnormalized config would report every default it did not spell
-        // out as a difference from the normalized copy the flock stores, so
-        // a Flockfile that changed nothing would be reported as drifting in
-        // a dozen fields.
-        //
-        // Nothing is recorded in the registry: this answers a question and
-        // registers nothing, so a `ConfigDrift` must not be able to change
-        // what the next `shep save` writes.
+        // unnormalized config would report every default it did not spell out
+        // as a difference. Nothing is recorded, since this answers a question
+        // and must not change what the next `shep save` writes.
         Request::ConfigDrift { apps } => match normalize_all(apps) {
             Err(err) => reply(Err(RpcError {
                 code: RpcErrorCode::InvalidConfig,
@@ -367,12 +333,10 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
             )
             .await
         }
-        // `Reloading` names an acceptance, and the deadline machinery above
-        // is why it has to. The supervisor answers this one as soon as the
-        // reload is taken, before the first replacement is spawned, so the
-        // reply lands well inside any budget; a reply that waited for the
-        // swaps would routinely outlive `MAX_DEADLINE_MS` and be abandoned by
-        // `with_deadline` while the reload it asked for went on running.
+        // `Reloading` names an acceptance: the supervisor answers as soon as
+        // the reload is taken, before the first replacement is spawned. A
+        // reply that waited for the swaps would routinely outlive
+        // `MAX_DEADLINE_MS` and be abandoned by `with_deadline`.
         Request::Reload { selector } => {
             selector_call(
                 id,
@@ -402,11 +366,9 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
         Request::Signal { selector, signal } => signal_request(id, selector, signal, ctx).await,
         Request::SendLine { selector, line } => {
             // Refused here, not silently split by the writer: a line
-            // carrying a newline would be delivered as two commands where
-            // the operator typed one, and to a REPL the second one is an
-            // instruction nobody sent. `\r` too — a line ending in CRLF
-            // reaches a shell as a command with a stray carriage return in
-            // it.
+            // carrying a newline would be delivered as two commands where the
+            // operator typed one. `\r` too, since CRLF reaches a shell as a
+            // command with a stray carriage return in it.
             if line.contains(['\n', '\r']) {
                 return reply(Err(RpcError {
                     code: RpcErrorCode::InvalidConfig,
@@ -433,25 +395,19 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
         },
         Request::Scale { name, count } => match ctx.supervisor.scale(&name, count).await {
             Ok(scaled) => {
-                // Recorded UNCONDITIONALLY, and this line is the whole reason
-                // `scale` hands back the config at all: without it `shep stock
-                // web 4` followed by `shep save` writes a roll saying
-                // `instances = 2`, and the scale is silently undone by the next
-                // reboot — a bug that cannot be seen until the machine comes
-                // back. Unconditionally, because a partial scale-up leaves real
-                // instances running that the roll has to know about too: this
-                // recording is about what the daemon DID, while the reply below
-                // is about whether the operator got what they asked for.
+                // Recorded unconditionally: without it `shep stock web 4`
+                // then `shep save` writes `instances = 2` and the next reboot
+                // undoes the scale. Unconditionally, since a partial scale-up
+                // leaves real instances the roll has to know about too.
                 let achieved = scaled.achieved();
                 let requested = scaled.requested;
                 ctx.registry.record(&[scaled.app]);
                 match scaled.shortfall {
                     None => reply(Ok(Response::Scaled(scaled.instances))),
-                    // Non-zero exit, on purpose: the operator asked for four
-                    // and has three. The sentence names both numbers because
-                    // an operator who reads a bare spawn failure does not know
-                    // the other three came up, and so cannot tell a scale that
-                    // achieved nothing from one that nearly finished.
+                    // Non-zero exit: the operator asked for four and has
+                    // three. The sentence names both numbers, so a reader can
+                    // tell a scale that achieved nothing from one that nearly
+                    // finished.
                     Some(message) => reply(Err(RpcError {
                         code: RpcErrorCode::SpawnFailed,
                         message: format!(
@@ -465,12 +421,9 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
             Err(err) => reply(Err(rpc_error(&err))),
         },
         // Scoped to `conn`, which is what makes a smit ephemeral: the
-        // connection layer forgets this one's marks in its own tail, and that
-        // tail is the single cleanup site the whole design turns on.
-        //
-        // `smit` arrives already validated — `Smit`'s hand-written
-        // `Deserialize` refused a control character before this arm was
-        // reached — so the only refusal left here is a name nothing holds.
+        // connection layer forgets this one's marks in its own tail. `smit`
+        // arrives already validated by `Smit`'s hand-written `Deserialize`,
+        // so the only refusal left here is a name nothing holds.
         Request::SetSmit { sheep, smit } => {
             match ctx.supervisor.set_smit(conn, &sheep, smit).await {
                 Ok(infos) => reply(Ok(Response::SmitPainted(infos))),
@@ -479,9 +432,8 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
         }
         Request::SaveRoll => match ctx.save_roll_now().await {
             Ok(Some(saved)) => reply(Ok(Response::RollSaved {
-                // Lossy on purpose, matching `to_info`'s treatment of log
-                // paths: a non-UTF-8 roll path must degrade one field, not
-                // abort the whole reply.
+                // Lossy, as `to_info` treats log paths: a non-UTF-8 roll
+                // path degrades one field rather than the whole reply.
                 path: saved.path.to_string_lossy().into_owned(),
                 apps: saved.apps,
             })),
@@ -496,8 +448,8 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                 daemon_version: None,
             })),
         },
-        // The same restore `boot` runs, called the same way — see
-        // `crate::snapshot::muster`, which is the whole of the rule.
+        // The same restore `boot` runs, called the same way
+        // (`crate::snapshot::muster`).
         Request::Muster => {
             match crate::snapshot::muster(&ctx.snapshot_path, &ctx.registry, &ctx.supervisor).await
             {
@@ -509,7 +461,7 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                 Ok(names) => match ctx.supervisor.list_checked().await {
                     Err(err) => reply(Err(rpc_error(&err))),
                     // Every sheep of every app the roll restored, not only
-                    // the ones this call spawned — see `Response::Mustered`.
+                    // the ones this call spawned (`Response::Mustered`).
                     Ok(infos) => reply(Ok(Response::Mustered(
                         infos
                             .into_iter()
@@ -519,13 +471,10 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                 },
             }
         }
-        // Re-read per request, never cached. `shep disable X && shep enable
-        // X` reloads a dog's configuration by bouncing it, and a copy taken
-        // at boot would answer that with the section as it was. It is no
-        // longer the only way: a dog subscribed to `config.dog.<name>` asks
-        // again without going down (`bus::publish_dog_config_changed`), and
-        // that path is this same arm answered a second time, which only a
-        // fresh read makes worth anything.
+        // Re-read per request, never cached: `shep disable X && shep enable
+        // X` bounces a dog to reload its configuration, and a copy taken at
+        // boot would answer with the section as it was. A dog subscribed to
+        // `config.dog.<name>` reaches this same arm without going down.
         Request::DogConfig { name } => match crate::dogs::dog_section(&ctx.dogs_config, &name) {
             Ok(toml) => reply(Ok(Response::DogSection { toml: toml.into() })),
             Err(err) => reply(Err(RpcError {
@@ -543,21 +492,15 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                     daemon_version: None,
                 })),
                 Ok(app) => {
-                    // Read before `start_dog` takes the app. This arm and
-                    // `dogs::spawn_enabled_dogs` are the two places that know
-                    // which file a dog's spawn resolved to, and an operator
+                    // Read before `start_dog` takes the app. An operator
                     // reading the dog's log during an upgrade is usually
-                    // asking exactly that.
+                    // asking which file the spawn resolved to.
                     let script = app.config().script.clone();
                     match ctx.supervisor.start_dog(app, spec.source).await {
-                        // `start_dog` is idempotent by NAME, so what comes back
-                        // is whatever already holds that name. An unmarked
-                        // entry means a sheep holds it: no dog was started, and
-                        // none can be while the name is taken. Answering with
-                        // the sheep would report a success that never happened,
-                        // so it is refused instead — and there is nothing to
-                        // undo, because the supervisor returns the squatter
-                        // without spawning anything.
+                        // `start_dog` is idempotent by name, so what comes
+                        // back is whatever already holds it. An unmarked entry
+                        // means a sheep holds it: nothing was spawned, so the
+                        // refusal has nothing to undo.
                         Ok(info) if info.dog.is_none() => reply(Err(RpcError {
                             code: RpcErrorCode::InvalidConfig,
                             message: format!(
@@ -569,10 +512,8 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                         Ok(info) => {
                             // Wording is about the binary this shepherd
                             // resolved, not about a spawn having happened:
-                            // `start_dog` is idempotent by name, so this may be
-                            // a dog that was already running. `spawn_dog_watch`
-                            // narrates the spawns themselves, off the bus, where
-                            // that distinction is not a guess.
+                            // `start_dog` is idempotent by name, so this may
+                            // be a dog that was already running.
                             crate::dogs::narrate(
                                 &ctx.events,
                                 &info,
@@ -588,11 +529,9 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                 }
             }
         }
-        // Through `delete` with an exact `Name` selector, which is the whole
-        // reason an exact selector still reaches a dog: disabling one reuses
-        // the stop-then-deregister path every sheep already takes — kill
-        // ladder, graceful timeout, deregistration — rather than opening a
-        // second way to end a supervised process.
+        // Through `delete` with an exact `Name` selector: disabling a dog
+        // reuses the stop-then-deregister path every sheep takes rather than
+        // opening a second way to end a supervised process.
         Request::DisableDog { name } => {
             match ctx.supervisor.delete(ProcessSelector::Name(name)).await {
                 Ok(ids) => reply(Ok(Response::Deleted(ids))),
@@ -624,9 +563,8 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
             id,
             result: Ok(Response::ShuttingDown),
         }),
-        // The acting half of `ConfigDrift` above, and the one arm in this
-        // function that changes a running flock's config without replacing
-        // anything running.
+        // The acting half of `ConfigDrift` above, and the one arm here that
+        // changes a running flock's config without replacing anything.
         Request::ApplyConfig { apps, reset } => match duplicate_name(&apps) {
             Some(name) => reply(Err(RpcError {
                 code: RpcErrorCode::InvalidConfig,
@@ -635,13 +573,10 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
             })),
             None => match ctx.supervisor.apply_config(apps, reset).await {
                 Ok(applied) => {
-                    // Recorded unconditionally, on the same reasoning the
-                    // `Scale` arm above gives: an apply that reached the
-                    // stored spec must reach the roll too, or a reboot
-                    // brings up config that was never running. An app whose
-                    // merge produced no honest config carries `None` and is
-                    // skipped rather than invented, which is the same call
-                    // `Applied::app`'s own doc argues at the other end.
+                    // Recorded unconditionally, as the `Scale` arm above is:
+                    // an apply that reached the stored spec must reach the
+                    // roll too. An app whose merge produced no honest config
+                    // carries `None` and is skipped rather than invented.
                     let recorded: Vec<ResolvedApp> =
                         applied.iter().filter_map(|a| a.app.clone()).collect();
                     ctx.registry.record(&recorded);
@@ -664,20 +599,16 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
 
 /// The first name two entries of an `ApplyConfig` share, if any.
 ///
-/// Peer input is untrusted, exactly as `Start`'s `normalize_all` treats it,
-/// and this is the one malformed shape a merge cannot survive quietly.
-/// `handle_apply_config` reads the override store ONCE for the whole request
+/// `handle_apply_config` reads the override store once for the whole request
 /// and writes it once at the end, so a second entry of the same name merges
-/// against the store as the FIRST entry found it rather than against the
-/// record the first entry just made: the first entry's record is overwritten
-/// and nothing anywhere says so.
+/// against the store as the first entry found it: the first entry's record is
+/// overwritten and nothing says so.
 ///
-/// Refused whole rather than per app. A document naming one app twice is
-/// malformed rather than partly wrong, and there is no reading of it under
-/// which one of the two entries is the one the operator meant.
+/// Refused whole rather than per app, since a document naming one app twice
+/// is malformed rather than partly wrong.
 ///
 /// Linear in a `BTreeSet`, matching `normalize_all`: a request carries the
-/// apps one Flockfile declared, which is tens of entries.
+/// apps one Flockfile declared.
 fn duplicate_name(apps: &[DeclaredApp]) -> Option<String> {
     let mut seen = BTreeSet::new();
     apps.iter()
@@ -688,9 +619,8 @@ fn duplicate_name(apps: &[DeclaredApp]) -> Option<String> {
 /// The wire form of one app's load, with the merged config dropped.
 ///
 /// `Applied` carries the whole merged [`ResolvedApp`] because `rpc.rs` hands
-/// it to the registry; [`SheepApplied`] does not, and that asymmetry is the
-/// point rather than an oversight. A client has no use for the config, and
-/// `env` is in it (IR-41), so the conversion is where the config stops.
+/// it to the registry; [`SheepApplied`] does not. A client has no use for the
+/// config, and `env` is in it, so the conversion is where the config stops.
 impl From<Applied> for SheepApplied {
     fn from(applied: Applied) -> Self {
         Self::new(
@@ -702,49 +632,18 @@ impl From<Applied> for SheepApplied {
     }
 }
 
-/// The dogs this daemon has given up on, and the dogs it is still waiting
-/// to hear from — the handover design's G13, as a reading rather than a
-/// prediction.
+/// The dogs this daemon has given up on, and the dogs it is still waiting to
+/// hear from.
 ///
-/// **Stale** is [`DogRefusals::stale`](crate::dogs::DogRefusals::stale):
-/// refused, restarted from the binary on disk, refused again. It is the
-/// only thing here a caller may report, and it is a fact about handshakes
-/// this daemon performed rather than about a version anybody recorded.
-/// G9's point, which task 2 measured: two dog builds differing only in the
-/// protocol they speak report the same crate version, so a version cannot
-/// answer this question and a handshake can.
+/// Stale is [`DogRefusals::stale`](crate::dogs::DogRefusals::stale): refused,
+/// restarted from the binary on disk, refused again. A version cannot answer
+/// it, since two dog builds differing only in protocol report the same one.
 ///
-/// **Pending** is what stops a caller reporting too early, and it has two
-/// sources because a dog can be unheard-from in two ways. A dog refused
-/// ONCE is mid-restart, so its verdict has been asked for and has not
-/// arrived. A dog this daemon supervises that has never handshook has not
-/// been asked yet — a carried dog whose connection died with the
-/// predecessor's image is exactly that, for the whole gap between the exec
-/// and its reconnect.
-///
-/// **Why the supervisor's own rows are a sound roster.** A dog is
-/// registered before this daemon accepts anything: `boot` restores the
-/// flock, runs `spawn_enabled_dogs`, and only then hands the listener to
-/// `serve`. So a caller that can ask this question is talking to a daemon
-/// that already knows which dogs it has, and there is no window where an
-/// empty roster reads as "every dog has answered".
-///
-/// Only a dog with a PROCESS counts. A dog that has errored out of its
-/// restart budget is not going to handshake, and one parked in a backoff
-/// cannot until it is respawned — waiting on either would make an operator
-/// pay a whole timeout for a dog that is already broken in a way every
-/// other listing reports. Nothing is lost by leaving them out: a dog whose
-/// restart this daemon ASKED for is in `restarting` above whatever the
-/// supervisor's row says about it, and a carried dog that has not dialled
-/// back yet is `Online` — its process never died, only its socket did.
-///
-/// **A pure read, and it must stay one.** The set below is also what
-/// [`crate::dogs::spawn_silent_dog_watch`] eventually acts on, and it would
-/// be tempting to drive that ladder from here instead of from a clock. It
-/// would also be wrong: `shep daemon reload` POLLS this question every 50ms
-/// while it waits, so three asks would walk a merely slow dog from restart
-/// to stale inside a second. Giving up on a dog is a claim about elapsed
-/// time, never about how often somebody asked.
+/// Pending has two sources: a dog refused once is mid-restart, and a
+/// supervised dog that has never handshaken has not been asked yet, which is
+/// what a carried dog is between the exec and its reconnect. Only a dog with
+/// a process counts. `shep daemon reload` polls this every 50ms, so the
+/// silent-dog ladder must stay on a clock rather than be driven from here.
 async fn dog_staleness(ctx: &RpcContext) -> (Vec<String>, Vec<String>) {
     let stale = ctx.dog_refusals.stale();
     let mut pending = ctx.dog_refusals.restarting();
@@ -761,14 +660,12 @@ async fn dog_staleness(ctx: &RpcContext) -> (Vec<String>, Vec<String>) {
 /// Why this shepherd cannot hand its flock to a successor in place, or
 /// `None` when it can.
 ///
-/// The sentence is rendered here rather than on the wire as a structured
-/// reason, for the reason [`Response::HandoverFitness`] gives: the set of
-/// things a handover cannot yet carry is exactly the set of things that
-/// phase has not built, and the client does nothing with it but print it.
+/// The sentence is rendered here rather than as a structured reason on the
+/// wire, for the reason [`Response::HandoverFitness`] gives: the client does
+/// nothing with it but print it.
 ///
-/// An engine that has stopped is a refusal too, not an error. The caller
-/// asked whether to signal a shepherd, and one whose actor is gone must be
-/// answered no.
+/// An engine that has stopped is a refusal too, not an error: the caller
+/// asked whether to signal a shepherd.
 #[cfg(unix)]
 async fn handover_refusal(ctx: &RpcContext) -> Option<String> {
     match ctx.supervisor.handover_fitness().await {
@@ -783,10 +680,8 @@ async fn handover_refusal(ctx: &RpcContext) -> Option<String> {
 /// Windows has no `execve`, so there is no image for a successor to become
 /// and every flock is refused.
 ///
-/// A refusal rather than an unimplemented request, because the two mean
-/// different things to the caller: this one is answered, and the answer is
-/// what sends `shep daemon reload` to the stop-and-start arm that is the
-/// permanent Windows answer (spec H5).
+/// A refusal rather than an unimplemented request: this one is answered, and
+/// the answer sends `shep daemon reload` to the stop-and-start arm.
 #[cfg(windows)]
 #[expect(
     clippy::unused_async,
@@ -802,20 +697,14 @@ async fn handover_refusal(_ctx: &RpcContext) -> Option<String> {
 
 /// Fills in each running sheep's live CPU and memory.
 ///
-/// The sample is taken here rather than inside the supervisor for two
-/// reasons that point the same way: the actor must never block, and the
-/// reading is a syscall walk over the host's whole process table, so it
-/// runs on a blocking-pool thread and not on a runtime worker.
+/// Sampled here rather than inside the supervisor: the actor must never
+/// block, and the reading is a syscall walk over the host's whole process
+/// table, so it runs on a blocking-pool thread.
 ///
 /// Joined by pid, not by id: [`StatsState`] keys on the root pid it was armed
-/// against, which is the same number [`ProcessInfo::pid`] carries, and a sheep
-/// with no pid is not running and has nothing to report.
-///
-/// Only `ListFlock` and `Describe` call this. `Started`/`Stopped`/
-/// `Restarted`/`Reloading`/`Reopened`/`Flushed` all answer with
-/// [`ProcessInfo`] too, and none of them is a place an operator reads
-/// resource usage — paying that walk on every `stop` would be a cost for
-/// nobody.
+/// against, which is the number [`ProcessInfo::pid`] carries. Only `ListFlock`
+/// and `Describe` call this; the lifecycle verbs answer with [`ProcessInfo`]
+/// too, but none of them is where an operator reads resource usage.
 async fn with_live_stats(stats: &Arc<StatsState>, mut infos: Vec<ProcessInfo>) -> Vec<ProcessInfo> {
     let stats = Arc::clone(stats);
     let Ok(sample) = tokio::task::spawn_blocking(move || stats.sample_now()).await else {
@@ -836,41 +725,14 @@ async fn with_live_stats(stats: &Arc<StatsState>, mut infos: Vec<ProcessInfo>) -
 /// supervisor does not hold: whether it has ever answered this shepherd, and
 /// whether this shepherd has given up on it.
 ///
-/// The supervisor knows what a PROCESS is doing; whether a dog has ever
-/// spoken to this shepherd is connection state, and it lives in
-/// [`DogRefusals`](crate::dogs::DogRefusals) on the RPC context. So this is
-/// joined here for the same structural reason `with_live_stats` is, minus
-/// its cost: two map lookups per row under one lock, and no syscall at all.
+/// Connection state lives in [`DogRefusals`](crate::dogs::DogRefusals) on the
+/// RPC context, so it is joined here as `with_live_stats` is: two map lookups
+/// per row, and `stale()` called once for the whole listing. Both fields,
+/// because a dog spawned a moment ago and one this shepherd has stopped
+/// restarting are both `handshook: Some(false)` with a live process.
 ///
-/// **Why both, when `handshook` alone used to do.** They are not the same
-/// question and a listing that carried only the first could not tell two
-/// opposite situations apart: a dog spawned a moment ago that has not dialled
-/// back yet, and a dog this shepherd restarted, watched stay silent, and
-/// permanently stopped restarting. Both are `handshook: Some(false)` with a
-/// live process. The give-up was a latch inside
-/// [`DogRefusals`](crate::dogs::DogRefusals) that nothing on the wire could
-/// see, so every listing rendered the incident and the ordinary case as one
-/// word.
-///
-/// [`DogRefusals::stale`](crate::dogs::DogRefusals::stale) is called ONCE for
-/// the whole listing rather than per row, which is what keeps this to one
-/// lock acquisition per field instead of one per dog. The set it returns is
-/// small by construction — it holds only dogs this shepherd has given up on,
-/// and a flock with more than a handful of those has a bigger problem than a
-/// linear scan.
-///
-/// **Applied to `ListFlock` and `Describe` and to nothing else**, which is
-/// the same pair `with_live_stats` covers and not a coincidence. Those are
-/// the two verbs an operator reads a listing FROM. Every other reply
-/// carrying a `ProcessInfo` is a lifecycle answer -- `start`, `restart`,
-/// `reload` -- and a dog has not had a chance to dial back by the time one
-/// of those returns, so reporting the silence there would say a dog was
-/// silent for having only just been asked to start.
-///
-/// A sheep is skipped rather than set to `Some(false)`: it has no handshake
-/// and no version relationship with this shepherd at all, so `None` is the
-/// honest answer and it is what keeps every sheep row rendering exactly as
-/// it did before these fields existed.
+/// Applied to `ListFlock` and `Describe` alone. A sheep is skipped rather
+/// than set to `Some(false)`, having no handshake with this shepherd at all.
 fn with_dog_contact(
     refusals: &crate::dogs::DogRefusals,
     mut infos: Vec<ProcessInfo>,
@@ -887,14 +749,13 @@ fn with_dog_contact(
 
 /// Fills each row's `lambs` from a fresh walk of the process table.
 ///
-/// Applied to `Describe` and to nothing else. `ListFlock` deliberately does
-/// not walk: the walk is a second pass over every process on the machine,
-/// and a flock listing is the thing an operator leaves running in a loop —
-/// while a `describe` is one sheep, once, on purpose.
+/// Applied to `Describe` and to nothing else: the walk is a second pass over
+/// every process on the machine, and a flock listing is the thing an operator
+/// leaves running in a loop.
 ///
-/// A row with no pid is left `None` rather than set to `Some(vec![])`: a
-/// sheep that is not running has no tree to walk, which is the "not walked"
-/// case the field's own doc distinguishes from "walked and empty".
+/// A row with no pid is left `None` rather than `Some(vec![])`, which is the
+/// "not walked" case the field's own doc distinguishes from "walked and
+/// empty".
 async fn with_lambs(stats: &Arc<StatsState>, mut infos: Vec<ProcessInfo>) -> Vec<ProcessInfo> {
     if infos.iter().all(|info| info.pid.is_none()) {
         // Nothing to walk for: skip the table refresh entirely rather than
@@ -904,9 +765,8 @@ async fn with_lambs(stats: &Arc<StatsState>, mut infos: Vec<ProcessInfo>) -> Vec
     let stats = Arc::clone(stats);
     let pids: Vec<u32> = infos.iter().filter_map(|info| info.pid).collect();
     let Ok(walked) = tokio::task::spawn_blocking(move || {
-        // ONE index for the whole reply — `describe all` on a large flock
-        // walks the machine's process table once, not once per row. This is
-        // the split `LambIndex`'s own doc argues for.
+        // One index for the whole reply: `describe all` walks the machine's
+        // process table once, not once per row.
         let index = stats.lamb_index();
         pids.into_iter()
             .map(|pid| (pid, stats.lambs_of(&index, pid)))
@@ -915,8 +775,7 @@ async fn with_lambs(stats: &Arc<StatsState>, mut infos: Vec<ProcessInfo>) -> Vec
     .await
     else {
         // The blocking pool is gone or the task panicked: describe the sheep
-        // without their trees rather than fail the request over a
-        // decoration — exactly what `with_live_stats` does one function up.
+        // without their trees rather than fail the request over a decoration.
         return infos;
     };
     for info in &mut infos {
@@ -935,63 +794,36 @@ fn rpc_error(err: &SupervisorError) -> RpcError {
             message: msg.clone(),
             daemon_version: None,
         },
-        // The same code as `SpawnFailed` above, on the rule this function
-        // already applies twice below: `RpcErrorCode` is versioned, a client
-        // predating a new code cannot decode the reply at all, and that costs
-        // the operator the message as well as the code. "Could not start it",
-        // and exit 7, is true of a batch refused before it was registered.
-        //
-        // The bare payload rather than `err.to_string()`, unlike the two
-        // `Internal` groups below: those share a code with something else and
-        // need `Display` to tell them apart, while this message already opens
-        // with "nothing was registered" and says everything the prefix would.
+        // The same code as `SpawnFailed`: `RpcErrorCode` is versioned, and a
+        // client predating a new code cannot decode the reply at all. The
+        // bare payload rather than `err.to_string()`, since this message
+        // already opens with "nothing was registered".
         SupervisorError::CannotStart(msg) => RpcError {
             code: RpcErrorCode::SpawnFailed,
             message: msg.clone(),
             daemon_version: None,
         },
-        // `Internal` — an "unexpected daemon-side failure", which a log path
-        // the daemon can no longer open, or can no longer empty, both are.
-        // No code of its own: the wire enum is versioned, and a client that
-        // predates a new code cannot decode the reply at all, which would
-        // cost the operator the message as well. The message names every
-        // path that failed either way, and `err.to_string()` rather than the
-        // bare payload so the reader is told which of the two it is —
-        // `SupervisorError`'s `Display` is the only thing that still
-        // distinguishes them once they share a code.
+        // `Internal`, an unexpected daemon-side failure, and no code of its
+        // own since a client predating a new one could not decode the reply.
+        // `err.to_string()` rather than the bare payload: `Display` is the
+        // only thing distinguishing the two once they share a code.
         SupervisorError::ReopenFailed(_) | SupervisorError::FlushFailed(_) => RpcError {
             code: RpcErrorCode::Internal,
             message: err.to_string(),
             daemon_version: None,
         },
-        // `Internal` under protest, and the wire verb should revisit it
-        // rather than inherit it: an app already being reloaded is a CONFLICT
-        // the caller can act on — wait, or reload something else — and not an
-        // unexpected daemon-side failure at all. A code of its own is the
-        // right answer and is a wire change, not a mapping change:
-        // `RpcErrorCode` is versioned, `RpcErrorCode::ALL` and shep-cli's
-        // exit-code mapping both grow with it, and a client predating a new
-        // code cannot decode the reply. Until that is deliberate, a less
-        // precise code carrying the message beats a refusal an operator
-        // cannot read — `Display` names the app, which is the part that says
-        // what to do about it.
+        // `Internal` under protest: an app already being reloaded is a
+        // conflict the caller can act on, and the wire has no code for one.
+        // `Display` names the app, which is the part that says what to do.
         SupervisorError::ReloadInFlight(_) => RpcError {
             code: RpcErrorCode::Internal,
             message: err.to_string(),
             daemon_version: None,
         },
-        // Every `InvalidScale` is something the caller asked for that it can
-        // ask differently — a count of `0`, a dog, an app whose earlier scale
-        // is still shutting instances down, or (unreachably, through this
-        // path) a rescaled config `normalize` itself refused.
-        //
-        // The departures shape is the one exception to that reading, and it
-        // is why this mapping is no longer described as needing no
-        // revisiting: "wait and ask again" is a CONFLICT, the same thing
-        // `ReloadInFlight` above is. Both belong under a conflict code the
-        // wire does not have yet, and `InvalidConfig` carrying the message is
-        // the better of the two codes that exist — see
-        // `SupervisorError::InvalidScale`'s own doc for the argument.
+        // Every `InvalidScale` is something the caller can ask differently: a
+        // count of `0`, a dog, or an app whose earlier scale is still
+        // shutting instances down. That last one is a conflict, like
+        // `ReloadInFlight`, and the wire has no code for one.
         SupervisorError::InvalidScale(msg) => RpcError {
             code: RpcErrorCode::InvalidConfig,
             message: msg.clone(),
@@ -1044,21 +876,15 @@ where
     Outcome::Reply(Reply { id, result })
 }
 
-/// `Trigger`'s own resolve-then-map path. [`selector_call`] cannot serve
-/// it: that helper is typed `Fut: Future<Output = Result<Vec<ProcessInfo>,
-/// SupervisorError>>` with `ok: fn(Vec<ProcessInfo>) -> Response`, and
-/// `Response::Triggered` carries `Vec<ActionReply>` — a distinct row
-/// `ProcessInfo` cannot hold a reply body on. Everything else about the shape
-/// is the same: convert the selector, call the supervisor, map the rows.
+/// `Trigger`'s own resolve-then-map path. [`selector_call`] cannot serve it:
+/// that helper maps `Vec<ProcessInfo>`, and `Response::Triggered` carries
+/// `Vec<ActionReply>`, a row `ProcessInfo` cannot hold a reply body on.
 ///
-/// How long each app gets to answer is `AppConfig::action_timeout`, one
-/// value per matched sheep rather than one for the whole flock, read off
-/// each sheep's own config where the wait is armed (`Actor::begin_action`),
-/// including staying under [`DEFAULT_DEADLINE_MS`] —
-/// `shep_core::config::normalize` refuses a value no caller could ever be
-/// given enough deadline to outlast; a value merely past the *default*
-/// budget is accepted; the caller's own deadline is what decides whether
-/// that pays off.
+/// How long each app gets to answer is `AppConfig::action_timeout`, one value
+/// per matched sheep, read where the wait is armed (`Actor::begin_action`).
+/// `shep_core::config::normalize` refuses only a value no caller could ever
+/// outlast; one past the default budget is accepted, and the caller's own
+/// deadline decides whether that pays off.
 async fn trigger(
     id: u64,
     spec: SelectorSpec,
@@ -1078,11 +904,9 @@ async fn trigger(
     Outcome::Reply(Reply { id, result })
 }
 
-/// `Signal`'s own resolve-then-map path, mirroring [`trigger`]: the signal
-/// name is re-validated here even though the CLI validated it too — peer
-/// input is untrusted, the same rule `Request::Start`'s own `normalize_all`
-/// follows a few arms up — then the selector is converted, the supervisor is
-/// called, and the rows are mapped.
+/// `Signal`'s own resolve-then-map path, mirroring [`trigger`]. The signal
+/// name is re-validated here even though the CLI validated it too: peer input
+/// is untrusted, the rule `Request::Start` follows a few arms up.
 async fn signal_request(id: u64, spec: SelectorSpec, signal: String, ctx: &RpcContext) -> Outcome {
     let result = match OperatorSignal::parse(&signal) {
         None => Err(RpcError {
@@ -1124,10 +948,8 @@ mod tests {
     use tokio::time::Instant;
 
     /// Dispatches on a connection of its own, shadowing [`super::dispatch`]
-    /// so no case in this module has to name a [`ConnId`] it does not care
-    /// about. One fresh id per call is the honest reading: each of these is
-    /// one client asking one thing, and nothing here spans two requests on
-    /// the same connection.
+    /// so no case here has to name a [`ConnId`]. One fresh id per call:
+    /// nothing here spans two requests on the same connection.
     async fn dispatch(envelope: Envelope, ctx: &RpcContext) -> Outcome {
         super::dispatch(envelope, ConnId::next(), ctx).await
     }
@@ -1207,13 +1029,10 @@ mod tests {
         assert_eq!(reply.result.unwrap_err().code, RpcErrorCode::InvalidConfig);
     }
 
-    /// fails if `Add` spawns anything.
-    ///
-    /// The harness is scripted with NO processes, which is the forcing
-    /// mechanism rather than a convenience: `ScriptedRunner::spawn` refuses
-    /// with `script exhausted` once the list is empty, so a build that routed
-    /// this at `do_start` cannot reach a row that is `Stopped` with no pid.
-    /// It would land `Errored`, and the two assertions below say which.
+    /// The harness is scripted with no processes, which is the forcing
+    /// mechanism: `ScriptedRunner::spawn` refuses with `script exhausted`
+    /// once the list is empty, so a build that routed this at `do_start`
+    /// lands `Errored` rather than `Stopped` with no pid.
     #[tokio::test(start_paused = true)]
     async fn add_registers_a_stopped_member_and_spawns_nothing() {
         let h = harness(vec![]);
@@ -1276,13 +1095,9 @@ mod tests {
         assert_eq!(reply.result.unwrap_err().code, RpcErrorCode::InvalidConfig);
     }
 
-    /// fails if a second `Add` of a name the flock already has registers a
-    /// second row, or disturbs the first.
-    ///
-    /// The sheep here is ONLINE, which is the case that matters: re-running
-    /// `shep add Flockfile.toml` after editing the file is the ordinary thing
-    /// to do, and it must not stop a service. One script, so a second spawn
-    /// would fail rather than pass quietly.
+    /// The sheep is online, the case that matters: re-running `shep add
+    /// Flockfile.toml` after editing the file must not stop a service. One
+    /// script, so a second spawn would fail rather than pass quietly.
     #[tokio::test(start_paused = true)]
     async fn a_second_add_leaves_a_running_sheep_exactly_as_it_was() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -1343,18 +1158,11 @@ mod tests {
         }
     }
 
-    /// fails if a request naming the same app twice is applied rather than
-    /// refused.
-    ///
-    /// `handle_apply_config` reads the override store ONCE for the whole
-    /// file and writes it once at the end, which is what keeps an eleven-app
-    /// Flockfile to one lock. A second entry of the same name is therefore
-    /// merged against the store as the FIRST entry found it, not against the
-    /// record the first entry just made, so the first entry's record is lost
-    /// with nothing anywhere saying so. `normalize_all` refuses a duplicate
-    /// on the `Start` path and is not on this one; this arm is where the
-    /// mirror belongs, because it is the trust boundary and it can refuse
-    /// before the flock is touched at all.
+    /// `handle_apply_config` reads the override store once for the whole
+    /// file, so a second entry of the same name merges against the store as
+    /// the first entry found it and the first entry's record is lost.
+    /// `normalize_all` refuses a duplicate on the `Start` path and is not on
+    /// this one.
     #[tokio::test(start_paused = true)]
     async fn apply_config_refuses_a_request_naming_one_app_twice() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -1402,12 +1210,9 @@ mod tests {
         assert_eq!(roll.apps[0].app.script, "./srv");
     }
 
-    /// fails if an apply does not reach the muster roll.
-    ///
     /// The `Scale` arm's reasoning, applied to this one: a change that
     /// reached the stored spec and not the roll is undone by the next
-    /// reboot, and that is a bug nobody can see until the machine comes
-    /// back.
+    /// reboot.
     #[tokio::test(start_paused = true)]
     async fn apply_config_records_what_it_applied_in_the_registry() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -1461,10 +1266,8 @@ mod tests {
         assert_eq!(roll.apps[0].app.max_restarts, 99);
     }
 
-    /// fails if an app the flock does not have costs the whole request its
-    /// reply. One app that cannot be applied must not cost the rest of the
-    /// file its load, so a miss is a per-app refusal inside an `Ok` and
-    /// never an `Err`.
+    /// One app that cannot be applied must not cost the rest of the file its
+    /// load, so a miss is a per-app refusal inside an `Ok`, never an `Err`.
     #[tokio::test(start_paused = true)]
     async fn apply_config_refuses_an_unregistered_app_inside_the_reply() {
         let h = harness(vec![]);
@@ -1562,11 +1365,9 @@ mod tests {
         assert_eq!(hits[0].name, "api");
     }
 
-    /// Fails if `Reopen` is left to the catch-all arm at the bottom of
-    /// `run` — a verb this daemon has never heard of — which answers
-    /// `Internal` for a request it in fact implements. Also fails if it is
-    /// routed to another verb's supervisor call: `Stop` would answer
-    /// `Response::Stopped` and, worse, stop the sheep.
+    /// Fails if `Reopen` is left to `run`'s catch-all arm, which answers
+    /// `Internal` for a request this daemon implements, or if it is routed
+    /// to another verb's supervisor call: `Stop` would stop the sheep.
     #[tokio::test(start_paused = true)]
     async fn reopen_routes_to_the_supervisor_and_leaves_the_sheep_running() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -1610,31 +1411,17 @@ mod tests {
         );
     }
 
-    /// Fails if `Reload` is left to the catch-all arm at the bottom of `run`,
-    /// which answers `Internal` for a request this daemon in fact implements.
+    /// Fails if the arm is routed to another verb's supervisor call while
+    /// keeping `Response::Reloading`, which no assertion on the reply alone
+    /// can see. What separates a reload is the flock it leaves behind: two
+    /// entries in one instance slot, the drainee `Stopping` under its
+    /// original id and a replacement `Starting` under a new one.
     ///
-    /// Fails too if the arm is routed to another verb's supervisor call while
-    /// keeping `Response::Reloading` as its answer — the shape a copy-pasted
-    /// arm takes, and one no assertion on the reply alone can see. What
-    /// separates a reload from every other verb is the flock it leaves
-    /// behind: two entries in one instance slot, the drainee `Stopping` under
-    /// its original id and a replacement `Starting` under a new one. A
-    /// `restart` leaves one entry under the same id, a `stop` one entry
-    /// `Stopped`.
-    ///
-    /// The mid-swap state is what is asserted, and it is not a race: nothing
-    /// here advances the clock, so the replacement's readiness wait cannot
-    /// elapse between the two dispatches. `ListFlock` is queued to an actor
-    /// that has already finished `handle_reload` — the reply is sent inside
-    /// it, before the swap starts, but the whole function runs to completion
-    /// before the actor takes another message.
-    ///
-    /// Three scripts, of which a correct run uses two: the original and its
-    /// replacement. The third is sized for the spawn a broken arm performs
-    /// that a correct one does not — a `restart` misroute's respawn on top of
-    /// a swap — so it lands as a live entry rather than as the
-    /// `SpawnFailed("script exhausted")` that an exhausted pool turns into
-    /// `Errored`, which reads like a different failure entirely.
+    /// The mid-swap state is not a race: nothing advances the clock, and
+    /// `ListFlock` is queued to an actor that runs `handle_reload` to
+    /// completion before it takes another message. Three scripts, of which a
+    /// correct run uses two; the third is sized for the spawn a broken arm
+    /// performs, so it lands as a live entry rather than as `Errored`.
     #[tokio::test(start_paused = true)]
     async fn reload_routes_to_the_supervisor_and_starts_a_swap() {
         let h = harness(vec![ProcScript::never_exits(); 3]);
@@ -1689,22 +1476,12 @@ mod tests {
         assert_eq!(flock[1].status, ProcStatus::Starting);
     }
 
-    /// The whole of what an operator sees when a reload is refused, and both
-    /// refusals reach them the same way: the daemon's code becomes the CLI's
-    /// exit status, and the daemon's message is the only thing printed.
-    ///
-    /// Fails if either arm answers a code that is not `Internal` — the
-    /// `RpcErrorCode` set is versioned, so neither refusal has one of its
-    /// own, and `SupervisorError`'s `Display` is what is left to tell them
-    /// apart. Fails too if `ReloadInFlight`'s arm drops the app's name: the
-    /// name is the actionable half of that message, because it says which
-    /// reload to wait for.
-    ///
-    /// `ReloadInFlight` reaching the wire at all is pinned in `supervisor`
-    /// (`a_second_reload_of_an_app_already_reloading_is_refused`), as is a
-    /// reload arriving after a shutdown has begun
-    /// (`a_reload_is_refused_once_a_shutdown_has_begun`, which answers
-    /// `EngineStopped`). What neither reaches is this mapping.
+    /// The daemon's code becomes the CLI's exit status and its message is
+    /// all that is printed. Fails if either refusal answers a code that is
+    /// not `Internal`, since neither has one of its own and
+    /// `SupervisorError`'s `Display` is what tells them apart. Fails too if
+    /// `ReloadInFlight`'s arm drops the app's name, which says which reload
+    /// to wait for.
     #[test]
     fn a_refused_reload_is_internal_and_says_which_refusal_it_was() {
         let in_flight = rpc_error(&SupervisorError::ReloadInFlight("web".to_string()));
@@ -1717,10 +1494,9 @@ mod tests {
     }
 
     /// Fails if `Reload` skips the selector conversion, or converts it
-    /// without reporting the failure — a peer regex the daemon cannot compile
-    /// is the client's usage error, not an internal one. A hand-rolled arm
-    /// that answered `Reloading` correctly could still lose this; it is the
-    /// shared `selector_call` helper that keeps it.
+    /// without reporting the failure: a peer regex the daemon cannot compile
+    /// is the client's usage error. The shared `selector_call` is what keeps
+    /// it; a hand-rolled arm answering `Reloading` could still lose it.
     #[tokio::test(start_paused = true)]
     async fn a_bad_reload_selector_is_invalid_config() {
         let h = harness(vec![]);
@@ -1760,34 +1536,19 @@ mod tests {
         assert_eq!(reply.result.unwrap_err().code, RpcErrorCode::InvalidConfig);
     }
 
-    /// Fails if `Trigger` is left to the catch-all arm at the bottom of
-    /// `run` — a verb this daemon has never heard of — which answers
-    /// `Internal` for a request it in fact implements. Fails too if the row
-    /// stops carrying the sheep it is about.
+    /// `TimedOut` rather than `NoChannel` is the assertion that matters: the
+    /// action was really delivered and waited on, and `web`'s 3s
+    /// `action_timeout` elapsed inside the request's own budget. Raise it
+    /// past [`DEFAULT_DEADLINE_MS`] and the reply becomes `DeadlineExceeded`
+    /// instead, which names no sheep; that ordering is pinned right below in
+    /// `an_oversized_action_timeout_loses_the_race`.
     ///
-    /// `TimedOut` rather than `NoChannel` is the assertion that matters, and
-    /// it is two claims at once. The action was really delivered and really
-    /// waited on — `NoChannel` is what a build that never reached the sheep
-    /// would answer — and `web`'s `action_timeout` (3s, `AppConfig::minimal`'s
-    /// spec default) elapsed INSIDE the request's own budget. Raise it past
-    /// [`DEFAULT_DEADLINE_MS`] and this stops being a row at all:
-    /// `with_deadline` fires first and the reply becomes `DeadlineExceeded`,
-    /// which names no sheep and says nothing about which of them answered —
-    /// pinned right below, in `an_oversized_action_timeout_loses_the_race`.
-    /// The ordering is what both cases pin; the constants are pinned in
-    /// `budgets_default_and_clamp`.
-    ///
-    /// Nothing answers because the harness keeps no handle on its runner, so
-    /// no case here can put a reply on a child's end of the channel. An app's
-    /// own words reaching a caller is pinned a tier down, in
-    /// `a_triggered_action_answers_with_the_apps_reply`.
+    /// Nothing answers, because the harness keeps no handle on its runner.
     #[tokio::test(start_paused = true)]
     async fn trigger_routes_to_the_flock_and_reports_each_match_within_the_budget() {
         // Two apps, not one: ids start at 0, so a single-app harness would
-        // give `web` id 0 — indistinguishable from a row-mapping bug that
-        // drops the real id and leaves the field's default. Registering
-        // `other` first pushes `web` to id 1, a value only the real mapping
-        // produces.
+        // give `web` id 0, indistinguishable from a row-mapping bug that
+        // leaves the field's default. `other` first pushes `web` to id 1.
         let h = harness(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
         let mut web = AppConfig::minimal("web", "./srv");
         web.channel = true;
@@ -1840,9 +1601,8 @@ mod tests {
         );
     }
 
-    /// fails if a bad signal name reaches the supervisor. It must be refused at the
-    /// dispatch boundary with `InvalidConfig`, not turned into a `NotFound` or an
-    /// `Internal` deeper in — an operator who typed `SIGHUPP` needs the accepted
+    /// A bad signal name must be refused at the dispatch boundary with
+    /// `InvalidConfig`: an operator who typed `SIGHUPP` needs the accepted
     /// list, and only this arm has it.
     #[tokio::test]
     async fn a_signal_name_outside_the_grammar_is_refused_with_the_accepted_list() {
@@ -1867,12 +1627,9 @@ mod tests {
         assert!(err.message.contains("SIGUSR2"), "{}", err.message);
     }
 
-    /// fails if a line carrying a newline reaches the supervisor. Delivered
-    /// unrefused it would land as two commands where the operator typed one,
-    /// so it must be refused at the dispatch boundary with `InvalidConfig`
-    /// and never reach `send_line` at all — there is no sheep in this
-    /// fixture to answer it, so a `NotFound` here would mean the refusal was
-    /// skipped rather than that it fired.
+    /// Refused at the dispatch boundary, so it never reaches `send_line`.
+    /// There is no sheep in this fixture to answer it, so a `NotFound` here
+    /// would mean the refusal was skipped rather than that it fired.
     #[tokio::test]
     async fn a_line_carrying_a_newline_is_refused_before_it_reaches_the_supervisor() {
         let h = harness(vec![]);
@@ -1894,27 +1651,12 @@ mod tests {
         assert!(err.message.contains("newline"), "{}", err.message);
     }
 
-    /// Fails if the daemon's own per-app wait is ever allowed to reach or
-    /// exceed the caller's default RPC budget. `shep_core::config::normalize`
-    /// only refuses an `action_timeout` no caller could ever satisfy however
-    /// long a deadline it asks for (its own ceiling, 58s); anything between
-    /// that and [`DEFAULT_DEADLINE_MS`] normalizes fine, on the documented
-    /// understanding that a caller sending no deadline of its own has to lose
-    /// this exact race. This case drives that failure mode for real rather
-    /// than asserting a constant comparison: `web`'s `action_timeout` is set
-    /// past the 5s default budget, the request carries no deadline of its own
-    /// (`envelope`'s `deadline_ms: None`), and under the paused clock
-    /// `dispatch`'s own `with_deadline` wins — the reply is
-    /// `DeadlineExceeded`, never a `Triggered` row, honest or otherwise.
-    ///
-    /// Confirmed by mutating the sibling case above rather than by
-    /// construction: raising `AppConfig::minimal`'s `action_timeout` there to
-    /// 9s (past `DEFAULT_DEADLINE_MS`, same value this case uses) reproduced
-    /// exactly this — `RpcError { code: DeadlineExceeded, message: "the
-    /// request deadline of 5000 ms expired before the daemon finished" }`
-    /// where that test expected a `TimedOut` row. This case pins that same
-    /// shape as its own assertion, so a regression that reintroduces it fails
-    /// the suite outright instead of needing a mutation run to surface again.
+    /// `web`'s `action_timeout` is set past the 5s default budget and the
+    /// request carries no deadline of its own, so under the paused clock
+    /// `dispatch`'s own `with_deadline` wins and the reply is
+    /// `DeadlineExceeded` rather than a `Triggered` row.
+    /// `shep_core::config::normalize` refuses only a timeout no caller could
+    /// ever satisfy, so anything under that has to lose this race.
     #[tokio::test(start_paused = true)]
     async fn an_oversized_action_timeout_loses_the_race() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -1968,10 +1710,9 @@ mod tests {
         assert_eq!(reply.result.unwrap_err().code, RpcErrorCode::InvalidConfig);
     }
 
-    /// A selector matching no registered sheep is a whole-request `NotFound`
-    /// — same as every other selector-in verb, `a_selector_matching_nothing_is_not_found`
-    /// pins it for `Stop` — kept separate from a per-row `NoChannel`, which
-    /// only ever appears inside a non-empty match and never on its own.
+    /// A selector matching no registered sheep is a whole-request
+    /// `NotFound`, kept separate from a per-row `NoChannel`, which only
+    /// appears inside a non-empty match.
     #[tokio::test(start_paused = true)]
     async fn a_trigger_matching_nothing_is_not_found() {
         let h = harness(vec![]);
@@ -1992,18 +1733,11 @@ mod tests {
         assert_eq!(reply.result.unwrap_err().code, RpcErrorCode::NotFound);
     }
 
-    /// The whole of an operator's feedback loop for a rotation that failed:
-    /// the daemon's code becomes the CLI's exit status (`Internal` is 9), and
-    /// the daemon's message is the only thing printed about which path went
-    /// wrong.
-    ///
-    /// Fails if the `ReopenFailed | FlushFailed` arm answers any other code —
-    /// `SpawnFailed` exits 7 and reads as "could not start it", which is a
-    /// different call to whoever is paged. Fails too if that arm sends the
-    /// bare payload instead of `err.to_string()`: once the two share one wire
-    /// code, `SupervisorError`'s `Display` is the only thing left telling a
-    /// reader which half of the log plane failed, and both payloads are just
-    /// paths and reasons.
+    /// Fails if the `ReopenFailed | FlushFailed` arm answers any other code:
+    /// `SpawnFailed` exits 7 and reads as "could not start it". Fails too if
+    /// it sends the bare payload instead of `err.to_string()`, since once the
+    /// two share a wire code `Display` is all that tells a reader which half
+    /// of the log plane failed.
     #[test]
     fn a_log_plane_failure_is_internal_and_says_which_half_failed() {
         let reopen = rpc_error(&SupervisorError::ReopenFailed(
@@ -2088,35 +1822,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn envelope_deadline_ms_actually_bounds_the_reply() {
-        // `budgets_default_and_clamp` proves `budget()` in isolation, and
-        // `work_past_its_deadline_answers_deadline_exceeded` proves
-        // `with_deadline` in isolation — neither one exercises the wire from
-        // `Envelope::deadline_ms` into `budget()` inside `dispatch` itself
-        // (rpc.rs line ~139: `budget(envelope.deadline_ms)`). A reviewer
-        // changing that call to `budget(None)` left the full suite green,
-        // which is exactly the gap this test closes: it drives a REAL
-        // envelope with a client-supplied deadline through `dispatch`
-        // against a supervisor command that provably takes longer than that
-        // deadline, and checks the reply is `DeadlineExceeded`.
-        //
-        // "Provably longer": `Stop` on an `ignores_signals()` sheep goes
-        // through the real kill ladder (`kill.rs::kill_process`), which
-        // SIGTERMs (ignored — that's the whole point of this script), then
-        // waits up to `app.kill_timeout` (1600ms, `AppConfig::minimal`'s
-        // spec default) before escalating to SIGKILL — and the supervisor's
-        // reply to `stop()` doesn't land until that whole ladder resolves
-        // (`begin_manual`/`PendingReply`, supervisor.rs). `never_exits()`
-        // does NOT work for this: despite the name, it still `obeys_signal`
-        // and resolves its `wait()` the instant `signal()` is called, with
-        // no virtual time elapsed at all — `ignores_signals()` is the one
-        // script that actually forces the full `kill_timeout` wait. A 1ms
-        // client deadline is far below that 1600ms floor, so under the
-        // paused clock `dispatch`'s own `tokio::time::timeout` is
-        // guaranteed to fire first — provided `envelope.deadline_ms`
-        // genuinely reached `budget`. If it didn't (e.g. `budget(None)`
-        // uses the 5s default), 1600ms < 5000ms and this would NOT time
-        // out — see the revert experiment in merge-blockers-report.md,
-        // which changes exactly that line and confirms this test fails.
+        // Drives a real envelope's `deadline_ms` through `dispatch` into
+        // `budget`. `Stop` on an `ignores_signals()` sheep waits the full
+        // 1600ms `kill_timeout` ladder, far past this 1ms deadline, while a
+        // build passing `budget(None)` would take the 5s default and pass.
         let h = harness(vec![ProcScript::ignores_signals()]);
         dispatch(
             envelope(
@@ -2168,11 +1877,9 @@ mod tests {
         assert!(err.message.contains("250 ms"), "{}", err.message);
     }
 
-    /// fails if `SaveRoll` stops writing, or writes without reporting: the
-    /// assertion reads the file the reply named and compares its app count
-    /// against the number the reply claimed, so a handler that answered
-    /// `apps: 0` for a two-app flock — or named a path it never wrote —
-    /// reddens here rather than in an operator's terminal after a reboot.
+    /// The assertion reads the file the reply named and compares its app
+    /// count against the number the reply claimed, so a handler answering
+    /// `apps: 0` for a two-app flock reddens here.
     #[tokio::test]
     async fn save_roll_writes_the_file_it_names_and_counts_what_it_recorded() {
         let h = harness(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
@@ -2235,21 +1942,14 @@ mod tests {
         assert_eq!(roll.apps[0].app.instances, 4);
     }
 
-    /// fails if a PARTIAL scale-up leaves the muster roll holding the PRE-scale
-    /// count — the durability half of the same bug the test above covers for the
-    /// full-success path, and the assertion nobody wrote when `scale` landed.
+    /// `web` at two instances, scaled to four, with one script left so the
+    /// first new spawn succeeds and the second fails. Three instances are
+    /// then running: a roll saying `2` stops one at the next muster, a roll
+    /// saying `4` brings up a count that never ran. Only `3` is the truth,
+    /// and it gets there only if the handler records off the `Err` path too.
     ///
-    /// Reproduced: `web` at two instances, scaled to four, one script left in the
-    /// pool so the first new spawn succeeds and the second fails. Three instances
-    /// are then running and healthy. A roll saying `2` means the next `shep
-    /// muster` or reboot silently stops one of them; a roll saying `4` means it
-    /// brings up a count that never ran. Only `3` — what is actually running — is
-    /// the truth, and it only gets there if the handler records off the `Err`
-    /// path too.
-    ///
-    /// The reply is asserted as well as the roll: recording what the daemon did
-    /// must not quietly turn "I gave you three of four" into a success an
-    /// operator's `&&` chain walks straight past.
+    /// The reply is asserted as well as the roll: recording what the daemon
+    /// did must not turn "three of four" into a success.
     #[tokio::test]
     async fn a_partial_scale_is_recorded_in_the_roll_and_still_reported_short() {
         let h = harness(vec![ProcScript::never_exits(); 3]);
@@ -2290,10 +1990,9 @@ mod tests {
         );
     }
 
-    /// fails if the handler forwards `snapshot_now`'s engine-stopped
-    /// `Ok(())` as a success. That is the whole reason this verb exists:
-    /// a save that wrote nothing and said "saved" is the failure mode an
-    /// operator reboots into.
+    /// Fails if the handler forwards `snapshot_now`'s engine-stopped `Ok(())`
+    /// as a success. A save that wrote nothing and said "saved" is the
+    /// failure mode an operator reboots into.
     #[tokio::test]
     async fn save_roll_against_a_stopped_engine_is_an_error_not_a_silent_success() {
         let h = harness(vec![]);
@@ -2309,18 +2008,14 @@ mod tests {
         );
     }
 
-    /// fails if `Muster` reports only what THIS call spawned. Assembling a
-    /// flock that is already assembled starts nothing, so an empty reply
-    /// there is indistinguishable from "the roll was empty" — the one thing
-    /// this reply exists to tell apart.
+    /// Assembling a flock that is already assembled starts nothing, so a
+    /// reply naming only what this call spawned cannot be told from "the roll
+    /// was empty".
     ///
-    /// One script, deliberately: `web`'s first start consumes it, so a muster
-    /// that started the roll's apps unconditionally would find the pool
-    /// exhausted on the duplicate `instance_slots` hands it, and
-    /// `ScriptedRunner` answers `SpawnFailed("script exhausted")` — which
-    /// lands as a second, `Errored` `web` in the listing rather than as a
-    /// failed reply. Both assertions below are what catch it; the count sees
-    /// the extra row and the name assertion pins which one survived.
+    /// One script: `web`'s first start consumes it, so a muster that started
+    /// the roll's apps unconditionally would exhaust the pool and land a
+    /// second, `Errored` `web` in the listing. The count and the name
+    /// assertion are what catch it.
     #[tokio::test]
     async fn a_second_muster_still_reports_the_flock_the_roll_restored() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -2351,8 +2046,8 @@ mod tests {
         assert_eq!(infos[0].status, ProcStatus::Online);
     }
 
-    /// Starts `web` through `h` and returns nothing — every case below opens
-    /// this way, and none of them asserts on the start reply itself.
+    /// Starts `web` through `h` and returns nothing: no case below asserts
+    /// on the start reply itself.
     async fn start_web(h: &Harness) {
         reply_of(
             dispatch(
@@ -2372,7 +2067,7 @@ mod tests {
     ///
     /// # Panics
     ///
-    /// If the reply is anything but `Flock` — a fixture bug at the call site.
+    /// If the reply is anything but `Flock`, which is a fixture bug.
     async fn list_flock(ctx: &RpcContext, id: u64) -> Vec<ProcessInfo> {
         let reply = reply_of(dispatch(envelope(id, Request::ListFlock), ctx).await);
         let Ok(Response::Flock(infos)) = reply.result else {
@@ -2381,13 +2076,13 @@ mod tests {
         infos
     }
 
-    /// fails if `ListFlock` stops taking a live sample — the fields would
-    /// come back `None` for a running sheep, which a reader renders as `-`
-    /// and an operator reads as "shep cannot see it".
+    /// Without a live sample the fields come back `None` for a running sheep,
+    /// which a reader renders as `-` and an operator reads as "shep cannot
+    /// see it".
     #[tokio::test]
     async fn list_flock_carries_a_live_memory_reading_for_a_running_sheep() {
         // The harness's sampler is scripted, so the number below is the
-        // fixture's and not the machine's — this asserts the plumbing, not
+        // fixture's and not the machine's; this asserts the plumbing, not
         // sysinfo. `ScriptedRunner` hands out `FIRST_SCRIPTED_PID`, and the
         // scripted reading describes a tree rooted at that same pid.
         let h = harness_with_stats(vec![ProcScript::never_exits()]);
@@ -2403,16 +2098,10 @@ mod tests {
         );
     }
 
-    /// fails if a listing measures CPU over its own window rather than over
-    /// the one since the last periodic sample.
-    ///
-    /// The case the previous test cannot reach: there, `cpu_percent` is
-    /// `None` for a running sheep and stays `None` under an implementation
-    /// that hard-codes it. Here a baseline exists, so a real number has to
-    /// come back — and the SECOND listing is what says which window produced
-    /// it. 1500 CPU-ms over the 15 s since the baseline is 10%; the same
-    /// counter measured over the millisecond since the previous listing is
-    /// hundreds of percent.
+    /// A baseline exists here, so a real number has to come back, and the
+    /// second listing says which window produced it: 1500 CPU-ms over the
+    /// 15 s since the baseline is 10%, while the same counter over the
+    /// millisecond since the previous listing is hundreds of percent.
     #[tokio::test]
     async fn list_flock_measures_cpu_from_the_periodic_baseline_not_from_the_previous_listing() {
         let h = harness_with_stats(vec![ProcScript::never_exits()]);
@@ -2443,10 +2132,9 @@ mod tests {
         );
     }
 
-    /// fails if `Describe` stops taking a live sample. It is the second of
-    /// the two verbs an operator reads resource usage from, and an
-    /// implementation wired into `ListFlock` alone passes every other case
-    /// here.
+    /// `Describe` is the second of the two verbs an operator reads resource
+    /// usage from, and an implementation wired into `ListFlock` alone passes
+    /// every other case here.
     #[tokio::test]
     async fn describe_carries_a_live_reading_too() {
         let h = harness_with_stats(vec![ProcScript::never_exits()]);
@@ -2470,16 +2158,13 @@ mod tests {
         assert_eq!(infos[0].memory_bytes, Some(SCRIPTED_TREE_BYTES));
     }
 
-    /// fails if a sheep with no pid is given someone else's numbers. The
-    /// join is keyed on the pid a reading was taken against, and one that
-    /// fell back to anything else — the id, or simply the first reading in
-    /// the sample — would print one sheep's resource use against another.
+    /// The join is keyed on the pid a reading was taken against; one falling
+    /// back to the id, or to the first reading in the sample, would print one
+    /// sheep's resource use against another.
     ///
-    /// Two sheep, and both are needed. A listing holding only the stopped
-    /// one cannot tell a pid-keyed join from any other: stopping a sheep
-    /// unwatches it, so the sample comes back empty and EVERY join misses.
-    /// The running sheep is what puts a reading in that sample for a
-    /// fallback to reach.
+    /// Two sheep, and both are needed: stopping a sheep unwatches it, so a
+    /// listing holding only the stopped one leaves the sample empty and every
+    /// join misses.
     #[tokio::test]
     async fn a_sheep_with_no_pid_reports_no_stats() {
         let h = harness_with_stats(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
@@ -2517,8 +2202,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} is missing from the listing"))
         };
         // The scripted table describes the first spawn's pid and no other,
-        // so this is the one row in the listing carrying a reading — and the
-        // one a fallback join would hand to its neighbour.
+        // so this is the one row carrying a reading, and the one a fallback
+        // join would hand to its neighbour.
         assert_eq!(named("web").pid, Some(FIRST_SCRIPTED_PID));
         assert_eq!(named("web").memory_bytes, Some(SCRIPTED_TREE_BYTES));
 
@@ -2527,16 +2212,12 @@ mod tests {
         assert_eq!(named("worker").cpu_percent, None);
     }
 
-    /// fails if a lifecycle verb starts paying for a sample. A 5.77 ms
-    /// syscall walk over the host's whole process table, on every `start`,
-    /// buys a reading nobody reads there.
+    /// A 5.77 ms syscall walk over the host's whole process table, on every
+    /// `start`, buys a reading nobody reads there.
     ///
-    /// Asserted on `Started` rather than on `Stopped`, which is the reply a
-    /// reader expects here: a stopped sheep has no pid, so its row comes
-    /// back empty whether or not the verb sampled, and the assertion would
-    /// hold for either implementation. `Started` answers with a running
-    /// sheep whose pid DOES join a scripted reading — pinned below, so this
-    /// case cannot quietly become the vacuous one.
+    /// Asserted on `Started` rather than on `Stopped`: a stopped sheep has no
+    /// pid, so its row comes back empty whether or not the verb sampled and
+    /// the assertion would hold for either implementation.
     #[tokio::test]
     async fn a_lifecycle_reply_carries_no_stats() {
         let h = harness_with_stats(vec![ProcScript::never_exits()]);
@@ -2589,10 +2270,9 @@ mod tests {
         info
     }
 
-    /// fails if `DisableDog` is wired to anything but a real deregistration
-    /// — a handler that answered `Deleted(vec![])` without stopping
-    /// anything passes every type-level test and leaves the dog running
-    /// after `shep disable` reported success.
+    /// A handler that answered `Deleted(vec![])` without stopping anything
+    /// passes every type-level test and leaves the dog running after `shep
+    /// disable` reported success.
     #[tokio::test(start_paused = true)]
     async fn disabling_a_dog_stops_it_and_takes_it_off_the_listing() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -2615,10 +2295,8 @@ mod tests {
         assert!(h.ctx.supervisor.list().await.is_empty());
     }
 
-    /// fails if the daemon serves a section it cached at boot. The file is
-    /// written AFTER the harness built its context, so a cached reader
-    /// answers the empty string here — which is exactly the bug that would
-    /// make `shep disable X && shep enable X` fail to pick up an edit.
+    /// The file is written after the harness built its context, so a reader
+    /// that cached at boot answers the empty string here.
     #[tokio::test(start_paused = true)]
     async fn a_dog_config_request_reads_the_file_as_it_stands_now() {
         let h = harness(vec![]);
@@ -2641,11 +2319,9 @@ mod tests {
         assert!(toml.contains("30s"));
     }
 
-    /// fails if `describe all` lists a dog, and fails if `describe <dog>`
-    /// stops reaching one. Both halves: a filter that excluded dogs
-    /// outright would leave `shep describe bark` unable to answer at all,
-    /// and a listing that includes them puts a row in the flock table with
-    /// nowhere to go.
+    /// Both halves: a filter that excluded dogs outright would leave `shep
+    /// describe bark` unable to answer at all, and a listing that includes
+    /// them puts a row in the flock table with nowhere to go.
     #[tokio::test(start_paused = true)]
     async fn describe_sweeps_past_a_dog_and_still_answers_when_one_is_named() {
         let h = harness(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
@@ -2704,11 +2380,9 @@ mod tests {
         assert_eq!(hits[0].id, dog.id);
     }
 
-    /// fails if `EnableDog` reports the sheep that already holds the name
-    /// as though a dog had started. `start_dog` is idempotent by name, so
-    /// the squatter comes back as an `Ok` — and a caller that trusted it
-    /// would print "bark enabled", write `enabled_dogs = ["bark"]`, and
-    /// never have a dog, on this boot or any later one.
+    /// `start_dog` is idempotent by name, so the squatter comes back as an
+    /// `Ok`, and a caller that trusted it would print "bark enabled", write
+    /// `enabled_dogs = ["bark"]`, and never have a dog.
     #[tokio::test(start_paused = true)]
     async fn enabling_a_dog_over_a_sheeps_name_is_refused_rather_than_faked() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -2753,9 +2427,8 @@ mod tests {
         assert_eq!(listed[0].dog, None);
     }
 
-    /// fails if `ListFlock` starts walking, or if `Describe` stops. The split
-    /// is a cost decision (`with_lambs`' own doc) and nothing else enforces
-    /// it — both arms build their rows from the same `snapshot_all`, so a
+    /// The split is a cost decision (`with_lambs`) and nothing else enforces
+    /// it: both arms build their rows from the same `snapshot_all`, so a
     /// helper applied in the wrong place looks correct at every other level.
     #[tokio::test(start_paused = true)]
     async fn only_describe_carries_a_lamb_tree() {
@@ -2835,16 +2508,9 @@ mod tests {
         (stale, pending)
     }
 
-    /// fails if a flock with no dogs at all is reported as having something
-    /// unsettled. This is what an ordinary reload asks, and the answer it
-    /// gets is what decides whether the operator reads a line about dogs
-    /// they do not run.
-    ///
     /// The sheep is the point, not scenery: a reader that walked every row
-    /// instead of every DOG row would hold an operator's reload open
-    /// waiting for `web` to handshake, which it is never going to do — a
-    /// sheep is an arbitrary executable and does not speak this protocol at
-    /// all (spec, part 4).
+    /// instead of every dog row would hold an operator's reload open waiting
+    /// for `web` to handshake, which a sheep never does.
     #[tokio::test]
     async fn a_flock_of_ordinary_sheep_has_nothing_stale_and_nothing_pending() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -2865,14 +2531,9 @@ mod tests {
         assert_eq!(staleness(&h.ctx).await, (Vec::new(), Vec::new()));
     }
 
-    /// fails if a listing reports a dog as healthy that this shepherd has
-    /// never once heard from.
-    ///
-    /// The production defect this field exists for: `shep flock` printed
-    /// `(o.o) online`, restarts 0, for a dog whose own log was filling with
-    /// protocol refusals. `status` was not wrong — the process really was
-    /// up — but it is the answer to a question the operator was not asking.
-    /// Both halves are asserted, because reporting the silence and losing
+    /// `shep flock` printed `(o.o) online`, restarts 0, for a dog whose own
+    /// log was filling with protocol refusals: `status` answers a question
+    /// the operator was not asking. Both halves are asserted, since losing
     /// the liveness would be the same defect pointed the other way.
     #[tokio::test]
     async fn a_listing_says_which_dogs_have_answered_this_shepherd() {
@@ -2903,13 +2564,9 @@ mod tests {
         );
     }
 
-    /// fails if the join reaches a sheep.
-    ///
-    /// A sheep is an arbitrary executable and does not speak this protocol
-    /// at all (spec, part 4), so it has no handshake to report and `None`
-    /// is the only honest answer. `Some(false)` here would paint every
-    /// sheep in the flock as broken, which is a worse bug than the one this
-    /// field fixes.
+    /// A sheep does not speak this protocol at all, so it has no handshake to
+    /// report and `None` is the only honest answer. `Some(false)` here would
+    /// paint every sheep in the flock as broken.
     #[tokio::test]
     async fn a_sheep_carries_no_handshake_fact_at_all() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -2924,15 +2581,9 @@ mod tests {
         );
     }
 
-    /// fails if a listing cannot tell a silence this shepherd is still
-    /// waiting out from one it has stopped waiting on.
-    ///
-    /// Both rows are `handshook: Some(false)` with a live process, and until
-    /// `dog_stale` existed that was the whole of what a listing said about
-    /// either. One of them needs nothing done about it — the dog was spawned
-    /// a moment ago — and the other is a dog this shepherd will never restart
-    /// again. Rendering them the same word is what left an operator with no
-    /// surface that reported the give-up at all.
+    /// Both rows are `handshook: Some(false)` with a live process. One needs
+    /// nothing done about it, the dog having been spawned a moment ago; the
+    /// other is a dog this shepherd will never restart again.
     #[tokio::test]
     async fn a_listing_says_which_silent_dogs_this_shepherd_gave_up_on() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -2969,8 +2620,7 @@ mod tests {
         );
 
         // And it heals: a dog that gets in clears everything held against
-        // it, so the listing must stop reporting a give-up that no longer
-        // holds.
+        // it, so the listing must stop reporting the give-up.
         h.ctx.dog_refusals.handshook("metrics");
         let talking = list_flock(&h.ctx, 3).await;
         let dog = talking
@@ -3007,11 +2657,9 @@ mod tests {
         assert_eq!(rows[0].handshook, Some(false));
     }
 
-    /// fails if a registered dog that has never handshaken reads as an
-    /// answer. That state is exactly what a carried dog is for the whole
-    /// gap between the exec and its reconnect, so a report taken while it
-    /// holds would be the early report G13 forbids: the dog has said
-    /// nothing, and "nothing stale" would be read as "every dog came back".
+    /// A carried dog holds that state for the whole gap between the exec and
+    /// its reconnect, so a report taken while it holds would read "nothing
+    /// stale" as "every dog came back".
     #[tokio::test]
     async fn a_dog_that_has_not_handshaken_is_pending() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -3030,12 +2678,10 @@ mod tests {
         );
     }
 
-    /// fails if the report can be taken while a dog's one restart is still
-    /// in flight. A refused dog passes THROUGH this state on its way to
-    /// being stale, so a reader that treated it as settled would report
-    /// every stale dog as healthy — the exact failure the waiting exists
-    /// for. Drives the ladder rather than asserting on the record, because
-    /// the claim is about what a caller over the wire sees.
+    /// A refused dog passes through this state on its way to being stale, so
+    /// a reader that treated it as settled would report every stale dog as
+    /// healthy. Drives the ladder rather than asserting on the record,
+    /// because the claim is about what a caller over the wire sees.
     #[tokio::test]
     async fn a_dog_being_restarted_is_pending_and_then_stale() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -3057,14 +2703,10 @@ mod tests {
         );
     }
 
-    /// fails if a dog nobody is going to hear from holds the report open. A
-    /// dog with no process — out of its restart budget, parked in a
-    /// backoff, or stopped by an operator — cannot handshake, so waiting on
-    /// one would make every later reload pay the whole budget for a dog
-    /// already reported broken everywhere else. Measured under an isolated
-    /// `SHEP_HOME`: a `bark` looping on a bad config is `waiting-restart`
-    /// most of the time, and every reload during that loop would have paid
-    /// for it.
+    /// A dog with no process, out of its restart budget, parked in a backoff
+    /// or stopped by an operator, cannot handshake, so waiting on one would
+    /// make every later reload pay the whole budget for a dog already
+    /// reported broken everywhere else.
     #[tokio::test]
     async fn a_dog_that_has_stopped_running_is_not_waited_on() {
         let h = harness(vec![ProcScript::never_exits()]);

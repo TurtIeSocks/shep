@@ -1,9 +1,8 @@
 //! Directory listing rendering, `shep serve`'s pure autoindex tier.
 //!
-//! No `cfg`, no I/O: the worker (Task 6) reads a directory, drops any name
-//! starting with `.` unless `--hidden` (decision 4), sorts directories
-//! first, and hands the result to [`render`]. This module only turns that
-//! list into HTML — it never touches the filesystem itself.
+//! No `cfg`, no I/O: the worker reads a directory, drops any name
+//! starting with `.` unless `--hidden`, sorts directories first, and
+//! hands the result to [`render`], which only turns that list into HTML.
 
 /// Whether an [`Entry`] names a file or a directory.
 ///
@@ -21,7 +20,7 @@ enum Kind {
 /// directory.
 ///
 /// Built with [`Entry::file`] or [`Entry::dir`]. [`render`] does not stat
-/// anything — the caller already read the directory and knows which
+/// anything: the caller already read the directory and knows which
 /// constructor applies to each name.
 #[derive(Debug, Clone)]
 pub struct Entry {
@@ -51,22 +50,15 @@ impl Entry {
 
 /// Renders a directory listing as one HTML document.
 ///
-/// `entries` are file names, already sorted, directories first. `prefix` is
-/// the request path the listing is for, always ending in `/` — the caller
-/// redirects a directory request without a trailing slash before it ever
-/// gets here.
+/// `entries` are file names, already sorted, directories first, and
+/// already filtered: the caller drops any name starting with `.` unless
+/// `--hidden`. `prefix` is the request path the listing is for, always
+/// ending in `/`.
 ///
-/// Two escapes, and they are different escapes for different sinks. The name
-/// is HTML-escaped for the text node (`&`, `<`, `>`, `"`, `'`), because a
-/// file named `<script>alert(1)</script>` is a thing a build tool produces
-/// by accident and a stored-XSS otherwise. The href is percent-encoded via
-/// [`encode_segment`], because a name with a space, a `#` or a `?` produces
-/// a link that goes somewhere else.
-///
-/// `entries` reaches here already filtered: the caller drops any name
-/// starting with `.` unless `--hidden` (decision 4). A listing that names
-/// `.env` and then 404s on it has still leaked the filename, which is the
-/// whole reason listing is off by default.
+/// The name is HTML-escaped for the text node, since a filename can
+/// itself be `<script>...</script>`. The href is percent-encoded via
+/// [`encode_segment`] instead, since a name with a space, `#` or `?`
+/// would otherwise produce a link to somewhere else.
 #[must_use]
 pub fn render(prefix: &str, entries: &[Entry]) -> String {
     let mut out = String::new();
@@ -95,16 +87,12 @@ pub fn render(prefix: &str, entries: &[Entry]) -> String {
 
 /// Percent-encodes one path segment for a URL.
 ///
-/// Public within `serve` because there are **two** sinks, not one: this
-/// module's `href`s, and the trailing-slash redirect's `Location` in the
-/// worker. A directory named with any non-ASCII byte would otherwise produce
-/// a `Location` that `http::write_head`'s control-byte check refuses, and
-/// the operator would get a 500 on a directory that exists.
+/// Public within `serve`: also used by the worker's trailing-slash
+/// redirect `Location`, where an unencoded non-ASCII byte would produce a
+/// header `http::write_head`'s control-byte check refuses.
 ///
 /// The safe set is `encodeURIComponent`'s: ASCII alphanumerics plus
-/// `- _ . ~ ! * ' ( )`. Everything else, byte by byte, becomes `%XX` —
-/// including every byte of a multi-byte UTF-8 sequence, so a non-ASCII name
-/// still produces a header value that is entirely printable ASCII.
+/// `- _ . ~ ! * ' ( )`. Everything else becomes `%XX`, byte by byte.
 #[must_use]
 pub fn encode_segment(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
@@ -157,9 +145,7 @@ mod tests {
         assert!(html.contains("href=\"%3Cscript%3Ealert(1)"), "{html}");
     }
 
-    /// fails if a name with a space or a `#` produces a broken link — the
-    /// second half of the escaping pair, and the half that is about
-    /// correctness rather than security.
+    /// fails if a name with a space or a `#` produces a broken link.
     #[test]
     fn a_filename_with_a_space_or_a_hash_produces_a_link_that_resolves() {
         let html = render("/docs/", &[Entry::file("release notes #2.md")]);
@@ -169,10 +155,8 @@ mod tests {
         );
     }
 
-    /// fails if a non-ASCII name produces bytes a header cannot carry. The
-    /// same encoder feeds the worker's redirect `Location`, where an
-    /// unencoded byte is a 500 on a directory that exists rather than a
-    /// cosmetic problem.
+    /// fails if a non-ASCII name produces bytes a header cannot carry: the
+    /// same encoder feeds the worker's redirect `Location`.
     #[test]
     fn a_non_ascii_name_encodes_to_printable_ascii() {
         let encoded = encode_segment("документы");

@@ -49,15 +49,10 @@ fn parse_rate(raw: Option<&str>) -> u32 {
 
 /// Turns a rate into the sleep between lines.
 ///
-/// `Duration::from_secs_f64`, not integer millisecond division: at any rate
-/// above 1000/s, `1000 / rate` floors to zero and the loop busy-spins
-/// instead of honouring the rate it was given. This stays honest at any
-/// rate a `u32` can hold -- up to the point where the computed interval
-/// itself rounds to zero, which `from_secs_f64` does for `rate` close
-/// enough to `u32::MAX` that `1.0 / rate` underflows a `Duration`'s
-/// resolution. Checked on the computed interval rather than by guessing a
-/// numeric threshold below `u32::MAX`, so the rule stays true regardless of
-/// exactly where `from_secs_f64` starts rounding down to zero.
+/// `Duration::from_secs_f64`, not integer millisecond division: above
+/// 1000/s, integer division floors to zero and the loop busy-spins.
+/// Near `u32::MAX`, the computed interval itself can round to zero.
+/// The check runs on the interval rather than a numeric threshold.
 ///
 /// # Panics
 ///

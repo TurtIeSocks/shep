@@ -1,14 +1,14 @@
-//! `cron_restart` schedule parsing — the croner-backed cron grammar (spec §4)
+//! `cron_restart` schedule parsing: the croner-backed cron grammar (spec §4).
 //!
-//! The dialect is five-field standard cron only: widening a grammar later is
-//! backwards-compatible, narrowing one is not, so this starts narrow rather
-//! than inheriting croner's full extension set. croner
-//! still accepts `L`, `W`, `#` and `?` natively — rejecting them is this
-//! module's job, done by a token-aware pre-parse scan, because a character
-//! scan alone would reject `JUL` and `WED` (both contain a reserved letter).
-//! The seven vixie `@nickname` shorthands are expanded to five fields before
-//! croner ever sees them: croner's own nickname table has no `@midnight`
-//! arm, so delegating would accept `@daily` and reject `@midnight`.
+//! Five-field standard cron only. croner still accepts `L`, `W`, `#` and
+//! `?` natively; rejecting them is this module's job, done by a
+//! token-aware pre-parse scan, since a character scan alone would reject
+//! `JUL` and `WED` (both contain a reserved letter).
+//!
+//! The seven vixie `@nickname` shorthands are expanded to five fields
+//! before croner ever sees them: its own nickname table has no
+//! `@midnight` arm, so delegating would accept `@daily` and reject
+//! `@midnight`.
 
 use core::fmt;
 
@@ -44,13 +44,13 @@ const NAMES: [&str; 19] = [
 /// The croner and chrono-tz types are private: a cron dialect is a Flockfile
 /// grammar promise, and pinning it to a dependency's public types would make
 /// that dependency's next major version a breaking change to shep's own
-/// config surface (IR-11).
+/// config surface.
 // wire format: the accepted pattern grammar is a config contract; widening or
 // narrowing it is a breaking change
 #[derive(Debug, Clone)]
 pub struct CronSchedule {
     /// The pattern exactly as the caller wrote it, including a nickname
-    /// spelling — never croner's normalized `Cron::as_str` rendering.
+    /// spelling, never croner's normalized `Cron::as_str` rendering.
     pattern: String,
     zone: Tz,
     cron: Cron,
@@ -61,8 +61,8 @@ impl CronSchedule {
     ///
     /// # Errors
     ///
-    /// - [`CronParseError::Pattern`] — croner rejected the pattern.
-    /// - [`CronParseError::Timezone`] — the name is not an IANA zone.
+    /// - [`CronParseError::Pattern`]: croner rejected the pattern.
+    /// - [`CronParseError::Timezone`]: the name is not an IANA zone.
     pub fn parse(pattern: &str, timezone: Option<&str>) -> Result<Self, CronParseError> {
         let zone = match timezone {
             Some(name) => parse_timezone_name(name).ok_or_else(|| CronParseError::Timezone {
@@ -95,33 +95,16 @@ impl CronSchedule {
 
     /// The first occurrence strictly after `after`, in UTC.
     ///
-    /// Returns `None` when the pattern has no further occurrence croner is
-    /// willing to search for — a pattern like `0 0 30 2 *` (30 February) that
-    /// can never match.
-    ///
-    /// A pattern that matches an hour repeated by a DST fall-back can return
-    /// the same wall-clock occurrence twice across two successive calls —
-    /// once for each pass through that hour. This is croner's own standard
-    /// local-time search semantics, not a defect this wrapper introduces or
-    /// could suppress without also making the reverse case (a spring-forward
-    /// hour that never occurs) harder to reason about.
+    /// Returns `None` when the pattern can never match again, like `0 0 30 2 *`
+    /// (30 February). A DST fall-back hour resolves to its earlier instant
+    /// only, never the repeated wall-clock hour twice, croner's own semantics.
     ///
     /// # Errors
-    ///
-    /// - [`CronScheduleError::Search`] — croner failed the search for a reason
-    ///   other than exhaustion, carrying its own sentence.
+    /// - [`CronScheduleError::Search`]: the search failed for a reason other than exhaustion.
     ///
     /// # Panics
-    ///
-    /// Panics if converting `after` into `zone`'s local calendar lands
-    /// outside the range chrono's `NaiveDateTime` can represent — chrono
-    /// panics rather than erroring in that case, and croner has no fallible
-    /// entry point that avoids it (e.g. `DateTime::<Utc>::MAX_UTC` read in
-    /// `Pacific/Kiritimati`, UTC+14, which pushes the local instant past the
-    /// representable range). Unreachable from `Utc::now()`, which is the
-    /// only `after` this crate's own callers pass; documented rather than
-    /// guarded because a guard would exist solely for an instant no caller
-    /// can construct without going out of their way to do it.
+    /// If converting `after` into `zone`'s calendar falls outside what
+    /// `NaiveDateTime` can represent. Unreachable from `Utc::now()`.
     pub fn next_after(
         &self,
         after: DateTime<Utc>,
@@ -144,13 +127,13 @@ impl CronSchedule {
 }
 
 /// Growth is expected: croner's dialect has more rejection modes than this
-/// enum distinguishes today, and a future `cron_timezone` shorthand would add
-/// one more (IR-20).
+/// enum distinguishes today, and a future `cron_timezone` shorthand would
+/// add one more.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CronParseError {
     /// The pattern is not valid in shep's dialect. Carries the pattern as the
-    /// user wrote it and the rendered reason — croner's own sentence where
+    /// user wrote it and the rendered reason: croner's own sentence where
     /// croner did the rejecting, ours where the pre-parse pass did.
     Pattern {
         /// The pattern as the user wrote it
@@ -182,7 +165,7 @@ impl core::error::Error for CronParseError {}
 ///
 /// One variant today and no `#[non_exhaustive]`: the only failure a search can
 /// have that is not exhaustion is croner's own, and a second variant would be
-/// a second reason, not a second rendering of this one (IR-20).
+/// a second reason, not a second rendering of this one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CronScheduleError {
     /// croner could not resolve the next occurrence; carries its rendered reason.
@@ -218,7 +201,7 @@ fn cron_parser() -> CronParser {
 }
 
 /// Parses an IANA timezone name. Shared by [`CronSchedule::parse`] and
-/// `normalize`'s standalone `cron_timezone` check — a Flockfile may carry a
+/// `normalize`'s standalone `cron_timezone` check: a Flockfile may carry a
 /// timezone with no `cron_restart` to pair it with, and spec §5 says that
 /// typo fails loudly too.
 pub(super) fn parse_timezone_name(name: &str) -> Option<Tz> {
@@ -226,31 +209,26 @@ pub(super) fn parse_timezone_name(name: &str) -> Option<Tz> {
 }
 
 /// True when `trimmed` is exactly one whitespace-free token starting with
-/// `@` — the only shape nickname expansion applies to. A multi-token pattern
-/// that happens to contain `@` is left alone; croner will reject it on its
-/// own terms.
+/// `@`, the only shape nickname expansion applies to. A multi-token
+/// pattern containing `@` is left alone; croner rejects it on its own
+/// terms.
 ///
-/// The `split_whitespace().count() == 1` clause has no mutation test of its
-/// own: a multi-token `@`-leading pattern ends in `Err(CronParseError::Pattern)`
-/// either way, whether this function routes it to [`expand_nickname`]'s
-/// "not a recognized nickname" rejection or leaves it for croner's own
-/// malformed-pattern rejection. Weakening the clause changes which message
-/// fires, not whether the pattern is accepted, so it reads as unguarded —
-/// noted here rather than left looking load-bearing.
+/// The `split_whitespace().count() == 1` clause has no mutation test: a
+/// multi-token `@`-leading pattern ends in the same error either way, just
+/// with a different message, so weakening the clause changes which
+/// message fires, not whether the pattern is accepted.
 fn is_single_at_token(trimmed: &str) -> bool {
     trimmed.starts_with('@') && trimmed.split_whitespace().count() == 1
 }
 
 /// Expands a single-token `@`-pattern against the closed vixie table.
 /// `@reboot` and anything unrecognized are rejected here, with a message
-/// naming the reason — never handed to croner, whose own rejection would
+/// naming the reason, never handed to croner, whose own rejection would
 /// read as a field-count complaint that says nothing about nicknames.
 fn expand_nickname(trimmed: &str, original: &str) -> Result<String, CronParseError> {
     if trimmed.eq_ignore_ascii_case("@reboot") {
-        // Just the reason, not "@reboot is not a supported cron_restart
-        // pattern:" again — the caller's `CronParseError::Pattern` Display
-        // impl already renders `invalid cron_restart pattern `@reboot`:`
-        // ahead of this, and repeating it here doubled the message.
+        // Just the reason: `CronParseError::Pattern`'s Display already
+        // renders `invalid cron_restart pattern `@reboot`:` ahead of this.
         return Err(CronParseError::Pattern {
             pattern: original.to_string(),
             reason: "shep's own restart policy already decides when a sheep starts".to_string(),
@@ -273,7 +251,7 @@ fn expand_nickname(trimmed: &str, original: &str) -> Result<String, CronParseErr
 /// Rejects croner's `L`, `W`, `#` and `?` extensions before the pattern
 /// reaches croner, which accepts all four natively. Scans token-aware, per
 /// whitespace-separated field, treating a recognized three-letter month or
-/// weekday name as opaque first — a character-wise scan would reject `JUL`
+/// weekday name as opaque first: a character-wise scan would reject `JUL`
 /// and `WED`, which are valid standard cron.
 fn reject_extension_characters(candidate: &str, original: &str) -> Result<(), CronParseError> {
     for field in candidate.split_whitespace() {
@@ -388,7 +366,7 @@ mod tests {
     #[test]
     fn year_field_pattern_is_rejected() {
         // fails if `.seconds(Seconds::Disallowed)` was "simplified away" on
-        // the theory that a `.year(...)` call was also needed — one setting
+        // the theory that a `.year(...)` call was also needed: one setting
         // closes both widenings
         match CronSchedule::parse("0 3 * * * 2027", None) {
             Err(CronParseError::Pattern { pattern, .. }) => assert_eq!(pattern, "0 3 * * * 2027"),
@@ -398,18 +376,9 @@ mod tests {
 
     #[test]
     fn nicknames_expand_to_the_same_occurrence_sequence_as_their_five_field_form() {
-        // fails if any expansion is wrong (`@weekly` as `0 0 * * 1` is the
-        // likely slip) and fails if `@midnight` was left to croner, whose
-        // nickname table has no arm for it
-        //
-        // The five-field forms below are transcribed by hand from spec §4
-        // and do NOT read the module's `NICKNAMES` table — comparing a
-        // nickname's expansion against a copy of the same table it came
-        // from is a tautology (corrupting `NICKNAMES` corrupts both sides
-        // of the comparison identically, so the test still passes). Proven
-        // by mutation: with this table read from `NICKNAMES`, mutating
-        // `@weekly`'s row to `0 0 * * 1` — the exact slip named above — left
-        // all tests green.
+        // Transcribed by hand from spec §4, not read from `NICKNAMES`:
+        // comparing a table against a copy of itself would pass even if
+        // both were wrong.
         let anchor = dt("2026-01-01T00:00:00Z");
         let expected_expansions: [(&str, &str); 7] = [
             ("@yearly", "0 0 1 1 *"),
@@ -507,7 +476,7 @@ mod tests {
     #[test]
     fn zone_offset_can_move_the_occurrence_to_a_different_utc_date() {
         // fails the same way as the Oslo case, but here the local and UTC
-        // calendar dates disagree — a naive UTC-only implementation gets the
+        // calendar dates disagree: a naive UTC-only implementation gets the
         // date wrong in the other direction
         let schedule = CronSchedule::parse("30 23 * * *", Some("Pacific/Auckland")).unwrap();
         let seq = occurrence_sequence(&schedule, dt("2026-07-05T00:00:00Z"), 3);
@@ -588,13 +557,9 @@ mod tests {
 
     #[test]
     fn search_failure_other_than_exhaustion_surfaces_as_err() {
-        // fails if `Err(_) => Ok(None)` collapses the two `CronError` arms
-        // into one — the inversion that turns a transient search failure
-        // into "this schedule never fires again", the same shape as the
-        // `Ok(None)` above but silently wrong instead of correct. A
-        // maximal-UTC instant pushes the zone conversion past what croner
-        // can search from, which it reports as `InvalidTime` rather than
-        // `TimeSearchLimitExceeded` — the `Err` arm this schedule must take.
+        // Guards `Err(_) => Ok(None)` from collapsing both `CronError` arms
+        // into one. `MAX_UTC` reports `InvalidTime`, not
+        // `TimeSearchLimitExceeded`, so this must take the `Err` arm.
         let schedule = CronSchedule::parse("0 3 * * *", None).unwrap();
         match schedule.next_after(DateTime::<Utc>::MAX_UTC) {
             Err(CronScheduleError::Search { reason }) => {
@@ -643,7 +608,7 @@ mod tests {
 
     #[test]
     fn day_of_month_nearest_weekday_extension_is_rejected() {
-        // fails if `W` is dropped from the scan — the character most likely
+        // fails if `W` is dropped from the scan: the character most likely
         // to be skipped, since `JUL`/`WED` make a naive scan treat it as
         // part of a name
         assert_extension_char_rejected("0 0 1W * *", 'W');
@@ -663,10 +628,10 @@ mod tests {
 
     #[test]
     fn month_and_weekday_names_are_not_mistaken_for_extension_characters() {
-        // fails if the scan is character-wise instead of name-aware — `JUL`
+        // fails if the scan is character-wise instead of name-aware: `JUL`
         // contains `L` and `WED` contains `W`, both legal here. A suite that
         // only covers rejections would pass an implementation that rejects
-        // every name-bearing pattern, which is why this row exists.
+        // every name-bearing pattern.
         let schedule = CronSchedule::parse("0 0 * JUL WED", None).unwrap();
         assert_eq!(schedule.pattern(), "0 0 * JUL WED");
     }

@@ -1,5 +1,4 @@
-//! Fixtures the pane test modules share. See the phase plan for why they live
-//! in one file rather than three.
+//! Fixtures the pane test modules share.
 
 use std::ffi::OsStr;
 use std::path::PathBuf;
@@ -65,8 +64,8 @@ pub fn flock_of(count: u32, with_readings: u32) -> Vec<ProcessInfo> {
         .collect()
 }
 
-/// One plausible host reading: the same numbers the gallery's scenes use, so a
-/// failure here and a frame the maintainer is looking at name the same figures.
+/// One plausible host reading: the same numbers the gallery's scenes use, so
+/// a failure here and a frame under review name the same figures.
 pub fn sample() -> HostSample {
     HostSample {
         load: (2.31, 4.10, 3.88),
@@ -86,17 +85,12 @@ pub fn with_host(sample: HostSample, flock: Vec<ProcessInfo>) -> App {
     app
 }
 
-/// A dashboard with no host reading — **and the two ways there are of having
-/// none are not the same state.**
-///
-/// `unsupported: true` applies `Msg::Host { sample: None }`, which is what a
-/// platform `sysinfo` does not support produces; the reducer sets
-/// `host_unsupported` from it and the strip says so.
-/// `unsupported: false` applies **no `Msg::Host` at all**, which is the state
-/// before the first heartbeat, and the strip says `not read yet` instead.
-/// Passing a `None` sample for the second would produce the first, and the
-/// test asserting the two sentences differ would pass by rendering one of them
-/// twice.
+/// A dashboard with no host reading. The two ways of having none are not the
+/// same state: `unsupported: true` applies `Msg::Host { sample: None }`, the
+/// signal a `sysinfo` that does not support the platform produces, and the
+/// strip says so. `unsupported: false` applies no `Msg::Host` at all, the
+/// state before the first heartbeat, and the strip says `not read yet`
+/// instead.
 pub fn with_host_none(flock: Vec<ProcessInfo>, unsupported: bool) -> App {
     let mut app = app_with(flock, plain());
     if unsupported {
@@ -113,8 +107,8 @@ pub fn with_feed(tail: Tail) -> App {
     app
 }
 
-/// Like [`with_feed`], but selects sheep `id` first — for the tests that
-/// need the header to name a specific sheep.
+/// Like [`with_feed`], but selects sheep `id` first, for the tests that need
+/// the header to name a specific sheep.
 pub fn with_feed_and_selection(tail: Tail, id: u32) -> App {
     let mut app = app_with(flock_of(3, 0), plain());
     for _ in 0..id {
@@ -124,7 +118,7 @@ pub fn with_feed_and_selection(tail: Tail, id: u32) -> App {
     app
 }
 
-/// Like [`with_feed`], but with an explicit palette — for the one test that
+/// Like [`with_feed`], but with an explicit palette, for the one test that
 /// asserts on a specific foreground colour.
 pub fn with_feed_and_palette(tail: Tail, palette: Palette) -> App {
     let mut app = app_with(flock_of(3, 0), palette);
@@ -138,26 +132,18 @@ pub fn with_no_selection() -> App {
     app_with(Vec::new(), plain())
 }
 
-/// A TWO-sheep dashboard with the selection walked onto `info`.
-///
-/// Two, and the selection not on row 0, on purpose: Task 7's first mutation
-/// replaces `selected_row()` with `rows().first()`, and a one-sheep fixture
-/// would make that mutation invisible. Both properties are ASSERTED below
-/// rather than assumed, which is the whole reason this walks the cursor
-/// instead of pressing `j` once.
+/// A two-sheep dashboard with the selection walked onto `info`, on row 1
+/// rather than row 0, so a `selected_row()` that fell back to the first row
+/// would be caught. Both properties are asserted below rather than assumed.
 pub fn with_selection(info: ProcessInfo) -> App {
     with_selection_and_palette(info, plain())
 }
 
 /// The same, at a given palette.
 ///
-/// The decoy is `!decoy` rather than `decoy` because the table reads by NAME:
-/// with an ordinary name the decoy sorts wherever the alphabet puts it, and
-/// this fixture is used with sheep called `api`, `cron` and `gateway`. It used
-/// to press `j` once and trust `info` to be row 1, which was true only while
-/// the table read by id and the decoy held id 0. `!` sorts below every ASCII
-/// letter and digit, so the decoy is row 0 whatever the sheep under test is
-/// called.
+/// The decoy is named `!decoy` rather than `decoy`: the table reads by name,
+/// and `!` sorts below every ASCII letter and digit, so the decoy is row 0
+/// whatever the sheep under test is called.
 pub fn with_selection_and_palette(info: ProcessInfo, palette: Palette) -> App {
     assert!(
         info.id > 0,
@@ -176,12 +162,10 @@ pub fn with_selection_and_palette(info: ProcessInfo, palette: Palette) -> App {
     app
 }
 
-/// A sheep whose listing DID carry lambs.
+/// A sheep whose listing carries lambs.
 ///
-/// `ListFlock` never populates this field — that is the whole of design
-/// decision 4 — so this fixture is deliberately impossible. The pane must not
-/// mention lambs even when handed some, because the failure being guarded is a
-/// heading or a caption promising a list, not a missing `if let`.
+/// `ListFlock` never populates this field, so this fixture cannot occur live:
+/// the pane must not mention lambs even when handed some.
 pub fn sheep_with_lambs() -> ProcessInfo {
     ProcessInfo::builder(9, "gateway", ProcStatus::Online)
         .pid(Some(48_301))
@@ -254,12 +238,8 @@ pub fn lamb_line_of(app: &App) -> String {
         .expect("the pane has a lamb line")
 }
 
-/// A dashboard with twelve sheep and a full bleats feed — Task 8's own
-/// fixture, for the checks that need every pane to have more than it can
-/// show: the flock table needs rows to prove it kept the middle of the
-/// screen, and the feed needs enough lines to fill its reserved rows so a
-/// short terminal's layout sweep can tell a genuine hole in the arithmetic
-/// apart from a pane that is up but has nothing to say.
+/// A dashboard with twelve sheep and a full bleats feed, for the checks that
+/// need every pane to have more than it can show.
 pub fn full_app() -> App {
     let mut app = app_with(flock_of(12, 12), plain());
     app.update(Msg::Bleats {
@@ -322,9 +302,8 @@ pub fn filtered_app_of(flock: Vec<ProcessInfo>, query: &str) -> App {
     app
 }
 
-/// The same four sheep with `query` half-typed and the box still OPEN: no
-/// `TextApply`, which is the whole difference between this and
-/// [`filtered_app`].
+/// The same four sheep with `query` half-typed and the box still open: no
+/// `TextApply`, which is the whole difference from [`filtered_app`].
 pub fn editing_app(query: &str) -> App {
     let mut app = app_with(named_flock(), plain());
     app.update(Msg::Key(KeyPress::FilterStart));
@@ -351,11 +330,9 @@ fn named_flock() -> Vec<ProcessInfo> {
 /// [`filtered_app`]'s four sheep with the gate open and the cursor on `api`
 /// at id 2, which is the sheep every action assertion in this file names.
 ///
-/// The cursor is WALKED to `api` rather than moved a fixed number of rows.
-/// The table reads by name, so which row `api` occupies depends on what
-/// the other three sheep happen to be called, not on its id. A fixture
-/// that silently selects a different sheep than its doc claims is worse
-/// than one that fails, so the walk asserts it arrived.
+/// The cursor is walked to `api` rather than moved a fixed number of rows:
+/// the table reads by name, so which row `api` occupies depends on the
+/// other sheep's names, not on its id.
 pub fn allowed_app() -> App {
     let mut app = app_with(named_flock(), plain());
     app.set_control_for_tests(Control::Allowed);
@@ -387,16 +364,11 @@ pub fn acting_app(verb: ActionVerb) -> App {
     app
 }
 
-/// An armed confirm with a filter applied AND a notice standing, so the bar
-/// has something in three slots at once and the ordering assertion has
-/// something to fail on.
+/// An armed confirm with a filter applied and a notice standing, so the bar
+/// has something in all three slots at once.
 ///
-/// Order matters: the filter is applied first, then the action is armed, then
-/// the notice is raised — NOT the other way round. Arming is a keypress, and
-/// `on_key`'s normal branch opens with `self.notice = None`, so arming AFTER
-/// the notice would wipe the very notice this fixture exists to leave
-/// standing. `Msg::Event(BusEvent::Dropped { .. })` never passes through
-/// `on_key` at all, so raising the notice last is what makes it survive.
+/// Order matters: the notice must be raised after arming, since `on_key`'s
+/// normal branch clears it, and `Msg::Event` never passes through `on_key`.
 pub fn armed_app_with_a_filter_and_a_notice() -> App {
     let mut app = filtered_app("api");
     app.set_control_for_tests(Control::Allowed);
@@ -421,7 +393,7 @@ pub fn settings_snapshot() -> SettingsSnapshot {
         allow_control: config("false"),
         style_level: config("full"),
         // The document declares it, so the file and the resolved value
-        // agree -- see `SettingsSnapshot::style_level_in_file`.
+        // agree.
         style_level_in_file: Some("full".to_string()),
         dogs: vec![
             DogView {
@@ -450,9 +422,8 @@ pub fn app_in_settings() -> App {
 }
 
 /// [`app_in_settings_with_control`] with the cursor already moved onto
-/// `field`'s row, by real `SelectDown` keypresses -- not by poking the
-/// cursor index directly, so a test using this fixture is exercising the
-/// same path an operator would.
+/// `field`'s row, by real `SelectDown` keypresses rather than poking the
+/// cursor index directly.
 pub fn app_in_settings_on(field: SettingField) -> App {
     let mut app = app_in_settings_with_control();
     let target = app
@@ -487,9 +458,8 @@ pub fn app_in_settings_at() -> (App, Instant) {
 /// keypresses the same way [`app_in_settings_on`] moves it.
 ///
 /// The one state where a scalar's value in force and its value on disk
-/// disagree, which is the whole reason `[style]` carries two of them --
-/// every other field's layers belong to the shepherd's process, where
-/// lookout can see neither.
+/// disagree. Every other field's layers belong to the shepherd's process,
+/// where lookout can see neither.
 pub fn app_in_settings_with_shadowed_style(source: StyleSource) -> App {
     let mut app = app_in_settings_on(SettingField::StyleLevel);
     let mut snapshot = settings_snapshot();
@@ -513,10 +483,9 @@ pub fn app_in_settings_with_control() -> App {
     app
 }
 
-/// [`settings_snapshot`]'s own scalars, with `dogs` replaced -- for the
-/// dogs-table tests, which need particular names, `enabled` bits and (for
-/// the join) a matching or mismatching flock, none of which
-/// [`settings_snapshot`]'s own fixed two cover.
+/// [`settings_snapshot`]'s own scalars, with `dogs` replaced, for the
+/// dogs-table tests, which need particular names, `enabled` bits, and a
+/// matching or mismatching flock.
 fn settings_snapshot_with_dogs(dogs: Vec<DogView>) -> SettingsSnapshot {
     SettingsSnapshot {
         dogs,
@@ -524,10 +493,10 @@ fn settings_snapshot_with_dogs(dogs: Vec<DogView>) -> SettingsSnapshot {
     }
 }
 
-/// `otel` runs online while the file disables it -- what "a removed name
-/// keeps running" looks like from the outside. `ledger` is enabled in the
-/// file and absent from the flock -- a dog that failed to start. Exercises
-/// [`super::settings::dog_rows`]'s join, not the toggle.
+/// `otel` runs online while the file disables it: a removed name still
+/// running. `ledger` is enabled in the file and absent from the flock: a dog
+/// that failed to start. Exercises [`super::settings::dog_rows`]'s join, not
+/// the toggle.
 pub fn app_in_settings_with_dog_drift() -> App {
     let flock = vec![
         ProcessInfo::builder(90, "otel", ProcStatus::Online)
@@ -539,11 +508,8 @@ pub fn app_in_settings_with_dog_drift() -> App {
     app.update(Msg::Key(KeyPress::Settings));
     app.update(Msg::Settings {
         result: Ok(settings_snapshot_with_dogs(vec![
-            // Real paths, not `None`: `otel` and `ledger` are not in
-            // `BUILT_IN_DOGS`, so `dog_candidates` can only have built them
-            // from `[daemon] adopted_dogs`, and every value in that map is
-            // a path. A `None` here is a row the reader cannot produce
-            // from a document shep wrote.
+            // Real paths, not `None`: `otel` and `ledger` are adopted dogs,
+            // and every value in `[daemon] adopted_dogs` is a path.
             DogView {
                 name: "otel".to_string(),
                 enabled: false,
@@ -559,10 +525,10 @@ pub fn app_in_settings_with_dog_drift() -> App {
     app
 }
 
-/// `bark` is up but has never completed a handshake -- Phase 3b's own
-/// `handshook: Some(false)` -- so [`super::settings::dog_rows`] must read it
-/// `silent`, not `online`, the same correction
-/// [`crate::vocabulary::Reported`] makes for the flock table.
+/// `bark` is up but has never completed a handshake
+/// (`handshook: Some(false)`), so [`super::settings::dog_rows`] must read it
+/// `silent`, not `online`, the same correction [`crate::vocabulary::Reported`]
+/// makes for the flock table.
 pub fn app_in_settings_with_silent_dog() -> App {
     let flock = vec![
         ProcessInfo::builder(91, "bark", ProcStatus::Online)
@@ -584,8 +550,7 @@ pub fn app_in_settings_with_silent_dog() -> App {
 }
 
 /// Two candidate dogs for the toggle tests: `metrics` disabled, `otel`
-/// enabled -- one of each starting bit, so a test can pick whichever
-/// direction (`enable`/`disable`) it means to arm.
+/// enabled, so a test can pick whichever direction it means to arm.
 fn settings_snapshot_for_toggle_tests() -> SettingsSnapshot {
     settings_snapshot_with_dogs(vec![
         DogView {
@@ -603,8 +568,7 @@ fn settings_snapshot_for_toggle_tests() -> SettingsSnapshot {
 
 /// A dashboard with the settings screen open on
 /// [`settings_snapshot_for_toggle_tests`], the control gate open, and the
-/// cursor moved onto `name`'s dog row by real `SelectDown` keypresses --
-/// the same real-path rule [`app_in_settings_on`] follows for a scalar row.
+/// cursor moved onto `name`'s dog row by real `SelectDown` keypresses.
 ///
 /// The six scalar rows always sort first in `Settings::rows`, so the dog at
 /// index `i` of [`settings_snapshot_for_toggle_tests`]'s own list sits at

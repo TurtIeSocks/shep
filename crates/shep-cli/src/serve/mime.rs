@@ -2,7 +2,7 @@
 //!
 //! No `cfg`, no I/O, no allocation on the lookup path: [`content_type`] takes
 //! the request path already resolved by `serve::path` and returns the
-//! `Content-Type` header value the worker (Task 6) writes for it.
+//! `Content-Type` header value the worker writes for it.
 
 /// Extension → content type. About twenty-five entries, ASCII-lowercased on
 /// lookup, `application/octet-stream` for anything else.
@@ -12,9 +12,8 @@
 /// be a crate in the tree for a lookup, plus a second opinion about `.js`
 /// nobody asked for.
 ///
-/// `charset=utf-8` is on the text types deliberately. Without it a browser
-/// falls back to a locale-dependent encoding and a UTF-8 page renders as
-/// mojibake on somebody else's machine and not on yours.
+/// `charset=utf-8` is on the text types: without it a browser falls back
+/// to a locale-dependent encoding and a UTF-8 page renders as mojibake.
 const TYPES: &[(&str, &str)] = &[
     ("html", "text/html; charset=utf-8"),
     ("htm", "text/html; charset=utf-8"),
@@ -51,10 +50,9 @@ const FALLBACK: &str = "application/octet-stream";
 
 /// The `Content-Type` header value for a request path, by its extension.
 ///
-/// The extension is everything after the **last** `.` — `archive.tar.gz`
-/// looks up `gz`, not `tar.gz` — matched against [`TYPES`]
-/// case-insensitively, so `.HTML` and `.Html` resolve like `.html`. A path
-/// with no `.` at all, or an extension [`TYPES`] does not list, gets
+/// The extension is everything after the last `.` (`archive.tar.gz` looks
+/// up `gz`), matched against [`TYPES`] case-insensitively. A path with no
+/// `.` at all, or an extension [`TYPES`] does not list, gets
 /// [`FALLBACK`].
 #[must_use]
 pub fn content_type(path: &str) -> &'static str {
@@ -78,24 +76,23 @@ mod tests {
         assert_eq!(content_type("style.css"), "text/css; charset=utf-8");
     }
 
-    /// fails if an unknown extension or a missing one stops falling back to
-    /// the generic binary type — the two ways a path can miss the table.
+    /// fails if an unknown extension or a missing one stops falling back
+    /// to the generic binary type.
     #[test]
     fn an_unknown_extension_and_no_extension_both_fall_back() {
         assert_eq!(content_type("archive.wat"), FALLBACK);
         assert_eq!(content_type("Makefile"), FALLBACK);
     }
 
-    /// fails if the lookup stops being case-insensitive — a served
-    /// filesystem is not obligated to use lowercase extensions.
+    /// fails if the lookup stops being case-insensitive.
     #[test]
     fn the_lookup_is_case_insensitive() {
         assert_eq!(content_type("INDEX.HTML"), "text/html; charset=utf-8");
         assert_eq!(content_type("Index.Html"), "text/html; charset=utf-8");
     }
 
-    /// fails if a double extension resolves on the first dot instead of the
-    /// last — `archive.tar.gz` is not a `.tar` file.
+    /// fails if a double extension resolves on the first dot instead of
+    /// the last.
     #[test]
     fn a_double_extension_uses_only_the_last_one() {
         assert_eq!(content_type("archive.tar.gz"), FALLBACK);

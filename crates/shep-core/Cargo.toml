@@ -11,11 +11,10 @@ documentation = "https://docs.rs/shep-core"
 keywords = ["shep", "process-manager", "supervisor", "flockfile", "protocol"]
 categories = ["config", "parsing", "data-structures"]
 
-# No `default` feature exists, so docs.rs's own default build would compile
-# this crate without `schema` — `flockfile_schema_json` and every `JsonSchema`
-# impl it gates would render as though they don't exist. `all-features` is
-# baked into the docs.rs build per published version and cannot be changed
-# after the fact, so this has to be right before the first `cargo publish`.
+# No `default` feature exists, so docs.rs's default build would compile this
+# crate without `schema`, hiding `flockfile_schema_json` and every
+# `JsonSchema` impl. `all-features` is baked into the docs.rs build per
+# published version and cannot change after the fact.
 [package.metadata.docs.rs]
 all-features = true
 
@@ -23,12 +22,10 @@ all-features = true
 # Off by default. `JsonSchema` derives for the Flockfile document schema
 # (`assets/flockfile.schema.json`), which `shep schema` prints.
 #
-# Inside this workspace the gate is inert: cargo unifies features across the
-# graph, so every `--all-features` gate command and the shipped `shep` binary
-# compile this crate WITH schemars regardless. What it buys is out-of-tree —
-# a consumer of the published shep-core does not compile a proc macro for a
-# JSON Schema they may not want, and neither does a standalone
-# `cargo build -p shep-daemon`.
+# Inert inside this workspace: cargo unifies features, so every
+# `--all-features` command and the shipped `shep` binary compile this crate
+# with schemars regardless. It matters only for a consumer of the published
+# crate, or a standalone `cargo build -p shep-daemon`.
 schema = ["dep:schemars"]
 
 [dependencies]
@@ -39,42 +36,33 @@ serde-saphyr.workspace = true
 json5.workspace = true
 regex.workspace = true
 tokio-util.workspace = true
-# `transport` — the control plane's carrier (unix socket / Windows named
-# pipe). shep-core already owned the codec and the protocol types; owning the
-# transport beside them is what keeps `cfg(unix)` out of every layer above,
-# and it is the seam a Windows tier is impossible without. Adds no crate to
-# the workspace tree: shep-daemon, shep-client and shep-cli all already
-# depend on tokio, and `net`/`time` are features two of them already enable.
+# `transport`: the control plane's carrier (unix socket / Windows named
+# pipe). Owned here, not above, to keep `cfg(unix)` out of every layer above.
+# Adds no crate: shep-daemon, shep-client and shep-cli already depend on
+# tokio, and `net`/`time` are features two of them already enable.
 tokio = { workspace = true, features = ["net", "time", "io-util", "macros"] }
 bytes.workspace = true
 croner.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
-# Adds no PACKAGE to the tree: `rmcp`'s server feature already resolves
-# schemars 1.2.2 for whistle, workspace-pinned exactly. Verified with
-# `grep -c '^name = "schemars"$' Cargo.lock` == 1 before and after. It does
-# add one dependency EDGE, so the unanchored `grep -c schemars Cargo.lock`
-# goes 5 -> 6; that is expected, not a version conflict.
+# Adds no package to the tree: rmcp's server feature already resolves
+# schemars 1.2.2 for whistle, workspace-pinned exactly. Adds one edge only.
 schemars = { workspace = true, optional = true }
-# Compiles `watch_options`/`ignore_watch` globs at config time. The same engine
-# spec §4 names for the daemon's own watch filter, so a pattern `normalize`
-# accepts is one the filter can build (spec §4 "globs via globset").
+# Compiles `watch_options`/`ignore_watch` globs at config time, the same
+# engine spec §4 names for the daemon's own watch filter: a pattern
+# `normalize` accepts is one the filter can build.
 globset.workspace = true
-# `barks::append` stages the rewritten ring through a uniquely-named sibling temp
-# file and `persist`es it over the ledger — rename(2), the same shape
-# shep-daemon's muster-roll write uses. The uniqueness is the point: a single
-# deterministic `<path>.tmp` let one writer's rename consume another's staging
-# file, which is half the lost-update bug this dependency closes. Already a
-# normal dependency of shep-daemon, so this adds a crate to shep-core's tree and
-# none to the workspace's.
+# `barks::append` stages the rewritten ring through a uniquely-named sibling
+# temp file and `persist`es it over the ledger via rename(2). The uniqueness
+# matters: a single deterministic `<path>.tmp` lets one writer's rename
+# consume another's staging file. Adds no crate: shep-daemon already depends
+# on it.
 tempfile.workspace = true
 
-# `barks::append` holds an advisory `flock` across its whole read-modify-rename so
-# two writer processes serialise instead of clobbering. nix is already a
-# dependency of shep-daemon and shep-cli and already carries the `fs` feature in
-# shep-daemon, so this adds no crate to the tree — only a feature. A `cfg(unix)`
-# table because nix does not build on Windows, the same split the other two
-# crates use; `barks.rs` carries the Windows story in code.
+# `barks::append` holds an advisory `flock` across its whole read-modify-rename
+# so two writer processes serialise instead of clobbering. Adds no crate:
+# nix already carries the `fs` feature in shep-daemon. `cfg(unix)`: nix does
+# not build on Windows; `barks.rs` carries the Windows story in code.
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["fs"] }
 
@@ -83,12 +71,11 @@ insta.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "io-util"] }
 futures-util.workspace = true
 
-# `cfg(any())` never matches any target, so nothing here is ever compiled into any real
-# build — but Cargo's resolver still walks these entries when computing the dependency
-# graph, including under `-Z minimal-versions`. Used to force floor pins for transitive
-# deps whose own Cargo.toml under-declares their true minimum (see root Cargo.toml
-# comment for the per-crate reasoning). Safe to drop a line once the corresponding
-# upstream crate corrects its own declared floor.
+# `cfg(any())` never matches, so nothing here compiles into a real build, but
+# Cargo's resolver still walks these entries under `-Z minimal-versions`.
+# Forces floor pins for transitive deps that under-declare their true
+# minimum (see root Cargo.toml). Safe to drop a line once upstream corrects
+# its own floor.
 [target.'cfg(any())'.dependencies]
 annotate-snippets.workspace = true
 anstyle.workspace = true

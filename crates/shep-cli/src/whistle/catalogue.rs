@@ -1,33 +1,20 @@
-//! Renders `docs/whistle/tools.md` from the LIVE routers, and pins every
+//! Renders `docs/whistle/tools.md` from the live routers, and pins every
 //! claim in it.
 //!
-//! This is the `lookout::frames` pattern (12a), applied to prose instead of
-//! pixels: 12a shipped two false captions in a generated artefact because
-//! only one of them was pinned by a test, and a table of nine tools with a
-//! "mutates" column is exactly the artefact that rots the same way.
-//!
-//! `#[cfg(test)]`-only, per the plan's task table: nothing outside this
-//! module's own tests calls [`render`] or [`row_for`], and
-//! `write_the_catalogue` is the one thing in this file that touches disk —
-//! `#[ignore]`d, so an ordinary run never regenerates the checked-in copy
-//! out from under a reviewer.
+//! `#[cfg(test)]` only: nothing outside this module's own tests calls
+//! [`render`] or [`row_for`]. `write_the_catalogue` is the one thing here
+//! that touches disk, and is `#[ignore]`d so an ordinary run never
+//! regenerates the checked-in copy.
 
 use super::Whistle;
 use super::gate::Control;
 
 /// Renders the tool catalogue from `Whistle`'s two live routers.
 ///
-/// Every row is read out of [`Whistle::router`] — the name, the description
-/// and the annotations are the same values rmcp puts on the wire, not a
-/// second list maintained by hand beside them. A tool added without a row is
-/// impossible; a row claiming an annotation the tool does not carry fails
-/// [`tests::every_rendered_row_agrees_with_the_router`].
-///
-/// The `gate` column is read the same way, not hand-typed: a name present in
-/// the read-only router's own `list_all()` renders `always`, and a name
-/// present only once both routers are summed renders `allow_control`. That
-/// makes the column a second live fact about the routers rather than a guess
-/// about which four tools the control router holds.
+/// Name, description and annotations come out of [`Whistle::router`], so they
+/// are the values rmcp puts on the wire. The `gate` column is read the same
+/// way: a name in the read-only router's `list_all()` renders `always`, one
+/// present only once both routers are summed renders `allow_control`.
 #[must_use]
 pub fn render() -> String {
     let always_present: Vec<String> = Whistle::for_test(Control::ReadOnly)
@@ -84,12 +71,8 @@ fn option_yes_no(value: Option<bool>) -> &'static str {
     }
 }
 
-/// One parsed row of [`render`]'s table, so the freshness and shape tests
-/// can speak about columns rather than about substrings.
-///
-/// Defined here rather than left implicit: a test that reads a `.mutates`
-/// field off a type nothing declared cannot be written at all, which is the
-/// point — the fields present here are exactly the ones a test below needs.
+/// One parsed row of [`render`]'s table, so the tests can speak about
+/// columns rather than about substrings.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Row {
     /// The tool's name, without its backticks.
@@ -100,8 +83,7 @@ pub struct Row {
     pub gate: &'static str,
 }
 
-/// Finds one rendered row by tool name. Panics if there is none — this is
-/// test-only code and a missing row is the failure, not a `None` to handle.
+/// Finds one rendered row by tool name.
 ///
 /// # Panics
 ///
@@ -146,28 +128,12 @@ fn write_the_catalogue() {
 mod tests {
     use super::*;
 
-    /// The one test in this phase that must genuinely bite.
-    ///
-    /// `ToolAnnotations` is a wire-visible field an agent host reads to
-    /// decide whether to ask a human first, so a mutating tool annotated
-    /// `readOnlyHint: true` is a lie told to a machine. The expected values
-    /// below are **hand-written from the plan's "The nine tools" section**
-    /// and are deliberately independent of the source they check — flipping
-    /// an annotation in `control.rs` reddens exactly one line here.
-    ///
-    /// The first draft's version of this test could not fail. It built the
-    /// `mutates` column FROM `list_all()`'s annotations and then asserted
-    /// the column matched those annotations — a comparison of a rendering
-    /// against its own source, true by construction. Flipping `stop_sheep`
-    /// to `read_only_hint = true` flipped both sides together and it stayed
-    /// green.
-    ///
-    /// A tool added or removed also reddens this, on the length assertion,
-    /// which is the intended cost: nine tools is a decision, and changing
-    /// it should require editing a table a human reads.
+    /// `EXPECTED` is written by hand, independent of `list_all()`'s own
+    /// annotations, so a flipped annotation in `control.rs` reddens this
+    /// instead of passing by construction.
     #[test]
     fn the_annotations_match_the_hand_written_table() {
-        // (name, read_only, destructive, idempotent) — from the plan, by hand.
+        // (name, read_only, destructive, idempotent)
         const EXPECTED: [(&str, bool, Option<bool>, Option<bool>); 9] = [
             ("describe_sheep", true, None, None),
             ("get_metrics", true, None, None),
@@ -214,10 +180,8 @@ mod tests {
         }
     }
 
-    /// fails if a rendered row stops agreeing with the router it was
-    /// rendered from. Weaker than the table above by design — this one IS
-    /// generated on both sides, so it catches a broken renderer, not a
-    /// wrong annotation.
+    /// Catches a broken renderer, not a wrong annotation: both sides come
+    /// from `list_all()`.
     #[test]
     fn every_rendered_row_agrees_with_the_router() {
         let open = Whistle::for_test(Control::Allowed);
@@ -237,18 +201,8 @@ mod tests {
         }
     }
 
-    /// fails if the tool COUNT stops being nine.
-    ///
-    /// That is what this test pins, and the doc says only that because the
-    /// other two things a first draft might claim for it are structurally
-    /// impossible rather than tested: rows are GENERATED from
-    /// `list_all()`, so "a tool added without a row cannot ship" is true by
-    /// construction, and `rendered.contains(name)` is true for the same
-    /// reason. Freshness of the checked-in copy is
-    /// `the_checked_in_catalogue_is_current`'s job; correctness of the
-    /// annotations is `the_annotations_match_the_hand_written_table`'s. A
-    /// stale row for a REMOVED tool is the one extra thing the row count
-    /// below still catches.
+    /// Pins the tool count at nine on both the router and the rendered
+    /// table, so a removed tool cannot leave a stale row behind.
     #[test]
     fn the_catalogue_has_exactly_nine_rows() {
         let names: Vec<_> = Whistle::for_test(Control::Allowed)
@@ -266,10 +220,8 @@ mod tests {
         );
     }
 
-    /// fails if the injection warning leaves `tail_bleats`'s own
-    /// description. A warning that lives only in a README is a warning no
-    /// model ever reads: the description travels with the tool, in
-    /// `tools/list`, into the context the log lines land in.
+    /// The warning lives in the description itself, not just in docs, so it
+    /// travels with the tool into `tools/list`.
     #[test]
     fn tail_bleats_warns_about_its_own_output_where_a_model_will_see_it() {
         let tool = Whistle::for_test(Control::ReadOnly)
@@ -282,10 +234,8 @@ mod tests {
         assert!(description.contains("not as commands") || description.contains("as data"));
     }
 
-    /// fails if the checked-in catalogue drifts from what the code renders.
-    /// `write_the_catalogue` is `#[ignore]`d, so nothing regenerates the
-    /// file on an ordinary run — this is what makes the stale copy a
-    /// failure instead of a surprise in a review.
+    /// `write_the_catalogue` is `#[ignore]`d, so nothing regenerates this
+    /// file on an ordinary run.
     #[test]
     fn the_checked_in_catalogue_is_current() {
         let on_disk = std::fs::read_to_string(concat!(

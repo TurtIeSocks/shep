@@ -1,24 +1,16 @@
-//! One `parse_selector`, shared by every verb that takes a selector off the
-//! command line.
-//!
-//! Every verb that takes a selector (`lifecycle`, `logs`, `query`, `bleats`,
-//! `trigger`) shares this one function rather than each parsing it locally.
+//! One `parse_selector`, shared by `lifecycle`, `logs`, `query`, `bleats`
+//! and `trigger`.
 
 use shep_core::selector::ProcessSelector;
 
 use crate::exit::ExitCode;
 use crate::output::Streams;
 
-/// Parses `raw` client-side, so a malformed selector is a fast local usage
-/// error rather than a round trip to the daemon (the daemon re-parses it
-/// too, but only after this one already succeeded).
+/// Parses `raw` client-side, so a malformed selector is a local usage error
+/// rather than a round trip. The daemon re-parses it anyway.
 ///
-/// Returns a [`ProcessSelector`], not a `SelectorSpec`: most callers put a
-/// selector on the wire and convert what this returns themselves, with
-/// `SelectorSpec::from(&selector)` — `bleats` is the one exception, and
-/// never puts a selector on the wire at all (the daemon's topic filter has
-/// no sheep identity to match one against), so it uses what this returns
-/// directly.
+/// Returns a [`ProcessSelector`], not a `SelectorSpec`: callers that put one
+/// on the wire convert with `SelectorSpec::from(&selector)` themselves.
 pub(crate) fn parse_selector(
     streams: &mut Streams<'_>,
     raw: &str,
@@ -50,9 +42,7 @@ mod tests {
         assert!(err.is_empty());
     }
 
-    /// `/[/` is one of the only three inputs the selector grammar rejects —
-    /// same fixture `lifecycle`'s and `logs`'s own malformed-selector tests
-    /// use.
+    /// `/[/` is one of only three inputs the selector grammar rejects.
     #[test]
     fn a_malformed_selector_is_a_local_usage_error() {
         let mut out = Vec::new();

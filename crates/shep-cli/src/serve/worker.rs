@@ -1,19 +1,12 @@
-//! `shep serve`'s worker: binds a listener, accepts connections, and answers
-//! each one against [`ServeConfig`] — the last piece Phase 15 decision 5's
-//! whole argument was building toward.
+//! `shep serve`'s worker: binds a listener, accepts connections, and
+//! answers each one against [`ServeConfig`].
 //!
-//! `#[cfg(unix)]`: this module binds a real listener and reads real files,
-//! the same reason `serve::fs` is unix-only and `lookout`/`whistle`
-//! already are. `path`, `mime`, `listing` and `auth` stay pure; this is the
-//! module that actually calls them.
+//! `#[cfg(unix)]`: this binds a real listener and reads real files, same
+//! as `serve::fs`. `path`, `mime`, `listing` and `auth` stay pure; this is
+//! the module that calls them.
 //!
-//! The accept loop is copied from `dog::metrics::run`/`accept_forever`
-//! deliberately, not reinvented: bind, race `SIGINT`/`SIGTERM` against the
-//! loop, one task per connection, `Connection: close` on every reply. Two
-//! things that loop does not need and this one must have (decision 4): an
-//! admission [`tokio::sync::Semaphore`] and a whole-connection
-//! [`tokio::time::timeout`]. The metrics dog is loopback-only and writes one
-//! small in-memory body; `serve` is invited to bind wider and streams files
+//! The accept loop admits through a [`tokio::sync::Semaphore`] and wraps
+//! each connection in a [`tokio::time::timeout`]: `serve` streams files
 //! off disk, so a client that stops reading mid-transfer must not hold a
 //! task, an open file and a socket for the rest of the process's life.
 
@@ -32,47 +25,34 @@ use crate::exit::ExitCode;
 use crate::http::{self, Header, HttpError, HttpRequest};
 
 /// How long [`http::read_request`] waits for a connected peer to finish
-/// sending its request before this worker gives up on it. The same value
-/// and the same reasoning as `dog::metrics`'s own `READ_TIMEOUT`: generous
-/// for an ordinary client, small enough that a peer that connects and says
-/// nothing does not hold a task — and, here, a semaphore permit — open
+/// sending its request before this worker gives up on it. Generous for
+/// an ordinary client, small enough that a peer that connects and says
+/// nothing does not hold a task, and here, a semaphore permit, open
 /// indefinitely.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How many connections may be in flight at once.
 ///
-/// A permit is held for the whole life of a connection task, so this is a
-/// hard ceiling on tasks, open files and sockets together. Without it a
-/// client that requests a large file and then stops reading holds all three
-/// indefinitely — `tokio::io::copy` waits on a full send buffer forever —
-/// and a few hundred of those exhaust the process's descriptor table with no
-/// error anywhere. 512 is comfortably above what a static site serving a
-/// page's worth of assets needs and comfortably below a default
-/// `RLIMIT_NOFILE`.
+/// A permit is held for the whole life of a connection task, so this
+/// bounds tasks, open files and sockets together: a client that stops
+/// reading holds all three until `tokio::io::copy` gives up. 512 sits
+/// comfortably below a default `RLIMIT_NOFILE`.
 const MAX_CONNECTIONS: usize = 512;
 
 /// The whole-connection deadline every real `shep serve` runs with: read,
 /// resolve, respond and copy together.
 ///
-/// `READ_TIMEOUT` bounds the read phase only. A static file server has no
-/// legitimate minute-long request, and the alternative to a deadline is a
-/// slow-read client holding a permit until the process exits.
-///
-/// Carried on [`ServeConfig`] rather than read directly, so a test can ask
-/// for a deadline it can wait out on a real clock. The test that covers this
-/// used to force sixty virtual seconds on a paused clock and raced tokio's
-/// auto-advance against real socket IO, failing about one run in three.
+/// `READ_TIMEOUT` bounds only the read phase. Carried on [`ServeConfig`]
+/// rather than read directly, so a test can use a duration it can wait
+/// out on a real clock rather than a paused one racing tokio's
+/// auto-advance against real socket IO.
 pub const CONNECTION_DEADLINE: Duration = Duration::from_secs(60);
 
-/// What a running `serve` worker was told to do. Built by the verb (Task 7)
-/// from its flags, and by nothing else.
+/// What a running `serve` worker was told to do.
 ///
-/// No `Debug`: [`Credentials`] deliberately carries none (its own doc
-/// explains why — there is no line of output anywhere in shep where
-/// printing a credential is the right answer), and a struct holding an
-/// `Option<Credentials>` inherits that same answer rather than working
-/// around it with a hand-written impl that has to remember not to print the
-/// one field that matters.
+/// No `Debug`: [`Credentials`] carries none, and a struct holding an
+/// `Option<Credentials>` inherits that rather than risking a
+/// hand-written impl that forgets to redact it.
 pub struct ServeConfig {
     /// The docroot, already canonical and already known to be a directory.
     pub root: PathBuf,
@@ -84,41 +64,32 @@ pub struct ServeConfig {
     pub listing: bool,
     /// Serve paths with a leading-dot segment, and list them. Off by
     /// default: `shep serve .` in a repo checkout would otherwise publish
-    /// `.env` and the whole `.git` object store (decision 4).
+    /// `.env` and the whole `.git` object store.
     pub hidden: bool,
     /// Credentials every request must satisfy, if any.
     pub auth: Option<Credentials>,
     /// Permit a symlink anywhere in the resolved path, falling back to a
-    /// canonicalize-then-`starts_with` containment check that reopens the
-    /// TOCTOU the default per-component walk closes. Off by default
-    /// (decision 5); `--follow-symlinks` on `ServeArgs` is the only place
-    /// this is ever set true. Passed straight through to `fs::contain`.
+    /// canonicalize-then-`starts_with` containment check. Off by default;
+    /// passed straight through to `fs::contain`, whose own doc names the
+    /// residual race each mode still leaves open.
     pub follow_symlinks: bool,
     /// How long one connection may live, start to finish.
     ///
-    /// [`CONNECTION_DEADLINE`] everywhere outside tests. A parameter rather
-    /// than a constant read at the use site so the test covering it can pick
-    /// a duration it can wait out for real, instead of pausing the clock and
-    /// racing tokio's auto-advance against live socket IO.
+    /// [`CONNECTION_DEADLINE`] everywhere outside tests. A parameter
+    /// rather than a constant, so a test can pick a duration it can wait
+    /// out for real.
     pub connection_deadline: Duration,
 }
 
 /// Runs `shep serve`'s worker until it is signalled: binds `cfg.bind` and
-/// serves until `SIGINT` or `SIGTERM` — the latter is what the shepherd's
-/// own kill ladder actually sends first (`shep disable`'s first rung), and a
-/// worker that only handles `SIGINT` rides the whole ladder to `SIGKILL` on
-/// every `shep stop`, which is slow and looks like a hang.
+/// serves until `SIGINT` or `SIGTERM`, the latter being what the
+/// shepherd's own kill ladder sends first.
 ///
-/// A refused bind is fatal: this worker's whole purpose is to serve that
-/// port, and one that is running but bound to nothing is worse than a
-/// registered sheep `shep flock` reports as errored, because the first
-/// looks fine from the outside.
-///
-/// `run`'s only caller is `commands::serve`, which the `--foreground` flag
-/// dispatches straight to this function. This module's own tests never call
-/// `run` itself: they drive [`accept_forever`] directly, because `run`'s
-/// `SIGTERM` handling needs a real stop ladder to exercise, which only the
-/// e2e tier can provide.
+/// A refused bind is fatal: a worker running but bound to nothing is
+/// worse than one `shep flock` reports as errored, since the first looks
+/// fine from the outside. Tests drive [`accept_forever`] directly rather
+/// than this function, since exercising `SIGTERM` needs a real stop
+/// ladder.
 pub async fn run(cfg: ServeConfig) -> ExitCode {
     let listener = match TcpListener::bind(cfg.bind).await {
         Ok(listener) => listener,
@@ -145,17 +116,12 @@ pub async fn run(cfg: ServeConfig) -> ExitCode {
 }
 
 /// Accepts connections off `listener` forever, one task per connection.
-/// Never returns on its own — [`run`] races it against the two shutdown
-/// signals, and a test drives it directly, aborting the
-/// [`tokio::task::JoinHandle`] it comes back on rather than waiting for a
-/// return that never happens.
+/// Never returns: [`run`] races it against the shutdown signals, and a
+/// test aborts the [`tokio::task::JoinHandle`] it returns instead.
 ///
-/// A permit is acquired **before** the task is spawned, and
-/// non-blockingly: a connection that arrives once the cap is already full is
-/// closed immediately rather than queued for a permit that may never come
-/// free — queuing would still hold the accepted socket, just without a task
-/// attached to it yet, which is the same descriptor exhaustion under a
-/// different name.
+/// A permit is acquired before the task is spawned, non-blockingly: a
+/// connection past the cap is closed immediately rather than queued,
+/// since queuing would still hold the accepted socket without a task.
 async fn accept_forever(listener: TcpListener, cfg: Arc<ServeConfig>, semaphore: Arc<Semaphore>) {
     loop {
         match listener.accept().await {
@@ -178,10 +144,9 @@ async fn accept_forever(listener: TcpListener, cfg: Arc<ServeConfig>, semaphore:
     }
 }
 
-/// Answers exactly one request on `stream`, in the order decision 6 pins:
-/// read, auth, method, body, resolve, hidden, contain, then a directory or
-/// a file. Every reply — refusal, redirect, listing or file — is logged as
-/// one access-log line (decision 16) before this returns.
+/// Answers exactly one request on `stream`: read, auth, method, body,
+/// resolve, hidden, contain, then a directory or a file, in that order.
+/// Every reply is logged as one access-log line before this returns.
 async fn handle_connection(mut stream: TcpStream, cfg: Arc<ServeConfig>) {
     let peer = stream.peer_addr().ok();
 
@@ -198,16 +163,12 @@ async fn handle_connection(mut stream: TcpStream, cfg: Arc<ServeConfig>) {
         .split(['?', '#'])
         .next()
         .unwrap_or(request.target.as_str());
-    // The logged path starts as the raw target, escaped — decision 16's
-    // fallback for every refusal that happens before resolution succeeds.
-    // It is overwritten with the *resolved* path the moment resolution
-    // does succeed, a few lines down.
+    // The logged path starts as the raw target, escaped, and is
+    // overwritten with the resolved path once resolution succeeds.
     let mut logged_path = escape_for_log(raw_path);
 
-    // 2. auth — before path resolution (decision 6, pinned by
-    // `an_unauthenticated_request_is_401_whatever_the_path_says`): an
-    // unauthenticated client must not be able to use 400-vs-404 to map the
-    // filesystem before it has proven who it is.
+    // 2. auth, before path resolution: an unauthenticated client must not
+    // use 400-vs-404 to map the filesystem before it proves who it is.
     if let Some(creds) = &cfg.auth {
         let header = request.headers.get("authorization").map(String::as_str);
         if !creds.satisfies(header) {
@@ -228,7 +189,7 @@ async fn handle_connection(mut stream: TcpStream, cfg: Arc<ServeConfig>) {
         }
     }
 
-    // 3. method — this server answers GET and HEAD only.
+    // 3. method: this server answers GET and HEAD only.
     if request.method != "GET" && request.method != "HEAD" {
         let body = b"method not allowed; this server answers GET and HEAD\n";
         send(
@@ -246,7 +207,7 @@ async fn handle_connection(mut stream: TcpStream, cfg: Arc<ServeConfig>) {
         return;
     }
 
-    // 4. body — this server never reads one.
+    // 4. body: this server never reads one.
     let has_declared_body = request
         .headers
         .get("content-length")
@@ -272,26 +233,24 @@ async fn handle_connection(mut stream: TcpStream, cfg: Arc<ServeConfig>) {
     };
     logged_path = format!("/{}", segments.join("/"));
 
-    // 6. hidden — a 404, not a 403, so it does not distinguish "hidden"
-    // from "missing" (decision 6). Before any filesystem access, so it
-    // costs nothing and leaks nothing.
+    // 6. hidden: a 404, not a 403, checked before any filesystem access.
     if path::is_hidden(&segments) && !cfg.hidden {
         let (status, bytes) = send_not_found(&mut stream, &cfg, &request).await;
         log_access(peer, &request.method, &logged_path, status, bytes);
         return;
     }
 
-    // 7. contain — the syscall tier's containment walk and its symlink
-    // refusal (default mode) or canonicalize-and-check (`--follow-symlinks`).
+    // 7. contain: the syscall tier's containment walk and symlink
+    // refusal, or canonicalize-and-check under `--follow-symlinks`.
     let Some(resolved) = fs::contain(&cfg.root, &segments, cfg.follow_symlinks).await else {
         let (status, bytes) = send_not_found(&mut stream, &cfg, &request).await;
         log_access(peer, &request.method, &logged_path, status, bytes);
         return;
     };
 
-    // 8. metadata: a directory goes to step 9, anything else to step 10 —
-    // "anything else" includes a fifo, a socket or a device node, which
-    // `fs::open_regular` refuses on its own.
+    // 8. metadata: a directory goes to step 9, anything else (a fifo, a
+    // socket, a device node) to step 10, where `fs::open_regular` refuses
+    // it.
     let metadata = match tokio::fs::metadata(&resolved).await {
         Ok(metadata) => metadata,
         Err(_err) => {
@@ -327,11 +286,9 @@ async fn handle_connection(mut stream: TcpStream, cfg: Arc<ServeConfig>) {
             {
                 Ok(()) => log_access(peer, &request.method, &logged_path, 301, 0),
                 Err(_err) => {
-                    // The response-splitting lock refused the `Location` it
-                    // was just given — unreachable in practice, since
-                    // `encode_segment` already produces printable ASCII, but
-                    // this is the defensive answer rather than a half
-                    // response or a panic.
+                    // A peer disconnect, not a bad header: `encode_segment`
+                    // only ever produces printable ASCII, so `write_head`'s
+                    // control-byte check never fires from this call.
                     let body = b"could not build the redirect\n";
                     send(&mut stream, 500, "text/plain", body, vec![]).await;
                     log_access(peer, &request.method, &logged_path, 500, body.len() as u64);
@@ -391,16 +348,13 @@ async fn handle_connection(mut stream: TcpStream, cfg: Arc<ServeConfig>) {
     log_access(peer, &request.method, &logged_path, status, len);
 }
 
-/// Answers a 404 — or, if `cfg.spa` is set, the method is `GET`/`HEAD`, and
+/// Answers a 404, or, if `cfg.spa` is set, the method is `GET`/`HEAD`, and
 /// the request's `Accept` header names `text/html`, serves the docroot's
-/// `index.html` with a 200 instead (decision 10). Every 404 this worker
-/// would otherwise answer funnels through here, so the one-`Accept`-header
-/// gate lives in exactly one place rather than being wired into some
-/// refusals and forgotten at others (Step 6.4's mutation 3 is precisely
-/// this gate going missing at one call site).
+/// `index.html` with a 200 instead. Every 404 this worker would otherwise
+/// answer funnels through here, so the gate lives in one place.
 ///
-/// Returns the status actually answered and the number of body bytes, for
-/// the caller's access-log line.
+/// Returns the status actually answered and the body byte count, for the
+/// caller's access-log line.
 async fn send_not_found(
     stream: &mut TcpStream,
     cfg: &ServeConfig,
@@ -424,18 +378,15 @@ async fn send_not_found(
     (404, body.len() as u64)
 }
 
-/// Streams `file` (already open, `len` bytes long per its own metadata) as
-/// the body of a 200. The head goes through [`respond`], the same as every
-/// other reply this worker sends; the body does not, because a streamed
-/// file has no `&[u8]` to hand it.
+/// Streams `file` (already open, `len` bytes long per its own metadata)
+/// as the body of a 200. The head goes through [`respond`]; the body
+/// does not, since a streamed file has no `&[u8]` to hand it.
 ///
-/// `file.take(len)`, not a bare copy: `len` came from the open handle's own
-/// metadata, and a file that grew between the open and this copy would
-/// otherwise desync the framing this already declared in `Content-Length`.
-/// A file that instead *shrank* still desyncs — fewer bytes than declared —
-/// and `Connection: close` (every reply in this crate's `http` module
-/// carries it) is what turns that into a client-visible truncation rather
-/// than a hang.
+/// `file.take(len)`, not a bare copy: `len` came from the open handle's
+/// own metadata, so a file that grew between the open and this copy still
+/// matches the `Content-Length` already declared. A file that shrank
+/// still sends fewer bytes than declared; `Connection: close` turns that
+/// into a visible truncation rather than a hang.
 ///
 /// `HEAD` never copies the body, only its length.
 async fn serve_file(
@@ -458,12 +409,7 @@ async fn serve_file(
 }
 
 /// Reads `dir`'s entries, dropping a leading-dot name unless `hidden` is
-/// set — the same predicate `path::is_hidden` applies to a whole resolved
-/// path, called here on one filename at a time, so the two cannot drift
-/// apart. Directories sort before files, each group alphabetically; the
-/// ordering is built here, by which `Vec` a name lands in and in what order
-/// they are appended, rather than by inspecting a rendered entry's kind
-/// after the fact.
+/// set. Directories sort before files, each group alphabetically.
 async fn read_listing(dir: &std::path::Path, hidden: bool) -> std::io::Result<Vec<listing::Entry>> {
     let mut dirs = Vec::new();
     let mut files = Vec::new();
@@ -487,20 +433,15 @@ async fn read_listing(dir: &std::path::Path, hidden: bool) -> std::io::Result<Ve
     Ok(entries)
 }
 
-/// Writes exactly one response head. Every reply this worker sends funnels
-/// through here, and this is the one place the nosniff header is appended —
-/// decision 4's whole argument, since the reply that renders
-/// attacker-influenced filenames into HTML (the listing) is one of the
-/// replies that must carry it, same as every refusal and the streamed file.
-/// The body — empty for a redirect, a small `&[u8]` for a refusal or the
-/// listing, or a streamed file ([`serve_file`]) — is always the caller's to
-/// write afterward.
+/// Writes exactly one response head. Every reply funnels through here,
+/// and this is the one place the nosniff header is appended, since the
+/// listing renders attacker-influenced filenames into HTML. The body is
+/// always the caller's to write afterward.
 ///
 /// # Errors
-/// [`HttpError`] if the underlying write failed, or if a header value
-/// carried a control byte (`write_head`'s response-splitting lock, decision
-/// 5's response-splitting note) — the caller answers with nothing further,
-/// since nothing has reached the stream yet.
+/// [`HttpError`] if the write failed, or if a header value carried a
+/// control byte (`write_head`'s response-splitting lock). The caller
+/// answers with nothing further, since nothing has reached the stream.
 async fn respond(
     stream: &mut TcpStream,
     status: u16,
@@ -534,13 +475,11 @@ async fn send(
     }
 }
 
-/// One access-log line per request (decision 16), written to stdout —
-/// `serve` runs as a registered sheep, so `shep bleats <name>` is this log
-/// with no new plumbing.
+/// One access-log line per request, written to stdout: `serve` runs as a
+/// registered sheep, so `shep bleats <name>` is this log.
 ///
-/// `path` is already the resolved path where resolution succeeded, or the
-/// raw target where it did not — [`escape_for_log`] has already run on it
-/// either way by the time this is called.
+/// `path` is the resolved path where resolution succeeded, or the raw
+/// target where it did not; [`escape_for_log`] has already run on it.
 fn log_access(peer: Option<SocketAddr>, method: &str, path: &str, status: u16, bytes: u64) {
     let peer = peer.map_or_else(|| "-".to_string(), |addr| addr.to_string());
     println!("{peer} \"{method} {path}\" {status} {bytes}");
@@ -548,9 +487,9 @@ fn log_access(peer: Option<SocketAddr>, method: &str, path: &str, status: u16, b
 
 /// Escapes every byte outside printable ASCII (`0x20..=0x7e`) as `\xNN`.
 ///
-/// Not decoration: the raw request target can carry any byte a client
-/// sends, and an operator reading `shep bleats` in a terminal would
-/// otherwise be handed a stranger's ANSI escape sequences.
+/// The raw request target can carry any byte a client sends, so this
+/// stops an operator reading `shep bleats` from receiving a stranger's
+/// ANSI escapes.
 fn escape_for_log(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for byte in s.bytes() {
@@ -563,11 +502,8 @@ fn escape_for_log(s: &str) -> String {
     out
 }
 
-// `unix` because the server cases assert file modes on served files — guarantees the Windows tier
-// deliberately makes differently, each argued at its own call site
-// above. What Windows claims instead is covered by `tests/cli_e2e.rs`
-// and by the real-flock verification in the Windows port's own notes;
-// this module's unix coverage is unchanged.
+// unix only: the cases assert file modes on served files.
+// Windows coverage is in `tests/cli_e2e.rs`.
 #[cfg(all(test, unix))]
 mod tests {
     use std::collections::HashMap;
@@ -580,8 +516,7 @@ mod tests {
 
     /// A running worker bound to an OS-assigned loopback port. Aborts its
     /// accept loop on drop, so a worker left listening past its own test
-    /// cannot hold a port for the rest of the binary's run — the same
-    /// shape as `dog::metrics`'s own `RunningDog`.
+    /// cannot hold a port for the rest of the binary's run.
     struct RunningServer {
         addr: SocketAddr,
         handle: JoinHandle<()>,
@@ -599,9 +534,7 @@ mod tests {
         }
     }
 
-    /// Creates a docroot at `root` (a child of the caller's own `TempDir` —
-    /// every test below owns its outer guard directly, so nothing this tier
-    /// writes lands outside one) holding `files`, each `(relative path,
+    /// Creates a docroot at `root` holding `files`, each `(relative path,
     /// contents)`.
     fn write_tree(root: &Path, files: &[(&str, &str)]) {
         std::fs::create_dir_all(root).unwrap();
@@ -615,9 +548,7 @@ mod tests {
     }
 
     /// A default [`ServeConfig`] over `root`, bound to an OS-assigned
-    /// loopback port — never a fixed one, which is how a suite starts
-    /// failing on a developer's machine for reasons unrelated to the change
-    /// under test.
+    /// loopback port.
     fn config(root: &Path) -> ServeConfig {
         ServeConfig {
             root: std::fs::canonicalize(root).unwrap(),
@@ -674,9 +605,8 @@ mod tests {
         built
     }
 
-    /// Binds `config.bind`, reads back the OS-assigned address, and serves
-    /// it in the background with a real admission semaphore — the same cap
-    /// production code uses, so a test of the cap needs no separate one.
+    /// Binds `config.bind`, reads back the OS-assigned address, and
+    /// serves it in the background with a real admission semaphore.
     async fn serve_on_free_port(config: ServeConfig) -> RunningServer {
         let listener = TcpListener::bind(config.bind).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -718,11 +648,10 @@ mod tests {
         }
     }
 
-    /// Sends one raw request (already a full, correctly terminated HTTP/1.1
-    /// head) and returns the parsed response. Every step is wrapped in a
-    /// generous timeout: a test that hangs here is a bug in the worker
-    /// under test, not a reason to hang the suite (IR-46 — the timeout
-    /// wraps the asynchronous call, never a synchronous one).
+    /// Sends one raw request (a full, correctly terminated HTTP/1.1 head)
+    /// and returns the parsed response. Every step is wrapped in a
+    /// generous timeout, so a hang here is a bug in the worker, not the
+    /// suite.
     async fn send_request(addr: SocketAddr, request: &str) -> Response {
         let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr))
             .await
@@ -775,9 +704,8 @@ mod tests {
         .await
     }
 
-    /// Standard base64 (RFC 4648), test-only: `auth`'s own decoder is
-    /// private to its module, and production code here only ever answers a
-    /// header, never builds one.
+    /// Standard base64 (RFC 4648), test-only: production code here only
+    /// ever answers a header, never builds one.
     fn base64_encode(input: &str) -> String {
         const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let bytes = input.as_bytes();
@@ -802,19 +730,16 @@ mod tests {
         out
     }
 
-    /// The traversal table again, this time end to end over a real socket,
-    /// so it covers the handler's ordering and not only the resolver.
+    /// The traversal table again, end to end over a real socket, so it
+    /// covers the handler's ordering and not only the resolver.
     ///
-    /// Each case asserts the exact status. `assert_ne!(status, 200)` would
-    /// pass against a server that 500s on everything, which is the shape a
-    /// security test fails in.
+    /// Each case asserts the exact status: `assert_ne!(status, 200)`
+    /// would pass against a server that 500s on everything.
     #[tokio::test]
     async fn every_traversal_shape_is_refused_over_a_real_socket() {
-        // One guard over everything: the docroot is a CHILD of the tempdir,
-        // and the negative control is its sibling. `tree.path().parent()`
-        // would be `/tmp` or `/var/folders/.../T` — shared, world-writable,
-        // never cleaned up by the `TempDir` guard, and a predictable name
-        // two concurrent runs of this suite would race on.
+        // The docroot is a child of the tempdir, and the negative control
+        // is its sibling: `tempdir().path()` alone is shared and never
+        // cleaned up.
         let outer = tempfile::tempdir().unwrap();
         let root = outer.path().join("www");
         write_tree(
@@ -853,8 +778,7 @@ mod tests {
         }
     }
 
-    /// fails if a symlink out of the docroot is served over the socket —
-    /// the handler's use of `contain`, not the pure function's own test.
+    /// fails if a symlink out of the docroot is served over the socket.
     #[tokio::test]
     async fn a_symlink_out_of_the_docroot_is_a_404_and_not_a_body() {
         let outer = tempfile::tempdir().unwrap();
@@ -876,12 +800,8 @@ mod tests {
         assert!(!response.body.contains("nope"), "{response:?}");
     }
 
-    /// fails if the follow-symlinks flag on `ServeConfig` does not actually
-    /// reach `fs::contain` through the worker — Task 3 already pins
-    /// `contain`'s own behavior;
-    /// this is the wiring between the flag on `ServeConfig` and the
-    /// function call, over a real socket, on the exact deploy layout the maintainer's
-    /// ruling names.
+    /// fails if the follow-symlinks flag on `ServeConfig` does not reach
+    /// `fs::contain` through the worker.
     #[tokio::test]
     async fn a_symlinked_deploy_layout_is_served_only_with_follow_symlinks() {
         let outer = tempfile::tempdir().unwrap();
@@ -905,10 +825,8 @@ mod tests {
     }
 
     /// fails if `--follow-symlinks` is mistaken for "trust every path"
-    /// instead of "permit a symlink component, still enforce containment".
-    /// A symlink that leaves the docroot must still 404 with the flag on —
-    /// the canonicalize fallback (decision 5) is a different check, not the
-    /// absence of one.
+    /// instead of "permit a symlink component, still enforce
+    /// containment".
     #[tokio::test]
     async fn follow_symlinks_does_not_let_a_symlink_escape_the_root() {
         let outer = tempfile::tempdir().unwrap();
@@ -929,7 +847,7 @@ mod tests {
 
     /// fails if auth is checked after path resolution. An unauthenticated
     /// client must not be able to tell a refused traversal (400) from a
-    /// missing file (404) apart — that difference maps the filesystem.
+    /// missing file (404) apart.
     #[tokio::test]
     async fn an_unauthenticated_request_is_401_whatever_the_path_says() {
         let outer = tempfile::tempdir().unwrap();
@@ -999,9 +917,7 @@ mod tests {
         assert_eq!(response.headers["location"], "/docs/");
     }
 
-    /// fails if listing is on by default. Off is the decision (decision 9);
-    /// a default that enumerates filenames is the kind of default nobody
-    /// revisits.
+    /// fails if listing is on by default.
     #[tokio::test]
     async fn a_directory_with_no_index_is_404_unless_listing_is_on() {
         let outer = tempfile::tempdir().unwrap();
@@ -1017,9 +933,8 @@ mod tests {
         assert!(response.body.contains("Index of"), "{response:?}");
     }
 
-    /// fails if the SPA fallback fires for an asset request. A missing
-    /// `/assets/app.js` must 404, not answer HTML with a 200 — the browser
-    /// error that produces names a script type and never the missing file.
+    /// fails if the SPA fallback fires for an asset request: a missing
+    /// `/assets/app.js` must 404, not answer HTML with a 200.
     #[tokio::test]
     async fn the_spa_fallback_serves_index_for_navigations_and_404s_for_assets() {
         let outer = tempfile::tempdir().unwrap();
@@ -1070,10 +985,6 @@ mod tests {
     }
 
     /// fails if a dotfile is served, or if `--hidden` stops serving one.
-    /// Both halves in one test: `shep serve .` in a repo checkout
-    /// publishing `.env` is the failure this refusal exists for, and
-    /// `.well-known/acme-challenge/x` is the one real reason the flag
-    /// exists rather than a hard ban.
     #[tokio::test]
     async fn a_dotfile_is_404_unless_hidden_is_set() {
         let outer = tempfile::tempdir().unwrap();
@@ -1106,11 +1017,8 @@ mod tests {
         );
     }
 
-    /// fails if a listing names a file the server will not serve. A listing
-    /// that prints `.env` and then 404s on it has leaked the filename,
-    /// which is the whole reason listing is off by default. Also the one
-    /// response that renders attacker-influenced text into HTML, so
-    /// `nosniff` is asserted here too.
+    /// fails if a listing names a file the server will not serve, or
+    /// drops `nosniff` on its own response.
     #[tokio::test]
     async fn a_listing_omits_hidden_entries_and_carries_nosniff() {
         let outer = tempfile::tempdir().unwrap();
@@ -1125,11 +1033,8 @@ mod tests {
         assert_eq!(response.headers["x-content-type-options"], "nosniff");
     }
 
-    /// fails if a directory whose name is not ASCII answers 500. The
-    /// redirect's `Location` is built from the resolved segments and must
-    /// be percent-encoded through the same function the listing hrefs use —
-    /// unencoded, the header value carries bytes `write_head` refuses, and
-    /// the operator gets a 500 on a directory that exists.
+    /// fails if a directory whose name is not ASCII answers 500 instead
+    /// of a percent-encoded redirect.
     #[tokio::test]
     async fn a_directory_with_a_non_ascii_name_redirects_rather_than_500ing() {
         let outer = tempfile::tempdir().unwrap();
@@ -1146,15 +1051,9 @@ mod tests {
     }
 
     /// fails if there is no ceiling on concurrent connections. Opens
-    /// `MAX_CONNECTIONS` sockets and holds every one of them open (the
-    /// server is left mid-`read_request`, waiting on a request that never
-    /// arrives, for its own `READ_TIMEOUT` — the semaphore permit for each
-    /// is held for exactly as long as that task is alive), then asserts a
+    /// `MAX_CONNECTIONS` sockets and holds them open, then asserts a
     /// connection past the cap is closed within a fraction of a second
-    /// rather than held. Without the semaphore this test does not fail by
-    /// hanging forever — it fails by the deadline below actually elapsing,
-    /// which is the production symptom in miniature: a connection that
-    /// should have been refused was accepted and left to wait instead.
+    /// rather than held.
     #[tokio::test]
     async fn connections_beyond_the_cap_are_closed_rather_than_queued_forever() {
         let outer = tempfile::tempdir().unwrap();
@@ -1197,18 +1096,9 @@ mod tests {
     /// fails if a connection that stops reading mid-body is held for the
     /// life of the process.
     ///
-    /// On a REAL clock with a deliberately tiny deadline, not a paused one.
-    /// The paused-clock version of this test failed about one run in three:
-    /// tokio auto-advances a paused clock to the earliest pending timer
-    /// whenever the runtime goes idle, so the assertion held only if the
-    /// server task had already registered its own deadline timer by the
-    /// time the runtime first idled. That was a race against real socket
-    /// IO -- a connect, a write, and an 8 MiB body -- and when it lost, the
-    /// test's own guard was the earliest timer and fired instead. An
-    /// earlier attempt to fix it removed a bounded read for the same
-    /// reason and left the underlying race in place.
-    ///
-    /// Nothing here waits on virtual time, so there is no ordering to race.
+    /// Runs on a real clock with a tiny deadline. A paused clock races
+    /// tokio's auto-advance against real socket IO, and the wrong side
+    /// can win.
     #[tokio::test]
     async fn a_connection_that_stops_reading_is_dropped_at_the_deadline() {
         let outer = tempfile::tempdir().unwrap();
