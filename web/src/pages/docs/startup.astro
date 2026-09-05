@@ -80,7 +80,8 @@ removed  /Library/LaunchDaemons/io.github.turtiesocks.shep.deploy.plist  absent`
       <code>sudo</code>, the unit is built for <code>$SUDO_USER</code> rather
       than root, so it supervises the flock the operator actually has, and
       its <code>$SHEP_HOME</code> is that user's own <code>~/.shep</code>
-      unless <code>--home</code> says otherwise. shep won't create that
+      unless <code>--home</code> or a <code>$SHEP_HOME</code> that survived
+      <code>sudo</code> says otherwise. shep won't create that
       directory for another user, since root would own it and the daemon
       couldn't open it. If it isn't there yet, run any shep verb as that
       user first, or pass <code>--home</code>.
