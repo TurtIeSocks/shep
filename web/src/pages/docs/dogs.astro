@@ -293,11 +293,12 @@ within = "2m"
 sinks = ["oncall"]`}</CodeBlock>
     <p class="fine">
       A sink URL can't carry credentials.{" "}
-      <code>https://user:pass@hooks.example.com/</code> is refused when bark
-      tries to deliver, not silently stripped: nothing here sends an{" "}
-      <code>Authorization</code> header, so the pair could only be discarded
-      or sent as part of a hostname. Discord and Slack put the secret in the
-      path instead, which is why the whole URL is a credential.
+      <code>https://user:pass@hooks.example.com/</code> is refused when{" "}
+      <code>dogs.toml</code> is read, not when a rule first fires: nothing
+      here sends an <code>Authorization</code> header, so the pair could
+      only be discarded or sent as part of a hostname. Discord and Slack put
+      the secret in the path instead, which is why the whole URL is a
+      credential.
     </p>
     <p>
       Leave <code>[[bark.rules]]</code> out and bark doesn't go quiet:

@@ -175,6 +175,35 @@ impl From<std::io::Error> for FetchError {
     }
 }
 
+/// The reason [`parse_url`] and [`super::dog::bark::sinks`] both give for
+/// a URL carrying credentials. It names no URL, which is the point: the
+/// text being refused is the text holding the password.
+pub const CREDENTIALS_REFUSAL: &str = concat!(
+    "credentials before the host (`user@` or `user:pass@`) are not supported; ",
+    "the url is not echoed, since it carries one"
+);
+
+/// Whether `url`'s authority carries a `user@` or `user:pass@` prefix.
+///
+/// The rule [`parse_url`] refuses on, separated out so a caller holding a
+/// URL it has not parsed yet can refuse the same shape at config-load time
+/// rather than at first use. A `url` naming neither scheme answers
+/// `false`: it has no authority to look in, and [`parse_url`] refuses it
+/// on the scheme instead.
+pub fn url_carries_credentials(url: &str) -> bool {
+    let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let authority = match rest.find('/') {
+        Some(i) => &rest[..i],
+        None => rest,
+    };
+    authority.contains('@')
+}
+
 /// Parses `url` into a [`Target`] naming where [`get`] should connect.
 ///
 /// Hand-rolled: a fetch target is never more than a scheme, a host, an
@@ -191,6 +220,14 @@ impl From<std::io::Error> for FetchError {
 ///   `https://`, carries a `user@` or `user:pass@` authority, names a
 ///   non-numeric port, or names no host.
 pub fn parse_url(url: &str) -> Result<Target, FetchError> {
+    // Ahead of the host/port split, which trusts the last colon: without
+    // this, `user:pass@host:8443` parses to the host `user:pass@host` and
+    // `user:pass@host` to the host `user` and the port `pass@host`, so a
+    // password reaches either a `Target` field or, through that split's
+    // own refusal, an error message quoting the whole URL.
+    if url_carries_credentials(url) {
+        return Err(FetchError::Url(CREDENTIALS_REFUSAL.to_owned()));
+    }
     let (https, rest) = match url.strip_prefix("https://") {
         Some(rest) => (true, rest),
         None => match url.strip_prefix("http://") {
@@ -206,18 +243,6 @@ pub fn parse_url(url: &str) -> Result<Target, FetchError> {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
     };
-    // Ahead of the host/port split, which trusts the last colon: without
-    // this, `user:pass@host:8443` parses to the host `user:pass@host` and
-    // `user:pass@host` to the host `user` and the port `pass@host`, so a
-    // password reaches either a `Target` field or, through the port
-    // refusal below, an error message quoting the whole URL.
-    if authority.contains('@') {
-        return Err(FetchError::Url(
-            "credentials before the host (`user@` or `user:pass@`) are not supported; the url \
-             is not echoed, since it carries one"
-                .to_owned(),
-        ));
-    }
     let (host, port) = match authority.rsplit_once(':') {
         Some((h, p)) => (
             h,
