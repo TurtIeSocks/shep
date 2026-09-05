@@ -2,7 +2,8 @@
 //! URL parsing ([`parse_url`]) and TLS setup ([`tls_connector`]) it shares
 //! with `dog::bark::sinks`. An HTTP client, where `crate::http` is a
 //! hand-rolled, TLS-free server. Either scheme is accepted; a caller
-//! wanting only `https://` enforces that itself.
+//! wanting only `https://` enforces that itself. A URL carrying
+//! credentials before the host (`user@`, `user:pass@`) is refused.
 //!
 //! [`get`] refuses, in this order: a 3xx naming a `Location`; any other
 //! non-2xx; any `Transfer-Encoding`, since it reads exactly
@@ -33,10 +34,16 @@ pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 
 /// A URL, parsed into what [`get`] needs to reach it.
 ///
-/// `Debug` is derived and not redacted: `parse_url` does not strip a
-/// `user:pass@host` authority, so `host` can carry credentials from a URL
-/// that has them.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// `Debug` is REDACTED (IR-41), and `path` is the field that needs it: a
+/// Discord or Slack webhook URL is a bearer credential and carries its
+/// token as a path segment, which is why
+/// [`Sink`](crate::dog::bark::sinks::Sink) redacts its own `Debug` too. A
+/// `Target` printed into a log, a panic message or an error chain must not
+/// hand that token to whoever reads the log.
+///
+/// `host` needs no redaction: [`parse_url`] refuses a `user@` or
+/// `user:pass@` authority rather than folding it into `host`.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Target {
     /// `true` for `https://`, `false` for `http://`.
     pub https: bool,
@@ -48,6 +55,19 @@ pub struct Target {
     pub path: String,
 }
 
+/// Manual: a derived `Debug` would print `path` in full, and `path` is
+/// where a webhook's own credential lives. Every `Target` collapses to its
+/// scheme, host and port, with `path` withheld.
+impl fmt::Debug for Target {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Target {{ https: {}, host: {:?}, port: {}, path: <redacted> }}",
+            self.https, self.host, self.port
+        )
+    }
+}
+
 /// Why [`parse_url`] or [`get`] failed.
 ///
 /// `Debug` needs no redaction: every field is a URL this module was given
@@ -56,6 +76,9 @@ pub struct Target {
 pub enum FetchError {
     /// `url` did not parse as an absolute `http://`/`https://` URL. Carries
     /// a human-readable reason, never the raw bytes of a malformed input.
+    /// The reason usually quotes `url`; the one refusal that does not is
+    /// the `user:pass@` authority, whose whole point is that the text
+    /// carries a credential.
     Url(String),
     /// The connection failed, the TLS handshake failed, or the response
     /// was not well-formed HTTP: no parseable status line, a header block
@@ -157,9 +180,16 @@ impl From<std::io::Error> for FetchError {
 /// Hand-rolled: a fetch target is never more than a scheme, a host, an
 /// optional port and a path.
 ///
+/// Credentials before the host are refused rather than stripped: nothing
+/// downstream of here sends an `Authorization` header, so a `user:pass@`
+/// prefix could only ever be silently discarded or silently sent as part
+/// of a hostname. `ProbeTarget::parse` refuses the same shape for the same
+/// reason.
+///
 /// # Errors
 /// - [`FetchError::Url`] if `url` does not start with `http://` or
-///   `https://`, names a non-numeric port, or names no host.
+///   `https://`, carries a `user@` or `user:pass@` authority, names a
+///   non-numeric port, or names no host.
 pub fn parse_url(url: &str) -> Result<Target, FetchError> {
     let (https, rest) = match url.strip_prefix("https://") {
         Some(rest) => (true, rest),
@@ -176,6 +206,18 @@ pub fn parse_url(url: &str) -> Result<Target, FetchError> {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
     };
+    // Ahead of the host/port split, which trusts the last colon: without
+    // this, `user:pass@host:8443` parses to the host `user:pass@host` and
+    // `user:pass@host` to the host `user` and the port `pass@host`, so a
+    // password reaches either a `Target` field or, through the port
+    // refusal below, an error message quoting the whole URL.
+    if authority.contains('@') {
+        return Err(FetchError::Url(
+            "credentials before the host (`user@` or `user:pass@`) are not supported; the url \
+             is not echoed, since it carries one"
+                .to_owned(),
+        ));
+    }
     let (host, port) = match authority.rsplit_once(':') {
         Some((h, p)) => (
             h,
@@ -674,6 +716,43 @@ mod tests {
             Err(FetchError::Url(_))
         ));
         assert!(matches!(parse_url("not a url"), Err(FetchError::Url(_))));
+    }
+
+    /// Both halves matter. The refusal is the fix; the exact string is
+    /// what proves the refusal did not itself print the password, which is
+    /// what quoting `url` in the message would have done.
+    #[test]
+    fn a_url_carrying_credentials_is_refused_without_echoing_them() {
+        for url in [
+            "https://user:hunter2@example.com:8443/webhook",
+            "https://user:hunter2@example.com/webhook",
+            "http://hunter2@example.com/webhook",
+        ] {
+            let err = parse_url(url).unwrap_err();
+            assert!(matches!(err, FetchError::Url(_)), "{url}: {err:?}");
+            assert_eq!(
+                err.to_string(),
+                "not a fetchable url: credentials before the host (`user@` or `user:pass@`) are \
+                 not supported; the url is not echoed, since it carries one",
+                "{url}"
+            );
+            assert!(!format!("{err} {err:?}").contains("hunter2"), "{url}");
+        }
+    }
+
+    /// A Discord webhook URL is a bearer credential and carries its token
+    /// as a path segment, so `Target`'s `Debug` withholds the path the way
+    /// `Sink`'s withholds the whole URL.
+    #[test]
+    fn a_targets_debug_redacts_the_path() {
+        let target = parse_url("https://discord.com/api/webhooks/123/s3cr3t-token")
+            .expect("a plain https url parses");
+        let rendered = format!("{target:?}");
+        assert_eq!(
+            rendered,
+            r#"Target { https: true, host: "discord.com", port: 443, path: <redacted> }"#
+        );
+        assert!(!rendered.contains("s3cr3t-token"));
     }
 
     /// A smuggling-style ambiguity: picking one would let a proxy make
