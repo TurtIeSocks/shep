@@ -660,10 +660,10 @@ pins `add` at `Enforce`, since it reaches that through the `_` arm rather
 than by being named.
 
 **`PROTOCOL_VERSION` moved to 4 on 2026-09-04.** It went to 3 first, for
-`ApplyConfig`'s payload rename described below, and then to 4 for the three
+`ApplyConfig`'s payload rename described below, and then to 4 for the four
 requests the lookout config panes needed. The second move is argued in
 `docs/decisions.md` and is the one that broke the additive rule on purpose:
-those three variants ARE additive, and the rule said not to bump, and skipping
+those four variants are additive, and the rule said not to bump, and skipping
 the bump is what made `ApplyConfig` fail on a dead client rather than a named
 refusal. The paragraph below is about the 3.
 

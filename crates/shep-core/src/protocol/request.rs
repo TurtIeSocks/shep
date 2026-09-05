@@ -2246,7 +2246,7 @@ mod tests {
                     apps: vec![AppConfig::minimal("web", "./srv")],
                 },
             },
-            // The three config-pane requests. `SheepConfig` takes a name
+            // The four config-pane requests. `SheepConfig` takes a name
             // rather than a selector, like `Scale` and `SetSmit` above and
             // for their reason: a pane edits one sheep.
             Envelope {
