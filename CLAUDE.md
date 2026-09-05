@@ -462,6 +462,24 @@ crash or an autorestart respawn still walks into G12 row 5 unannounced. And
 `Child::kill` does not reach descendants, so a probe's grandchild can
 outlive it; closing that needs a process group rather than a patch.
 
+**There are three doors into the override store, not one.** A Flockfile
+load through `Request::ApplyConfig`, described below, is the one that
+existed first and it is the one the rest of this paragraph is about. The
+other two arrived with the lookout config panes: `Request::SetSheepEnv`
+sets or removes one env key, and `Request::SetSheepField` sets one
+non-env field. Both write an operator override directly.
+
+The distinction is not cosmetic and it cost a review round to find. A
+Flockfile load says the TEMPLATE declares this key, so the daemon spends
+any operator override for it, correctly, because a key put back to the
+template is not one an operator is still holding a value for. A pane says
+the OPERATOR sets this key, so the override has to stay: the sheep really
+does still differ from its file. A pane borrowing `ApplyConfig` with
+`--reset=file` and a one-key `declared` set therefore wrote the right value
+and erased the record of it, so the `*` marker built to show operator
+overrides never appeared for the pane's own writes. `SetSheepField` exists
+because of that.
+
 **Config overrides merged on 2026-09-03, and it changes what a Flockfile
 IS.** A Flockfile is a project template committed to the app's repository,
 never written by shep, and what an operator tunes afterwards lives in a
