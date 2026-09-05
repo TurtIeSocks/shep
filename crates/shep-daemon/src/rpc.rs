@@ -711,12 +711,12 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
         // before the file is opened, so a mistyped name leaves no stray
         // table behind for a dog that will never exist.
         //
-        // Guarded on `known_dogs`, not on the running flock: a guard on
-        // `supervisor.list()` would refuse the dog most in need of
-        // configuring, one that is disabled or has never started. The
-        // running flock is still consulted too, as a widening, because a
-        // dog adopted and enabled since this shepherd booted is not yet
-        // in the list the CLI handed over at boot.
+        // Guarded on `known_dogs`, not on the running flock: a guard on the
+        // flock alone would refuse the dog most in need of configuring, one
+        // that is disabled or has never started. The running flock is still
+        // consulted too, as a widening, because a dog adopted and enabled
+        // since this shepherd booted is not yet in the list the CLI handed
+        // over at boot.
         //
         // Written here rather than through the supervisor: `dogs.toml` is
         // not supervisor state, and the file's path and the bus are both
@@ -725,10 +725,13 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
         // and a section written with nothing publishing that topic leaves
         // a running dog reading the old one.
         Request::SetDogConfig { name, toml } => {
+            // A stopped engine runs no dogs, so "not running" is the honest
+            // answer and `known_dogs` is left carrying the guard alone.
             let running_dog = || async {
                 ctx.supervisor
-                    .list()
+                    .list_checked()
                     .await
+                    .unwrap_or_default()
                     .iter()
                     .any(|info| info.name == name && info.dog.is_some())
             };
@@ -3672,6 +3675,34 @@ mod tests {
             std::fs::read_to_string(&h.ctx.dogs_config).unwrap(),
             "[bark]\npoll = \"60s\"\n"
         );
+    }
+
+    /// `otel` is outside the harness's built-in dogs, so the guard gets past
+    /// `known_dogs` and reaches the running-flock widening, which is the half
+    /// that has to answer on a stopped engine.
+    #[tokio::test]
+    async fn setting_a_dogs_config_against_a_stopped_engine_is_refused_not_a_panic() {
+        let h = harness(vec![]);
+        h.ctx.supervisor.shutdown().await;
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::SetDogConfig {
+                        name: "otel".to_string(),
+                        toml: "poll = \"30s\"\n".to_string().into(),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+
+        let Err(err) = reply.result else {
+            panic!("otel is not a known dog and must be refused")
+        };
+        assert_eq!(err.code, RpcErrorCode::NotFound, "{err:?}");
     }
 
     /// Both halves: a filter that excluded dogs outright would leave `shep
