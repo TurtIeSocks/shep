@@ -6525,10 +6525,10 @@ impl<R: ProcessRunner> Actor<R> {
                 continue;
             };
             // Against THIS slot's own spec and before it is overwritten,
-            // exactly as `apply_one` does it: instance 0 may already have
-            // promoted while its siblings have not, so a later promotion
-            // diffing `pending` against a shared `next_spec` would conclude
-            // there was nothing to re-resolve. `|=`, never `=`.
+            // and `|=` rather than `=`. Both halves are `apply_one`'s and
+            // the argument for them is stated there, at the same line in
+            // that function -- not restated here, because a paraphrase of
+            // a reason is what goes stale when the reason changes.
             if let Some(parked) = &parked {
                 let spawned = slot.entry.spec.config();
                 slot.entry.pending_reidentifies |=

@@ -1232,7 +1232,7 @@ mod tests {
     use crate::testing::{
         Harness, SCRIPTED_TREE_BYTES, harness, harness_identifying, harness_with_stats, identity,
     };
-    use shep_core::config::{AppConfig, DeclaredApp, ResetDepth};
+    use shep_core::config::{AppConfig, ApplyGroup, DeclaredApp, ResetDepth, apply_group};
     use shep_core::protocol::{
         ActionOutcome, ActionReply, DogSource, Request, Response, RpcErrorCode, SelectorSpec,
     };
@@ -3366,6 +3366,111 @@ mod tests {
             ["max_restarts", "script"],
             "both are the operator's"
         );
+    }
+
+    /// fails if a `Live` field that cannot reach the running child stops
+    /// saying so.
+    ///
+    /// **One of the two cases that make `pending` worth carrying at all.**
+    /// The other three answers this reply gives -- `max_restarts` in force,
+    /// `script` parked -- a client could have derived from `apply_group`
+    /// without asking. This one it cannot: `reached_spec` builds a SUBSET
+    /// of the config, running plus the one field that reaches, and
+    /// `normalize` checks fields against each other. `watch` needs a `cwd`,
+    /// and a `cwd` that is itself still parked is not on the running spec
+    /// for the subset to find, so a `Live` field parks. If this ever stops
+    /// being reachable, `pending` is a restatement of `apply_group` and
+    /// should be deleted.
+    #[tokio::test(start_paused = true)]
+    async fn a_live_field_whose_subset_will_not_normalize_parks_instead() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        // No `cwd`, which is what makes `watch` refusable on its own.
+        let started = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::Start {
+                        apps: vec![AppConfig::minimal("web", "./srv")],
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        assert!(started.result.is_ok(), "{:?}", started.result);
+
+        // `cwd` is NeedsRespawn, so this parks and the RUNNING spec still
+        // has none.
+        let reply = set_field(&h.ctx, 2, "web", "cwd", serde_json::json!("/srv")).await;
+        let Ok(Response::SheepFieldSet { pending, .. }) = reply else {
+            panic!("{reply:?}")
+        };
+        assert!(pending, "cwd needs a respawn");
+
+        // `watch` is Live, so `apply_group` alone predicts "in force now".
+        // The merge is valid -- it carries the parked `cwd` -- but the
+        // subset is `running + watch`, which is a watch with no directory.
+        let reply = set_field(&h.ctx, 3, "web", "watch", serde_json::json!(true)).await;
+        let Ok(Response::SheepFieldSet { pending, .. }) = reply else {
+            panic!("{reply:?}")
+        };
+        assert_eq!(
+            apply_group("watch"),
+            ApplyGroup::Live,
+            "the premise: apply_group predicts this one applies now"
+        );
+        assert!(
+            pending,
+            "a Live field the running child cannot be given still parks"
+        );
+
+        // And the pane's own durable marker agrees, so an operator who
+        // misses the status line still sees it on the row.
+        let view = sheep_config_view(&h.ctx, 4, "web").await;
+        assert!(
+            view.pending.contains(&"watch".to_string()),
+            "{:?}",
+            view.pending
+        );
+    }
+
+    /// fails if `autostart` stops reporting as in force.
+    ///
+    /// **The second case that makes `pending` worth carrying.** It is
+    /// `ApplyGroup::NextSpawn`, so `apply_group` predicts an operator must
+    /// restart for it, and that would be telling them to do nothing useful:
+    /// `snapshot::restorable` reads it at muster or boot rather than at a
+    /// spawn, so it is in force the moment it lands on the stored spec.
+    /// `kill_signal` is its group-mate and really is read at a spawn, and
+    /// is asserted beside it so this pins the carve-out rather than the
+    /// whole group.
+    #[tokio::test(start_paused = true)]
+    async fn autostart_reports_in_force_and_its_group_mate_reports_pending() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+
+        for key in ["autostart", "kill_signal"] {
+            assert_eq!(
+                apply_group(key),
+                ApplyGroup::NextSpawn,
+                "the premise: both are the same group"
+            );
+        }
+
+        let reply = set_field(&h.ctx, 2, "web", "autostart", serde_json::json!(false)).await;
+        let Ok(Response::SheepFieldSet { pending, .. }) = reply else {
+            panic!("{reply:?}")
+        };
+        assert!(
+            !pending,
+            "autostart is read at muster, so a restart would do nothing"
+        );
+
+        let reply = set_field(&h.ctx, 3, "web", "kill_signal", serde_json::json!("SIGINT")).await;
+        let Ok(Response::SheepFieldSet { pending, .. }) = reply else {
+            panic!("{reply:?}")
+        };
+        assert!(pending, "kill_signal really is read at a spawn");
     }
 
     /// fails if a dog can be handed a config field. The same hole
