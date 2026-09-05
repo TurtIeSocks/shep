@@ -402,7 +402,7 @@ The format is line-oriented text:
 
 ```
 shep-log-rotate 0.1.3
-shep-protocol: 3
+shep-protocol: 4
 ```
 
 - Line 1 is `<name> <version>`. Shep takes the last whitespace-separated
@@ -437,9 +437,9 @@ question costs one argument on a process that was going to start anyway.
 The refusal names both numbers and both ways out:
 
 ```
-/usr/local/bin/shep-otel: this dog was built for shep protocol 2, and this
-shep speaks 3; reinstall the dog without --locked so it builds against the
-current shep-core, or run a shep that speaks 2
+/usr/local/bin/shep-otel: this dog was built for shep protocol 3, and this
+shep speaks 4; reinstall the dog without --locked so it builds against the
+current shep-core, or run a shep that speaks 3
 ```
 
 Only a stated protocol can refuse an adopt. The version is never compared
@@ -500,9 +500,9 @@ the upgrade.
 
 ```
 notice[dog_binary_skew]: `log-rotate`'s binary at /usr/local/bin/shep-log-rotate
-was built for shep protocol 4, and this shep speaks 3; restarting it brings it
-back on that binary, unable to connect. Run a shep that speaks 4, or reinstall
-the dog against protocol 3, and restart it again
+was built for shep protocol 5, and this shep speaks 4; restarting it brings it
+back on that binary, unable to connect. Run a shep that speaks 5, or reinstall
+the dog against protocol 4, and restart it again
 ```
 
 Then it restarts the dog. This is a warning and never a refusal: the
@@ -678,8 +678,15 @@ pydog publishes no schema; edit dogs.toml with $EDITOR
 ```
 
 The schema is asked for when the pane opens rather than at adopt time, and
-the dog does not have to be running: it is spawned with the flag and killed.
-Configure then enable is the order an operator wants, and it works.
+the dog does not have to be running. Configure then enable is the order an
+operator wants, and it works.
+
+**Asking runs it.** Opening the pane on an adopted dog spawns that binary
+with `--schema`, waits a second for an answer, then kills it, on the same
+terms `shep adopt` asks on. That is a third party's code executing because
+somebody pressed a key, so it is worth knowing before browsing the config of
+a dog you did not write. A built-in dog is shep's own binary and is never
+spawned.
 
 A dog that answers something that is not JSON gets one line, and is adopted
 anyway:

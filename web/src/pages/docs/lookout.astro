@@ -708,6 +708,13 @@ esc/s close   j/k select   g/G fir… read-only`;
       gets no pane, and a line saying where its settings do live:
     </p>
     <CodeBlock>{`pydog publishes no schema; edit dogs.toml with $EDITOR`}</CodeBlock>
+    <Callout variant="careful">
+      Asking runs it. Opening the pane on an adopted dog spawns that binary
+      with <code>--schema</code>, waits a second for an answer, then kills
+      it. That is a third party's code executing because you pressed a key,
+      and it is worth knowing before you browse the config of a dog you did
+      not write. A built-in dog is shep's own binary and is never spawned.
+    </Callout>
     <p>
       The pane is flat, with no section headers: a dog's schema carries no
       groups, and inventing some would be shep deciding how somebody else's
