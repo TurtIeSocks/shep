@@ -1086,12 +1086,19 @@ impl ConfigPane {
     /// The current value of `key`, rendered for a cell.
     ///
     /// A scalar shows bare, an absent or `null` value shows `(unset)`, and
-    /// anything else shows compact JSON. `env` is the one field whose value
-    /// this pane never holds -- the shepherd strips it on the way out -- so
-    /// it shows its key count instead, and the sub-screen shows the names.
+    /// anything else shows compact JSON. A SHEEP's `env` is the one field
+    /// whose value this pane never holds -- the shepherd strips it on the
+    /// way out -- so it shows its key count instead, and the sub-screen
+    /// shows the names.
+    ///
+    /// That special case is gated on the target, not on the key alone. A
+    /// dog's schema is somebody else's, and one declaring a field named
+    /// `env` used to be answered out of [`Self::env_keys`], which
+    /// [`Self::dog`] always leaves empty: the cell read `0 keys`, and the
+    /// editor seeded from it wrote that string into the dog's own config.
     #[must_use]
     pub fn value(&self, key: &str) -> String {
-        if key == "env" {
+        if key == "env" && matches!(self.target, PaneTarget::Sheep { .. }) {
             return match self.env_keys.len() {
                 1 => "1 key".to_owned(),
                 count => format!("{count} keys"),
@@ -1610,6 +1617,34 @@ mod tests {
             schema,
             "webhook = \"https://hook/OLD\"\n".to_owned(),
         )
+    }
+
+    /// fails if the pane answers a DOG's `env` field out of the sheep-only
+    /// key list. `ConfigPane::dog` always leaves `env_keys` empty, so the
+    /// cell read `0 keys`, nothing locked the row, and `begin_typing` seeded
+    /// the editor from it -- two keystrokes wrote `env = "0 keys"` into
+    /// that dog's `dogs.toml`. No built-in declares such a field; the dog
+    /// pane exists for schemas shep did not write.
+    #[test]
+    fn a_dogs_own_env_field_reads_its_section_and_not_the_sheep_key_count() {
+        let schema = serde_json::json!({
+            "properties": {
+                "env": { "type": "string" },
+            }
+        });
+        let mut pane = ConfigPane::dog(
+            "pydog".into(),
+            None,
+            schema,
+            "env = \"staging\"\n".to_owned(),
+        );
+        assert_eq!(pane.value("env"), "staging");
+        pane.move_to_key("env");
+        pane.begin_typing();
+        let Some(PanePending::Typing { buffer, .. }) = pane.pending_edit() else {
+            panic!("{:?}", pane.pending_edit());
+        };
+        assert_eq!(buffer, "staging");
     }
 
     /// fails if the confirm sentence quotes a credential. The pane renders
