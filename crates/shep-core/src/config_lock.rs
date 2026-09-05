@@ -47,7 +47,7 @@ pub fn create_config_file(parent: &Path) -> std::io::Result<tempfile::NamedTempF
 /// and it says so at the point it nests them.
 ///
 /// The lock is on a sibling `<name>.lock`, never on the config itself,
-/// and that is the whole design decision — the same one `barks::RingLock`
+/// and that is the whole design decision, the same one `barks::RingLock`
 /// records: `ShepToml::save` finishes by `rename`ing a new file over the
 /// config, which replaces the inode. A lock taken on the config would be a
 /// lock on an inode the very next successful save unlinks; the next writer

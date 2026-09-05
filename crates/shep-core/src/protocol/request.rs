@@ -1467,7 +1467,7 @@ impl From<String> for DogSectionToml {
     }
 }
 
-/// Debug does not print the section body (IR-41) — see the type doc for why.
+/// Debug does not print the section body (IR-41) -- see the type doc for why.
 /// Exact-string-tested below (`dog_section_toml_debug_does_not_leak`) so a
 /// future `#[derive(Debug)]` fails that test instead of silently reopening
 /// the leak.

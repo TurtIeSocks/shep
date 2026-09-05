@@ -3790,8 +3790,8 @@ mod tests {
         }
     }
 
-    /// fails if `DisableDog` is wired to anything but a real deregistration
-    /// — a handler that answered `Deleted(vec![])` without stopping
+    /// fails if `DisableDog` is wired to anything but a real deregistration:
+    /// a handler that answered `Deleted(vec![])` without stopping
     /// anything passes every type-level test and leaves the dog running
     /// after `shep disable` reported success.
     #[tokio::test(start_paused = true)]
@@ -3818,7 +3818,7 @@ mod tests {
 
     /// fails if the daemon serves a section it cached at boot. The file is
     /// written AFTER the harness built its context, so a cached reader
-    /// answers the empty string here — which is exactly the bug that would
+    /// answers the empty string here, which is exactly the bug that would
     /// make `shep disable X && shep enable X` fail to pick up an edit.
     #[tokio::test(start_paused = true)]
     async fn a_dog_config_request_reads_the_file_as_it_stands_now() {
