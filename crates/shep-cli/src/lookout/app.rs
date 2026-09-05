@@ -1320,6 +1320,16 @@ pub struct App {
     /// The settings screen's own state. `None` is the dashboard; `Some` is
     /// the screen, open over it.
     settings: Option<Settings>,
+    /// Which sheep a config pane is open for, or wanted for.
+    ///
+    /// Set by `e` when the read goes out, cleared the moment the pane
+    /// closes, and checked when a reply lands. Without it, two `e` presses
+    /// against a slow shepherd followed by an `Esc` re-opened the pane on
+    /// the second reply, over a dashboard the operator had already gone
+    /// back to. [`Self::config_pane`] alone cannot answer that: it is
+    /// `None` both while a first read is in flight and after a close, and
+    /// those two want opposite things done with a reply.
+    config_target: Option<String>,
     /// The open config pane, or `None`. Opened by `e` on a selected sheep,
     /// and closed by `e` or `Escape` from inside it.
     ///
@@ -1359,6 +1369,7 @@ impl App {
             lambs: None,
             action: None,
             settings: None,
+            config_target: None,
             config_pane: None,
             style: (StyleLevel::Full, StyleSource::Default),
         }
@@ -1890,6 +1901,14 @@ impl App {
     /// swallowed, and a refresh that fails does not blank a pane that was
     /// showing something real.
     fn on_sheep_config(&mut self, name: &str, result: Result<Response, RequestError>) -> Effect {
+        // A reply nobody is waiting for any more: two `e` presses against a
+        // slow shepherd, then `Esc`, and the second answer used to re-open
+        // the pane over a dashboard the operator had gone back to. Dropped
+        // in silence, because nothing went wrong and the operator asked for
+        // nothing that is still outstanding.
+        if self.config_target.as_deref() != Some(name) {
+            return Effect::None;
+        }
         match result {
             Ok(Response::SheepConfig(view)) => {
                 let carried = self.config_pane.as_ref().map(|pane| pane.view().clone());
@@ -2250,7 +2269,10 @@ impl App {
             return Effect::None;
         }
         match self.selected_name() {
-            Some(name) => Effect::Send(Sent::SheepConfig { name }),
+            Some(name) => {
+                self.config_target = Some(name.clone());
+                Effect::Send(Sent::SheepConfig { name })
+            }
             None => Effect::None,
         }
     }
@@ -2270,7 +2292,12 @@ impl App {
             KeyPress::Quit => return Effect::Quit,
             // Both close. `Escape` closes rather than cascading to a filter
             // clear or a quit, exactly as it does on the settings screen.
-            KeyPress::Edit | KeyPress::Escape => self.config_pane = None,
+            KeyPress::Edit | KeyPress::Escape => {
+                self.config_pane = None;
+                // Cleared together, always. A read still in flight for this
+                // pane must not re-open it behind the operator's back.
+                self.config_target = None;
+            }
             KeyPress::SelectUp
             | KeyPress::SelectDown
             | KeyPress::SelectFirst
@@ -6432,5 +6459,57 @@ mod tests {
             said, "web is a dog, and a dog's config comes from `shep adopt`",
             "verbatim, no prefix"
         );
+    }
+
+    /// fails if a config reply re-opens a pane the operator has closed.
+    ///
+    /// Two `e` presses against a slow shepherd, then `Esc`: the second
+    /// answer used to land on a dashboard the operator had gone back to and
+    /// put the pane straight back up.
+    #[test]
+    fn a_config_reply_for_a_pane_nobody_wants_is_dropped() {
+        let mut app =
+            fixtures::with_selection(ProcessInfo::builder(9, "web", ProcStatus::Online).build());
+        let reply = || Msg::Replied {
+            sent: Sent::SheepConfig {
+                name: "web".to_string(),
+            },
+            result: Ok(Response::SheepConfig(Box::new(
+                fixtures::sheep_config_view(),
+            ))),
+        };
+        app.update(Msg::Key(KeyPress::Edit));
+        app.update(Msg::Key(KeyPress::Edit));
+        app.update(reply());
+        assert!(app.config_pane().is_some(), "the first answer opens it");
+
+        app.update(Msg::Key(KeyPress::Escape));
+        assert!(app.config_pane().is_none());
+
+        app.update(reply());
+        assert!(
+            app.config_pane().is_none(),
+            "the second answer lands on a dashboard and is dropped"
+        );
+        assert!(app.notice().is_none(), "silently: nothing went wrong");
+    }
+
+    /// fails if closing the pane stops making a later `e` work again. The
+    /// drop above is keyed on a target, and a target left set or left stale
+    /// would either re-open on a stray reply or refuse the next open.
+    #[test]
+    fn e_still_opens_a_pane_after_one_was_closed() {
+        let mut app = fixtures::app_in_sheep_pane();
+        app.update(Msg::Key(KeyPress::Escape));
+        app.update(Msg::Key(KeyPress::Edit));
+        app.update(Msg::Replied {
+            sent: Sent::SheepConfig {
+                name: "web".to_string(),
+            },
+            result: Ok(Response::SheepConfig(Box::new(
+                fixtures::sheep_config_view(),
+            ))),
+        });
+        assert!(app.config_pane().is_some());
     }
 }
