@@ -619,7 +619,7 @@ pub fn sheep_config_view() -> SheepConfigView {
         .insert("LOG_LEVEL".to_string(), "debug".to_string());
     SheepConfigView::new(
         config,
-        vec!["max_restarts".to_string(), "instances".to_string()],
+        vec!["max_restarts".to_string(), "reuse_port".to_string()],
         vec!["kill_signal".to_string()],
     )
 }

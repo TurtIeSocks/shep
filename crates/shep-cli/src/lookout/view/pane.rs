@@ -727,7 +727,7 @@ mod tests {
                 .map(|(_, _, _, key)| key)
                 .collect()
         };
-        assert_eq!(flagged('*'), ["instances", "max_restarts"]);
+        assert_eq!(flagged('*'), ["reuse_port", "max_restarts"]);
         assert_eq!(flagged('!'), ["kill_signal"]);
         assert_eq!(rows_of(&text).len(), 39, "every field is drawn at 120");
     }

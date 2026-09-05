@@ -8,13 +8,13 @@ expression: "text_of(&lines).join(\"\\n\")"
    err_file                   (unset)                                                                         respawn   
    fold                       (unset)                                                                         now       
    group                      (unset)                                                                         respawn   
- =*instances                  3                                                                               read-only 
+ = instances                  3                                                                               read-only 
    interpreter                (unset)                                                                         respawn   
   !kill_signal                (unset)                                                                         next start
    merge_logs                 false                                                                           respawn   
  = name                       web                                                                             read-only 
    out_file                   (unset)                                                                         respawn   
-   reuse_port                 false                                                                           now       
+  *reuse_port                 false                                                                           now       
    script                     ./srv                                                                           respawn   
    user                       (unset)                                                                         respawn   
 
