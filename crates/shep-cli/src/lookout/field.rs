@@ -31,6 +31,15 @@ pub enum FieldKind {
 /// `Debug` is derived rather than redacted (IR-41): this is a schema, and a
 /// schema describes a value without carrying one. A secret's SHAPE is not a
 /// secret.
+///
+/// `default` is the one field that could weaken that, since it is a value
+/// rather than a description of one, and it does not: a schema's `default`
+/// comes from a static constant, either the committed
+/// `crates/shep-core/assets/flockfile.schema.json` or a dog's own
+/// `--schema` answer, which is its binary describing itself. Neither has
+/// ever seen this flock. A LIVE value reaches the pane through
+/// `ConfigPane`'s own values map instead, which is why that type's `Debug`
+/// is redacted by hand while this one is derived.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field {
     /// The property name, which is also the key a write carries.
