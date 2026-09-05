@@ -1,19 +1,13 @@
-//! Query verbs: `flock`, `describe`, `fold`, `ping` — the read-only half of
-//! the verb set. None of them mutate the flock, and none of them autostart:
-//! `main` hands every one of these an already-connected [`Client`], the
-//! same contract `commands::lifecycle` documents on its own module.
+//! Query verbs: `flock`, `describe`, `fold`, `ping`. None mutate the flock,
+//! and none autostart: `main` hands each one an already-connected [`Client`].
 //!
 //! `describe` and `fold` share one shape (`Request::Describe` against a
-//! [`SelectorSpec`]) — `fold` is a one-line specialisation of `describe`
-//! that supplies `SelectorSpec::Fold` directly rather than parsing one from
-//! a raw string, kept as a thin wrapper rather than a copy.
+//! [`SelectorSpec`]); `fold` supplies `SelectorSpec::Fold` directly.
 //!
-//! `ping` deliberately does not ask the daemon for its own version and pid:
-//! the handshake already answered that, in the
-//! [`HelloAck`](shep_core::protocol::HelloAck) [`Client::daemon`] holds, so
-//! asking again would be a wasted round trip for information already in
-//! hand. It still issues `Request::Ping` itself, as the liveness check the
-//! verb exists for.
+//! `ping` does not ask the daemon for its version and pid: the handshake
+//! already answered that, in the
+//! [`HelloAck`](shep_core::protocol::HelloAck) [`Client::daemon`] holds. It
+//! still issues `Request::Ping` as the liveness check.
 
 use shep_client::Client;
 use shep_core::paths::ShepPaths;
@@ -34,13 +28,10 @@ use crate::output::{
 /// Sends `body`, renders whatever the daemon answers through [`emit`], and
 /// maps every way that can go wrong to its exit code.
 ///
-/// `extract` pulls the verb's own payload out of `Response`; `Response` is
-/// `#[non_exhaustive]` (Global Constraints), so an answer `extract` does not
-/// recognise — a variant this client predates, or simply the wrong one for
-/// this verb — maps to [`ExitCode::Internal`] rather than being guessed at.
-/// Every query verb uses the client's default deadline, so unlike
-/// `commands::lifecycle`'s version of this helper there is no deadline
-/// parameter to thread through.
+/// `extract` pulls the verb's own payload out of `Response`, which is
+/// `#[non_exhaustive]`: an answer it does not recognise maps to
+/// [`ExitCode::Internal`] rather than being guessed at. Every query verb uses
+/// the client's default deadline, so there is no deadline parameter.
 async fn request_and_render<T, F>(
     client: &Client,
     streams: &mut Streams<'_>,
@@ -74,16 +65,13 @@ where
 }
 
 /// `describe` and `fold`'s shared body: one `Request::Describe` against
-/// `selector`, rendered through [`emit_described`] — the sheep table, then
+/// `selector`, rendered through [`emit_described`] as the sheep table and
 /// each sheep's lamb tree beneath it. `command` is the verb name the output
-/// envelope reports (`"describe"` or `"fold"`), which is why this takes it
-/// as a parameter rather than hard-coding one.
+/// envelope reports.
 ///
-/// Not routed through [`request_and_render`], for the same reason
-/// [`flock`] is not: `emit_described` renders one `Vec<ProcessInfo>` into
-/// two tables in table mode, which no single [`Render`] impl can express —
-/// this is the small bespoke path this verb needs instead of widening that
-/// helper into a second renderer.
+/// Not routed through [`request_and_render`]: `emit_described` renders one
+/// `Vec<ProcessInfo>` into two tables, which no single [`Render`] impl can
+/// express.
 async fn describe_selector(
     client: &Client,
     streams: &mut Streams<'_>,
@@ -109,22 +97,11 @@ async fn describe_selector(
     }
 }
 
-/// `shep flock` when no shepherd answers: the muster roll, marked stopped.
+/// `shep flock` when no shepherd answers: the muster roll, marked stopped
 ///
-/// "Nothing is running" is a perfectly good answer to "what is running", and
-/// turning it into `error[daemon_unreachable]` made looking at the flock a
-/// dead end on exactly the machine where someone most needs to look -- one
-/// that has just rebooted. The roll on disk holds everything needed to
-/// answer, and `shep muster` is the way back, so both are stated.
-///
-/// The exit code stays [`ExitCode::DaemonUnreachable`] even though this
-/// prints a successful-looking table, and that is the important part: a
-/// monitoring script running `shep flock` must not read a dead supervisor as
-/// a healthy empty flock. The output is for the human, the code is for the
-/// script, and they are telling the truth about different things.
-///
-/// A missing or unreadable roll is not an error either -- a machine that has
-/// never run `shep save` has nothing to show, which is itself the answer.
+/// The exit code stays [`ExitCode::DaemonUnreachable`] even though the table
+/// looks successful: a monitoring script must not read a dead supervisor as
+/// a healthy empty flock. A missing or unreadable roll is not an error.
 pub fn flock_from_roll(streams: &mut Streams<'_>, paths: &ShepPaths) -> ExitCode {
     let saved = std::fs::read(&paths.snapshot)
         .ok()
@@ -142,11 +119,8 @@ pub fn flock_from_roll(streams: &mut Streams<'_>, paths: &ShepPaths) -> ExitCode
                 .collect()
         })
         .unwrap_or_default();
-    // The roll is stored in whatever order it was written, which is neither
-    // meaningful nor stable. Name is the whole key here: a roll holds one
-    // entry per APP, not per instance, so there are no two rows to break a
-    // tie between and no id to break it with. Same first key as every other
-    // listing shep prints (`shep_core::protocol::sort_flock`).
+    // The roll's stored order is neither meaningful nor stable. Name is the
+    // whole key: one entry per app, so there is no tie to break.
     sheep.sort_unstable_by(|a, b| a.name.cmp(&b.name));
 
     if streams.fmt == Format::Table {
@@ -168,10 +142,8 @@ pub fn flock_from_roll(streams: &mut Streams<'_>, paths: &ShepPaths) -> ExitCode
         );
     }
     let empty = sheep.is_empty();
-    // An empty roll renders no table at all in table form: bare column
-    // headers over nothing read as a glitch, and the line above already said
-    // there is nothing. JSON still gets the empty array, because a script
-    // parsing this wants one shape, not two.
+    // No table for an empty roll: bare headers over nothing read as a glitch.
+    // JSON still gets the empty array, because a script wants one shape.
     if !(empty && streams.fmt == Format::Table) {
         let _ = emit(
             &mut *streams.out,
@@ -188,33 +160,16 @@ pub fn flock_from_roll(streams: &mut Streams<'_>, paths: &ShepPaths) -> ExitCode
 }
 
 /// Lists the whole flock: the sheep table, then the dogs table beneath it
-/// whenever any dog is registered — [`emit_flock`]'s own job — with a
-/// flourish ahead of the sheep table when the sheep have nothing else to
-/// look at: none registered, or every one of them at rest. See
-/// [`sheep_flourish`] for exactly what qualifies and why dogs are excluded
-/// from the check.
+/// whenever any dog is registered, with a [`sheep_flourish`] above
 ///
-/// The flourish is gated on `Format::Table` and
-/// `streams.style.level.sheep()` and nothing else, matching every other
-/// STATUS-column face — `--format json` and a piped `Format::Table` (which
-/// `run_argv` already forces to [`crate::style::StyleLevel::Bare`], whose
-/// `sheep()` is `false`) render exactly what they did before this flourish
-/// existed.
-///
-/// Not routed through [`request_and_render`]: that helper renders exactly
-/// one [`Render`] type per verb, through [`emit`]. A flock listing renders
-/// through two tables built from one `Vec<ProcessInfo>`, which no single
-/// `Render` impl can express — `emit_flock` is the small path this verb
-/// needs instead of widening that helper into a second renderer, keeping
-/// the same connect/request/extract/render shape every other query verb
-/// here has.
+/// The flourish is gated on `Format::Table` and `streams.style.level.sheep()`
+/// and nothing else. Not routed through [`request_and_render`], which renders
+/// one [`Render`] type per verb rather than two tables from one
+/// `Vec<ProcessInfo>`.
 pub async fn flock(client: &Client, streams: &mut Streams<'_>) -> ExitCode {
     match client.request(Request::ListFlock).await {
         Ok(Response::Flock(procs)) => {
-            // Read before `procs` moves into `emit_flock`, and printed
-            // ahead of the table it describes: "no sheep in the flock yet"
-            // reads as the answer, with the table underneath as the
-            // receipt, rather than a mascot bolted onto the end.
+            // Read before `procs` moves into `emit_flock`.
             let art = (streams.fmt == Format::Table && streams.style.level.sheep())
                 .then(|| sheep_flourish(&procs))
                 .flatten();
@@ -241,21 +196,11 @@ pub async fn flock(client: &Client, streams: &mut Streams<'_>) -> ExitCode {
 }
 
 /// The flourish for one flock listing, or `None` when neither the
-/// empty-flock nor the all-asleep state applies.
+/// empty-flock nor the all-asleep state applies
 ///
-/// Dogs are excluded from both checks (`ProcessInfo::dog`), deliberately:
-/// the flourish sits beside the sheep table, so it is a claim about the
-/// sheep, and a metrics or bark dog left running answers a different
-/// question than whether the flock is at rest — the dogs table beneath
-/// already renders that fact on its own. A flock whose sheep are all
-/// stopped but whose dog is still up is exactly the case a reader looking
-/// at two tables, one with something alive in it, would find a cheerful
-/// "all asleep" line wrong beside.
-///
-/// [`ProcStatus::Stopping`] does not count as asleep. It is reload's
-/// transient for the instance being replaced, not rest (`ProcStatus`'s own
-/// doc), so a flock with one sheep mid-shutdown does not flip this on
-/// merely because nothing else is `Online`.
+/// Dogs are excluded from both checks: the flourish sits beside the sheep
+/// table and is a claim about the sheep. [`ProcStatus::Stopping`] does not
+/// count as asleep, being reload's transient rather than rest.
 fn sheep_flourish(listing: &[ProcessInfo]) -> Option<String> {
     let sheep: Vec<&ProcessInfo> = listing.iter().filter(|p| p.dog.is_none()).collect();
     if sheep.is_empty() {
@@ -267,26 +212,13 @@ fn sheep_flourish(listing: &[ProcessInfo]) -> Option<String> {
         .then(|| flourish::all_asleep(sheep.len()))
 }
 
-/// Lists the dogs, and nothing else: the same `Request::ListFlock` `flock`
-/// sends, filtered to the entries carrying a `dog` marker and rendered as
-/// [`DogRows`] through the ordinary [`request_and_render`] path every other
-/// query verb here uses — `DogRows` is a [`Render`] impl like any other, so
-/// no bespoke render path is needed the way `flock`'s own split is.
+/// Lists the dogs and nothing else: the same `Request::ListFlock` [`flock`]
+/// sends, filtered to the entries carrying a `dog` marker
 ///
-/// `args.filter`, when given, narrows further to a case-insensitive
-/// substring match against each dog's own name — the one field a running
-/// dog and a community-index entry actually share; [`available_dogs`] is
-/// where `package`/`description` join it, per [`DogsArgs::filter`]'s own
-/// doc.
-///
-/// Deliberately not [`emit_flock`]: that function's contract is a MIXED
-/// listing, sheep table first: handing it a dogs-only `Vec<ProcessInfo>`
-/// would still print the sheep table's header row for zero sheep, which is
-/// exactly what this verb's own doc comment (`Commands::Dogs`, "and nothing
-/// else") rules out. The two call sites still share one table renderer —
-/// `render_table::<DogRows>`, reached here through `emit` and from inside
-/// `emit_flock`'s own dogs section — so there is exactly one place that
-/// knows how to lay out a dogs table.
+/// `args.filter` is a case-insensitive substring match against the dog's
+/// name, the one field a running dog and a community-index entry share.
+/// Not [`emit_flock`], which would print the sheep table's header row over
+/// a dogs-only listing.
 pub async fn dogs(client: &Client, streams: &mut Streams<'_>, args: &DogsArgs) -> ExitCode {
     let filter = args.filter.as_deref();
     request_and_render(
@@ -308,40 +240,25 @@ pub async fn dogs(client: &Client, streams: &mut Streams<'_>, args: &DogsArgs) -
     .await
 }
 
-/// Whether `filter` (already lower-cased at the one call site that needs
-/// it) matches any of `haystacks`, case-insensitively. The one substring
-/// rule backing [`DogsArgs::filter`]'s own doc comment, shared by [`dogs`]
-/// (matching on name alone) and [`available_dogs`] (name, package and
-/// description) so it lives in one place rather than two copies that could
-/// drift apart on which field counts.
+/// Whether `filter` matches any of `haystacks`, case-insensitively. Shared
+/// by [`dogs`] (name alone) and [`available_dogs`] (name, package and
+/// description).
 fn matches_filter(filter: &str, haystacks: &[&str]) -> bool {
     let filter = filter.to_lowercase();
     haystacks.iter().any(|h| h.to_lowercase().contains(&filter))
 }
 
-/// Lists the dogs published in the community index — `shep dogs
-/// --available`. Reaches no [`Client`] and no [`Request`]: nothing here
-/// touches the wire at all, which is the property `Commands::Dogs`'s own
-/// guard arm in `main`'s dispatch (`lib.rs`) exists to preserve — this must
-/// answer with no shepherd running.
+/// Lists the dogs published in the community index: `shep dogs --available`
 ///
-/// `Format::Table` gets two affordances `--format json` does not, the same
-/// kind of split [`flock`]'s own doc draws between its roll fallback and a
-/// failed JSON request: a filter that narrows the listing to exactly one
-/// dog prints that dog's detail view (its install and adopt commands)
-/// instead of a one-row table, and a filter that matches nothing prints
-/// `no dog matches "<filter>"` and still exits [`ExitCode::Success`] — an
-/// empty search result is an answer, not a failure. `--format json` always
-/// renders the plain array through the ordinary [`emit`] path, whatever its
-/// length: every field either affordance would show is already on each row
-/// there, via [`AvailableDog`]'s own `Serialize`.
+/// Reaches no [`Client`], so it answers with no shepherd running. Under
+/// `Format::Table` a filter matching one dog prints its detail view, and a
+/// filter matching nothing prints `no dog matches "<filter>"` and still
+/// exits [`ExitCode::Success`]. `--format json` always renders the array.
 ///
 /// # Errors reaching the operator
-/// A failure to read or parse the index prints `reading the dog index from
-/// {url}: {err}` and exits [`ExitCode::Failure`] — [`dog_index::IndexError`]
-/// deliberately carries the URL on none of its variants but its own
-/// `InsecureUrl` (that type's own doc says why), so naming it here is what
-/// tells the operator which URL failed.
+/// A failure to read or parse the index names the URL and exits
+/// [`ExitCode::Failure`]: [`dog_index::IndexError`] carries it on one
+/// variant only.
 pub async fn available_dogs(streams: &mut Streams<'_>, args: &DogsArgs) -> ExitCode {
     let url = dog_index::index_url();
     let index = match dog_index::fetch_index(&url).await {
@@ -386,22 +303,12 @@ pub async fn available_dogs(streams: &mut Streams<'_>, args: &DogsArgs) -> ExitC
     code
 }
 
-/// The clause both notices below end in, because both counts are
-/// properties of the fetched document rather than of the search.
-///
-/// Without it, `shep dogs --available wombat` prints `1 entry contained
-/// control characters` beside no rows at all, and the honest reading of
-/// that — one of the entries you are looking at was hostile — is the wrong
-/// one. Saying which set the number counts is cheaper than making the
-/// number mean something else.
+/// The clause both notices below end in: the counts describe the fetched
+/// document, not the filtered listing they are printed beside.
 const INDEX_WIDE: &str = ", across the whole index rather than this listing";
 
 /// Prints [`dog_index::Index::skipped`]/[`dog_index::Index::sanitised`] as
-/// footer notices when either is non-zero — a reader who sees one has a
-/// reason to go look at the index itself. Independent of the filter and of
-/// how many rows matched: both counts describe the fetch, not the search,
-/// so they are worth saying even alongside a detail view or a "no dog
-/// matches" line, and [`INDEX_WIDE`] is what says so out loud.
+/// footer notices when either is non-zero, whatever the filter matched.
 fn note_index_costs(streams: &mut Streams<'_>, skipped: usize, sanitised: usize) {
     if skipped > 0 {
         streams.aside(
@@ -425,9 +332,7 @@ fn note_index_costs(streams: &mut Streams<'_>, skipped: usize, sanitised: usize)
 
 /// The lone-match affordance [`available_dogs`] prints for `Format::Table`:
 /// full detail on one dog, ending in the two copy-pasteable commands an
-/// operator needs to adopt it. Never reached from `--format json` — see
-/// [`available_dogs`]'s own doc for why a machine consumer needs nothing
-/// this adds.
+/// operator needs to adopt it. Never reached from `--format json`.
 ///
 /// # Errors
 /// The underlying write failed.
@@ -445,9 +350,8 @@ fn render_detail(out: &mut dyn std::io::Write, dog: &AvailableDog) -> std::io::R
 }
 
 /// The `$ ...` line [`render_detail`] prints for how to build `source`'s
-/// binary. [`DogSourceKind::Manual`] carries free-form prose instead of a
-/// command — that variant's own doc says why — so it prints with no `$` at
-/// all, just the two-space indent the command lines share.
+/// binary. [`DogSourceKind::Manual`] carries prose instead of a command, so
+/// it prints with no `$`, just the two-space indent the command lines share.
 fn install_line(source: &DogSourceKind, package: &str) -> String {
     match source {
         DogSourceKind::Cargo {
@@ -462,21 +366,13 @@ fn install_line(source: &DogSourceKind, package: &str) -> String {
     }
 }
 
-/// The `$ shep adopt ...` line [`render_detail`] prints, built from
-/// `adopt_as` — never `name` or `package`. [`AvailableDog::adopt_as`]'s own
-/// doc is why: a dog cannot learn the name it was adopted under, so the
-/// wrong name here would ship a copy-pasteable command that silently
-/// discards its entire `[dog.<name>]` config section. [`DogSourceKind::Manual`]
-/// has no predictable install path to fill in, so its line names the
-/// placeholder literally rather than guessing one.
+/// The `$ shep adopt ...` line [`render_detail`] prints
 ///
-/// Always spells `--name` explicitly, even for an entry (like this
-/// project's own `shep-log-rotate`) whose `adopt_as` happens to equal
-/// `package` with `shep-` stripped -- `shep adopt`'s own default would
-/// already get that one right, but the index is user-contributed and
-/// nothing enforces the naming convention on `package`, so a future entry
-/// whose default would NOT match `adopt_as` must not ship a silently wrong
-/// copy-pasteable command.
+/// Built from `adopt_as`, never `name` or `package`: a wrong name ships a
+/// command that silently discards the dog's whole config section.
+/// [`DogSourceKind::Manual`] has no predictable install path, so its line
+/// names the placeholder literally. `--name` is always spelled, since
+/// nothing enforces the naming convention on a user-contributed `package`.
 fn adopt_line(source: &DogSourceKind, adopt_as: &str, package: &str) -> String {
     match source {
         DogSourceKind::Cargo { .. } | DogSourceKind::CargoGit { .. } => {
@@ -493,9 +389,8 @@ fn adopt_line(source: &DogSourceKind, adopt_as: &str, package: &str) -> String {
 
 /// Describes the sheep matching `args.selector` in detail.
 pub async fn describe(client: &Client, streams: &mut Streams<'_>, args: &SelectorArgs) -> ExitCode {
-    // One pass per target, each rendered as its own detail view: `describe`
-    // answers with a tree per sheep (its lambs), not a row, so merging several
-    // into one payload would lose the per-sheep shape the verb exists for.
+    // One pass per target, each its own detail view: `describe` answers with
+    // a tree per sheep, so merging them would lose that shape.
     let mut failure: Option<ExitCode> = None;
     for raw in &args.selectors {
         let selector = match parse_selector(streams, raw) {
@@ -510,10 +405,8 @@ pub async fn describe(client: &Client, streams: &mut Streams<'_>, args: &Selecto
     failure.unwrap_or(ExitCode::Success)
 }
 
-/// Lists one fold (spec §5 / §9): `Request::Describe { selector:
-/// SelectorSpec::Fold(args.name) }`, delegating straight to
-/// [`describe_selector`] rather than re-implementing the request/render
-/// shape.
+/// Lists one fold: `Request::Describe` with `SelectorSpec::Fold(args.name)`,
+/// delegating to [`describe_selector`].
 pub async fn fold(client: &Client, streams: &mut Streams<'_>, args: &FoldArgs) -> ExitCode {
     describe_selector(
         client,
@@ -536,20 +429,10 @@ mod tests {
 
     use super::*;
 
-    /// Every `envelopes.recv()` in this module is bounded by this timeout
-    /// rather than left to run to completion — the same rule
-    /// `commands::lifecycle`'s tests apply
-    /// (`crates/shep-cli/src/commands/lifecycle.rs:613,652`). Without it, a
-    /// mutation that made `ping` render from `client.daemon()` without
-    /// issuing the request would hang the test meant to catch it past 90
-    /// seconds instead of failing it: a test that fails by hanging gives CI
-    /// a killed job, not a named assertion.
+    /// Bounds every `envelopes.recv()` here: a verb that never reaches the
+    /// wire must fail by assertion, not by hanging the job.
     const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
-    /// `flock` must send `Request::ListFlock` and nothing else — mutating it
-    /// to send `Request::Stop` must not leave this test green. An
-    /// implementation that sent `Request::Describe` (e.g. copy-pasted from
-    /// `describe`) fails this too.
     #[tokio::test]
     async fn flock_asks_the_daemon_to_list_the_whole_flock() {
         let dir = tempfile::tempdir().unwrap();
@@ -571,11 +454,6 @@ mod tests {
         assert_eq!(sent.body, Request::ListFlock);
     }
 
-    /// The client-side parse is the point: `describe` must send a compiled
-    /// `SelectorSpec` inside `Request::Describe`, not the raw string and not
-    /// `SelectorSpec::All` regardless of input. Without this, a `describe`
-    /// that always sent `SelectorSpec::All` would pass every other test in
-    /// this module.
     #[tokio::test]
     async fn describe_sends_the_parsed_selector_in_its_compiled_form() {
         let dir = tempfile::tempdir().unwrap();
@@ -615,10 +493,8 @@ mod tests {
         }
     }
 
-    /// `"/[/"` is one of the only three inputs the selector grammar rejects
-    /// (an unterminated regex character class). A `describe` that skipped
-    /// the client-side parse would send it to the daemon and exit
-    /// `NotFound` instead of failing locally.
+    /// `"/[/"` is one of the only three inputs the selector grammar rejects:
+    /// an unterminated regex character class.
     #[tokio::test]
     async fn a_malformed_selector_exits_usage_without_a_round_trip() {
         let dir = tempfile::tempdir().unwrap();
@@ -649,9 +525,6 @@ mod tests {
         );
     }
 
-    /// `fold <name>` must ask for exactly that fold, via `Request::Describe
-    /// { selector: SelectorSpec::Fold(name) }` — not `describe`'s selector
-    /// grammar, and not a wider `SelectorSpec::All`.
     #[tokio::test]
     async fn fold_asks_the_daemon_for_that_fold_and_nothing_wider() {
         let dir = tempfile::tempdir().unwrap();
@@ -678,17 +551,9 @@ mod tests {
         );
     }
 
-    /// Proves the `Response::Flock` arm inside `flock`'s own `extract`
-    /// closure is wired to the right variant, not merely that some payload
-    /// renders as `FlockRows` in isolation (`output/rows.rs`'s own tests
-    /// already cover that) and not merely that the right request went out
-    /// (`flock_asks_the_daemon_to_list_the_whole_flock`, above, covers
-    /// that). `Response::Flock` and `Response::Described` both wrap a bare
-    /// `Vec<ProcessInfo>`, so a match arm swapped between them compiles
-    /// clean and passes every other test in this file — this is the one
-    /// that fails: `FakeDaemon::reply_to_list` scripts a real
-    /// `Response::Flock`, not the `Response::Pong` every other fake in this
-    /// module hands back regardless of what was sent.
+    /// `Response::Flock` and `Response::Described` both wrap a bare
+    /// `Vec<ProcessInfo>`, so an arm swapped between them compiles clean.
+    /// `reply_to_list` scripts a real `Response::Flock` to catch that.
     #[tokio::test]
     async fn flock_response_round_trips_into_rendered_flock_rows() {
         let dir = tempfile::tempdir().unwrap();
@@ -714,14 +579,6 @@ mod tests {
         assert_eq!(json["data"][0]["name"], "web");
     }
 
-    /// Proves the `Response::Described` arm inside `describe_selector`'s
-    /// `extract` closure is wired to the right variant, by the same
-    /// reasoning as the test above — and, since `fold` delegates straight
-    /// to `describe_selector` rather than duplicating it, this covers
-    /// `fold`'s wiring too without a third fake-daemon round trip. Also
-    /// covers Minor 5: `describe` and `fold` share this one code path and
-    /// this one `command` string parameter, so an envelope with `"describe"`
-    /// and `"fold"` swapped would otherwise go unasserted.
     #[tokio::test]
     async fn describe_response_round_trips_into_rendered_flock_rows() {
         let dir = tempfile::tempdir().unwrap();
@@ -754,34 +611,26 @@ mod tests {
         assert_eq!(json["data"][0]["name"], "web");
     }
 
-    // --- Whole-branch review item 6: sheep_flourish had no test at all ----
+    // --- sheep_flourish ---
 
-    /// A sheep, `status` and nothing else pinned -- `sheep_flourish` never
-    /// reads a field this doesn't set, and the id only has to be unique
-    /// enough to keep two sheep from looking like the same one.
+    /// A sheep with `status` pinned and nothing else.
     fn sheep(id: u32, status: ProcStatus) -> ProcessInfo {
         ProcessInfo::builder(id, format!("s{id}"), status).build()
     }
 
-    /// A registered dog -- `sheep_flourish` must never let one answer a
-    /// question that is about the sheep half of the listing.
+    /// A registered dog, which `sheep_flourish` must never count as a sheep.
     fn dog(id: u32) -> ProcessInfo {
         ProcessInfo::builder(id, format!("d{id}"), ProcStatus::Online)
             .dog(Some(DogSource::BuiltIn))
             .build()
     }
 
-    /// A listing with nothing registered gets the empty-flock flourish.
     #[test]
     fn sheep_flourish_fires_empty_flock_on_a_truly_empty_listing() {
         let art = sheep_flourish(&[]).expect("an empty listing must flourish");
         assert!(art.contains("no sheep in the flock yet"), "{art}");
     }
 
-    /// A listing with dogs but no sheep is empty for this predicate's own
-    /// purpose -- a dog is not a sheep, so a registry holding only dogs has
-    /// exactly as much to say about the flock as one holding nothing at
-    /// all.
     #[test]
     fn sheep_flourish_treats_dogs_only_as_an_empty_flock() {
         let art =
@@ -789,8 +638,7 @@ mod tests {
         assert!(art.contains("no sheep in the flock yet"), "{art}");
     }
 
-    /// Every sheep at rest gets the all-asleep flourish, naming the real
-    /// sheep count -- dogs excluded from that count too.
+    /// The count in the flourish excludes dogs too.
     #[test]
     fn sheep_flourish_fires_all_asleep_when_every_sheep_is_stopped() {
         let listing = [
@@ -802,10 +650,6 @@ mod tests {
         assert!(art.contains("2 in the flock, all asleep"), "{art}");
     }
 
-    /// The exact case this module's own doc calls out: a dog still running
-    /// beside an all-stopped flock must not block the "all asleep" claim --
-    /// the flourish is about the sheep, and the dogs table beneath it
-    /// already says the dog is up.
     #[test]
     fn a_live_dog_does_not_block_all_asleep() {
         let listing = [sheep(1, ProcStatus::Stopped), dog(2)];
@@ -813,8 +657,6 @@ mod tests {
         assert!(art.contains("1 in the flock, all asleep"), "{art}");
     }
 
-    /// A mixed flock -- some sheep up, some not -- has plenty to look at
-    /// already, so neither flourish fires.
     #[test]
     fn sheep_flourish_is_silent_on_a_mixed_flock() {
         let listing = [sheep(1, ProcStatus::Online), sheep(2, ProcStatus::Stopped)];
@@ -825,10 +667,8 @@ mod tests {
         );
     }
 
-    /// `Stopping` -- reload's transient for the instance being replaced, not
-    /// rest -- must not read as asleep merely because nothing is `Online`.
-    /// A flourish claiming "all asleep" over a flock mid-reload would be
-    /// wrong at the exact moment an operator is watching it happen.
+    /// `Stopping` is reload's transient for the instance being replaced, so
+    /// a flock mid-reload must not read as asleep.
     #[test]
     fn stopping_does_not_count_as_asleep() {
         let listing = [
@@ -842,13 +682,8 @@ mod tests {
         );
     }
 
-    /// The gate `flock` actually applies -- `fmt == Format::Table &&
-    /// streams.style.level.sheep()` -- pinned against a real call rather
-    /// than trusted from its own doc comment. The daemon answers an empty
-    /// flock on every one of these (`FakeDaemon`'s own default, unarmed),
-    /// which is exactly the case `sheep_flourish` always fires on, so
-    /// whether the art actually reaches `streams.out` is purely a function
-    /// of the gate.
+    /// The daemon answers an empty flock on every case here, which
+    /// `sheep_flourish` always fires on, so only the gate decides.
     #[tokio::test]
     async fn the_flourish_only_prints_under_table_format_and_a_sheep_drawing_level() {
         use crate::style::{Presentation, StyleLevel};

@@ -1,22 +1,13 @@
 //! The little HTTP this binary needs: [`read_request`], [`write_response`]
 //! and [`write_head`].
 //!
-//! Hand-rolled rather than pulled from a crate, and the reason is the whole
-//! dependency tree: this workspace carries no HTTP server and does not want
-//! one for a loopback endpoint serving one path, and — the maintainer's 2026-08-15
-//! ruling on `serve` — no more of one for a genuinely simple static file
-//! server over code this crate already owns. What it needs is a request
-//! line, a header map and a body — under a hundred lines against
-//! `tokio::io`, with no TLS to get wrong because the metrics endpoint is
-//! loopback by default and binding it wider is the operator's explicit act.
-//! `shep-daemon/src/probes/os.rs`'s hand-rolled HTTP *client* probe made the
-//! same call for the same reason; this is that call's server-side twin.
+//! No TLS: the metrics endpoint is loopback by default, and binding it
+//! wider is the operator's own act.
 //!
 //! Generic over [`AsyncRead`]/[`AsyncWrite`] rather than `TcpStream`, so a
-//! test drives [`read_request`]/[`write_response`]/[`write_head`] over a
-//! `tokio::io::duplex` pair with no socket at all. `dog::metrics` is the one
-//! caller that binds a real [`tokio::net::TcpListener`] today.
-
+//! test drives all three over a `tokio::io::duplex` pair with no socket at
+//! all. `dog::metrics` is the one caller that binds a real
+//! [`tokio::net::TcpListener`] today.
 use core::fmt;
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -46,10 +37,9 @@ pub struct HttpRequest {
 
 /// Why [`read_request`] or [`write_response`] failed.
 ///
-/// `Debug` needs no redaction (unlike `DogRunError` one directory up): every
-/// field here is a size or a fixed reason string, never a header value — and
-/// a header value is where an `Authorization` would be. A derived `Debug`
-/// stays safe to log.
+/// `Debug` needs no redaction: every field is a size or a fixed reason
+/// string, never a header value, which is where an `Authorization` would
+/// be.
 #[derive(Debug)]
 pub enum HttpError {
     /// The underlying read or write failed, or the peer closed the
@@ -70,19 +60,11 @@ pub enum HttpError {
     },
     /// No request arrived within the caller's `read_timeout`.
     Timeout,
-    /// A header name or value passed to [`write_head`] carried a byte outside
-    /// the printable ASCII range (`0x20..=0x7e`) — a CR, an LF, or anything
-    /// above the range such as DEL. Carries a fixed reason, never the
-    /// offending name or value: unlike this enum's other variants, the value
-    /// that trips this one can be attacker-controlled (a percent-decoded
-    /// request path reflected into a `Location`), so the same rule that keeps
-    /// this type's `Debug` safe to log — never a header value — applies here
-    /// too. `HttpError` is private to this crate — `lib.rs` declares
-    /// `mod http;`, not `pub mod http;` — so IR-20's `#[non_exhaustive]`
-    /// question does not arise.
-    ///
-    /// `write_head`'s caller is `serve::worker`, which returns this variant
-    /// for a response header it cannot write out safely.
+    /// A header name or value passed to [`write_head`] carried a byte
+    /// outside the printable ASCII range (`0x20..=0x7e`). Carries a fixed
+    /// reason, never the offending name or value: the string that trips
+    /// this can be attacker-controlled, a percent-decoded request path
+    /// reflected into a `Location`.
     BadHeader {
         /// What was bad: `"a header name"` or `"a header value"`.
         what: &'static str,
@@ -124,26 +106,16 @@ impl From<std::io::Error> for HttpError {
 
 /// Reads one request off `stream`, bounded in both size and time.
 ///
-/// Hand-rolled rather than pulled from a crate, and the reason is the whole
-/// dependency tree: this workspace carries no HTTP server and does not want
-/// one for a loopback endpoint serving one path. What it needs is a request
-/// line, a header map and a body — under a hundred lines against
-/// `tokio::io`, with no TLS to get wrong because the metrics endpoint is
-/// loopback by default and binding it wider is the operator's explicit act.
-///
-/// Both bounds are load-bearing. `MAX_HEADER_BYTES` is what stops a peer
-/// sending headers forever; `read_timeout` is what stops one that opens a
-/// connection and says nothing from holding a task open. A metrics endpoint
-/// is reachable by anything that can reach the port, which on a shared host
-/// is more than the operator.
+/// Both bounds are load-bearing. [`MAX_HEADER_BYTES`] stops a peer sending
+/// headers forever; `read_timeout` stops one that opens a connection and
+/// says nothing from holding a task open.
 ///
 /// # Errors
-/// - [`HttpError::Io`] — the read failed or the peer closed mid-request.
-/// - [`HttpError::Malformed`] — no request line, or a header with no colon.
-/// - [`HttpError::TooLarge`] — the head exceeded [`MAX_HEADER_BYTES`], or
+/// - [`HttpError::Io`] if the read failed or the peer closed mid-request.
+/// - [`HttpError::Malformed`] if a request line or a header colon is missing.
+/// - [`HttpError::TooLarge`] if the head exceeded [`MAX_HEADER_BYTES`], or
 ///   the declared `content-length` exceeded [`MAX_BODY_BYTES`].
-/// - [`HttpError::Timeout`] — the request did not arrive within
-///   `read_timeout`.
+/// - [`HttpError::Timeout`] if nothing arrived within `read_timeout`.
 pub async fn read_request<R: AsyncRead + Unpin>(
     stream: &mut R,
     read_timeout: Duration,
@@ -160,10 +132,9 @@ async fn read_request_unbounded_time<R: AsyncRead + Unpin>(
     stream: &mut R,
 ) -> Result<HttpRequest, HttpError> {
     // `stream.take(N)` is what turns "a peer that never sends a line
-    // terminator" into a bounded read: once the take's budget is spent,
-    // the underlying `poll_read` reports EOF and `read_head`'s own length
-    // check fires on that same call, rather than `read_until` waiting
-    // forever for a `\n` that is never coming.
+    // terminator" into a bounded read: once the budget is spent `poll_read`
+    // reports EOF and `read_head`'s own length check fires on that same
+    // call, rather than `read_until` waiting for a `\n` never coming.
     let mut reader = BufReader::new(stream.take(MAX_HEADER_BYTES as u64 + 1));
     let head = read_head(&mut reader).await?;
     let (method, target, headers) = parse_head(&head)?;
@@ -178,11 +149,9 @@ async fn read_request_unbounded_time<R: AsyncRead + Unpin>(
                 limit: MAX_BODY_BYTES,
             });
         }
-        // The head-reading ceiling above no longer applies to the body —
-        // reuse the same `Take` (so any bytes already buffered past the
-        // blank line are not lost) but reset its budget to exactly the
-        // declared length, so a read past `content-length` is structurally
-        // impossible rather than merely untried.
+        // Reuse the same `Take`, so bytes already buffered past the blank
+        // line are not lost, but reset its budget to the declared length:
+        // a read past `content-length` is then structurally impossible.
         reader.get_mut().set_limit(len as u64);
         let mut body = vec![0_u8; len];
         reader.read_exact(&mut body).await?;
@@ -199,20 +168,18 @@ async fn read_request_unbounded_time<R: AsyncRead + Unpin>(
     })
 }
 
-/// Reads the request head — start line through the terminating blank line —
+/// Reads the request head, start line through the terminating blank line,
 /// one `\n`-delimited chunk at a time off `reader`, refusing growth past
-/// [`MAX_HEADER_BYTES`]. `reader`'s own size ceiling ([`read_request_unbounded_time`]'s
-/// `Take`) is what makes that refusal happen at all rather than hanging: see
-/// this module's tests for the flood case this guards against.
+/// [`MAX_HEADER_BYTES`]. `reader`'s own `Take` is what makes that a refusal
+/// rather than a hang.
 async fn read_head<S: AsyncRead + Unpin>(reader: &mut BufReader<S>) -> Result<Vec<u8>, HttpError> {
     let mut head = Vec::new();
     loop {
         let mut line = Vec::new();
         let read = reader.read_until(b'\n', &mut line).await?;
         if read == 0 {
-            // The take's budget has not been exceeded (that case returns
-            // below, on this same call, before a next iteration is ever
-            // reached) — this is the peer genuinely closing the connection.
+            // The take's budget has not been exceeded, that case returning
+            // below on this same call: the peer genuinely closed.
             return Err(HttpError::Io(std::io::Error::from(
                 std::io::ErrorKind::UnexpectedEof,
             )));
@@ -279,10 +246,8 @@ fn strip_trailing_cr(line: &[u8]) -> &[u8] {
 /// reply, so neither side has to reason about keep-alive, pipelining, or a
 /// half-read body left in the buffer.
 ///
-/// The status line's reason phrase is empty (`HTTP/1.1 200 `) rather than
-/// looked up from a table — RFC 7230 §3.1.2 allows a zero-length
-/// reason-phrase, and every caller in this workspace (a metrics scraper) reads
-/// the status code, not the reason text.
+/// The status line's reason phrase is empty (`HTTP/1.1 200 `), which RFC
+/// 7230 §3.1.2 allows; every caller here reads the status code.
 ///
 /// # Errors
 /// - The underlying write failed.
@@ -302,36 +267,26 @@ pub async fn write_response<W: AsyncWrite + Unpin>(
 }
 
 /// One extra response header: a name and a value, both already final.
-///
-/// Built by `serve::worker`, which attaches these to a response before
-/// `write_head` writes them out.
 pub struct Header<'a> {
     /// The header name, written exactly as given.
     pub name: &'a str,
-    /// The value, written exactly as given — refused if it carries a control
+    /// The value, written exactly as given. Refused if it carries a control
     /// byte, see [`write_head`].
     pub value: &'a str,
 }
 
 /// Writes a response head and stops, leaving the body to the caller.
 ///
-/// [`write_response`] is still the right function when the whole body is
-/// already a `&[u8]` — the metrics dog's exposition is exactly that. This one
-/// exists for `serve`, which streams a file it has not read: `content_length`
-/// comes from the file's metadata and the caller copies the bytes afterwards.
-///
-/// Every response carries `Connection: close`, the same as [`write_response`],
-/// so a caller that writes fewer bytes than it declared closes the connection
-/// and the client sees a truncated response rather than a hang.
+/// [`write_response`] is the right function when the whole body is already
+/// a `&[u8]`. This one exists for `serve`, which streams a file it has not
+/// read: `content_length` comes from the file's metadata. Every response
+/// carries `Connection: close`, so a caller that writes fewer bytes than it
+/// declared gives a truncated response rather than a hang.
 ///
 /// # Errors
-/// - [`HttpError::Io`] — the write failed.
-/// - [`HttpError::BadHeader`] — a header name or value carries a byte outside
-///   the printable ASCII range. A `Location` built from a request path is the
-///   case this exists for: a percent-encoded CRLF that reached this far would
-///   otherwise split the response and let a client inject headers of its own.
-///   The caller answers 500; nothing is written to the stream first, so the
-///   refusal cannot itself produce a malformed response.
+/// - [`HttpError::Io`] if the write failed.
+/// - [`HttpError::BadHeader`] if a header name or value carries a byte
+///   outside printable ASCII. Nothing is written to the stream first.
 pub async fn write_head<W: AsyncWrite + Unpin>(
     stream: &mut W,
     status: u16,
@@ -368,9 +323,8 @@ pub async fn write_head<W: AsyncWrite + Unpin>(
 }
 
 /// Whether `s` carries a byte outside the printable ASCII range
-/// (`0x20..=0x7e`) — a CR, an LF, or anything above it such as DEL. Any of
-/// these, written unescaped into a response head, splits it: a CRLF pair
-/// starts a new header line, and a lone CR or LF is enough for some clients.
+/// (`0x20..=0x7e`): a CR, an LF, or anything above it such as DEL. Written
+/// unescaped into a response head, any of these splits it.
 fn has_control_byte(s: &str) -> bool {
     s.bytes().any(|b| !(0x20..=0x7e).contains(&b))
 }
@@ -381,10 +335,8 @@ mod tests {
 
     use super::*;
 
-    /// fails if the body is read past `content-length`, or if a request with
-    /// no body blocks waiting for one. The second half is what a bare
-    /// `read_to_end` gets wrong, and it hangs rather than failing — which is
-    /// why this test is bounded and why the timeout is a parameter at all.
+    /// A bare `read_to_end` hangs on a request with no body rather than
+    /// failing, so this test is bounded.
     #[tokio::test]
     async fn a_request_is_read_to_its_declared_length_and_no_further() {
         let (mut client, mut server) = tokio::io::duplex(4096);
@@ -415,16 +367,12 @@ mod tests {
         );
     }
 
-    /// fails if a peer can grow the dog's memory by sending headers
-    /// forever. The metrics endpoint is reachable by anything that can
-    /// reach the port; on a shared host that is more than the operator.
+    /// The metrics endpoint is reachable by anything that can reach the
+    /// port; on a shared host that is more than the operator.
     #[tokio::test]
     async fn a_head_past_the_ceiling_is_refused_rather_than_buffered() {
         let (mut client, mut server) = tokio::io::duplex(64 * 1024);
         let mut flood = b"GET / HTTP/1.1\r\n".to_vec();
-        // `repeat_n`, not `repeat().take()` (brief's literal test text used
-        // the latter): clippy's `manual_repeat_n` denies it under this
-        // workspace's `-D warnings`, and the two are behaviorally identical.
         flood.extend(std::iter::repeat_n(b'x', MAX_HEADER_BYTES + 1));
         client.write_all(&flood).await.unwrap();
         assert!(matches!(
@@ -439,7 +387,6 @@ mod tests {
         ));
     }
 
-    /// fails if a peer that connects and says nothing holds a task open.
     /// The tokio clock is paused, so this measures the timeout rather than
     /// waiting for it.
     #[tokio::test(start_paused = true)]
@@ -451,10 +398,8 @@ mod tests {
         assert!(matches!(err, HttpError::Timeout), "{err:?}");
     }
 
-    /// fails if `Connection: close` is dropped from the response. Without
-    /// it a client is entitled to keep the connection open and wait for a
-    /// second reply that never comes, and `curl 127.0.0.1:9615/metrics`
-    /// hangs after printing the exposition.
+    /// Without it a client waits for a second reply that never comes, and
+    /// `curl 127.0.0.1:9615/metrics` hangs after printing the exposition.
     #[tokio::test]
     async fn every_response_closes_its_connection() {
         let (mut client, mut server) = tokio::io::duplex(4096);
@@ -470,8 +415,7 @@ mod tests {
         assert!(response.ends_with("ok"), "{response:?}");
     }
 
-    /// fails if a header value carrying CRLF is written to the stream —
-    /// response splitting, reachable from a percent-encoded path in a
+    /// Response splitting, reachable from a percent-encoded path in a
     /// `Location`.
     #[tokio::test]
     async fn a_header_value_with_a_control_byte_is_refused_before_anything_is_written() {
@@ -500,8 +444,6 @@ mod tests {
         }
     }
 
-    /// fails if the extra headers are dropped, or if the declared length stops
-    /// matching what the caller was told to write.
     #[tokio::test]
     async fn a_head_carries_its_extra_headers_and_its_declared_length() {
         let (mut client, mut server) = tokio::io::duplex(4096);

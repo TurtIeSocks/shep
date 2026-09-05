@@ -1,17 +1,10 @@
 //! Behavioral tests for [`shep_daemon::tokio_runner::TokioRunner`] against
 //! real Windows child processes.
 //!
-//! The Windows counterpart to `real_runner.rs`, which is `#![cfg(unix)]` and
-//! built entirely on `/bin/sh` scripts. This file is deliberately NOT a
-//! translation of that one: most of its cases turn on signal delivery, and
-//! the Windows tier's honest answer to a graceful signal is a refusal. What
-//! is asserted here instead is the set of properties the Windows runner
-//! genuinely claims, each of which would be a silent, dangerous failure if
-//! it did not hold.
-//!
-//! The load-bearing one is job containment. A sheep outside its job is a
-//! sheep `kill_tree` cannot reach, so `shep stop` would report success and
-//! leave a process running — the worst failure mode a supervisor has.
+//! Windows has no signal delivery, so most cases here assert properties
+//! the Windows runner claims instead. The load-bearing one is job
+//! containment: a sheep outside its job is one `kill_tree` cannot reach,
+//! so `shep stop` would report success while leaving a process running.
 
 #![cfg(windows)]
 
@@ -22,31 +15,23 @@ use std::time::Duration;
 use shep_daemon::runner::{ProcessRunner, RunningProcess, SpawnSpec, StopSignal};
 use shep_daemon::tokio_runner::TokioRunner;
 
-/// A child that stays alive far longer than any test here, and that keeps
-/// working with its stdio redirected.
+/// A child that stays alive far longer than any test here, with its stdio
+/// redirected.
 ///
-/// `ping`, not the more obvious `timeout /t`: `timeout.exe` refuses to run at
-/// all when stdin is not a console ("ERROR: Input redirection is not
-/// supported"), and the runner gives every sheep a null stdin. It exits
-/// instantly instead of sleeping, which silently turns a containment test
-/// into a test of nothing — measured, not guessed.
+/// `ping`, not `timeout /t`: `timeout.exe` refuses to run when stdin is
+/// not a console, and the runner gives every sheep a null stdin, so it
+/// would otherwise exit instantly instead of sleeping.
 const LONG_RUNNING: [&str; 4] = ["ping", "-n", "600", "127.0.0.1"];
 
-/// How long a "did it actually die" assertion waits before failing. Generous:
-/// a loaded CI box terminating a process tree is slower than a quiet laptop,
-/// and every use below resolves far sooner in the normal case.
+/// How long a "did it actually die" assertion waits before failing:
+/// generous, since a loaded CI box is slower than a quiet laptop.
 const SETTLE: Duration = Duration::from_secs(15);
 
 /// The environment a real sheep gets, in miniature.
 ///
-/// NOT `BTreeMap::new()`, and the difference is the whole reason this helper
-/// exists. The runner calls `env_clear()` before applying `SpawnSpec::env`,
-/// so an empty map means a child with a genuinely empty environment — which
-/// on Windows is not "a clean child", it is a broken one: `powershell`
-/// launched that way produces no output and no error at all. `assemble`'s
-/// `base_env` is what saves a real sheep from this, and it is private, so a
-/// spec built by hand for a test has to reproduce its floor or it is testing
-/// a configuration shep never actually produces.
+/// Not empty: the runner's `env_clear()` means an empty environment
+/// breaks `cmd`/`powershell` on Windows. `assemble`'s private `base_env`
+/// normally supplies this floor; a hand-built spec must reproduce it.
 fn realistic_env() -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     for key in [
@@ -85,9 +70,8 @@ fn cmd_spec(dir: &tempfile::TempDir, args: &[&str]) -> SpawnSpec {
 
 /// Reads `path` until it contains `needle`, or fails after [`SETTLE`].
 ///
-/// Polls rather than reading once: the log pump writes on its own task, so a
-/// single read immediately after the child exits is a race the test would
-/// lose intermittently rather than consistently — the worst kind.
+/// Polls rather than reading once: the log pump writes on its own task, so
+/// a single read right after the child exits can race it.
 async fn wait_for_log(path: &PathBuf, needle: &str) -> String {
     let started = tokio::time::Instant::now();
     let deadline = tokio::time::Instant::now() + SETTLE;
@@ -99,10 +83,8 @@ async fn wait_for_log(path: &PathBuf, needle: &str) -> String {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    // An empty log says only that nothing arrived, not why. On the CI runner
-    // this fired with `last saw ""`, which left the interesting half unasked:
-    // a sheep that failed to launch at all reports it on stderr, and the
-    // runner writes that to a sibling file nobody was reading.
+    // An empty log says nothing arrived, not why. A sheep that failed to
+    // launch reports it on stderr, in a sibling file this does not check.
     let sibling = path.with_file_name(path.file_name().and_then(|name| name.to_str()).map_or_else(
         || "web-err.log".to_string(),
         |name| name.replace("out", "err"),
@@ -134,37 +116,11 @@ fn pid_is_alive(pid: u32) -> bool {
 
 /// Every live `ping` the sheep has spawned.
 ///
-/// Replaces having the sheep print its own child's pid, which needed a
-/// shell that could ask Windows for it, which meant PowerShell, which is
-/// what hung this suite for four CI runs. This asks the same question from
-/// the test process, where an empty answer is a visible failure rather
-/// than a wait that never ends.
-///
-/// The concern that led to the sheep naming its own child was that
-/// `sysinfo` might not SEE a grandchild that `Win32_Process` showed, which
-/// would make a containment test pass while finding nothing. That is why
-/// the caller asserts this is non-empty: a grandchild it cannot find fails
-/// the test rather than skipping the assertion.
-///
-/// # Why this filters on the image name
-///
-/// It asked for "a child of the sheep" until 2026-09-04, and that is not
-/// the same question. `cmd` running the fixture has THREE children: the
-/// `ping` it backgrounds with `start /b`, the `ping` it then waits on, and
-/// a `conhost.exe` that Windows creates on its behalf to host the console
-/// (`CREATE_NO_WINDOW` suppresses the window, not the console). The old
-/// form returned whichever the process table happened to yield first, and
-/// a process table is a map whose iteration order is nobody's contract:
-/// measured over 30 runs on a real Windows box, `conhost.exe` came first in
-/// 12 of them.
-///
-/// So roughly a third of runs asserted job containment against console
-/// infrastructure, which is a process the fixture never spawned and which
-/// Windows tears down on its own schedule once the console has no clients
-/// left. Over those same 30 runs it was reliably the slowest of the three
-/// to go after `kill_tree`: 140ms at worst against the two pings' 65ms. A
-/// case whose subject changes from run to run is one that can go red
-/// without anything having regressed, and this one did, on 2026-08-31.
+/// Every live `ping` the sheep spawned, read from the process table since
+/// the sheep cannot report a pid without PowerShell. Filtered by image name:
+/// `cmd` also owns a `conhost.exe` the job does not, and a map's iteration
+/// order handed that one back a third of the time. Callers fail on an empty
+/// answer rather than skip the assertion.
 fn pings_under(parent: u32) -> Vec<u32> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate};
     let mut system = sysinfo::System::new();
@@ -188,8 +144,7 @@ fn pings_under(parent: u32) -> Vec<u32> {
         .collect()
 }
 
-/// fails if a real child's stdout never reaches its log file. The most basic
-/// thing the runner does, and the one every other case here depends on.
+/// fails if a real child's stdout never reaches its log file.
 #[tokio::test]
 async fn a_real_child_writes_its_stdout_to_the_log_file() {
     let dir = tempfile::tempdir().unwrap();
@@ -210,10 +165,9 @@ async fn a_real_child_writes_its_stdout_to_the_log_file() {
 
 /// fails if `kill_tree` does not stop the sheep itself.
 ///
-/// Also pins the exit code, which matters more on Windows than it looks:
-/// there is no signal number for a listing to show, so `137` is the ONLY
-/// thing distinguishing "shep killed this" from "it exited on its own" in
-/// `ProcessInfo::last_exit` and the `EXIT` column.
+/// Also pins the exit code: Windows carries no signal number, so `137` is
+/// what distinguishes a shep-killed sheep from one that exited on its own
+/// in `ProcessInfo::last_exit` and the `EXIT` column.
 #[tokio::test]
 async fn kill_tree_stops_a_long_running_sheep_and_reports_a_recognisable_code() {
     let dir = tempfile::tempdir().unwrap();
@@ -234,49 +188,22 @@ async fn kill_tree_stops_a_long_running_sheep_and_reports_a_recognisable_code() 
     );
 }
 
-/// fails if a sheep's own child survives `kill_tree` — the whole reason the
+/// fails if a sheep's own child survives `kill_tree`, the reason the
 /// runner creates a job object at all.
 ///
 /// The sheep is a `cmd` batch that launches a background `ping` with
-/// `start /b` and then waits, so there is a grandchild to contain and a
-/// parent for `kill_tree` to address.
-///
-/// The grandchildren are found by walking the process table
-/// (`sysinfo`'s `parent()` reports the relationship reliably; `Win32_Process`
-/// would too, but reaching it needs a shell able to ask Windows for a pid,
-/// which means PowerShell — and PowerShell is what hangs this suite, see
-/// below). An empty answer from `pings_under` fails the case, so a
-/// grandchild the test cannot see fails it rather than skipping the
-/// assertion and looking green.
-///
-/// EVERY `ping` the sheep spawned has to die, not an arbitrary one of them:
-/// see `pings_under` for why asking for "a child" was picking console
-/// infrastructure a third of the time, and reporting a containment failure
-/// when it did.
-///
-/// This is the assertion that would go red if `spawn` ever stopped assigning
-/// the child to its job — a change that breaks nothing else, and that every
-/// other test in this file would keep passing through.
+/// `start /b` and waits, giving `kill_tree` a grandchild to contain.
+/// Every `ping` the sheep spawned has to die, not whichever the table
+/// listed first.
 #[tokio::test]
 async fn kill_tree_reaches_a_grandchild_and_not_just_the_sheep() {
     let dir = tempfile::tempdir().unwrap();
     let mut spec = cmd_spec(&dir, &["echo", "placeholder"]);
-    // `cmd` from a batch file, not `powershell -Command`: a PowerShell
-    // fixture here hangs the suite, with both log files present and empty.
+    // `cmd` from a batch file, not `powershell -Command`: PowerShell hangs
+    // this suite.
     //
-    // `start /b` is the grandchild: a process the sheep spawns that
-    // outlives it, which is the whole point of the case. The sheep then
-    // waits, so `kill_tree` has something to kill.
-    //
-    // Both pings count to 600, not 60, for the reason [`LONG_RUNNING`]
-    // gives: a fixture child has to outlive the test by a margin nobody has
-    // to think about. At 60 it did not. The background ping starts ticking
-    // before the sheep has even logged, and the steps between that and the
-    // kill are two full process-table walks, so a loaded machine can spend
-    // longer here than the child was given: measured on a real Windows box
-    // under 32 spinning loads, 5 runs in 30 died of old age before the kill
-    // and the slowest single run took 154s. Ten minutes is the same number
-    // every other case in this file already uses.
+    // The pings count to 600 so a loaded machine cannot age them out before
+    // the kill; see `LONG_RUNNING`.
     const CRLF: &str = "\r\n";
     let script = dir.path().join("lamb.cmd");
     std::fs::write(
@@ -344,12 +271,9 @@ async fn kill_tree_reaches_a_grandchild_and_not_just_the_sheep() {
 
 /// fails if the graceful rung pretends to have delivered something.
 ///
-/// The refusal is the contract (see `TokioProc::signal`'s Windows arm), and
-/// the message is part of it: an operator whose `shep stop` took the full
-/// `kill_timeout` and ended in a termination needs the reason to be findable,
-/// and this string in the daemon log is where it is findable. An arm that
-/// returned `Ok(())` would leave the ladder believing a polite stop landed
-/// and would make the whole platform difference invisible.
+/// The refusal message names the supported path, so an operator whose
+/// `shep stop` ends in a `kill_timeout` termination can find the reason
+/// in the daemon log.
 #[tokio::test]
 async fn the_graceful_rung_refuses_honestly_and_names_the_way_out() {
     let dir = tempfile::tempdir().unwrap();
@@ -377,13 +301,10 @@ async fn the_graceful_rung_refuses_honestly_and_names_the_way_out() {
 /// `wait_ready`, just the runner's own `SHEP_CHANNEL_PIPE` and the pumps
 /// behind `ProcIo::from_child`.
 ///
-/// **The fixture is a `.cmd` FILE rather than `cmd /C <script>`, and that is
-/// load-bearing.** `std::process::Command` escapes an argument's inner
-/// quotes as `\"`, which is the MSVC C runtime's convention and NOT
-/// `cmd.exe`'s — cmd takes the backslash literally, so a redirect target
-/// arrives as `\"C:\...\"` and fails with "The filename, directory name, or
-/// volume label syntax is incorrect". Measured, after two wrong guesses.
-/// A script file's CONTENTS go through no such escaping.
+/// The fixture is a `.cmd` file, not `cmd /C <script>`: `std::process::Command`
+/// escapes an argument's inner quotes MSVC-style, which `cmd.exe` reads
+/// literally, breaking a quoted redirect target. A script file's contents
+/// go through no such escaping.
 #[tokio::test]
 async fn a_child_reaches_the_shepherd_channel_by_pipe_name() {
     let dir = tempfile::tempdir().unwrap();

@@ -20,11 +20,8 @@
 #![doc(test(attr(deny(warnings))))]
 #![forbid(unsafe_code)]
 
-// Declared above `barks`, `kv` and `overrides` because all three begin and
-// end a write through it, as do `shep.toml`, `dogs.toml` and the muster
-// roll in the crates above this one: one create-at-`0600` staging file and
-// one definition of what finishes an atomic replace, rather than six
-// writers each carrying their own copy and deciding how far to flush.
+// Shared atomic-write primitive: barks, kv, overrides, shep.toml, dogs.toml
+// and the muster roll all write through it.
 pub mod atomic_file;
 pub mod barks;
 pub mod config;
@@ -41,11 +38,8 @@ pub mod protocol;
 pub mod selector;
 pub mod signals;
 pub mod status;
-// Declared next to `protocol`, deliberately: that module owns what travels
-// over the control plane and this one owns what carries it. Keeping the two
-// in one crate is what lets every layer above them — the client's actor, the
-// daemon's connection state machine, every RPC verb — be written once with
-// no `cfg` in it at all.
+// OS-specific transport (unix socket or named pipe) lives here so nothing
+// above it needs a `cfg`.
 pub mod transport;
 pub mod values;
 

@@ -2,15 +2,11 @@
 //! [`ServerFrame::Reply`] to the request that asked for it and
 //! [`ServerFrame::Event`] to subscribers.
 //!
-//! [`spawn`] is the only thing this module exposes outside itself: a
-//! [`Client`](crate::client::Client) talks to its actor over the returned
-//! command channel and never touches the transport directly. That
-//! indirection is what lets one [`Client`](crate::client::Client) be shared
-//! across concurrent callers (`&self`, not `&mut self`) despite owning a
-//! single, non-cloneable framed transport underneath: two callers racing
-//! `request()` both send a [`Command`] and await their own
-//! [`oneshot`](tokio::sync::oneshot) reply, and only the actor ever touches
-//! the socket.
+//! Only the actor touches the transport. That is what lets one
+//! [`Client`](crate::client::Client) be shared across concurrent callers
+//! (`&self`, not `&mut self`) despite owning a single, non-cloneable
+//! [`Frames`](crate::connection::Frames): each caller sends a [`Command`]
+//! and awaits its own [`oneshot`](tokio::sync::oneshot) reply.
 
 use std::collections::HashMap;
 
@@ -24,21 +20,17 @@ use shep_core::protocol::{
 use crate::client::RequestError;
 use crate::connection::Frames;
 
-/// Capacity of the broadcast channel the actor uses to fan out
-/// [`BusEvent`]s to subscribers.
+/// Capacity of the broadcast channel the actor fans [`BusEvent`]s out over.
 ///
 /// Mirrors the daemon's own per-connection outbound queue (`CONN_QUEUE =
-/// 64`, `shep-daemon/src/server.rs:39`): a client-side buffer smaller than
-/// what the daemon itself is willing to queue before it starts dropping
-/// would lag behind the daemon's own backpressure for no reason (IR-26).
+/// 64`, `shep-daemon/src/server.rs`): a smaller client-side buffer would
+/// lag behind the daemon's backpressure for no reason.
 pub(crate) const EVENT_CHANNEL_CAPACITY: usize = 64;
 
 /// Depth of the actor's own command queue.
 ///
-/// Generous rather than tuned: a full queue only makes a caller's `send`
-/// await briefly for room, it never drops or fails a request, so this
-/// trades a little memory for one fewer value to benchmark. Matches
-/// [`EVENT_CHANNEL_CAPACITY`]'s own precedent for the same reason (IR-26).
+/// A full queue only makes a caller's `send` await for room; it never
+/// drops or fails a request. Matches [`EVENT_CHANNEL_CAPACITY`].
 const COMMAND_CHANNEL_CAPACITY: usize = 64;
 
 /// One command a [`Client`](crate::client::Client) sends to its actor task.
@@ -57,16 +49,10 @@ pub(crate) enum Command {
     /// Hand back a fresh [`broadcast::Receiver`] over the actor's own
     /// [`broadcast::Sender`].
     ///
-    /// Routed through the actor rather than handing
-    /// [`Client`](crate::client::Client) its own clone of the sender to
-    /// call `.subscribe()` on directly: `broadcast` closes a channel by
-    /// sender count reaching zero, never by receiver activity. A
-    /// `Client`-held clone would sit alive for as long as the `Client`
-    /// itself does, so the channel could never close — and every
-    /// [`crate::EventStream`] with it — even after this task's own loop
-    /// ends and drops the one clone it holds, which is exactly the moment a
-    /// `Client` that outlives its connection needs it to. Routing through
-    /// here keeps that clone the only one that ever exists outside `run`.
+    /// `broadcast` closes a channel by sender count reaching zero, never by
+    /// receiver activity, so the actor task holds the only clone: a
+    /// `Client`-held one would keep every [`crate::EventStream`] open for
+    /// as long as the `Client` lives.
     Subscribe {
         /// Resolved exactly once, by the actor.
         reply_to: oneshot::Sender<broadcast::Receiver<BusEvent>>,
@@ -77,8 +63,7 @@ pub(crate) enum Command {
 /// a [`Client`](crate::client::Client) sends [`Command`]s through.
 ///
 /// The spawned task keeps the only [`broadcast::Sender`] this connection
-/// will ever have; see [`Command::Subscribe`] for why nothing outside this
-/// module ever holds a clone of it.
+/// will ever have.
 pub(crate) fn spawn(frames: Frames) -> mpsc::Sender<Command> {
     let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (events_tx, _events_rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
@@ -104,11 +89,7 @@ async fn run(
                 match command {
                     Some(Command::Request { body, deadline_ms, reply_to }) => {
                         let alive = send_request(&mut frames, &mut next_id, &mut pending, body, deadline_ms, reply_to).await;
-                        // A request whose caller already stopped waiting (timed
-                        // out, or dropped the future) leaves a closed
-                        // `oneshot::Sender` behind; swept here so an abandoned
-                        // request doesn't linger in `pending` until the whole
-                        // connection closes.
+                        // drops entries whose caller already stopped waiting
                         pending.retain(|_, tx| !tx.is_closed());
                         if !alive {
                             break; // the write failed; the connection is dead
@@ -137,13 +118,11 @@ async fn run(
     }
 }
 
-/// Assigns the next request id, encodes and writes the envelope, and — once
-/// the write succeeds — records `reply_to` under that id so a later
-/// [`route_frame`] call can resolve it.
+/// Assigns the next request id, encodes and writes the envelope, then
+/// records `reply_to` under that id for [`route_frame`] to resolve.
 ///
-/// Returns `false` when the write itself failed, the caller's signal to
-/// stop the actor loop: the connection is no longer usable, so nothing
-/// sent after this point could succeed either.
+/// Returns `false` if the write failed: the connection is dead and the
+/// actor loop should stop.
 async fn send_request(
     frames: &mut Frames,
     next_id: &mut u64,
@@ -175,18 +154,14 @@ async fn send_request(
 }
 
 /// Decodes one frame off the wire and routes it: a [`Reply`] resolves the
-/// pending request with the matching id — by id, never by arrival order,
-/// because the daemon may legitimately emit a [`BusEvent`] for a request
-/// before it emits that same request's own reply — and a [`BusEvent`] is
-/// broadcast to subscribers.
+/// pending request with the matching id, and a [`BusEvent`] is broadcast
+/// to subscribers. Matched by id rather than arrival order, since the
+/// daemon may emit a [`BusEvent`] for a request before that request's own
+/// reply.
 ///
-/// A [`Reply`] whose id has no entry in `pending` (its caller's future was
-/// already cancelled) is dropped silently — there is nobody left to tell.
-/// A frame that fails to decode is dropped silently too: the daemon and
-/// this client share the same codec, so a bad frame here can only mean the
-/// codec itself drifted, which the version handshake already guards
-/// against, and there is no better recovery available at this layer than
-/// to keep reading.
+/// A [`Reply`] whose id has no entry in `pending`, or a frame that fails
+/// to decode, is dropped silently: there is nobody left to tell, and no
+/// better recovery is available at this layer than to keep reading.
 fn route_frame(
     bytes: &[u8],
     pending: &mut HashMap<u64, oneshot::Sender<Result<Response, RequestError>>>,
@@ -204,10 +179,7 @@ fn route_frame(
         ServerFrame::Event(event) => {
             let _ = events.send(event); // Err means no subscribers yet; the event is simply dropped
         }
-        // `ServerFrame` is `#[non_exhaustive]`: a future frame kind a newer
-        // daemon sends is additive by that type's own evolution rule, and
-        // an older client that doesn't understand it yet must not treat it
-        // as fatal — ignored, silently, same as an unknown `BusEvent` variant.
+        // `ServerFrame` is `#[non_exhaustive]`: an unknown variant is ignored, not fatal.
         _ => {}
     }
 }

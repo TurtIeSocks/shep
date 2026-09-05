@@ -1,16 +1,9 @@
-//! Compile-only proof (IR-38) that a crate outside `shep-daemon` can
-//! implement the pure-tier seam traits this crate exports.
+//! Compile-only check that a crate outside `shep-daemon` can implement the
+//! pure-tier seam traits this crate exports. Every method body is
+//! `todo!()` and never runs; only compilation is proved.
 //!
-//! Every method body below is `todo!()` and the one `#[test]` in this file
-//! never calls one — the proof is that this file compiles against the real
-//! trait definitions, not that these fakes behave like anything real.
-//! `daemon_e2e.rs` and `real_runner.rs` are this crate's two *behavioral*
-//! integration tiers, each carrying its own IR-38 deviation note; this is
-//! the crate's one actual compile-only file and is unaffected by either.
-//!
-//! No `#![cfg(unix)]`: every trait named here is pure tier, and gating this
-//! file would drop the proof from the Windows CI leg — the leg most likely
-//! to break it.
+//! No `#![cfg(unix)]`: these traits are pure tier, so this compiles on
+//! every platform.
 
 use core::future::Future;
 use core::pin::Pin;
@@ -22,7 +15,6 @@ use shep_daemon::limits::LimitEnforcer;
 use shep_daemon::limits::sample::{MemorySampler, ProcessRss};
 use shep_daemon::probes::{ProbeFailure, Prober};
 
-/// An external crate's `MemorySampler`.
 struct ExternalSampler;
 
 impl MemorySampler for ExternalSampler {
@@ -31,7 +23,6 @@ impl MemorySampler for ExternalSampler {
     }
 }
 
-/// An external crate's `LimitEnforcer`.
 struct ExternalEnforcer;
 
 impl LimitEnforcer for ExternalEnforcer {
@@ -44,7 +35,6 @@ impl LimitEnforcer for ExternalEnforcer {
     }
 }
 
-/// An external crate's `Prober`.
 struct ExternalProber;
 
 impl Prober for ExternalProber {

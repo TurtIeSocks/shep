@@ -1,22 +1,15 @@
 //! Reading a pm2 dump into rows.
 //!
-//! A dump is a JSON array of *instance* rows, one per running process rather
-//! than one per app — a clustered app comes back as several rows sharing a
-//! `name`. Measured against a real dump: a row is flat. `name`,
-//! `pm_exec_path`, `args`, and every other config field sit at the row's own
-//! top level, alongside the whole process environment splatted in as sibling
-//! string keys, and separately an `env` object holding that same
-//! environment plus one `env_<mode>` object per ecosystem-file environment
-//! block the app declared (`env_production`, `env_staging`, ...). `env`'s
-//! keys are a superset of the splatted top-level ones, which is what makes
-//! it usable as the bound on which top-level strings are environment rather
-//! than config.
+//! A dump is a JSON array of instance rows, one per running process: a
+//! clustered app comes back as several rows sharing a `name`. A row is flat,
+//! its config fields and the whole process environment splatted together at
+//! the top level. The row's `env` object holds that environment plus one
+//! `env_<mode>` object per ecosystem-file block; its keys being a superset of
+//! the splatted ones is what bounds env against config.
 //!
-//! [`parse`] reads through [`serde_json::Value`] rather than
-//! `#[serde(flatten)]`: flatten would need a catch-all map to collect the
-//! `env_<name>` keys, and that interacts badly with a row that also carries
-//! the whole process environment as sibling string keys. A dump is a
-//! handful of rows, so the plainer reading wins on readability.
+//! [`parse`] reads through [`serde_json::Value`]: `#[serde(flatten)]` would
+//! need a catch-all map for the `env_<name>` keys, which a row carrying the
+//! environment as siblings defeats.
 
 use std::collections::BTreeMap;
 
@@ -25,7 +18,7 @@ use serde_json::{Map, Value};
 /// One instance row out of a pm2 dump.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DumpRow {
-    /// The app's name — shared by every instance of a clustered app.
+    /// The app's name, shared by every instance of a clustered app.
     pub name: String,
     /// The script or binary pm2 was told to run.
     pub pm_exec_path: String,
@@ -47,18 +40,18 @@ pub(crate) struct DumpRow {
     pub max_memory_restart: Option<u64>,
     /// The row's `env` map: what the process is actually running with.
     pub env: BTreeMap<String, String>,
-    /// Every `env_<name>` map, keyed by the suffix — by construction these
-    /// hold only what the ecosystem file declared.
+    /// Every `env_<name>` map, keyed by the suffix. These hold only what the
+    /// ecosystem file declared.
     pub declared: BTreeMap<String, BTreeMap<String, String>>,
     /// Keys dropped because their value was neither a string, a number, nor
-    /// a boolean — nothing a Flockfile env can hold.
+    /// a boolean, none of which a Flockfile env can hold.
     pub unrepresentable: Vec<String>,
 }
 
 /// Why [`parse`] failed to read a dump.
 #[derive(Debug)]
 pub(crate) enum DumpError {
-    /// The document is not valid JSON. Carries `serde_json`'s own message.
+    /// The document is not valid JSON, carrying `serde_json`'s message.
     Json(String),
     /// The document parsed as JSON but is not the array of instance rows a
     /// dump is.
@@ -68,17 +61,14 @@ pub(crate) enum DumpError {
         /// The row's position in the dump array.
         index: usize,
     },
-    /// A row carries no `pm_exec_path`. Reported rather than silently
-    /// skipped: a dropped row is a Flockfile missing an app its operator
-    /// believes they migrated, discovered only after the reboot that needed
-    /// it.
+    /// A row carries no `pm_exec_path`. Reported, never skipped: a dropped
+    /// row is an app missing from the Flockfile.
     RowMissingScript {
         /// The row's position in the dump array.
         index: usize,
         /// The row's `name`.
         name: String,
-        /// The keys the row did carry, sorted and truncated to the first
-        /// 20, so the operator can see the shape and report it.
+        /// The keys the row did carry, sorted and truncated to 20.
         keys: Vec<String>,
     },
 }
@@ -102,10 +92,10 @@ impl core::error::Error for DumpError {}
 /// Parses a whole dump document.
 ///
 /// # Errors
-/// - [`DumpError::Json`] — the document is not valid JSON.
-/// - [`DumpError::NotAnArray`] — valid JSON, but not the array of instance rows a dump is.
-/// - [`DumpError::RowMissingName`] — a row carries no `name`.
-/// - [`DumpError::RowMissingScript`] — a row carries no `pm_exec_path` (carries the keys it did find).
+/// - [`DumpError::Json`] if the document is not valid JSON.
+/// - [`DumpError::NotAnArray`] if it is valid JSON but not an array of rows.
+/// - [`DumpError::RowMissingName`] if a row carries no `name`.
+/// - [`DumpError::RowMissingScript`] if a row carries no `pm_exec_path`.
 pub(crate) fn parse(source: &str) -> Result<Vec<DumpRow>, DumpError> {
     let document: Value =
         serde_json::from_str(source).map_err(|err| DumpError::Json(err.to_string()))?;
@@ -177,9 +167,8 @@ fn parse_row(index: usize, row: &Value) -> Result<DumpRow, DumpError> {
 }
 
 /// Collects every `env_<suffix>` object on a row's top level into a map
-/// keyed by the suffix, converting each inner value with [`stringify_map`].
-/// A key that merely starts with `env_` but is not a JSON object (should a
-/// future dump shape carry one) is skipped rather than guessed at.
+/// keyed by the suffix. An `env_` key whose value is not a JSON object is
+/// skipped.
 fn declared_envs(
     fields: &Map<String, Value>,
     unrepresentable: &mut Vec<String>,
@@ -202,12 +191,9 @@ fn declared_envs(
 
 /// Stringifies every scalar value in a JSON object, naming the rest.
 ///
-/// A value that is a string, number, or boolean becomes its string form —
-/// an ecosystem file's `PORT: 3000` arrives as a JSON number, and pm2 itself
-/// only ever runs a process with string environment values. Anything else
-/// (an object, an array, `null`) is dropped from the returned map and its
-/// key is named via `label_for`, pushed onto `unrepresentable`, rather than
-/// silently lost.
+/// A string, number, or boolean becomes its string form: an ecosystem file's
+/// `PORT: 3000` arrives as a JSON number. Anything else is dropped and its
+/// key pushed onto `unrepresentable`, labelled by `label_for`.
 fn stringify_map(
     fields: &Map<String, Value>,
     unrepresentable: &mut Vec<String>,
@@ -226,7 +212,7 @@ fn stringify_map(
 }
 
 /// The string form of a JSON scalar, or `None` for an object, array, or
-/// `null` — nothing a Flockfile env can hold.
+/// `null`.
 fn scalar_string(value: &Value) -> Option<String> {
     match value {
         Value::String(s) => Some(s.clone()),
@@ -264,11 +250,6 @@ mod tests {
 
     const FIXTURE: &str = include_str!("testdata/dump.pm2.json");
 
-    /// fails if the reader stops reading a row's fields from its own top
-    /// level. Every row in the fixture is flat, and `api`'s first row also
-    /// carries splatted session keys beside its config fields — a reader
-    /// that expected a wrapper object would find no `pm_exec_path` at all
-    /// and error instead of parsing.
     #[test]
     fn the_fixture_parses_into_four_rows_with_their_fields() {
         let rows = parse(FIXTURE).unwrap();
@@ -285,11 +266,6 @@ mod tests {
         assert_eq!(rows[2].merge_logs, Some(true));
     }
 
-    /// fails if a row with no `pm_exec_path` is skipped instead of reported.
-    /// A skipped row means a Flockfile missing an app the operator believes
-    /// they migrated, discovered after the reboot; the error names the
-    /// index, the app, and the keys the row did carry, which is what would
-    /// catch a dump shape the 2026-08-12 measurement did not cover.
     #[test]
     fn a_row_with_no_script_is_a_named_failure() {
         let odd = r#"[{"name":"web","script":"/srv/web"}]"#;
@@ -302,9 +278,8 @@ mod tests {
         assert!(keys.iter().any(|k| k == "script"), "{keys:?}");
     }
 
-    /// fails if a declared env value that is not a string aborts the parse
-    /// or is dropped in silence. `QUEUE_CONCURRENCY: 4` is a number in the
-    /// fixture because an ecosystem file's `PORT: 3000` is one in life.
+    /// `QUEUE_CONCURRENCY: 4` is a number in the fixture, as `PORT: 3000` is
+    /// in an ecosystem file.
     #[test]
     fn declared_env_scalars_are_stringified_and_the_rest_is_named() {
         let rows = parse(FIXTURE).unwrap();
@@ -316,9 +291,6 @@ mod tests {
         assert_eq!(rows[0].unrepresentable, ["OPTS"]);
     }
 
-    /// fails if a document that is not the array of rows a dump is gets
-    /// read as an empty dump — "imported 0 apps" for a file that was never
-    /// a dump is the least useful answer there is.
     #[test]
     fn a_document_that_is_not_an_array_is_refused() {
         assert!(matches!(parse("{}"), Err(DumpError::NotAnArray)));

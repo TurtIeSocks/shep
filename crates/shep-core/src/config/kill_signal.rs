@@ -1,31 +1,25 @@
 //! The stop-signal grammar: the four signals `kill_signal` may name.
 //!
-//! Lives in shep-core rather than beside the kill ladder that sends them
-//! because two layers need the same answer and only one of them can reach the
-//! OS: `normalize` has to REFUSE a name the daemon could not send, and the
-//! daemon has to MAP an accepted name onto its own portable `StopSignal`.
-//! Splitting that grammar across the two crates is how the clamp got in — the
-//! daemon knew four names, the validator knew none, and the gap between them
-//! was a `tracing::warn!` nobody reads in a detached process.
+//! Lives in shep-core rather than beside the kill ladder that sends them:
+//! `normalize` has to refuse a name the daemon could not send, and the
+//! daemon has to map an accepted name onto its own portable `StopSignal`,
+//! and only shep-core is shared by both.
 
 /// A signal `kill_signal` may name.
 ///
-/// Four, not every signal on the platform, and deliberately: each one here is
-/// a signal the daemon's stop ladder can actually deliver and then escalate
-/// past. Growth is possible but is not anticipated — the ladder's shape, not
-/// the grammar's, is what would have to change first — so this is left
-/// exhaustive rather than `#[non_exhaustive]` (IR-20: don't cargo-cult it).
-/// A caller matching on all four today gets a compile error the day a fifth
-/// arrives, which is the outcome we want at both call sites.
+/// Four, not every signal on the platform: each one here is a signal the
+/// daemon's stop ladder can actually deliver and then escalate past. Left
+/// exhaustive rather than `#[non_exhaustive]`, so a caller matching on
+/// all four today gets a compile error the day a fifth arrives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KillSignal {
-    /// `SIGTERM` — the default, and a graceful stop request.
+    /// `SIGTERM`: the default, and a graceful stop request.
     Term,
-    /// `SIGINT` — interrupt, what Ctrl-C sends.
+    /// `SIGINT`: interrupt, what Ctrl-C sends.
     Int,
-    /// `SIGQUIT` — quit, core-dumping by default.
+    /// `SIGQUIT`: quit, core-dumping by default.
     Quit,
-    /// `SIGUSR2` — user-defined signal 2, the one several runtimes reserve
+    /// `SIGUSR2`: user-defined signal 2, the one several runtimes reserve
     /// for a graceful restart.
     Usr2,
 }
@@ -43,9 +37,8 @@ impl KillSignal {
     /// Parses one `kill_signal` name, case-insensitively, with or without the
     /// `SIG` prefix. `None` for anything else.
     ///
-    /// Both spellings are accepted because both were accepted before this
-    /// grammar existed, and a validation pass that starts refusing a
-    /// Flockfile that worked yesterday is a worse bug than the one it fixes.
+    /// Both spellings are accepted: a validator refusing a Flockfile that
+    /// otherwise parses is a worse bug than the one it fixes.
     #[must_use]
     pub fn parse(name: &str) -> Option<Self> {
         match name.to_ascii_uppercase().as_str() {
@@ -73,7 +66,7 @@ impl KillSignal {
 mod tests {
     use super::*;
 
-    /// fails if `ACCEPTED` and `as_str` disagree — the list an operator is
+    /// fails if `ACCEPTED` and `as_str` disagree: the list an operator is
     /// shown in a refusal has to be the list `parse` actually takes, and the
     /// two are written out separately.
     #[test]

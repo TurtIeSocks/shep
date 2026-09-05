@@ -1,22 +1,15 @@
 //! `shep whistle`: the MCP interface, over stdio.
 //!
-//! **stdout is the transport.** A single stray byte on it — an error
-//! envelope, a `println!`, a tracing record — corrupts a JSON-RPC stream that
-//! the peer cannot resynchronise. So this verb never receives a `Streams`
-//! value and therefore cannot reach `output::emit`; it takes a stderr handle
-//! and nothing else, exactly as `dog::run_dog` does. No tracing subscriber is
-//! installed either: rmcp emits records internally, and with no subscriber
-//! they go nowhere, which is right for a process whose stdout is a wire.
+//! stdout is the transport: a single stray byte on it corrupts the JSON-RPC
+//! stream, so this verb takes only a stderr handle, never `output::emit`,
+//! and installs no tracing subscriber.
 //!
-//! **The peer is the launcher.** whistle binds no port, listens on no socket,
-//! and has nobody to authenticate. Whoever launched it already runs as this
-//! uid and can already run `shep stop`. See [`gate`] for what the control
-//! gate is and, more importantly, what it is not.
+//! The peer is the launcher: whistle binds no port, listens on no socket,
+//! and has nobody to authenticate. Whoever launched it already runs as
+//! this uid and can already run `shep stop`. See [`gate`] for what the
+//! control gate is, and is not.
 //!
-//! `catalogue` (`#[cfg(test)]` only, so not linkable from a non-test doc
-//! build) renders `docs/whistle/tools.md` off [`Whistle::router`], and pins
-//! every claim in it against the two live routers below — nothing outside
-//! its own tests calls into it.
+//! `catalogue` (`#[cfg(test)]` only) renders `docs/whistle/tools.md`.
 
 pub mod control;
 pub mod facts;
@@ -40,12 +33,9 @@ use crate::output;
 
 /// The MCP server. One per process.
 ///
-/// `Debug` is derived, not omitted: `[lints] workspace = true` in shep-cli's
-/// manifest (crates/shep-cli/Cargo.toml:150) makes
-/// `missing_debug_implementations` a deny, and it works —
-/// `ToolRouter<S>` carries a MANUAL `Debug` with no `S: Debug` bound
-/// (rmcp handler/server/router/tool.rs:336), as does `ToolRoute<S>` (:165).
-/// The repo's own convention is to carry it (lookout's `App`, app.rs:197).
+/// `Debug` is derived since `missing_debug_implementations` is denied
+/// workspace wide; `ToolRouter` and `ToolRoute` both carry a manual `Debug`
+/// with no `S: Debug` bound, so this compiles without one.
 #[derive(Debug)]
 pub struct Whistle {
     shepherd: shepherd::Shepherd,
@@ -57,16 +47,9 @@ pub struct Whistle {
 impl Whistle {
     /// The assembled router, for the catalogue and for the gate tests.
     ///
-    /// `#[tool_handler]` generates `call_tool`, `list_tools` and `get_tool` on
-    /// the `ServerHandler` impl (rmcp-macros/tool_handler.rs:44-95); it does
-    /// NOT put an accessor on the type, so tests that want to enumerate tools
-    /// need this.
-    ///
-    /// Nothing in `main` needs to list a whistle's tools, only to serve
-    /// them, so every caller of this is `#[cfg(test)]` — this module's own
-    /// gate tests below, and `catalogue`. `#[allow(dead_code)]` says so
-    /// explicitly rather than leaving an unexplained warning on a non-test
-    /// build.
+    /// `#[tool_handler]` generates `call_tool`/`list_tools`/`get_tool` but no
+    /// accessor, so tests that enumerate tools need this. Every caller is
+    /// `#[cfg(test)]`, hence `#[allow(dead_code)]` on a non-test build.
     #[allow(dead_code)]
     #[must_use]
     pub fn router(&self) -> &ToolRouter<Self> {
@@ -75,10 +58,8 @@ impl Whistle {
 
     /// A `Whistle` with a given gate and no reachable shepherd.
     ///
-    /// Every test in Tasks 8 and 9 asks a question about the router or the
-    /// instructions and never dials, so a `ShepPaths` rooted at a path that
-    /// does not exist is enough. Kept `#[cfg(test)]` so it cannot become a
-    /// production shortcut.
+    /// A `ShepPaths` rooted at a nonexistent path is enough, since nothing
+    /// here dials it.
     #[cfg(test)]
     #[must_use]
     pub fn for_test(control: gate::Control) -> Self {
@@ -90,11 +71,8 @@ impl Whistle {
 
     /// Builds the handler and its router.
     ///
-    /// The router is assembled here, once, from the gate: read-only always,
-    /// plus control when the gate is open. `ToolRouter` implements `Add`, so
-    /// the open case is one `+`. `disable_route` was considered and refused —
-    /// a deny-list is a filter over a live route where omission is the
-    /// absence of one, and one fewer thing to get wrong in a refactor.
+    /// Read-only tools always; control tools added via `ToolRouter`'s `Add`
+    /// impl when the gate is open.
     #[must_use]
     pub fn new(paths: ShepPaths, control: gate::Control) -> Self {
         let router = match control {
@@ -110,13 +88,11 @@ impl Whistle {
     }
 
     /// The two prose states `get_info`'s instructions cycle between,
-    /// pinned word for word by this module's own tests below.
+    /// pinned word for word by this module's tests below.
     ///
-    /// Reuses [`gate::Control::how_to_open`] for the read-only branch's "how
-    /// to turn this on" clause rather than re-typing it: `gate.rs`'s own doc
-    /// names this as one of three places that must say the same thing — the
-    /// other two are the malformed-config notice in [`whistle`] just below,
-    /// and the tool catalogue.
+    /// Reuses [`gate::Control::how_to_open`] for the "how to turn this on"
+    /// clause instead of retyping it, since the malformed-config notice
+    /// below and the tool catalogue must say the same thing.
     fn instructions(&self) -> String {
         match self.control {
             gate::Control::ReadOnly => format!(
@@ -148,23 +124,16 @@ impl ServerHandler for Whistle {
 }
 
 /// Runs `shep whistle`: resolves the control gate, then serves the MCP
-/// protocol over stdio until the peer disconnects. `main`'s whole
-/// `Commands::Whistle` arm.
+/// protocol over stdio until the peer disconnects.
 ///
-/// Reads `paths.daemon_config` once. A missing file is the ordinary case and
-/// reads as read-only, silently — see [`gate::resolve_control`]. A file that
-/// EXISTS but will not parse also reads as read-only (same function), but is
-/// not silent about it: this prints one notice to `err`, naming the path and
-/// the parse failure, because a broken config is exactly the moment an
-/// operator needs to know the gate did not open the way they expected.
+/// A missing `paths.daemon_config` reads as read-only, silently. One that
+/// exists but will not parse also reads as read-only, but prints a notice
+/// to `err` naming the path and the parse failure.
 ///
-/// Every failure this function can meet — a malformed config, a transport
-/// that never establishes, a peer that vanishes mid-serve — is reported
-/// through `err` and folded into the [`ExitCode`] returned rather than
-/// surfaced as `Err`: [`ExitCode::Failure`] if the stdio transport could not
-/// be established or the serve task ended in a panic, [`ExitCode::Success`]
-/// on any clean end, including the ordinary case of the peer closing the
-/// pipe.
+/// Every failure folds into the returned [`ExitCode`] rather than `Err`:
+/// [`ExitCode::Failure`] if the transport never establishes or the serve
+/// task panics, [`ExitCode::Success`] on any clean end, peer closing the
+/// pipe included.
 pub async fn whistle(err: &mut dyn Write, fmt: Format, paths: &ShepPaths) -> ExitCode {
     let file_source = std::fs::read_to_string(&paths.daemon_config).ok();
     if let Some(src) = file_source.as_deref()
@@ -210,20 +179,16 @@ pub async fn whistle(err: &mut dyn Write, fmt: Format, paths: &ShepPaths) -> Exi
 mod tests {
     use super::*;
 
-    /// fails if the instructions stop telling a read-only whistle how to
-    /// become a writing one. The control tools are ABSENT when the gate is
-    /// shut, so this string is the only thing standing between an operator
-    /// and the conclusion that whistle cannot act at all.
+    /// The instructions are the only thing telling a read-only operator
+    /// the gate can open at all.
     #[test]
     fn a_read_only_whistle_says_in_its_instructions_how_to_open_the_gate() {
         let info = Whistle::for_test(gate::Control::ReadOnly).get_info();
         let instructions = info.instructions.expect("whistle always sets instructions");
         assert!(instructions.contains("allow_control = true"));
         assert!(instructions.contains("shep.toml"));
-        // Capitalised, matching the shipped prose exactly. The prose is the
-        // contract here, not the assertion: if the two ever disagree, edit
-        // the assertion, because the string is operator-facing and was
-        // chosen word by word.
+        // Matches the shipped prose's capitalization exactly; the prose is
+        // the contract, not the assertion.
         assert!(
             instructions.contains("Read-only mode"),
             "and says which state it is in: {instructions}"
@@ -243,10 +208,9 @@ mod tests {
         );
     }
 
-    /// fails if the gate stops changing what is registered. Five tools with
-    /// the gate shut, nine with it open, and the four that appear are named
-    /// — a count alone would pass if a read tool were accidentally
-    /// duplicated.
+    /// Five tools with the gate shut, nine with it open; the four that
+    /// appear are named, since a count alone would pass a duplicated read
+    /// tool.
     #[test]
     fn the_gate_decides_which_tools_exist_at_all() {
         let shut: Vec<String> = Whistle::for_test(gate::Control::ReadOnly)

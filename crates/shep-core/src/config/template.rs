@@ -1,23 +1,15 @@
 //! The `{{instance}}` grammar for Flockfile values.
 //!
 //! Two tokens, `{{instance}}` and `{{name}}`, in env values, args, and the
-//! two log-path fields. Anything else between doubled braces is refused by
-//! name at config time, so a typo dies at `shep start` rather than reaching
-//! a child process as a literal string.
+//! two log-path fields. An unknown token between doubled braces is refused
+//! at config time rather than reaching a child process as literal text.
 //!
-//! # Why doubled braces
+//! Doubled braces avoid collision with single-brace content already in these
+//! values: JSON blobs, regex quantifiers, Go or Helm templates passed
+//! through as args.
 //!
-//! Single braces are ordinary content in the values this runs over: JSON
-//! blobs, regex quantifiers such as `{2,3}`, and Go or Helm templates passed
-//! through as args. Under a single-brace grammar with an unknown token
-//! refused, `LOG_FORMAT = '{"ts":"%t"}'` would stop a working Flockfile from
-//! starting. Doubled braces almost never appear by accident.
-//!
-//! # Escaping
-//!
-//! `{{{{` is a literal `{{` and `}}}}` is a literal `}}`, which is
-//! `format!`'s own doubling rule one level up. A lone `}}` is ordinary text,
-//! deliberately: `{"a":{"b":1}}` ends in one and must survive.
+//! `{{{{` and `}}}}` escape to literal `{{` and `}}`. A lone `}}`, as in
+//! `{"a":{"b":1}}`, is ordinary text and passes through unchanged.
 
 use core::fmt;
 
@@ -26,10 +18,8 @@ const TOKENS: &[&str] = &["instance", "name"];
 
 /// A value that is not a valid template.
 ///
-/// `pub(crate)`, like [`validate`] that produces it: `normalize` is the only
-/// caller, and it renders this into its own
-/// [`NormalizeError::BadTemplate`](super::normalize::NormalizeError::BadTemplate)
-/// rather than handing it on. Nothing outside shep-core has ever named it.
+/// `pub(crate)`: `normalize` is the only caller, and wraps this in its own
+/// [`NormalizeError::BadTemplate`](super::normalize::NormalizeError::BadTemplate).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TemplateError {
@@ -111,10 +101,8 @@ fn walk(
 
 /// Checks that every `{{...}}` in `value` names a token this grammar defines.
 ///
-/// `pub(crate)`: config time is the only moment this question is asked, and
-/// `normalize` is where config time happens. [`render`] stays public because
-/// shep-daemon's `assemble` substitutes on values `normalize` has already
-/// passed.
+/// `pub(crate)`: only `normalize` asks this, at config time. [`render`] stays
+/// public since shep-daemon's `assemble` runs it on already-validated values.
 ///
 /// # Errors
 ///
@@ -132,12 +120,8 @@ pub(crate) fn validate(value: &str) -> Result<(), TemplateError> {
 
 /// Substitutes the tokens in `value`.
 ///
-/// Call `validate` first: an unknown token here renders as nothing, because
-/// `normalize` is the seam that refuses one and a value reaching this
-/// function has already passed it. An unclosed `{{` is the other case
-/// `validate` exists to catch before this function ever sees the value: on
-/// one, `walk` stops with an error partway through, so this renders
-/// truncated at that point rather than including the rest of `value`.
+/// Call `validate` first: an unknown token renders as nothing, and an
+/// unclosed `{{` renders truncated at that point.
 #[must_use]
 pub fn render(value: &str, name: &str, instance: u32) -> String {
     let mut out = String::with_capacity(value.len());

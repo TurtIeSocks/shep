@@ -2,7 +2,7 @@
 //!
 //! The assembler takes a validated `ResolvedApp` and produces a fully-resolved
 //! [`SpawnSpec`] ready for [`ProcessRunner::spawn`](crate::runner::ProcessRunner::spawn).
-//! No I/O here — all defaults, env vars, and paths are pre-resolved by the
+//! No I/O here: all defaults, env vars, and paths are pre-resolved by the
 //! daemon before assembler is called (environment comes in via `ResolvedApp`).
 //!
 //! Public for its two out-of-crate readers and nothing else: `tests/real_runner.rs`
@@ -52,21 +52,14 @@ pub fn instance_slots(existing: &[u32], count: u32) -> Vec<u32> {
 /// The env every spawned child starts from, before the app's own `env` map
 /// is folded on top (app config always wins on conflict).
 ///
-/// `tokio_runner.rs` calls `env_clear()` then `envs(&spec.env)` — the child
-/// sees exactly this map and nothing else. Without a `PATH` in it, a bare
-/// program/interpreter name (anything with no `/`: `node`, `python3`, `sh`,
-/// a PATH-relative script) can never be found by exec; this is reading the
-/// DAEMON'S OWN env once (not a file, not the child's), so it stays a pure
-/// function of process state, not a filesystem/network IO the module doc's
-/// "no I/O" note is warning about.
+/// Without a `PATH` here, a bare program or interpreter name can never be
+/// found by exec. Reads the daemon's own environment once, so this stays a
+/// pure function of process state, not I/O.
 fn base_env() -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
-    // A PRESENT-but-EMPTY PATH ("PATH=" in the daemon's own env — a
-    // misconfigured launcher, `env -i PATH= shep-daemon`, ...) is treated
-    // the same as an ABSENT one: `Ok("")` would otherwise slip through
-    // `unwrap_or_else` untouched (that only catches the `Err` case) and
-    // reproduce this exact task's ENOENT bug, since an empty PATH resolves
-    // a bare program against the current directory, not a real search.
+    // An empty PATH ("PATH=") is treated as absent: `Ok("")` would
+    // otherwise slip through `unwrap_or_else`, and an empty PATH resolves a
+    // bare program against the cwd instead of searching.
     let path = std::env::var("PATH")
         .ok()
         .filter(|value| !value.is_empty())
@@ -85,10 +78,8 @@ fn base_env() -> BTreeMap<String, String> {
 const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 /// The `PATH` a child gets when the daemon itself has none.
 ///
-/// `%SystemRoot%` is not expanded here because this value is only ever
-/// reached when the environment is already broken enough to have no `PATH`;
-/// the literal paths below are correct on every standard Windows install and
-/// need no variable to resolve.
+/// Not expanded via `%SystemRoot%`: these literal paths are correct on
+/// every standard Windows install and need no variable to resolve.
 #[cfg(windows)]
 const DEFAULT_PATH: &str = r"C:\Windows\system32;C:\Windows;C:\Windows\System32\Wbem";
 
@@ -98,28 +89,11 @@ const INHERITED: &[&str] = &["HOME", "USER", "LANG", "TZ"];
 
 /// Variables inherited from the daemon's own environment, on top of `PATH`.
 ///
-/// **Much longer than the unix list, and it has to be.** `env_clear()` is a
-/// far blunter instrument on Windows: a great many Win32 APIs read
-/// `%SystemRoot%` directly, so a child started without it fails in ways that
-/// name nothing — winsock initialisation, temp-file creation and the CRT's
-/// own startup can all break before an app's `main` runs. Measured while
-/// porting: `powershell` launched with a genuinely empty environment
-/// produces no output and no error, which is exactly the kind of silent
-/// failure an operator cannot debug.
-///
-/// So this list is not a convenience allowlist like the unix one; it is the
-/// minimum a Windows process needs to behave like a process. `PATHEXT` and
-/// `COMSPEC` are what let a child resolve `foo` to `foo.cmd` and run a batch
-/// file at all; `TEMP`/`TMP` are where nearly every runtime writes; the
-/// `USERPROFILE`/`APPDATA`/`LOCALAPPDATA` trio is where language runtimes
-/// keep per-user state (a Node or Python sheep misbehaves without them);
-/// `PROCESSOR_ARCHITECTURE` and `NUMBER_OF_PROCESSORS` are read by thread-pool
-/// sizing in several runtimes.
-///
-/// The daemon-env-leakage contract in [`SpawnSpec`](crate::runner::SpawnSpec)
-/// is unchanged in kind — this is still a closed allowlist read once from the
-/// daemon's own environment, not an inherit-everything — it is simply a
-/// longer one, because the floor is higher here.
+/// Longer than the unix list because Windows children need it: many Win32
+/// APIs read `%SystemRoot%` directly, and `PATHEXT`/`COMSPEC` let a child
+/// resolve and run `.cmd` files at all. `TEMP`/`TMP` and the
+/// `USERPROFILE`/`APPDATA`/`LOCALAPPDATA` trio are where most runtimes keep
+/// per-user state. Still a closed allowlist, not inherit-everything.
 #[cfg(windows)]
 const INHERITED: &[&str] = &[
     "SystemRoot",
@@ -143,36 +117,16 @@ const INHERITED: &[&str] = &[
 
 /// Assembles a [`SpawnSpec`] from a validated app config and instance slot.
 ///
-/// Resolves the program/args from the interpreter config, merges env with the
-/// instance slot var, computes log file paths respecting `merge_logs`, and sets
-/// the shepherd-channel flag from `channel || wait_ready || shutdown_with_message`.
+/// `credentials` is resolved by the caller, since passwd/group lookups are
+/// real I/O and this function otherwise stays pure. `interpreter = None` or
+/// `Some("none")` runs the script directly; `Some(path)` runs `path` with
+/// `[script, ...args]`.
 ///
-/// `credentials` is resolved by the caller (passwd/group lookups are real
-/// I/O, so they stay out of this otherwise-pure function — see
-/// `crate::privilege::resolve`) and threaded straight onto the spec.
-///
-/// # Interpreter logic
-///
-/// - `interpreter = None` → runs the script directly as the program
-/// - `interpreter = Some("none")` → runs the script directly (explicit override)
-/// - `interpreter = Some(path)` → runs `path` with `[script, ...args]`
-///
-/// # Log paths
-///
-/// Default log paths are `logs/<name>-<instance>-out.log` and `-err.log`.
-/// When `merge_logs = true`, they become `logs/<name>-out.log` and `-err.log`
-/// (shared across all instances). Explicit `out_file`/`err_file` config
-/// always win over defaults, and are rendered through the
-/// `{{instance}}`/`{{name}}` grammar the same as `env` and `args`. Normalize
-/// has already refused a path that would render alike for every instance,
-/// unless `merge_logs` asked for that on purpose.
-///
-/// # Stdin
-///
-/// `SpawnSpec::stdin` carries `config.stdin` straight through. Nothing else
-/// turns it on: unlike `channel`, which `wait_ready` and
-/// `shutdown_with_message` both imply, no other flag needs fd 0 — so a sheep
-/// gets a piped stdin only when its own config asks for one.
+/// Explicit `out_file`/`err_file` win over the default log path and render
+/// through the same `{{instance}}`/`{{name}}` grammar as `env` and `args`;
+/// normalize already refused a path that collides across instances unless
+/// `merge_logs` asked for it. `SpawnSpec::stdin` carries `config.stdin`
+/// straight through: unlike `channel`, nothing else turns it on.
 #[must_use]
 pub fn assemble(
     app: &ResolvedApp,
@@ -191,31 +145,19 @@ pub fn assemble(
         .map(|value| template::render(value, &name, instance))
         .collect();
 
-    // Interpreter: resolve program and args
     let (program, args) = match &config.interpreter {
-        None => {
-            // Direct script execution
-            (config.script.clone(), rendered_args)
-        }
-        Some(interp) if interp == "none" => {
-            // Explicit "none" means direct script execution
-            (config.script.clone(), rendered_args)
-        }
+        None => (config.script.clone(), rendered_args),
+        Some(interp) if interp == "none" => (config.script.clone(), rendered_args),
         Some(interp) => {
-            // Interpreter with script as first arg
             let mut interp_args = vec![config.script.clone()];
             interp_args.extend(rendered_args);
             (interp.clone(), interp_args)
         }
     };
 
-    // Environment: base env FIRST (PATH + a small inherited allowlist), then
-    // the app's own env on top: env_clear() + envs(&spec.env) in
-    // tokio_runner.rs means anything not seeded here is invisible to the
-    // child (adversarial finding #1 — a bare interpreter/program spawned
-    // with no PATH is ENOENT, not a slow failure). Each value is rendered
-    // through the `{{instance}}`/`{{name}}` grammar as it is inserted, so a
-    // template can produce a value per instance slot.
+    // Anything not seeded here is invisible to the child: tokio_runner.rs
+    // calls env_clear() then envs(&spec.env). Each value renders through
+    // the {{instance}}/{{name}} grammar as it is inserted.
     let mut env = base_env();
     env.extend(
         config
@@ -223,16 +165,13 @@ pub fn assemble(
             .iter()
             .map(|(key, value)| (key.clone(), template::render(value, &name, instance))),
     );
-    // Always, and under fixed names. An app that wants the slot under its own
-    // variable writes `MY_VAR = "{{instance}}"` in its env, which is one
-    // mechanism instead of a dedicated config knob for a single value.
+    // Fixed names, always injected: an app that wants the slot under its
+    // own var can template it, e.g. `MY_VAR = "{{instance}}"`.
     env.insert("SHEP_INSTANCE".to_string(), instance.to_string());
     env.insert("SHEP_NAME".to_string(), name.clone());
 
-    // Working directory
     let cwd = config.cwd.as_ref().map(PathBuf::from);
 
-    // Log paths: instance-suffixed by default, or merged
     let log_stem = if config.merge_logs {
         format!("{}-", name)
     } else {
@@ -251,10 +190,9 @@ pub fn assemble(
         paths.logs.join(format!("{}err.log", log_stem))
     };
 
-    // Shepherd channel: enabled by its own field, or implied by either
-    // readiness flag — widening this gate must keep every existing term,
-    // since dropping one silently stops opening fd 3 for whatever app relied
-    // on it implying the channel.
+    // Also implied by wait_ready or shutdown_with_message: widening this
+    // must keep every term, or dropping one silently stops opening fd 3 for
+    // an app that relied on it implying the channel.
     let channel = config.channel || config.wait_ready || config.shutdown_with_message;
 
     SpawnSpec {
@@ -456,7 +394,6 @@ mod tests {
         let spec = assemble(&app, 0, &paths, None);
 
         assert_eq!(spec.out_file, PathBuf::from("/var/log/myapp.log"));
-        // err_file still uses default
         assert_eq!(
             spec.err_file,
             PathBuf::from("/home/ada/.shep/logs/app-0-err.log")
@@ -524,10 +461,8 @@ mod tests {
         assert!(spec.channel);
     }
 
-    // fails if any term is stuck open regardless of config (e.g. an
-    // accidental `|| true`, or a term that defaults on) — every one of the
-    // three flags is explicitly false here, so this is the counterpart the
-    // three positive tests above can't cover on their own.
+    // Catches a stuck-open gate (e.g. `|| true`), since all three flags are
+    // false here, unlike the three positive tests above.
     #[test]
     fn channel_disabled_when_all_three_flags_are_false() {
         let app_config = AppConfig {
@@ -591,10 +526,8 @@ mod tests {
         );
     }
 
-    /// fails if `stdin` does not reach the spec. It is the one field on the
-    /// way to the runner whose default is "closed", so a spec assembled
-    /// without it would silently give an opted-in app `/dev/null` and make
-    /// every sendline row read `no_stdin` with nothing to point at.
+    /// The one field on the way to the runner whose default is "closed":
+    /// a regression here would silently give an opted-in app `/dev/null`.
     #[test]
     fn the_stdin_flag_reaches_the_spawn_spec() {
         let mut app = AppConfig::minimal("repl", "./repl");
@@ -645,10 +578,8 @@ mod tests {
         assert_eq!(spec.out_file, PathBuf::from("/var/log/web-2.log"));
     }
 
-    /// fails if `stdin` is implied by something. `channel` is implied by
-    /// `wait_ready` and `shutdown_with_message` because both need fd 3;
-    /// nothing in shep needs fd 0, so nothing may turn it on behind the
-    /// operator's back.
+    /// Unlike `channel` (implied by `wait_ready`/`shutdown_with_message`),
+    /// nothing implies `stdin`.
     #[test]
     fn nothing_else_turns_stdin_on() {
         let mut app = AppConfig::minimal("web", "./srv");

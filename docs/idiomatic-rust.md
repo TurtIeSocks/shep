@@ -155,6 +155,17 @@ Priority when rules collide: **Readability > KISS > DRY** (the maintainer's glob
   workspace-internal surface. Third-party re-exports normalized under our
   namespace (`Error as SysError`).
 
+- **IR-47** A comment says only what the code cannot: an invariant, a
+  non-obvious why, a caller constraint, a platform caveat, a number's basis.
+  Never history (dates, "used to", "until", phase numbers), never a rejected
+  alternative, never a review argument, never a paraphrase of the next line.
+  Git history holds all of that. Shape: `//` one or two lines, four at most;
+  `///` one summary fragment plus at most six lines of body, twelve counting
+  `# Errors`; `//!` three to ten lines. No em dashes, no capitals for
+  emphasis, sentences at sixteen words or fewer. A test whose name is a
+  sentence needs no doc line. Match the project's own rate: about one prose
+  comment line per commit is the maintainer's measured habit, not ten.
+
 ## H. Testing
 
 - **IR-33** One crate-root `#[cfg(test)] mod test` fixture module per crate
@@ -242,4 +253,5 @@ Priority when rules collide: **Readability > KISS > DRY** (the maintainer's glob
 [ ] tuning consts named + benchmark comment                        (IR-26)
 [ ] new pub error enum: non_exhaustive per crate tier + why comment (IR-20)
 [ ] every await in a test has a forcing mechanism, not just a hope  (IR-46)
+[ ] comments say what the code cannot; no history, no argument         (IR-47)
 ```

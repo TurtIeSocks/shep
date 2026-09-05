@@ -20,7 +20,7 @@ use crate::runner::{
     SpawnSpec, StdinWrite, StopSignal,
 };
 
-/// Capacity of every channel the fake wires up — generous enough that no
+/// Capacity of every channel the fake wires up: generous enough that no
 /// test blocks on backpressure without meaning to.
 const CHANNEL_CAPACITY: usize = 32;
 
@@ -42,7 +42,7 @@ pub struct ProcScript {
     /// Whether the process honors `signal()`/`Shutdown` by exiting early
     pub obeys_signal: bool,
     /// Whether `kill_tree()` resolves its `wait()`. `true` for every ordinary
-    /// process — `SIGKILL` cannot be caught — and `false` only for
+    /// process (`SIGKILL` cannot be caught), `false` only for
     /// [`ProcScript::never_reports_its_exit`], which models the one child a
     /// kill ladder cannot end.
     pub obeys_kill: bool,
@@ -106,7 +106,7 @@ impl ProcScript {
         }
     }
 
-    /// Never exits on its own AND ignores signals — only `kill_tree` ends it
+    /// Never exits on its own and ignores signals: only `kill_tree` ends it
     #[must_use]
     pub fn ignores_signals() -> Self {
         Self {
@@ -118,16 +118,13 @@ impl ProcScript {
     /// Never resolves its `wait()` at all: not on a signal, and not on
     /// `kill_tree` either.
     ///
-    /// Models the one child a kill ladder cannot end — one wedged in
-    /// uninterruptible sleep, where `SIGKILL` is delivered and accepted by the
-    /// kernel and the `wait(2)` behind it simply never returns. `kill_process`
-    /// waits on that unbounded, so the sheep task never reports a
-    /// `Msg::Exited`, and this is the only way to put a test on what the
+    /// Models the one child a kill ladder cannot end: wedged in
+    /// uninterruptible sleep, where `SIGKILL` is delivered and accepted by
+    /// the kernel but `wait(2)` never returns. Lets a test see what the
     /// supervisor does when a message it is waiting on never comes.
     ///
-    /// The kill is still delivered and still counted
-    /// ([`ScriptedRunner::kill_counts`]) — what this withholds is the exit,
-    /// not the signal.
+    /// The kill is still delivered and counted
+    /// ([`ScriptedRunner::kill_counts`]); only the exit is withheld.
     #[must_use]
     pub fn never_reports_its_exit() -> Self {
         Self {
@@ -139,13 +136,10 @@ impl ProcScript {
     /// This script, with a forked lamb holding the child's stdout and stderr
     /// open past the child's own exit.
     ///
-    /// A scripted proc's log-control task otherwise ends with the proc,
-    /// which models the ordinary sheep: both streams reach EOF when the
-    /// child does, and that retires the real runner's pump. A lamb that
-    /// inherited those pipes retires nothing, and the pump is then left to
-    /// end on one of its other conditions — its `logs` receiver going away,
-    /// or the last control sender dropping. This is the only way to put a
-    /// test on that path from the fake tier.
+    /// A scripted proc's log-control task otherwise ends with the proc: both
+    /// streams reach EOF when the child does. A lamb that inherited them
+    /// keeps the pump alive on one of its other conditions instead: the
+    /// `logs` receiver going away, or the last control sender dropping.
     #[must_use]
     pub fn with_a_lamb_holding_the_pipe(self) -> Self {
         Self {
@@ -154,13 +148,10 @@ impl ProcScript {
         }
     }
 
-    /// Accepts every stdin write and answers none of them.
-    ///
-    /// Models the one thing a bounded stdin write exists for: an app that has
-    /// stopped reading fd 0, so the pipe fills at 64 KiB and the write blocks
-    /// until it reads, which it never does. The counterpart of
-    /// [`Self::never_reports_its_exit`] for the stdin path — the request is
-    /// delivered and recorded, what is withheld is the acknowledgement.
+    /// With [`SpawnSpec::stdin`] enabled, accepts every stdin write and
+    /// answers none of them: models an app that stopped reading fd 0. The
+    /// write is delivered and recorded, but the `done` acknowledgement is
+    /// withheld. With `stdin` disabled the runner closes the writer instead.
     #[must_use]
     pub fn never_reads_its_stdin() -> Self {
         Self {
@@ -182,12 +173,12 @@ pub struct FakeIo {
     pub to_child_rx: mpsc::Receiver<ShepherdMessage>,
 }
 
-/// Shared, thread-safe state for one scripted proc — lives in an `Arc` so
+/// Shared, thread-safe state for one scripted proc: lives in an `Arc` so
 /// [`FakeProc`]'s clones (used to drive `wait()` and `signal()`/`kill_tree()`
 /// from separate tasks in tests) and the `to_child` relay task all observe
 /// the same signal/kill events.
 struct ProcState {
-    /// Spawn-relative exit instant — computed once at spawn (cancel-safety: a
+    /// Spawn-relative exit instant, computed once at spawn (cancel-safety: a
     /// dropped-and-recreated `wait()` future must never restart this clock).
     exit_deadline: Instant,
     /// Outcome reported when `exit_deadline` is reached naturally
@@ -202,35 +193,34 @@ struct ProcState {
     /// both resolve it.
     signal_notify: Notify,
     /// Raw signal number recorded by the most recent explicit `signal()`
-    /// call. A `Shutdown` message does NOT set this (see `record_shutdown`),
+    /// call. A `Shutdown` message does not set this (see `record_shutdown`),
     /// so `wait()`'s fallback naturally reports `StopSignal::Term` for it.
     pending_signal: Mutex<Option<i32>>,
     /// Every raw signal number an explicit `signal()` call has recorded, in
-    /// call order — read back via [`ScriptedRunner::signals`]. A `Shutdown`
-    /// message does NOT append here, so tests can assert "no `signal()` call
+    /// call order, read back via [`ScriptedRunner::signals`]. A `Shutdown`
+    /// message does not append here, so tests can assert "no `signal()` call
     /// happened" even though the wait still resolved.
     signals: Mutex<Vec<i32>>,
     /// Every `signal_process` call, in call order. Separate from `signals`,
-    /// which records group deliveries — see `ScriptedRunner::process_signals`.
+    /// which records group deliveries; see `ScriptedRunner::process_signals`.
     process_signals: Mutex<Vec<OperatorSignal>>,
     /// Notified on `kill_tree()`; same before-or-during buffering as above
     kill_notify: Notify,
     /// `kill_tree()` call count, read back via [`ScriptedRunner::kill_counts`]
     kill_count: AtomicU32,
     /// Latches the first resolved outcome so a repeated `wait()` re-reports
-    /// it instead of racing the notify/sleep branches again — matches
+    /// it instead of racing the notify/sleep branches again: matches
     /// `tokio::process::Child::wait`'s documented repeat-call behavior.
     resolved: Mutex<Option<ExitOutcome>>,
     /// Flipped to `true` when `wait()` latches an outcome, and watched by
-    /// this proc's log-control task so that task ends with the proc — unless
+    /// this proc's log-control task so that task ends with the proc, unless
     /// [`ProcScript::lamb_holds_the_pipe`] says the streams outlive it.
     ///
     /// Without it the fake would answer a reopen aimed at a proc that exited
-    /// long ago, while the real runner's pump — and with it the receiving
-    /// end of [`ProcIo::log_ctl`] — is gone once the child's streams reach
-    /// EOF. A caller's "the pump is already gone" branch would then be
-    /// unreachable from this tier, and a test for it would pass whether or
-    /// not that branch existed.
+    /// long ago, while the real runner's pump (and with it the receiving end
+    /// of [`ProcIo::log_ctl`]) is gone once the child's streams reach EOF. A
+    /// caller's "the pump is already gone" branch would then be unreachable
+    /// from this tier.
     exited: watch::Sender<bool>,
 }
 
@@ -246,7 +236,7 @@ impl ProcState {
 
     /// A `Shutdown` message resolves an obeys_signal wait exactly like
     /// `signal()` would (falling back to `StopSignal::Term` since
-    /// `pending_signal` is left untouched), but is NOT itself an explicit
+    /// `pending_signal` is left untouched), but is not itself an explicit
     /// `signal()` call: it never appears in `signals`.
     fn record_shutdown(&self) {
         self.signal_notify.notify_one();
@@ -277,10 +267,10 @@ impl fmt::Debug for ProcState {
 ///
 /// `Clone`s share the same underlying state (private `ProcState`, held in an
 /// `Arc`), which lets one handle drive `wait()` on a spawned task while
-/// another delivers `signal()`/`kill_tree()` concurrently — the pattern the
+/// another delivers `signal()`/`kill_tree()` concurrently, the pattern the
 /// daemon's kill ladder uses against the real runner too. A control event
-/// (signal, shutdown, kill) resolves exactly ONE waiting `wait()` call, not
-/// every clone independently — `tokio::sync::Notify::notify_one` semantics.
+/// (signal, shutdown, kill) resolves exactly one waiting `wait()` call, not
+/// every clone independently: `tokio::sync::Notify::notify_one` semantics.
 #[derive(Debug, Clone)]
 pub struct FakeProc {
     pid: u32,
@@ -297,12 +287,10 @@ impl RunningProcess for FakeProc {
             return outcome;
         }
 
-        // Every branch resolves the wait, so this select! never re-loops: an
-        // event this wait doesn't obey simply isn't a candidate branch (the
-        // `if` guard), it doesn't fall through to a retry. With both guards
-        // off, `exit_deadline` is the only branch left — which for
-        // `never_reports_its_exit` is `NEVER_MS` away, so nothing this side
-        // of a month of virtual time resolves it.
+        // Every branch resolves the wait: an event this wait doesn't obey
+        // isn't a candidate branch (the `if` guard), not a fallthrough. With
+        // both guards off, only `exit_deadline` remains, which for
+        // `never_reports_its_exit` is `NEVER_MS` away.
         let outcome = tokio::select! {
             () = sleep_until(self.state.exit_deadline) => self.state.outcome,
             () = self.state.signal_notify.notified(), if self.state.obeys_signal => {
@@ -324,13 +312,10 @@ impl RunningProcess for FakeProc {
         outcome
     }
 
-    // A scripted proc models exactly ONE process with no descendants, so
-    // `signal`'s group-wide delivery contract and a leader-only delivery are
-    // indistinguishable here: there is nobody else in the group to reach.
-    // Both methods therefore record the call and resolve the wait, and
-    // neither is evidence that a real sheep's forked lambs are signalled —
-    // `tests/real_runner.rs` proves that against a real forking wrapper,
-    // which is the only tier that can.
+    // A scripted proc models exactly one process with no descendants, so
+    // `signal`'s group-wide contract and a leader-only delivery are
+    // indistinguishable here. Neither is evidence that a real sheep's
+    // forked lambs are signalled; `tests/real_runner.rs` proves that.
     fn signal(&mut self, sig: StopSignal) -> Result<(), RunnerError> {
         self.state.record_signal(sig.as_raw());
         Ok(())
@@ -341,14 +326,9 @@ impl RunningProcess for FakeProc {
         Ok(())
     }
 
-    // Recorded on its own list, not `record_signal`'s. A scripted proc models
-    // one process with no descendants, so the two deliveries are
-    // indistinguishable in what they REACH here — but they are entirely
-    // distinguishable in which one the supervisor called, and that is the fact
-    // a test of `shep signal` needs. Notably this does NOT resolve the wait:
-    // `signal` does (it is the stop ladder's polite rung and the scripted proc
-    // obeys it), and a nudge that killed the sheep would make every case here
-    // vacuous.
+    // Recorded on its own list, not `record_signal`'s: which one the
+    // supervisor called is exactly what a `shep signal` test needs. Does
+    // not resolve the wait; only `signal` does.
     fn signal_process(&mut self, sig: OperatorSignal) -> Result<(), RunnerError> {
         self.state.record_process_signal(sig);
         Ok(())
@@ -369,27 +349,27 @@ struct SpawnedProc {
     /// [`ScriptedRunner::with_a_pump_that_never_reports`]) then reads that
     /// app's counters back.
     name: String,
-    /// `false` once this spawn's log-control task has ended — read back via
+    /// `false` once this spawn's log-control task has ended, read back via
     /// [`ScriptedRunner::log_ctl_live`].
     log_ctl_live: Arc<AtomicBool>,
     /// How many [`LogCtl::Reopen`] requests this spawn's log-control task has
-    /// answered — read back via [`ScriptedRunner::reopens`].
+    /// answered, read back via [`ScriptedRunner::reopens`].
     reopens: Arc<AtomicU32>,
-    /// How many [`LogCtl::Flush`] requests it has answered — read back via
+    /// How many [`LogCtl::Flush`] requests it has answered, read back via
     /// [`ScriptedRunner::flushes`].
     flushes: Arc<AtomicU32>,
-    /// How many [`LogCtl::Resume`] requests it has been sent — read back via
+    /// How many [`LogCtl::Resume`] requests it has been sent, read back via
     /// [`ScriptedRunner::resumes`].
     #[cfg(unix)]
     resumes: Arc<AtomicU32>,
-    /// Every line written to this spawn's stdin, in write order — read back
+    /// Every line written to this spawn's stdin, in write order, read back
     /// via [`ScriptedRunner::stdin_lines`].
     stdin_lines: Arc<Mutex<Vec<String>>>,
     /// The identity this spawn was asked to run under, copied off
-    /// [`SpawnSpec::credentials`] — read back via
+    /// [`SpawnSpec::credentials`], read back via
     /// [`ScriptedRunner::spawned_as`].
     ///
-    /// The fake runs no program, so it cannot BECOME anyone; recording what
+    /// The fake runs no program, so it cannot become anyone; recording what
     /// it was asked for is the only way a supervisor-tier test can assert
     /// the identity a spawn actually carried rather than merely that a
     /// spawn happened.
@@ -399,8 +379,8 @@ struct SpawnedProc {
 /// The pid [`ScriptedRunner`] gives the first proc it spawns; each later
 /// spawn gets the next number up.
 ///
-/// Named so a fixture that has to describe that proc's process table — a
-/// scripted memory sampler, say — can say which pid it means instead of
+/// Named so a fixture that has to describe that proc's process table (a
+/// scripted memory sampler, say) can say which pid it means instead of
 /// repeating a literal this file is free to change.
 pub const FIRST_SCRIPTED_PID: u32 = 1000;
 
@@ -414,8 +394,8 @@ pub struct ScriptedRunner {
     /// that is what a caller has.
     ///
     /// Sibling to [`Self::refuse`] and needed for the same class of reason:
-    /// scripts are consumed in spawn ORDER, so a test cannot make one
-    /// PARTICULAR app of several fail by arranging the script list. Reaching
+    /// scripts are consumed in spawn order, so a test cannot make one
+    /// particular app of several fail by arranging the script list. Reaching
     /// `do_start`'s per-app failure handling needs a failure that lands on a
     /// named app while its neighbours succeed.
     ///
@@ -434,18 +414,14 @@ pub struct ScriptedRunner {
     refuse: Mutex<Vec<String>>,
     /// Sheep names whose log-control task accepts a [`LogCtl::ReportFds`]
     /// and never answers it, by name for the same reason as its two
-    /// siblings above: a case needs ONE named app of several to go silent
+    /// siblings above: a case needs one named app of several to go silent
     /// while its neighbours answer, and script order cannot say that.
     ///
-    /// Models the pump a handover has no other way to meet: one wedged on a
-    /// filesystem that has stopped completing writes, where the request is
-    /// delivered and it is the acknowledgement that never comes. The
-    /// counterpart of [`ProcScript::never_reports_its_exit`] for the
-    /// handover path.
-    ///
-    /// Only this one variant goes unanswered. The task stays live and still
-    /// serves [`LogCtl::Resume`], which is what lets a case tell "this pump
-    /// was never parked" apart from "this pump is gone".
+    /// Models a pump wedged on a filesystem that has stopped completing
+    /// writes: the request is delivered, only the acknowledgement never
+    /// comes. Only `ReportFds` goes unanswered; the task stays live and
+    /// still serves [`LogCtl::Resume`], which lets a case tell "never
+    /// parked" apart from "gone".
     #[cfg(unix)]
     deaf_pump: Mutex<Vec<String>>,
     /// State + IO for every spawn, indexed by spawn order, behind ONE lock.
@@ -481,11 +457,9 @@ impl ScriptedRunner {
     /// the numbers above it.
     ///
     /// For the one fixture shape the default cannot express: a scripted
-    /// process that ALSO opens a real socket to the daemon. Peer credentials
-    /// on a socket pair name the process that actually opened it, so a test
-    /// asserting on what the daemon concluded from a peer's pid needs the
-    /// scripted proc and the connecting process to be the same one — which
-    /// they are, when the caller passes `std::process::id()`.
+    /// process that also opens a real socket to the daemon, so peer
+    /// credentials name the same pid the caller passes as
+    /// `std::process::id()`.
     #[must_use]
     pub fn spawning_at(self, pid: u32) -> Self {
         *self.pid.lock().unwrap() = Some(pid);
@@ -541,7 +515,7 @@ impl ScriptedRunner {
         self
     }
 
-    /// `kill_tree()` call count per proc, indexed by spawn order — the only
+    /// `kill_tree()` call count per proc, indexed by spawn order: the only
     /// kill-assertion accessor.
     #[must_use]
     pub fn kill_counts(&self) -> Vec<u32> {
@@ -558,7 +532,7 @@ impl ScriptedRunner {
     ///
     /// `None` means the spawn carried no credentials at all, which is the
     /// child running as the shepherd. A test about a privilege drop must
-    /// assert on THIS rather than on the spawn's existence: a downgraded
+    /// assert on this rather than on the spawn's existence: a downgraded
     /// spawn and a correct one are alike in every other way the fake can
     /// report.
     ///
@@ -583,9 +557,7 @@ impl ScriptedRunner {
 
     /// Every raw signal number an explicit `signal()` call has recorded for
     /// the proc spawned at `spawn_index`, in call order. A `Shutdown`
-    /// message never appears here — only real `RunningProcess::signal`
-    /// calls do, so this and a resolved `ExitOutcome` together distinguish
-    /// "signalled" from "shut down over the channel".
+    /// message never appears here, only real `signal()` calls do.
     ///
     /// # Panics
     ///
@@ -604,10 +576,8 @@ impl ScriptedRunner {
     /// Every [`OperatorSignal`] a `signal_process` call has recorded for the
     /// proc spawned at `spawn_index`, in call order.
     ///
-    /// The counterpart to [`Self::signals`], which records the group-wide
-    /// deliveries the stop ladder makes. Two lists rather than one because
-    /// which of the two the supervisor called is exactly what a test of
-    /// `shep signal` is asking.
+    /// Separate from [`Self::signals`]'s group-wide deliveries: which of the
+    /// two the supervisor called is what a `shep signal` test asks.
     ///
     /// # Panics
     ///
@@ -626,13 +596,10 @@ impl ScriptedRunner {
     /// Whether the log-control task for the proc spawned at `spawn_index` is
     /// still running.
     ///
-    /// It runs while something still holds a [`ProcIo::log_ctl`] sender AND
-    /// something still holds the [`ProcIo::logs`] receiver AND the proc has
-    /// not exited (that last one only while no lamb holds the pipe —
-    /// [`ProcScript::with_a_lamb_holding_the_pipe`]). Those are the three
-    /// facts that keep a real runner's log pump alive, and this is how an
-    /// engine test pins them: the fake writes no files, so a pump left
-    /// running by mistake costs its tests nothing otherwise.
+    /// It runs while something holds a [`ProcIo::log_ctl`] sender, something
+    /// holds the [`ProcIo::logs`] receiver, and the proc has not exited,
+    /// unless a lamb holds the pipe
+    /// ([`ProcScript::with_a_lamb_holding_the_pipe`]).
     ///
     /// # Panics
     ///
@@ -648,10 +615,9 @@ impl ScriptedRunner {
     /// How many [`LogCtl::Reopen`] requests the proc spawned at `spawn_index`
     /// has been sent.
     ///
-    /// The fake writes no files, so this is the only thing an engine-tier
-    /// test can assert about a reopen: that the request reached this spawn's
-    /// end of [`ProcIo::log_ctl`] at all. Whether a reopened handle really
-    /// lands on a recreated inode is `tests/real_runner.rs`'s question.
+    /// The fake writes no files, so this proves only that the request
+    /// reached this spawn's end of [`ProcIo::log_ctl`]. Whether a reopened
+    /// handle lands on a recreated inode is `tests/real_runner.rs`'s question.
     ///
     /// # Panics
     ///
@@ -667,18 +633,10 @@ impl ScriptedRunner {
     /// How many [`LogCtl::Flush`] requests the proc spawned at `spawn_index`
     /// has been sent.
     ///
-    /// A separate counter from [`Self::reopens`] rather than one shared
-    /// "control requests" total, because the two verbs differ only in which
-    /// variant they push: a `flush` wired to send `LogCtl::Reopen` would
-    /// reopen the flock's handles and truncate nothing, and a single counter
-    /// would read the same either way.
-    ///
-    /// Note what this can and cannot show. The fake writes no files, so it
-    /// proves only that the request reached this spawn's end of
-    /// [`ProcIo::log_ctl`]. That the truncate happens AFTER the answer is
-    /// `supervisor.rs`'s own `LateWritingPumpRunner`, and that a real
-    /// handle's pending bytes land where they should is
-    /// `tests/real_runner.rs`.
+    /// A separate counter from [`Self::reopens`], not one shared "control
+    /// requests" total, so a `flush` wired to the wrong variant still moves
+    /// the wrong counter. The fake writes no files, so this proves only
+    /// that the request reached this spawn's end of [`ProcIo::log_ctl`].
     ///
     /// # Panics
     ///
@@ -694,10 +652,8 @@ impl ScriptedRunner {
     /// How many [`LogCtl::Resume`] requests the proc spawned at
     /// `spawn_index` has been sent.
     ///
-    /// The counter an abandoned handover is asserted against: a report
-    /// parks a real pump, so a handover that reported and then refused owes
-    /// one of these to every pump it reported to, or that sheep's log stops
-    /// for the life of the daemon.
+    /// A handover that reported and then refused owes one of these to
+    /// every pump it reported to, or that sheep's log stops for good.
     ///
     /// # Panics
     ///
@@ -714,10 +670,9 @@ impl ScriptedRunner {
     /// Every line the daemon has written to the stdin of the proc spawned at
     /// `spawn_index`, in write order.
     ///
-    /// The fake writes to no real pipe, so this proves only that the line
-    /// reached this spawn's end of [`ProcIo::to_stdin`] with its content
-    /// intact. That a real `\n`-terminated line lands in a real child's fd 0
-    /// is `tests/real_runner.rs`'s question.
+    /// Proves only that the line reached [`ProcIo::to_stdin`] intact; a
+    /// real `\n`-terminated line landing in a real fd 0 is
+    /// `tests/real_runner.rs`'s question.
     ///
     /// # Panics
     ///
@@ -749,20 +704,17 @@ impl ScriptedRunner {
     }
 }
 
-/// Five real, distinct, open descriptors for a fake pump to report, and the
+/// Six real, distinct, open descriptors for a fake pump to report, and the
 /// handles that keep them open.
 ///
-/// `/dev/null` because the fake never writes anything to them: what a caller
-/// asserts about a handover blob is that the numbers in it name something
-/// open, not what is on the far side. Six rather than four so a fake sheep
-/// stands in for one with a stdin pipe and a shepherd channel too, which is
-/// the widest shape a blob carries and so the one that catches a caller
-/// walking only part of it.
+/// `/dev/null`, since the fake never writes to them: a handover blob only
+/// needs the numbers to name something open. Six covers the widest shape a
+/// blob carries, stdin pipe and shepherd channel included.
 ///
 /// # Panics
 ///
-/// If `/dev/null` cannot be opened six times, which on any unix a test
-/// suite runs on means the process is out of descriptors.
+/// If `/dev/null` cannot be opened six times: the process is out of
+/// descriptors.
 #[cfg(unix)]
 #[track_caller]
 fn open_reportable_fds() -> ([std::fs::File; 6], crate::handover::CarriedFds) {
@@ -795,33 +747,18 @@ impl ProcessRunner for ScriptedRunner {
         Preflight::Unknown
     }
 
-    /// Six fields of `spec` are read by nothing here: `program`, `args`,
-    /// `env` and `cwd`, because the fake runs no program, and `out_file` and
-    /// `err_file`, because it writes no files. That is what keeps it
-    /// deterministic and instant under the paused clock — see this module's
-    /// own top-level `WHY`.
+    /// `program`, `args`, `env`, `cwd`, `out_file` and `err_file` are read
+    /// by nothing here: the fake runs no program and writes no files, which
+    /// keeps it deterministic and instant under the paused clock.
     ///
-    /// The other four are read, and this list is the whole of it rather than
-    /// a blanket claim with exceptions hung off it. That shape is what let
-    /// the paragraph go stale twice:
+    /// `name` matches [`ScriptedRunner::failing_to_spawn`]; `channel` and
+    /// `stdin` gate behavior below, since `begin_action` treats them as
+    /// load-bearing; `credentials` is recorded, never applied, since the
+    /// fake drops no privilege ([`ScriptedRunner::spawned_as`]).
     ///
-    /// - `name`, to match against [`ScriptedRunner::failing_to_spawn`], so a
-    ///   case can pick WHICH app's spawn refuses.
-    /// - `channel`, because `begin_action` (`supervisor.rs`) treats "does
-    ///   this sheep have a channel" as load-bearing, and a fake that
-    ///   answered that wrong for every spawn would be worse than one that
-    ///   could not answer at all. What it changes is below, gated on it.
-    /// - `stdin`, gated the same way and for the same reason.
-    /// - `credentials`, recorded rather than applied. The fake starts no
-    ///   process, so it drops no privilege and changes no identity at all,
-    ///   which is exactly why recording what it was ASKED for is the only way
-    ///   a test can assert the identity a spawn carried, through
-    ///   [`ScriptedRunner::spawned_as`].
-    ///
-    /// Real fd-3 delivery, refusal, and timeout — the facts this flag alone
-    /// cannot reach, since nothing here is a real socketpair to a real child
-    /// — are proven against [`crate::tokio_runner::TokioRunner`] instead, in
-    /// `tests/daemon_e2e.rs`.
+    /// Real fd-3 delivery, refusal and timeout are proven against
+    /// [`crate::tokio_runner::TokioRunner`] in `tests/daemon_e2e.rs`
+    /// instead, since nothing here is a real socketpair to a real child.
     fn spawn(&self, spec: &SpawnSpec) -> Result<(Self::Proc, ProcIo), RunnerError> {
         // Before the script is popped, so a sheep named to `failing_to_spawn`
         // leaves the list alone for the apps around it.
@@ -859,20 +796,10 @@ impl ProcessRunner for ScriptedRunner {
         let (relay_tx, relay_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (log_ctl_tx, mut log_ctl_rx) = mpsc::channel(CHANNEL_CAPACITY);
 
-        // The fake ignores `spec.out_file`/`err_file` and writes no files, so
-        // there is no handle here to swap and nothing about a reopen this
-        // tier can prove — `tests/real_runner.rs` is where a reopened handle
-        // meets a real inode. What the fake must not do is leave the
-        // acknowledgement unanswered: a caller awaiting one would hang
-        // against every scripted proc, so this answers each request as a
-        // live pump would.
-        //
-        // What it must ALSO not do is answer forever. A real pump ends when
-        // the child's streams reach EOF, so a reopen aimed at a sheep that
-        // has stopped fails to send; a fake that kept answering past its
-        // proc's exit would make that branch unreachable from this tier and
-        // every test of it vacuous. So this task ends on each of the three
-        // conditions that end a real pump, and on nothing else.
+        // The fake writes no files, so there is nothing to reopen; what it
+        // must do is answer every request like a live pump, and stop
+        // answering once the proc exits (unless a lamb holds the pipe), so
+        // that branch stays reachable to `tests/real_runner.rs`.
         let log_ctl_live = Arc::new(AtomicBool::new(true));
         let ctl_live = Arc::clone(&log_ctl_live);
         let reopens = Arc::new(AtomicU32::new(0));
@@ -893,8 +820,9 @@ impl ProcessRunner for ScriptedRunner {
                 [std::fs::File; 6],
                 crate::handover::CarriedFds,
             )> = None;
-            // Every unanswered report, kept alive rather than dropped — see
-            // the `ReportFds` arm below for why the two differ.
+            // Every unanswered report, kept alive rather than dropped: a
+            // deaf pump answers no caller while it lives. When it ends the
+            // senders drop and each waiter gets an acknowledgement error.
             #[cfg(unix)]
             let mut held_reports: Vec<
                 tokio::sync::oneshot::Sender<crate::handover::CarriedFds>,
@@ -907,12 +835,9 @@ impl ProcessRunner for ScriptedRunner {
                         // without racing this task.
                         Some(LogCtl::Reopen { done }) => {
                             reopen_count.fetch_add(1, Ordering::SeqCst);
-                            // Always `Ok`: the fake writes no files, so it
-                            // has no open that could fail. A pump that
-                            // cannot reopen a path is `tokio_runner`'s
-                            // tier, and a caller's handling of that answer
-                            // is tested against a runner written for it
-                            // (`supervisor`'s `FailingPumpRunner`).
+                            // Always `Ok`: the fake has no open that could
+                            // fail. A pump that cannot reopen is tested
+                            // against `supervisor`'s `FailingPumpRunner`.
                             let _ = done.send(Ok(()));
                         }
                         Some(LogCtl::Flush { done }) => {
@@ -922,23 +847,9 @@ impl ProcessRunner for ScriptedRunner {
                             // fail to land.
                             let _ = done.send(Ok(()));
                         }
-                        // The fake writes no files, so it holds no
-                        // descriptors of its own. A caller assembling a
-                        // handover still asserts that the numbers it gets
-                        // are really open, so six `/dev/null` handles stand
-                        // in — opened on the first request and held for the
-                        // rest of this task's life, so a suite full of tests
-                        // that never ask for a handover opens nothing. That
-                        // the numbers are the PUMP's own is
-                        // `tokio_runner`'s tier, against a real pipe.
-                        //
-                        // A pump named to
-                        // `ScriptedRunner::with_a_pump_that_never_reports`
-                        // keeps `done` instead, and holds it for the rest of
-                        // this task's life: dropping it would answer the
-                        // request with a closed channel, which is what a
-                        // pump that has ENDED looks like and is a different
-                        // case entirely.
+                        // Six `/dev/null` handles stand in for real
+                        // descriptors, opened once. A deaf pump holds
+                        // `done` instead of answering.
                         #[cfg(unix)]
                         Some(LogCtl::ReportFds { done }) => {
                             if deaf {
@@ -948,11 +859,9 @@ impl ProcessRunner for ScriptedRunner {
                                 let _ = done.send(fds.1);
                             }
                         }
-                        // Counted rather than acted on: the fake reads no
-                        // streams, so it has none to start reading again.
-                        // What a caller asserts here is that an abandoned
-                        // handover sent one at all, which is the half that
-                        // lives above the pump.
+                        // Counted rather than acted on: the fake has no
+                        // streams to resume reading. Asserts only that an
+                        // abandoned handover sent this.
                         #[cfg(unix)]
                         Some(LogCtl::Resume) => {
                             resume_count.fetch_add(1, Ordering::SeqCst);
@@ -966,7 +875,7 @@ impl ProcessRunner for ScriptedRunner {
                     () = logs_for_pump.closed() => break,
                     // Resolves when `wait()` latches an outcome, and errors
                     // once nothing holds this proc's state any more. Either
-                    // way the proc is over — which reaches the pump as both
+                    // way the proc is over, which reaches the pump as both
                     // streams hitting EOF, unless a lamb inherited them.
                     _ = exited_rx.changed(), if !lamb_holds_the_pipe => break,
                 }
@@ -977,24 +886,10 @@ impl ProcessRunner for ScriptedRunner {
             ctl_live.store(false, Ordering::SeqCst);
         });
 
-        // Relay task: the fake watches its own to_child stream so a `Shutdown`
-        // message resolves an obeys_signal wait (falling back to Term) exactly
-        // like `signal()` would — but via `record_shutdown`, NOT `record_signal`,
-        // so it never shows up in `ScriptedRunner::signals`. Every message is
-        // also forwarded onward so tests can independently observe daemon→child
-        // traffic via `FakeIo::to_child_rx`.
-        //
-        // Gated on `spec.channel` — mirroring `tokio_runner.rs`'s own `else`
-        // branch — so this fake agrees with the real runner about the one
-        // fact `begin_action` now treats as load-bearing: whether a sheep has
-        // a channel at all. `spec.channel == false` drops both real ends
-        // (`from_child_tx`, `raw_to_child_rx`) right here, exactly as the real
-        // runner does at spawn: `ProcIo::from_child` reads closed at once and
-        // `ProcIo::to_child.send()` fails immediately, rather than being
-        // accepted by a relay that will never run. `FakeIo`'s own test-facing
-        // handles get their own already-closed stand-ins in that branch —
-        // there is no reader or writer task on this spawn for a test to
-        // observe traffic through.
+        // Watches its own to_child stream: a `Shutdown` message resolves an
+        // obeys_signal wait via `record_shutdown`, not `record_signal`, so
+        // it never appears in `ScriptedRunner::signals`. Gated on
+        // `spec.channel`, mirroring the real runner's `false` branch.
         let (fake_from_child_tx, fake_to_child_rx) = if spec.channel {
             let relay_state = Arc::clone(&state);
             tokio::spawn(async move {
@@ -1020,13 +915,9 @@ impl ProcessRunner for ScriptedRunner {
             (stand_in_tx, dead_rx)
         };
 
-        // Gated on `spec.stdin`, mirroring `spec.channel`'s own `else` branch
-        // above: the fake writes to no real pipe, so what it must get right
-        // is the one fact the engine tier treats as load-bearing — whether
-        // this sheep has a stdin pipe at all. `spec.stdin == false` drops the
-        // receiver right here, exactly as the real runner does at spawn, so
-        // `ProcIo::to_stdin.is_closed()` answers immediately rather than a
-        // task that will never run silently accepting the send.
+        // Gated on `spec.stdin`, mirroring `spec.channel` above: `false`
+        // drops the receiver here, exactly as the real runner does, so
+        // `to_stdin.is_closed()` answers immediately.
         let (to_stdin_tx, to_stdin_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let stdin_lines = Arc::new(Mutex::new(Vec::new()));
         if spec.stdin {
@@ -1034,18 +925,14 @@ impl ProcessRunner for ScriptedRunner {
             let lines = Arc::clone(&stdin_lines);
             let mut rx = to_stdin_rx;
             tokio::spawn(async move {
-                // Withheld acknowledgements are held here rather than
-                // dropped, so a caller awaiting one hangs — the same shape a
-                // real write blocked on a full, unread pipe leaves its
-                // caller in — instead of resolving at once with a spurious
-                // "channel closed" error that no bounded-wait test could
-                // distinguish from a real answer.
+                // Withheld acknowledgements are held, not dropped, so an
+                // awaiting caller hangs (the shape a real full pipe leaves)
+                // instead of seeing a spurious "channel closed" error.
                 let mut withheld = Vec::new();
                 while let Some(StdinWrite { line, done }) = rx.recv().await {
                     // Recorded either way: `never_reads_its_stdin` withholds
-                    // the acknowledgement, not the delivery — the write still
-                    // reaches the app, which is the whole point of modelling
-                    // a pipe that fills rather than one that errors.
+                    // the acknowledgement, not the record, so the line is
+                    // kept while the caller stays pending.
                     lines.lock().unwrap().push(line);
                     if reads_stdin {
                         let _ = done.send(Ok(()));
@@ -1085,7 +972,7 @@ impl ProcessRunner for ScriptedRunner {
             log_ctl: log_ctl_tx,
             to_stdin: to_stdin_tx,
         };
-        // Arbitrary but deterministic — real pids come from the OS in the real runner.
+        // Arbitrary but deterministic: real pids come from the OS in the real runner.
         let pid = self
             .pid
             .lock()
@@ -1207,11 +1094,9 @@ mod tests {
         );
     }
 
-    /// fails if `signal_process` resolves the scripted proc's `wait()`. It must
-    /// not: `signal` does (it is the stop ladder's polite rung, and this script
-    /// obeys it), and a nudge that ended the sheep would make every supervisor
-    /// case in Step 4.3 vacuous — the row would read `Delivered` off a process
-    /// that had just died.
+    /// `signal_process` must not resolve the scripted proc's `wait()`:
+    /// `signal` does that (the stop ladder's polite rung), and a nudge that
+    /// ended the sheep would read `Delivered` off a process that had just died.
     #[tokio::test(start_paused = true)]
     async fn a_process_signal_does_not_end_the_scripted_proc() {
         let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
@@ -1263,9 +1148,9 @@ mod tests {
         let runner = ScriptedRunner::new(vec![ProcScript::stable_then_exit(5_000, 7)]);
         let (mut proc, _io) = runner.spawn(&spec()).unwrap();
 
-        // Drive `wait()` on a spawned task so we can abort (drop) it mid-flight — the
-        // same "sheep task owns the proc" shape `RunningProcess::wait` is documented
-        // for, and the shape the N1 regression actually happened under.
+        // Drive `wait()` on a spawned task so we can abort (drop) it
+        // mid-flight, the "sheep task owns the proc" shape
+        // `RunningProcess::wait` documents.
         let mut first_wait = proc.clone();
         let handle = tokio::spawn(async move { first_wait.wait().await });
         tokio::time::advance(Duration::from_secs(1)).await;
@@ -1275,8 +1160,8 @@ mod tests {
         );
         handle.abort(); // drop the wait() future without ever resolving it
 
-        // N1 regression guard: if the deadline were recomputed from *this* re-await
-        // instead of the original spawn-relative one, 4 more seconds would not be enough.
+        // If the deadline were recomputed from this re-await instead of the
+        // original spawn-relative one, 4 more seconds would not be enough.
         tokio::time::advance(Duration::from_secs(4)).await;
         let outcome = proc.wait().await;
         assert_eq!(
@@ -1341,15 +1226,13 @@ mod tests {
     /// `oneshot` sender was dropped unanswered. Either way a caller that
     /// awaits a reopen would hang against every scripted proc.
     ///
-    /// This tier proves the acknowledgement and nothing else — the fake
-    /// ignores `spec.out_file`/`err_file` and writes no files, so it has no
-    /// handle to swap. What a reopened handle does to a real inode is
-    /// `tokio_runner`'s own tests.
+    /// This tier proves the acknowledgement and nothing else: the fake
+    /// writes no files, so it has no handle to swap. What a reopened
+    /// handle does to a real inode is `tokio_runner`'s own tests.
     #[tokio::test(start_paused = true)]
     async fn a_reopen_is_acknowledged_by_the_scripted_runner() {
-        // One script for one spawn. A second spawn would answer
-        // `SpawnFailed("script exhausted")`, which is why the count is
-        // stated rather than left generous.
+        // One script for one spawn: a second would answer
+        // `SpawnFailed("script exhausted")`.
         let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
         let (_proc, io) = runner.spawn(&spec()).unwrap();
 
@@ -1378,9 +1261,8 @@ mod tests {
     /// not the code handled one.
     #[tokio::test(start_paused = true)]
     async fn a_proc_that_has_exited_closes_its_control_channel() {
-        // One script for one spawn. A second spawn would answer
-        // `SpawnFailed("script exhausted")` and never reach the channel at
-        // all, which is why the count is stated rather than left generous.
+        // One script for one spawn: a second would answer
+        // `SpawnFailed("script exhausted")` and never reach the channel.
         let runner = ScriptedRunner::new(vec![ProcScript::const_exit(0)]);
         let (mut proc, io) = runner.spawn(&spec()).unwrap();
         assert!(runner.log_ctl_live(0), "sanity: live before the proc exits");
@@ -1400,9 +1282,8 @@ mod tests {
             io.log_ctl.send(LogCtl::Reopen { done }).await.is_err(),
             "a reopen aimed at an exited proc must fail to send"
         );
-        // And a request that never reaches a pump resolves the caller's
-        // acknowledgement as an error rather than leaving it pending — the
-        // same no-op, observed a moment later.
+        // A request that never reaches a pump resolves the caller's
+        // acknowledgement as an error rather than leaving it pending.
         assert!(ack.await.is_err());
     }
 
@@ -1424,11 +1305,8 @@ mod tests {
         );
     }
 
-    /// fails if the scripted runner answers a stdin write for a spec that
-    /// asked for no pipe. A fake that accepted every write would make
-    /// `no_stdin` unreachable from the engine tier and every test of it
-    /// vacuous — the same trap `spec.channel` already had to be taught
-    /// about.
+    /// A fake that accepted every write would make `no_stdin` unreachable
+    /// from the engine tier, the same trap `spec.channel` had to be taught.
     #[tokio::test(start_paused = true)]
     async fn a_spawn_without_stdin_hands_back_a_closed_writer() {
         let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
@@ -1441,9 +1319,8 @@ mod tests {
         assert!(io.to_stdin.is_closed());
     }
 
-    /// fails if a spawn that DID ask for a pipe also hands back a closed
-    /// writer — which would make the case above pass for the wrong reason,
-    /// since a fake that closed every writer satisfies it.
+    /// The counterpart: a fake that closed every writer would make the
+    /// case above pass for the wrong reason.
     #[tokio::test(start_paused = true)]
     async fn a_spawn_with_stdin_hands_back_a_live_writer() {
         let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);

@@ -1,11 +1,10 @@
 //! Exits `0` once a sentinel file exists, and non-zero otherwise.
 //!
-//! Not the supervised app itself — the `target` an `exec` readiness probe
-//! runs. There is no everyday real-world example of an exec probe the way
-//! there is for HTTP or TCP, since most readiness is a socket coming up; this
-//! is the minimal program that makes one demonstrable: create the sentinel
-//! file by hand (`touch <path>`) and watch the next poll flip the sheep to
-//! ready.
+//! Not the supervised app itself: the `target` an `exec` readiness
+//! probe runs. Most readiness is a socket coming up. This is the
+//! minimal program that demonstrates an exec probe instead. Create
+//! the sentinel file (`touch <path>`) and watch the next poll flip
+//! the sheep to ready.
 //!
 //! # Usage
 //!

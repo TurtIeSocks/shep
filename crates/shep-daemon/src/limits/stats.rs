@@ -1,29 +1,14 @@
 //! Live per-sheep resource readings: the CPU and memory figures every row of
 //! `shep flock` carries.
 //!
-//! Sampling and enforcement are two jobs over one process-table reading, and
-//! they cover different sheep. [`super::LimitEnforcer`] is armed only where an
-//! app configured `max_memory`; [`StatsState`] watches **every** sheep with a
-//! pid, because a listing reports resource use whether or not the app set a
-//! ceiling — an app with no `max_memory` is the ordinary case, and a listing
-//! that reported nothing for it would be reporting nothing for most of the
-//! flock. Both are served by the same tick: the polling enforcer builds one
-//! [`TreeIndex`] per pass and hands it here before it runs the enforcement
-//! pass, so the syscall walk still happens once.
+//! [`super::LimitEnforcer`] samples only sheep with `max_memory` set;
+//! [`StatsState`] watches every sheep with a pid, off the same
+//! [`TreeIndex`] per polling tick.
 //!
-//! CPU is a rate where memory is a level, and that is the whole of the design
-//! here. Resident memory is whatever the current reading says, so an on-demand
-//! read answers it outright. Accumulated CPU time is a counter, so a
-//! percentage needs two readings and the wall time between them — which is
-//! what a **baseline** is: the counter and the instant recorded for one root
-//! pid at the last periodic tick. An on-demand read subtracts against that
-//! baseline and never writes one, so two listings a moment apart cannot divide
-//! a near-zero delta by a near-zero window; the window a percentage is
-//! measured over is instead always at most one `MEMORY_POLL_INTERVAL` old.
-//!
-//! Both totals are summed over the sheep's whole process tree, exactly as the
-//! memory limit is — see the [`limits`](super) module doc for what that tree
-//! is and where it diverges from the kill unit.
+//! Memory is a level and reads current on demand. CPU is a counter: a percentage needs the
+//! last periodic baseline, subtracted without writing one, so its window is usually one
+//! `MEMORY_POLL_INTERVAL` old, longer if a full breaches channel paused the poll loop. Both
+//! sum the whole tree; see [`limits`](super) for the kill-unit divergence.
 
 use core::fmt;
 use std::collections::{HashMap, HashSet};
@@ -67,14 +52,9 @@ struct Baseline {
 /// near-zero window and report anything from 0% to thousands.
 pub(crate) struct StatsState {
     sampler: Arc<dyn MemorySampler>,
-    // Both maps take `std::sync::Mutex`, not tokio's, for the reason
-    // `SysinfoSampler` gives for its own: every critical section below is a
-    // map operation, none is held across an `.await`, and a poisoned lock
-    // recovers with `PoisonError::into_inner` rather than ending a daemon
-    // whose whole job is staying up. Neither is ever held while the other
-    // is, and neither is ever held across the syscall walk — the walk's
-    // input is a snapshot of the watch map, taken and released first — so
-    // there is no lock order to get wrong.
+    // `std::sync::Mutex`: every critical section is a map operation, none
+    // held across an `.await`. Never held together, and never across the
+    // syscall walk, so there is no lock order to get wrong.
     /// Root pid per watched sheep id.
     watched: Mutex<HashMap<u32, u32>>,
     /// The last periodic reading, per watched root pid.
@@ -84,20 +64,13 @@ pub(crate) struct StatsState {
 /// An indexed snapshot of the machine's process table: who each process is,
 /// and which processes name it as their parent.
 ///
-/// Split out of [`StatsState::lambs_of`] rather than rebuilt per root, for
-/// the reason [`TreeIndex`]'s own doc already gives about the polling
-/// enforcer: the index is the expensive part — it scans the whole table —
-/// and a caller walking several roots (`shep describe all`, one root per
-/// row) builds it once and reuses it. Building per root would multiply a
-/// whole-machine scan by flock size on an operator's command.
-///
-/// One refresh of the process table happens per [`StatsState::lamb_index`]
-/// call, and none inside [`StatsState::lambs_of`], so the whole of a
-/// `describe`'s answer describes ONE instant rather than one instant per
-/// row.
+/// Built once per [`StatsState::lamb_index`] call and shared across
+/// [`StatsState::lambs_of`] calls, so a caller walking several roots
+/// (`shep describe all`) reuses one scan and one instant instead of
+/// re-walking the table per root.
 #[derive(Debug)]
 pub(crate) struct LambIndex {
-    /// Every process by pid — the name a lamb row carries.
+    /// Every process by pid, the name a lamb row carries.
     by_pid: HashMap<u32, ProcessIdentity>,
     /// Child pids per parent pid.
     children_of: HashMap<u32, Vec<u32>>,
@@ -115,22 +88,17 @@ impl StatsState {
 
     /// Starts sampling `root_pid` for `id`.
     ///
-    /// Re-watching an id replaces the previous pid — a respawn gives the same
+    /// Re-watching an id replaces the previous pid: a respawn gives the same
     /// id a new one.
     pub(crate) fn watch(&self, id: u32, root_pid: u32) {
         self.watched
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(id, root_pid);
-        // A pid entering the watch set starts from no baseline, never from
-        // one recorded while a DIFFERENT process held that number — the OS
-        // really does recycle pids, and inheriting a stale counter would
-        // charge a new sheep with whatever CPU the old one had accumulated.
-        // This one line is the whole of that guarantee, and it is enough
-        // because `watch` is the only door into the watch set: a baseline
-        // left behind by an id that stopped being watched is unreadable
-        // (`sample_now` reports only watched pids) until its pid is watched
-        // again, and that path runs this.
+        // A pid entering the watch set starts from no baseline, never one
+        // recorded while a different process held that number: the OS
+        // recycles pids, and inheriting a stale counter would charge a new
+        // sheep with the old one's accumulated CPU.
         self.baselines
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -152,8 +120,8 @@ impl StatsState {
     ///
     /// The whole map is replaced rather than updated in place, so an id that
     /// stopped being watched does not leave a baseline sitting in it until
-    /// the daemon exits. That is housekeeping, not the correctness rule —
-    /// [`Self::watch`] is what keeps a stale entry from ever being read.
+    /// the daemon exits. [`Self::watch`] is what keeps a stale entry from
+    /// ever being read.
     pub(crate) fn record_baseline(&self, index: &TreeIndex, now: Instant) {
         let fresh: HashMap<u32, Baseline> = self
             .watched_pids()
@@ -174,11 +142,9 @@ impl StatsState {
 
     /// [`Self::record_baseline`] over a reading this call takes itself.
     ///
-    /// For a caller that has not already built an index. The polling tick uses
-    /// the other one: it has an index in hand and must not walk the process
-    /// table twice per tick, which leaves this one with no production caller
-    /// — it exists so a test can put a baseline in place in one line instead
-    /// of reaching through to the sampler for an index of its own.
+    /// For a caller with no index already in hand. The polling tick always
+    /// has one and uses [`Self::record_baseline`] directly, so this has no
+    /// production caller; it lets a test set a baseline in one line.
     #[allow(dead_code, reason = "called only by this crate's tests")]
     pub(crate) fn record_baseline_now(&self, now: Instant) {
         let table = self.sampler.sample();
@@ -189,7 +155,7 @@ impl StatsState {
     ///
     /// Blocking: it performs the syscall walk itself, which is what makes the
     /// memory figure current rather than up to `MEMORY_POLL_INTERVAL` stale.
-    /// It writes no baseline — see this type's own doc for why that matters.
+    /// It writes no baseline: see this type's own doc for why.
     pub(crate) fn sample_now(&self) -> HashMap<u32, SheepStats> {
         let roots = self.watched_pids();
         let table = self.sampler.sample();
@@ -269,20 +235,13 @@ impl StatsState {
     /// Every process `index` reports as a descendant of `root_pid`, in pid
     /// order, excluding `root_pid` itself.
     ///
-    /// Takes the index rather than building one, so several roots share one
-    /// walk of the process table — the same split [`TreeIndex::build`] and
-    /// [`TreeIndex::sum_from`] already make, and for the same reason.
+    /// Cycle-safe like [`TreeIndex::total_over`]: the kernel does not
+    /// produce a cycle in the parent links, but a fixture can and a torn
+    /// `/proc` read might.
     ///
-    /// Cycle-safe, with the same shape [`TreeIndex::total_over`] uses: the
-    /// kernel does not produce a cycle in the parent links, but a fixture can
-    /// and a torn `/proc` read might, and a walk that spun on one would hang
-    /// a request rather than answer it.
-    ///
-    /// **This is not the set of processes a stop kills.** The kill acts on
-    /// the process group, which diverges from the ppid tree in both
-    /// directions — this module's own doc has the account. Anything
-    /// rendering this list owes the operator that caveat where they can see
-    /// it.
+    /// Not the set of processes a stop kills: the kill acts on the process
+    /// group, which diverges from the ppid tree in both directions. Anything
+    /// rendering this list owes the operator that caveat.
     pub(crate) fn lambs_of(&self, index: &LambIndex, root_pid: u32) -> Vec<Lamb> {
         // `visited` seeded with the root, which does two things at once: it
         // keeps the sheep out of its own lamb list, and it terminates a
@@ -307,11 +266,9 @@ impl StatsState {
 }
 
 impl fmt::Debug for StatsState {
-    // The sampler is a trait object and is not Debug; the two maps are behind
-    // locks this impl deliberately does not take, since a formatter reached
-    // from inside a locked section would deadlock the thread it was meant to
-    // help debug. Role only, and `finish_non_exhaustive` because the two maps
-    // really are omitted rather than absent.
+    // The sampler is a trait object and is not Debug. The two maps are
+    // behind locks this does not take, since a formatter called from inside
+    // a locked section would deadlock the thread it was meant to debug.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StatsState")
             .field("sampler", &"<dyn MemorySampler>")
@@ -322,23 +279,20 @@ impl fmt::Debug for StatsState {
 /// `baseline`'s counter against a later reading of the same tree, as a
 /// percentage of one core.
 ///
-/// `None` when no wall time has passed since the baseline — dividing by that
-/// window is what produces the nonsense figure the whole baseline scheme
-/// exists to avoid.
+/// `None` when no wall time has passed since the baseline: dividing by a
+/// zero window would produce a nonsense figure.
 fn cpu_percent(baseline: Baseline, cpu_ms: u64, now: Instant) -> Option<f32> {
     let window = now.saturating_duration_since(baseline.at);
     if window.is_zero() {
         return None;
     }
-    // Saturating: a counter that went BACKWARDS means the tree under this pid
-    // is not the tree the baseline was taken from — a lamb exited, or the pid
-    // was recycled — and zero is the honest reading for a window this
-    // baseline cannot describe.
+    // Saturating: a counter that went backwards means the tree under this
+    // pid is not the one the baseline was taken from (a lamb exited, or the
+    // pid was recycled), and zero is the honest reading for that window.
     let elapsed_cpu_ms = cpu_ms.saturating_sub(baseline.cpu_ms);
-    // CPU-milliseconds over wall-seconds is per-mille of one core, so a tenth
-    // of that is the percentage. Computed in f64 and narrowed once at the end:
-    // the subtraction above is exact in u64, and f32 alone would start losing
-    // milliseconds off a counter that has been running for a month.
+    // CPU-milliseconds over wall-seconds is per-mille of one core. Computed
+    // in f64 and narrowed once at the end, since f32 would lose milliseconds
+    // off a counter that has run for a month.
     let percent = elapsed_cpu_ms as f64 / window.as_secs_f64() / 10.0;
     Some(percent as f32)
 }
@@ -361,9 +315,6 @@ mod tests {
         }
     }
 
-    /// fails if a sheep with no baseline reports a number. A process spawned
-    /// since the last tick has no honest CPU figure, and one invented from a
-    /// 50 ms window is worse than an empty cell.
     #[tokio::test(start_paused = true)]
     async fn a_sheep_with_no_baseline_reports_no_cpu_but_still_reports_memory() {
         let sampler = Arc::new(ScriptedSampler::new(vec![vec![rss_cpu(
@@ -377,10 +328,8 @@ mod tests {
         assert_eq!(now[&100].memory_bytes, 4096, "memory is always current");
     }
 
-    /// fails if the delta is computed against the wrong pair of readings.
-    /// 1500 CPU-ms over a 15 s window is 10% of one core; a percentage
-    /// computed against the process's whole accumulated time instead would
-    /// read 16.7%, and against the wrong elapsed window, anything at all.
+    /// 1500 CPU-ms over a 15 s window is 10%; the process's whole
+    /// accumulated time instead would read 16.7%.
     #[tokio::test(start_paused = true)]
     async fn cpu_is_the_delta_since_the_periodic_baseline() {
         let sampler = Arc::new(ScriptedSampler::new(vec![
@@ -398,16 +347,13 @@ mod tests {
         assert!((cpu - 10.0).abs() < 0.01, "expected ~10%, got {cpu}");
     }
 
-    /// fails if an on-demand read writes the baseline. Two `flock` calls a
-    /// moment apart would then divide a near-zero CPU delta by a near-zero
-    /// window — the second call reporting anything from 0% to thousands,
-    /// depending on rounding.
+    /// An on-demand read must not write the baseline, or a second call a
+    /// moment later would divide a near-zero delta by a near-zero window.
     #[tokio::test(start_paused = true)]
     async fn a_second_read_a_moment_later_still_measures_from_the_periodic_baseline() {
-        // Three readings: the baseline, then two on-demand ones a millisecond
-        // apart. The CPU counter barely moves between the last two, which is
-        // exactly the shape that makes a baseline-writing implementation
-        // divide ~1 CPU-ms by ~1 ms and report ~100%.
+        // Three readings: baseline, then two on-demand reads a millisecond
+        // apart, where the CPU counter barely moves. A baseline-writing
+        // implementation would divide ~1 CPU-ms by ~1 ms here.
         let sampler = Arc::new(ScriptedSampler::new(vec![
             vec![rss_cpu(100, None, 4096, 1_000)],
             vec![rss_cpu(100, None, 4096, 2_500)],
@@ -432,10 +378,6 @@ mod tests {
         );
     }
 
-    /// fails if `unwatch` stops removing the id from the watch set. A sheep
-    /// that is gone would otherwise be sampled forever, and every listing
-    /// would carry a row for a pid the OS has already handed to somebody
-    /// else.
     #[tokio::test(start_paused = true)]
     async fn an_unwatched_sheep_is_no_longer_sampled() {
         let sampler = Arc::new(ScriptedSampler::new(vec![
@@ -454,11 +396,6 @@ mod tests {
         );
     }
 
-    /// fails if `watch` stops clearing the incoming pid's baseline. The OS
-    /// really does recycle pids, and no tick need run in between: the
-    /// baseline map is written only by the periodic tick, so between two of
-    /// them `watch` is the ONLY thing that can drop the counter the dead
-    /// process left behind on that number.
     #[tokio::test(start_paused = true)]
     async fn a_recycled_pid_starts_from_no_baseline_rather_than_the_dead_process_counter() {
         let sampler = Arc::new(ScriptedSampler::new(vec![
@@ -479,10 +416,6 @@ mod tests {
         );
     }
 
-    /// fails if the zero-length window is not guarded. A listing taken in the
-    /// same instant as a tick divides by zero, and f64 answers that with
-    /// `inf` or `NaN` rather than an error — `Some(inf)` would reach the
-    /// column and render as a number.
     #[tokio::test(start_paused = true)]
     async fn a_read_in_the_same_instant_as_the_baseline_reports_no_cpu() {
         let sampler = Arc::new(ScriptedSampler::new(vec![
@@ -497,9 +430,8 @@ mod tests {
         assert_eq!(stats.sample_now()[&100].cpu_percent, None);
     }
 
-    // IR-41: `StatsState`'s Debug is hand-rolled — the sampler is a trait
-    // object, and the two maps are behind locks a formatter must not take.
-    // Pinned exactly so a later edit cannot quietly start printing either.
+    // Pins the hand-rolled Debug output so a later edit cannot start
+    // printing the maps or the sampler.
     #[tokio::test(start_paused = true)]
     async fn stats_state_debug_names_the_sampler_by_role_and_prints_no_map() {
         let sampler = Arc::new(ScriptedSampler::new(vec![vec![rss_cpu(
@@ -513,10 +445,8 @@ mod tests {
         );
     }
 
-    // fails if `watched_for_test` stops reporting the pid an id is watched
-    // against, or stops replacing a re-watched id's pid rather than adding a
-    // second entry for it. `extras.rs`'s own case asserts on this helper, so
-    // a helper that lied would take that case with it.
+    // extras.rs's own case asserts on this helper; a helper that lied would
+    // take that case with it too.
     #[tokio::test(start_paused = true)]
     async fn watching_reports_each_id_once_against_its_current_pid() {
         let sampler = Arc::new(ScriptedSampler::new(vec![vec![rss_cpu(
@@ -543,9 +473,6 @@ mod tests {
         );
     }
 
-    /// fails if the walk includes the sheep's own pid. They are LAMBS — the
-    /// sheep is the row this list hangs off, and repeating it there would
-    /// double it in every rendering.
     #[test]
     fn the_lamb_walk_excludes_the_sheeps_own_pid() {
         let table = vec![
@@ -564,9 +491,8 @@ mod tests {
         );
     }
 
-    /// fails if the walk stops at the first generation. A `sh` wrapper that
-    /// execs a runtime that forks workers is three deep and is the ordinary
-    /// case, not an exotic one.
+    /// A `sh` wrapper execing a runtime that forks workers is three deep,
+    /// the ordinary case.
     #[test]
     fn the_lamb_walk_reaches_every_generation() {
         let table = vec![
@@ -579,13 +505,8 @@ mod tests {
         assert_eq!(stats.lambs_of(&stats.lamb_index(), 100).len(), 3);
     }
 
-    /// fails if a sibling subtree leaks in. Two sheep of the same app run
-    /// side by side, so a walk that took everything with a parent would
-    /// report each one's children under the other.
-    ///
-    /// Both roots are walked off ONE index, which is also the case for the
-    /// split Step 16.0b makes: `shep describe all` builds the index once and
-    /// calls `lambs_of` per row.
+    /// Both roots are walked off one index, as `shep describe all` does:
+    /// index built once, `lambs_of` called per row.
     #[test]
     fn a_sibling_subtree_is_not_this_sheeps() {
         let table = vec![
@@ -600,20 +521,10 @@ mod tests {
         assert_eq!(stats.lambs_of(&index, 200), vec![Lamb::new(201, "theirs")]);
     }
 
-    /// fails if a cycle in the parent links is walked twice, or spins
-    /// forever. The kernel does not produce one, but a fixture can and a
-    /// truncated `/proc` read might — `TreeIndex::total_over` already
-    /// terminates on this and the lamb walk must too.
-    ///
-    /// **No IR-46 bound, deliberately, and do not add one back.** `lambs_of`
-    /// is a synchronous `fn`: `tokio::time::timeout(_, async {
-    /// stats.lambs_of(..) })` runs the whole body on its first poll, so the
-    /// timer is never armed and a genuinely non-terminating walk hangs
-    /// exactly as it would bare — while the wrapper tells every later reader
-    /// the case is bounded. IR-46 asks for a bound on a case that can ONLY
-    /// fail by hanging; the `assert_eq!` below is a live failure mode, and
-    /// the mutation step (Step 16.4) reddens it. That, not a decorative
-    /// wrapper, is what makes this case able to fail.
+    /// `lambs_of` is a synchronous `fn`, so a `tokio::time::timeout` wrapper
+    /// around it never gets a chance to fire: the call runs to completion or
+    /// hangs on its first poll either way. The assertion below is what
+    /// actually catches a non-terminating walk.
     #[test]
     fn a_parent_link_cycle_terminates_and_reports_each_pid_once() {
         let table = vec![identity(100, Some(101), "a"), identity(101, Some(100), "b")];
@@ -628,9 +539,6 @@ mod tests {
         );
     }
 
-    /// fails if the rows come back in whatever order the map yielded.
-    /// `describe`'s output is read by people and diffed by scripts; an
-    /// unstable order makes both worse for no gain.
     #[test]
     fn lambs_come_back_in_pid_order() {
         let table = vec![
@@ -650,10 +558,8 @@ mod tests {
         );
     }
 
-    /// fails if a sampler that cannot report names produces bogus rows
-    /// instead of none. The trait's default `identify` returns nothing, and
-    /// every consumer has to read that as "unknown", never as "this sheep
-    /// has no lambs".
+    /// The default `identify` returns nothing; consumers must read that as
+    /// "unknown", never "no lambs".
     #[test]
     fn a_sampler_that_cannot_identify_reports_no_lambs() {
         // `ScriptedSampler::new(..)` implements only `sample`, taking the

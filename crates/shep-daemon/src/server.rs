@@ -1,22 +1,15 @@
 //! The connection layer: peer auth, handshake, subscriptions
 //!
 //! [`RpcServer`] owns the bound [`Listener`] and accepts connections until
-//! told to stop. Every accepted connection runs `handle_conn` (private — the
-//! connection state machine is an implementation detail, not public API) in
-//! its own task: a same-uid check ([`check_peer`], unix only), a version
-//! handshake, then a read loop that decodes envelopes and hands them to
-//! [`rpc::dispatch`](crate::rpc::dispatch) — the portable dispatcher Task 4
-//! built, which never sees a socket or a byte.
+//! told to stop. Each runs `handle_conn` in its own task: a same-uid check
+//! ([`check_peer`], unix only), a version handshake, then a read loop that
+//! decodes envelopes and hands them to
+//! [`rpc::dispatch`](crate::rpc::dispatch), which never sees a socket.
 //!
-//! The OS transport lives one crate down in [`shep_core::transport`], so the
-//! accept loop, the handshake and the connection state machine here are one
-//! implementation over a unix socket and a Windows named pipe alike. The
-//! single genuine platform difference left in this file is [`check_peer`].
-//!
-//! # Security
-//!
-//! See [`RpcServer`]'s doc for the canonical writeup; everything
-//! security-relevant in this crate anchor-links there rather than repeating it.
+//! The OS transport lives in [`shep_core::transport`], so everything here is
+//! one implementation over a unix socket and a Windows named pipe alike;
+//! [`check_peer`] is the only genuine platform difference left.
+//! [`RpcServer`]'s doc is the daemon's security writeup.
 
 use core::fmt;
 use core::time::Duration;
@@ -45,78 +38,18 @@ pub const HANDSHAKE_TIMEOUT_MS: u64 = 5_000;
 
 type Frames = FramedRead<ServerReadHalf, LengthDelimitedCodec>;
 
-/// The control socket — shep's privilege boundary
-///
-/// Wraps an already-bound [`Listener`] with the daemon-wide [`RpcContext`]
-/// and drives the accept loop.
+/// The control socket: shep's privilege boundary
 ///
 /// # Security
 ///
-/// This is the canonical security writeup for the whole daemon (IR-29):
-/// every other module that touches something security-relevant links back
-/// here instead of re-arguing it.
-///
-/// Design criteria: `$SHEP_HOME/run` is *intended* to be created `0700` so
-/// no other user can reach the socket path at all — that creation (and any
-/// permission check of an already-existing `run` dir) is the daemon's boot
-/// path's responsibility ([`crate::boot::init_dirs`], Task 6), not this
-/// module's: nothing in [`RpcServer`] creates, checks, or enforces that
-/// mode, it only accepts on whatever listener it is handed. Every accepted
-/// connection is checked with `SO_PEERCRED`/`getpeereid` ([`check_peer`])
-/// and refused unless the peer's uid equals the daemon's; this fails
-/// CLOSED — a connection whose credentials the OS will not report
-/// ([`AuthError::NoCredentials`]) is refused, not admitted, exactly like a
-/// confirmed uid mismatch.
-///
-/// **Both of those sentences describe the unix tier.** Windows reaches the
-/// same posture by a different route and one step earlier: there is no
-/// `0700` directory and no post-accept credential check, because the control
-/// pipe's own ACL denies a foreign local user the open-for-write that
-/// speaking this protocol requires, and the OS enforces that at `CreateFile`
-/// time before any byte reaches this module.
-/// [`shep_core::transport`]'s module doc is the canonical account of that
-/// difference, including what it does and does not cover.
-///
-/// The handshake refuses protocol skew with a typed
-/// error ([`RpcErrorCode::ProtocolMismatch`]) rather than silence; frames
-/// are capped at [`shep_core::protocol::MAX_FRAME_BYTES`]. Every
-/// peer-supplied *pattern* is bounded before it can cost the daemon
-/// unbounded work compiling it: a `Subscribe`'s topic-glob *count* (not the
-/// byte length of any individual pattern, which is unbounded short of
-/// `MAX_FRAME_BYTES`) is capped at [`crate::bus::MAX_TOPIC_PATTERNS`], and a
-/// `/regex/` [`shep_core::protocol::SelectorSpec`] — on every verb that
-/// carries one, without exception — is capped at a 1 MiB compiled size by
-/// [`shep_core::selector::ProcessSelector`]'s `TryFrom<SelectorSpec>` impl,
-/// which is the single door from the wire type to the matcher.
-/// Every call carries
-/// a clamped deadline ([`crate::rpc::budget`]). The one place this daemon
-/// writes secrets to disk — an app's `env`, verbatim, so a muster restore
-/// can reproduce it (spec §10 redacts them everywhere else) — is
-/// [`crate::snapshot::write_atomic`]'s `flock.json`, created owner-only
-/// (`0600`, Task 3) and kept there across its atomic rename.
-///
-/// A separate, install-time trust boundary: the CLI that daemonizes this
-/// process hands it a readiness-pipe descriptor over `SHEP_READY_FD` (spec
-/// §3), adopted through [`crate::sys::adopt_fd`] — this crate's only
-/// `unsafe fn`, and (as of Decision 1, 2026-08-08) its ONLY unsafe surface,
-/// full stop: [`crate::boot::boot`] receives the already-adopted
-/// [`std::fs::File`] via [`crate::boot::BootOptions::ready_fd`] and never
-/// touches a raw descriptor itself (`sys.rs`'s own doc has the full
-/// test-call-site accounting). That boundary sits between this process and
-/// its own parent, not between this process and an RPC peer — nothing
-/// arriving over the control socket can reach it — and a hostile or stale
-/// descriptor is refused (below fd 3, or not currently open) rather than
-/// adopted; see [`crate::sys`]'s own rationale essay for the full threat
-/// model.
-///
-/// Explicit non-goals: root can always read daemon memory; a peer with the
-/// same uid is fully trusted (it could simply run the binary itself); there
-/// is no post-handshake idle timeout (a same-uid peer that completes the
-/// handshake and then never sends another frame holds its connection, and
-/// this module's queue/task resources, open indefinitely); and there is no
-/// cap on the number of concurrent connections one uid can hold open
-/// ([`RpcServer::serve`] spawns and detaches unconditionally on every
-/// accepted connection).
+/// The daemon's canonical writeup; other modules link here. On unix a
+/// connection is refused unless `SO_PEERCRED`/`getpeereid` ([`check_peer`])
+/// names the daemon's own uid, and refused too when the OS will not answer.
+/// `$SHEP_HOME/run`'s `0700` is [`crate::boot::init_dirs`]'s job; Windows has
+/// neither, and refuses at open time through the pipe's ACL. Skew, frame size,
+/// a `Subscribe`'s glob count and a `/regex/` selector's compiled size are all
+/// capped, and every call carries a clamped deadline. A same-uid peer is fully
+/// trusted; there is no idle timeout and no per-uid connection cap.
 #[derive(Debug)]
 pub struct RpcServer {
     listener: Listener,
@@ -133,31 +66,21 @@ impl RpcServer {
     /// Accepts connections, each on its own task, until `shutdown` flips to
     /// `true` or its sender drops.
     ///
-    /// The accept loop is a `select!` over `listener.accept()` and
-    /// `shutdown.changed()` — both cancel-safe, so neither branch loses
-    /// state when the other resolves first. A transient accept error (e.g.
-    /// `EMFILE`) is logged and the loop continues: one bad `accept()` must
-    /// not take the whole daemon down.
+    /// Both `select!` branches are cancel-safe. A transient accept error such
+    /// as `EMFILE` is logged and the loop continues.
     ///
-    /// Each accepted connection's task is spawned and detached — this loop
-    /// does not track or await it. That is fine for `serve` itself (it never
-    /// blocks a still-running connection), but it means `serve` returning is
-    /// not a guarantee that every in-flight connection has finished; a
-    /// future daemon-shutdown sequence that needs to *drain* live
-    /// connections before exiting will need its own seam here (a
-    /// `tokio::task::JoinSet` in place of the bare `tokio::spawn`), not
-    /// yet built.
+    /// Connection tasks are spawned and detached, so `serve` returning does
+    /// not mean every in-flight connection has finished. Draining them would
+    /// need a `tokio::task::JoinSet` here.
     pub async fn serve(self, mut shutdown: watch::Receiver<bool>) {
         // `mut` because `Listener::accept` needs `&mut self` on both
         // platforms: a Windows named pipe server instance is consumed by
         // whoever connects to it, so accepting means handing that instance
         // out and creating the next one. See `shep_core::transport::Listener`.
         let Self { mut listener, ctx } = self;
-        // A shutdown signal that was ALREADY `true` before this loop's first
-        // `changed()` call would otherwise never be observed: `changed()`
-        // only resolves on a value newer than the one this receiver has
-        // last seen, and a receiver in fresh-from-the-daemon condition
-        // hasn't seen anything past the value it was constructed with.
+        // A shutdown signal already `true` before the first `changed()` would
+        // otherwise never be observed: `changed()` only resolves on a value
+        // newer than the one this receiver has seen.
         if *shutdown.borrow() {
             return;
         }
@@ -177,8 +100,8 @@ impl RpcServer {
                     }
                 }
                 changed = shutdown.changed() => {
-                    // An `Err` here means the sender dropped — treat that the
-                    // same as an explicit `true`: either way, stop serving.
+                    // An `Err` means the sender dropped: stop serving either
+                    // way.
                     if changed.is_err() || *shutdown.borrow() {
                         break;
                     }
@@ -190,26 +113,19 @@ impl RpcServer {
 
 /// Checks that a connected peer runs as the daemon's own user.
 ///
-// Peer-credential decision (deviation, deliberate): this uses
-// `tokio::net::UnixStream::peer_cred()`, not
-// `nix::sys::socket::getsockopt(PeerCredentials)`. nix 0.29 gates
-// `PeerCredentials` behind `#[cfg(linux_android)]` — on macOS, a tier-1
-// platform (spec §11), that sockopt does not exist and the daemon would not
-// compile. tokio's `UCred` already dispatches to `SO_PEERCRED` on Linux,
-// `getpeereid` on macOS/BSD, and `LOCAL_PEERCRED`/`getpeerucred` elsewhere,
-// needs no new dependency, and adds no unsafe. nix is still used for
-// `geteuid()` below, which has no such split.
+// `UnixStream::peer_cred()` rather than nix's `PeerCredentials`, which nix
+// gates behind `#[cfg(linux_android)]`, so it does not exist on macOS.
+// tokio's `UCred` dispatches to `SO_PEERCRED`, `getpeereid` or
+// `LOCAL_PEERCRED` per platform.
 ///
 /// # Errors
-/// - [`AuthError::NoCredentials`] — the OS refused to report peer credentials.
-/// - [`AuthError::ForeignUid`] — the peer's uid is not the daemon's.
+/// - [`AuthError::NoCredentials`]: the OS would not report peer credentials.
+/// - [`AuthError::ForeignUid`]: the peer's uid is not the daemon's.
 ///
 /// # Platform
 ///
-/// Unix only. There is no Windows counterpart, and there is not meant to be
-/// one: see [`handle_conn`]'s own comment and
-/// [`shep_core::transport`]'s module doc for why the pipe's ACL answers this
-/// question earlier than any post-accept check could.
+/// Unix only. The Windows pipe's ACL answers this question at open time; see
+/// [`shep_core::transport`]'s module doc.
 #[cfg(unix)]
 pub fn check_peer(stream: &tokio::net::UnixStream, daemon_uid: u32) -> Result<u32, AuthError> {
     let cred = stream
@@ -228,41 +144,18 @@ pub fn check_peer(stream: &tokio::net::UnixStream, daemon_uid: u32) -> Result<u3
 
 /// The connecting peer's pid, when the OS will name one.
 ///
-/// # Why this is not folded into [`check_peer`]
+/// Separate from [`check_peer`], which reads the same
+/// [`UCred`](tokio::net::unix::UCred): that answer admits or ends the
+/// connection, and this is a diagnostic that must never do either.
 ///
-/// It reads the same [`UCred`](tokio::net::unix::UCred) that function
-/// already throws all but the uid away from, so folding the two would save
-/// one `getsockopt` per connection. It stays separate because `check_peer`
-/// is an AUTHORISATION decision — its answer either admits the peer or ends
-/// the connection — and this is a diagnostic that must never do either. A
-/// pid the OS declines to report is a `None` here and nothing more; making
-/// it a `check_peer` variant would put a refusal one careless `?` away from
-/// a question that has no security content at all. The saved syscall is
-/// paid back many times over by the handshake round trip that follows.
-///
-/// # What `None` means, and what it does not
-///
-/// Not "no process is there" — that peer exists and has already passed the
-/// uid check. It means the platform has no answer: tokio fills the pid on
-/// Linux, macOS, the BSDs, Solaris and several more, and returns `None`
-/// everywhere else. Callers must degrade honestly rather than treat it as a
-/// fact, which is what [`Contact::Unknown`](crate::dogs::Contact::Unknown)
-/// exists to make hard to get wrong.
-///
-/// # Platform
-///
-/// Unix only, alongside [`check_peer`]. There is no Windows counterpart and
-/// there is not meant to be one: `shep_core::transport`'s module doc argues
-/// that establishing an admitted peer's identity there would need
-/// `ImpersonateNamedPipeClient` and raw FFI, which `#![forbid(unsafe_code)]`
-/// does not permit.
+/// `None` does not mean no process is there, only that the platform has no
+/// answer; callers degrade through
+/// [`Contact::Unknown`](crate::dogs::Contact::Unknown). Unix only.
 #[cfg(unix)]
 #[must_use]
 pub fn peer_pid(stream: &tokio::net::UnixStream) -> Option<u32> {
-    // Every failure is the same answer: an OS that would not say. A pid
-    // wide enough to overflow `u32` is not a thing any of these platforms
-    // produces, and inventing one here rather than dropping it would be
-    // worse than admitting ignorance.
+    // Every failure is the same answer: an OS that would not say. No platform
+    // here produces a pid too wide for `u32`.
     u32::try_from(stream.peer_cred().ok()?.pid()?).ok()
 }
 
@@ -279,12 +172,9 @@ pub fn daemon_uid() -> u32 {
 
 /// Why [`check_peer`] refused a connection.
 ///
-/// `#[non_exhaustive]`: today's two variants cover a credentials read that
-/// failed outright and one that succeeded but named the wrong uid, and a
-/// future check — a group-membership or TLS peer-certificate requirement —
-/// would need its own variant rather than stretching [`Self::ForeignUid`] to
-/// mean something it does not, and shep-daemon is a published library an
-/// out-of-tree matcher should not break for (IR-20).
+/// `#[non_exhaustive]`: a future check, a group membership or a peer
+/// certificate, would need its own variant rather than stretching
+/// [`Self::ForeignUid`] to mean something it does not.
 #[non_exhaustive]
 #[cfg_attr(windows, allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -316,18 +206,12 @@ impl core::error::Error for AuthError {}
 
 /// Error type ending one connection.
 ///
-/// Every variant is terminal: the connection layer logs it (via
-/// [`RpcServer::serve`]'s spawn) and closes the socket. None of these panic
-/// the daemon — a malformed or hostile peer can only ever cost itself its
-/// own connection.
+/// Every variant is terminal: the connection layer logs it and closes the
+/// socket. A malformed or hostile peer can only cost itself its connection.
 ///
-/// `#[non_exhaustive]`: the connection layer already distinguishes seven
-/// failure points across auth, framing, encode/decode, and handshake
-/// timing, and a future one — a TLS handshake failure, or a rate-limit
-/// refusal — would add its own variant rather than overloading
-/// [`Self::Auth`], which is specifically [`check_peer`]'s verdict, and
-/// shep-daemon is a published library an out-of-tree matcher should not
-/// break for (IR-20).
+/// `#[non_exhaustive]`: a future failure point, a TLS handshake or a
+/// rate-limit refusal, would add its own variant rather than overloading
+/// [`Self::Auth`], which is specifically [`check_peer`]'s verdict.
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum ConnError {
@@ -350,7 +234,7 @@ pub enum ConnError {
     HandshakeTimeout,
     /// The peer closed the connection before sending `Hello`.
     NoHandshake,
-    /// The connection's write queue is gone — the writer task exited.
+    /// The connection's write queue is gone: the writer task exited.
     PeerGone,
 }
 
@@ -395,11 +279,9 @@ impl From<AuthError> for ConnError {
     }
 }
 
-// `Decode` and `Encode` both wrap `WireError`, so only one of them could
-// ever claim `impl From<WireError> for ConnError`: the compiler forbids a
-// second one for the same source type, and picking one anyway would make a
-// bare `?` silently mislabel the other direction. Both stay explicit
-// `map_err` calls; see this task's own report.
+// `Decode` and `Encode` both wrap `WireError`, so only one could claim
+// `impl From<WireError> for ConnError` and a bare `?` would silently mislabel
+// the other direction. Both stay explicit `map_err` calls.
 
 impl From<std::io::Error> for ConnError {
     fn from(source: std::io::Error) -> Self {
@@ -412,30 +294,20 @@ impl From<std::io::Error> for ConnError {
 // request, and the writer task joined on every exit path so a protocol-skew
 // refusal is guaranteed to reach the wire before the socket closes.
 async fn handle_conn(stream: ServerStream, ctx: RpcContext) -> Result<(), ConnError> {
-    // Unix only, and its absence on Windows is a deliberate design decision
-    // rather than a gap — `shep_core::transport`'s module doc is the
-    // canonical writeup. In short: on unix the peer is admitted by the
-    // filesystem (`0700` on `$SHEP_HOME/run`) and this is the second layer
-    // behind that; on Windows the pipe's own ACL refuses a foreign user's
+    // Unix only. On Windows the pipe's own ACL refuses a foreign user's
     // open-for-write before a byte reaches this function, so the equivalent
-    // check has already happened, earlier and in the kernel. Adding a
-    // post-accept check there would need `ImpersonateNamedPipeClient` and
-    // raw FFI to re-answer a question the OS already answered.
+    // check has already happened in the kernel.
     #[cfg(unix)]
     check_peer(&stream, daemon_uid())?;
-    // Read once here, off the stream, and carried down to the handshake:
-    // this is the whole of what lets the silence ladder tell a dog that
-    // never reached the socket from one that reached it and would not say
-    // who it was. `None` on Windows, and on any unix whose OS declines to
-    // name a pid — see `peer_pid`, and `dogs::Contact::Unknown` for what a
-    // reader must do with that.
+    // Read once here and carried down to the handshake: this is what lets the
+    // silence ladder tell a dog that never reached the socket from one that
+    // reached it and would not say who it was. `None` on Windows.
     #[cfg(unix)]
     let peer = peer_pid(&stream);
     #[cfg(not(unix))]
     let peer: Option<u32> = None;
-    // Recorded BEFORE a byte is read, deliberately: a peer that connects
-    // and then says nothing at all has still reached this daemon, and that
-    // is exactly the fact the ladder is missing today.
+    // Recorded before a byte is read: a peer that connects and then says
+    // nothing at all has still reached this daemon.
     if let Some(pid) = peer {
         ctx.peer_contacts.connected(pid);
     }
@@ -449,16 +321,14 @@ async fn handle_conn(stream: ServerStream, ctx: RpcContext) -> Result<(), ConnEr
 
     let outcome = converse(&mut frames, &out_tx, conn, peer, &ctx).await;
 
-    // Drop the queue's sender and JOIN the writer before returning, on EVERY
-    // path: a protocol-skew refusal is written by that task, so returning the
-    // error early would close the socket before the client ever saw why.
+    // Drop the sender and join the writer on every path: a protocol-skew
+    // refusal is written by that task, so returning early would close the
+    // socket before the client saw why.
     drop(out_tx);
     let _ = writer.await;
-    // Beside the two lines above for the same reason their comment gives:
-    // this block is on EVERY path out. A smit belongs to the connection that
-    // painted it, and this is the one place that is true of. After the writer
-    // join, so a client that painted and immediately read still sees its own
-    // mark in the reply it was already sent.
+    // On every path out, for the same reason. A smit belongs to the connection
+    // that painted it. After the writer join, so a client that painted and
+    // immediately read still sees its own mark in the reply.
     ctx.supervisor.forget_smits(conn).await;
     outcome
 }
@@ -473,14 +343,10 @@ async fn converse(
     handshake(frames, out, peer, ctx).await?;
     let mut forwarder: Option<JoinHandle<()>> = None;
     let outcome = read_loop(frames, out, conn, ctx, &mut forwarder).await;
-    // EVERY path out of read_loop — Ok or any `?`-propagated Err — lands
-    // here: a live forwarder MUST be aborted, not just dropped. Dropping a
-    // JoinHandle detaches the task rather than stopping it, and a detached
-    // forwarder keeps holding its own clone of `out` forever, which keeps
-    // write_loop's `rx.recv()` from ever observing every sender gone —
-    // which hangs `handle_conn`'s `writer.await` forever, which leaks the
-    // task and the connection's fds and never actually closes the socket.
-    // (Regression: see `a_garbage_frame_after_subscribing_still_closes_the_connection`.)
+    // Every path out of `read_loop` lands here, and a live forwarder must be
+    // aborted rather than dropped: dropping a `JoinHandle` detaches the task,
+    // which keeps its clone of `out` alive, which keeps `write_loop` from ever
+    // seeing every sender gone and hangs `handle_conn`'s `writer.await`.
     if let Some(forwarder) = forwarder {
         forwarder.abort();
     }
@@ -530,11 +396,8 @@ async fn handshake(
         .map_err(|_| ConnError::HandshakeTimeout)?
         .ok_or(ConnError::NoHandshake)??;
     let hello: Hello = decode_frame(&frame).map_err(ConnError::Decode)?;
-    // Ahead of the protocol check, and that ordering is the point: this
-    // records what the peer SENT, not what this daemon made of it. A dog
-    // refused on protocol skew still named itself, and a diagnosis that
-    // forgot so would put it back in the anonymous pile it does not belong
-    // in.
+    // Ahead of the protocol check: this records what the peer sent, not what
+    // this daemon made of it. A dog refused on skew still named itself.
     if hello.dog_name.is_some()
         && let Some(pid) = peer
     {
@@ -548,23 +411,16 @@ async fn handshake(
                 "daemon speaks protocol {PROTOCOL_VERSION}, client sent {}",
                 hello.protocol
             ),
-            // The refusal names our PROTOCOL, which does not say which shep
+            // The refusal names our protocol, which does not say which shep
             // is running. `shep daemon reload` chooses its mechanism by
-            // version, and this is the one path where the ack that would
-            // have carried it never arrives. Same field the ack uses, so a
-            // client cannot learn two versions for one daemon.
+            // version, and this is the one path where the ack never arrives.
             daemon_version: Some(ctx.daemon_version.clone()),
         });
         send(out, &refusal).await?;
-        // The refusal is on the writer's queue before anything else
-        // happens, so a peer that is about to be restarted still learns
-        // why. Then: which dog was that, and what does this daemon owe it?
-        //
-        // `None` is every client that is not a dog, and the CLI is nearly
-        // all of them. A `shep` verb has no way to name a dog here — the
-        // name travels only on `ReconnectingClient`, the type dogs use and
-        // no verb does — so the branch below cannot be reached by an
-        // operator with a stray `$SHEP_DOG_NAME` in their environment.
+        // The refusal is queued before anything else happens, so a peer about
+        // to be restarted still learns why. `dog_name` is `None` for every
+        // client that is not a dog: the name travels only on
+        // `ReconnectingClient`, which no `shep` verb uses.
         match &hello.dog_name {
             Some(dog) => {
                 crate::dogs::record_refused_dog(
@@ -573,10 +429,8 @@ async fn handshake(
                     &ctx.dog_refusals,
                     &ctx.supervisor,
                 );
-                // Into the dog's own log as well as the daemon's. Both
-                // protocol numbers, because "protocol mismatch" without
-                // them tells an operator nothing they can act on, and the
-                // dog's log is where they will look first.
+                // Into the dog's own log too, carrying both protocol numbers:
+                // that log is where an operator looks first.
                 crate::dogs::narrate_by_name(
                     &ctx.supervisor,
                     &ctx.events,
@@ -587,17 +441,10 @@ async fn handshake(
                     ),
                 );
             }
-            // A refused client this daemon cannot restart and would not
-            // want to: an operator running an older `shep` against a newer
-            // daemon, who is already reading the skew in plain English from
-            // their own CLI. `debug!` rather than `warn!`, which this was
-            // until a real reload across a protocol bump measured it: the
-            // CLI polls the socket while it waits for a successor, so ONE
-            // `shep daemon reload` produced 442 of these in 9.8 seconds,
-            // and the daemon's default level is `warn`. The only fact this
-            // adds over `handle_conn`'s own "connection ended" line is the
-            // client's crate version, which is worth carrying and is not
-            // worth waking anybody for.
+            // An operator running an older `shep` already reads the skew from
+            // their own CLI. `debug!`, not `warn!`: the CLI polls while it
+            // waits for a successor, so one reload across a protocol bump
+            // produced 442 of these in 9.8 seconds.
             None => tracing::debug!(
                 client_protocol = hello.protocol,
                 client_version = %hello.client_version,
@@ -608,15 +455,12 @@ async fn handshake(
             client: hello.protocol,
         });
     }
-    // A dog that got in is not stale, whatever this daemon held against it
-    // before — including the restart it was just given, which is exactly
-    // the case that has to clear.
+    // A dog that got in is not stale, including after the restart it was just
+    // given, which is the case that has to clear.
     if let Some(dog) = &hello.dog_name {
-        // Only the TRANSITION is narrated. A dog reconnects — after a
-        // handover, after a daemon restart, after any dropped connection —
-        // and a line per connection would bury the dog's own output in its
-        // own log. `handshook` answers whether this shepherd had already
-        // heard from it.
+        // Only the transition is narrated: a dog reconnects after a handover
+        // or a daemon restart, and a line per connection would bury its own
+        // output in its own log.
         if ctx.dog_refusals.handshook(dog) {
             crate::dogs::narrate_by_name(
                 &ctx.supervisor,
@@ -654,9 +498,9 @@ async fn send<T: Serialize>(out: &mpsc::Sender<Bytes>, value: &T) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
-    // Real time: every test here drives a real UnixStream. Under a paused
-    // clock the runtime auto-advances whenever it goes idle, which can expire
-    // HANDSHAKE_TIMEOUT_MS before the peer's bytes are delivered.
+    // Real time: every test here drives a real socket, and a paused clock
+    // auto-advances when the runtime idles, expiring HANDSHAKE_TIMEOUT_MS
+    // before the peer's bytes arrive.
     use super::*;
     use crate::bus::SharedEvent;
     use crate::fake::{FIRST_SCRIPTED_PID, ProcScript};
@@ -706,13 +550,9 @@ mod tests {
     /// Spawns `handle_conn` over a real connected pair and hands back the
     /// client end.
     ///
-    /// A real transport on both platforms — a socketpair on unix, an actual
-    /// named pipe on Windows — rather than an in-memory duplex, because
-    /// several tests below turn on what a peer sees when the other side
-    /// closes, which only a real transport reproduces. `async` (it was not,
-    /// when it could call the synchronous `UnixStream::pair`) because
-    /// creating a pipe pair means connecting one, and every caller is
-    /// already inside a `#[tokio::test]`.
+    /// A real transport on both platforms, a socketpair on unix and a named
+    /// pipe on Windows, rather than an in-memory duplex: several tests below
+    /// turn on what a peer sees when the other side closes.
     async fn connected(ctx: RpcContext) -> Client {
         let (server, client) = shep_core::transport::connected_pair().await.unwrap();
         tokio::spawn(async move {
@@ -725,7 +565,7 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_acks_a_matching_protocol() {
-        let h = harness(vec![]); // same helper shape as rpc.rs's tests
+        let h = harness(vec![]);
         let mut client = connected(h.ctx.clone()).await;
         client
             .send(&Hello {
@@ -763,10 +603,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_protocol_refusal_carries_the_daemon_version() {
-        // The refusal reports the daemon's PROTOCOL, which says nothing
-        // about which crate version is running. `shep daemon reload` picks
-        // between a handover and a stop-and-start by version, and a protocol
-        // bump is exactly when it is needed, so the refusal has to name it.
+        // `shep daemon reload` picks between a handover and a stop-and-start
+        // by crate version, which the protocol number does not give it.
         let h = harness(vec![]);
         let mut client = connected(h.ctx.clone()).await;
         client
@@ -779,9 +617,8 @@ mod tests {
         let refusal: HelloReply = client.recv().await;
         let err = refusal.expect_err("skew must be refused");
         assert_eq!(err.code, RpcErrorCode::ProtocolMismatch);
-        // The same string the ack would have carried, from the same field:
-        // a client must never learn two different versions for one daemon
-        // depending on whether its handshake was accepted.
+        // The same field the ack uses: a client must never learn two versions
+        // for one daemon.
         assert_eq!(err.daemon_version.as_deref(), Some(&*h.ctx.daemon_version));
     }
 
@@ -876,7 +713,7 @@ mod tests {
             .unwrap();
         h.ctx.events.send(event(ProcessEventKind::Online)).unwrap();
 
-        // Back-to-back arrival is the filtering assertion — no negative wait.
+        // Back-to-back arrival is the filtering assertion: no negative wait.
         let first: ServerFrame = client.recv().await;
         let second: ServerFrame = client.recv().await;
         assert!(matches!(
@@ -917,16 +754,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_garbage_frame_after_subscribing_still_closes_the_connection() {
-        // Regression test (Opus security review, post-Task-5): a live
-        // forwarder holds its own clone of `out`. If a connection error
-        // (garbage frame, oversize frame, ...) after Subscribe skipped
-        // aborting that forwarder, `out_tx`'s drop in `handle_conn` would NOT
-        // be the last sender — write_loop's `rx.recv()` would never see
-        // every sender go away, `handle_conn`'s `writer.await` would hang
-        // forever, and the socket would never actually close. Subscribing
-        // first is what makes that path reachable; the plain
-        // `a_garbage_frame_ends_the_connection_without_panicking` test above
-        // never subscribes, so it could not have caught this.
+        // A live forwarder holds its own clone of `out`. Not aborting it on a
+        // connection error leaves `out_tx`'s drop short of the last sender, so
+        // `writer.await` hangs and the socket never closes. Subscribing first
+        // is what makes that path reachable.
         let h = harness(vec![]);
         let mut client = connected(h.ctx.clone()).await;
         client
@@ -958,28 +789,15 @@ mod tests {
         );
     }
 
-    /// `cfg(unix)`, like [`check_peer`] itself. Windows has no counterpart
-    /// to gate: the pipe's ACL refuses a foreign user's open before
-    /// `handle_conn` is reached at all, so there is no post-accept decision
-    /// here for a test to exercise. See `shep_core::transport`'s module doc.
+    /// `cfg(unix)`, like [`check_peer`] itself: the Windows pipe's ACL
+    /// refuses a foreign user before `handle_conn` is reached at all.
     #[cfg(unix)]
     #[tokio::test]
     async fn peer_credentials_gate_on_uid() {
-        // What this DOES prove: check_peer's own uid-comparison and error
-        // construction are correct — same-uid accepts and hands back the
-        // uid, a mismatched daemon_uid is refused as ForeignUid with both
-        // uids recorded.
-        //
-        // What this does NOT prove: that a connection from an actual
-        // different-uid OS process is rejected. `UnixStream::pair()` always
-        // reports both ends as owned by this test process's own uid (there is
-        // no way to fake the peer side of `SO_PEERCRED`/`getpeereid` — the
-        // kernel derives it from the real socket, and `tokio::net::unix::UCred`
-        // has no public constructor for a synthetic one), so this test can
-        // only vary the `daemon_uid` argument, never the peer's true uid.
-        // Exercising the real cross-uid path needs a second OS user (root in
-        // CI, or two accounts) actually connecting — out of reach for this
-        // crate's test harness; see the report's security-review note.
+        // `UnixStream::pair()` reports both ends as this process's own uid,
+        // and `UCred` has no synthetic constructor, so only the `daemon_uid`
+        // argument can vary: this pins the comparison, not a real cross-uid
+        // connection.
         let (a, _b) = tokio::net::UnixStream::pair().unwrap();
         let me = daemon_uid();
         assert_eq!(check_peer(&a, me).unwrap(), me);
@@ -994,13 +812,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_slow_subscriber_gets_a_dropped_notice_instead_of_hanging_the_bus() {
-        // Adversarial finding #3: bus.rs's `step()` unit test proves the
-        // Lagged->Dropped translation in isolation, but nothing before this
-        // exercised it through the REAL connection stack — CONN_QUEUE
-        // filling, the forwarder parking on `out.send`, and the broadcast
-        // ring (bus.rs's BUS_CAPACITY) actually overflowing for a subscriber
-        // that truly never reads. Real time: real socket, matching this
-        // whole test mod's rule.
+        // Drives the Lagged-to-Dropped translation through the real
+        // connection stack rather than in isolation. Real time: real socket.
         let h = harness(vec![]);
         let mut client = connected(h.ctx.clone()).await;
         client
@@ -1022,10 +835,9 @@ mod tests {
             .await;
         let _: ServerFrame = client.recv().await; // the Subscribed reply
 
-        // Never call client.recv() again until AFTER the flood: CONN_QUEUE
+        // Never call `client.recv()` again until after the flood: CONN_QUEUE
         // fills, the forwarder blocks on `out.send`, and the broadcast ring
-        // (BUS_CAPACITY) takes the overflow from there — the exact
-        // back-pressure chain bus.rs's module comment documents.
+        // takes the overflow from there.
         let flood = crate::bus::BUS_CAPACITY + CONN_QUEUE + 16;
         for i in 0..flood {
             h.ctx
@@ -1040,9 +852,8 @@ mod tests {
                 .unwrap();
         }
 
-        // Resume reading. The count comes from tokio's own Lagged(n) inside
-        // the forwarder, never hand-computed here (no-hand-computed-sequences
-        // rule) — this only asserts a Dropped notice arrives and is nonzero.
+        // Resume reading. The count comes from tokio's own `Lagged(n)` inside
+        // the forwarder, never hand-computed here.
         let dropped = loop {
             match client.recv::<ServerFrame>().await {
                 ServerFrame::Event(BusEvent::Dropped { count }) => break count,
@@ -1058,18 +869,13 @@ mod tests {
 
     // --- G8: what a refused DOG's handshake costs it ------------------
     //
-    // A refused handshake never reaches a request, so `Request::DogConfig`'s
-    // name — the one place a dog otherwise identifies itself — is
-    // unreachable on exactly the path where the daemon has to know which
-    // dog it just refused. `Hello.dog_name` is what closes that, and these
-    // four tests are what the daemon does with it.
+    // A refused handshake never reaches a request, so `Hello.dog_name` is the
+    // only place the daemon learns which dog it just refused.
 
     /// Registers `name` as a built-in dog and returns the row it produced.
     ///
-    /// Straight through [`crate::supervisor::SupervisorHandle::start_dog`]
-    /// rather than through `Request::EnableDog`, because the request path
-    /// would need a handshaken connection of its own and the point here is
-    /// what a REFUSED one does.
+    /// Straight through [`crate::supervisor::SupervisorHandle::start_dog`]:
+    /// `Request::EnableDog` would need a handshaken connection of its own.
     async fn start_dog(ctx: &RpcContext, name: &str) -> ProcessInfo {
         let spec = crate::dogs::DogSpec {
             name: name.to_string(),
@@ -1085,11 +891,10 @@ mod tests {
     /// One refused handshake, announcing `dog` (or nothing, for a client
     /// that is not a dog), returning once the daemon has closed on it.
     ///
-    /// The close is the forcing mechanism for everything synchronous
-    /// (IR-46): the daemon records the refusal and decides what it owes the
-    /// dog BEFORE it returns the error that closes the socket, so a caller
-    /// that has seen the close can read the verdict without racing it. The
-    /// restart itself runs on its own task and needs [`await_dog`].
+    /// The daemon records the refusal and decides what it owes the dog before
+    /// it returns the error that closes the socket, so a caller that has seen
+    /// the close can read the verdict without racing it. The restart itself
+    /// runs on its own task and needs [`await_dog`].
     async fn refuse_as(ctx: &RpcContext, dog: Option<&str>) {
         let mut client = connected(ctx.clone()).await;
         client
@@ -1121,10 +926,8 @@ mod tests {
     /// [`RECV_TIMEOUT`], returning how long it took.
     ///
     /// The restart a refusal triggers runs on its own task, so there is no
-    /// handle to await; polling a real condition against a hard ceiling is
-    /// the forcing mechanism (IR-46). The elapsed time is returned because
-    /// the never-restart-twice test below sizes its negative window against
-    /// it rather than against a guess.
+    /// handle to await. The elapsed time is returned because the
+    /// never-restart-twice test below sizes its negative window against it.
     async fn await_dog(ctx: &RpcContext, name: &str, pid: u32) -> Duration {
         let began = tokio::time::Instant::now();
         let seen = tokio::time::timeout(RECV_TIMEOUT, async {
@@ -1144,15 +947,11 @@ mod tests {
         began.elapsed()
     }
 
-    /// fails if a refused dog is left mute. This is G8's step 2, and the
-    /// daemon is the only party that can take it: the dog's own client has
-    /// stopped rather than spinning (that is `ReconnectingClient`'s half),
-    /// and a dog carried across a handover is a live process holding a dead
-    /// socket that nothing else will replace.
+    /// fails if a refused dog is left mute. The daemon is the only party that
+    /// can restart it: the dog's own client has stopped rather than spinning.
     ///
-    /// The pid moving is the assertion, not the restart count: a restart
-    /// that re-registered the row without re-spawning would leave a dog
-    /// exactly as mute as it was.
+    /// The pid moving is the assertion, not the restart count: a restart that
+    /// re-registered the row without re-spawning leaves the dog as mute.
     #[tokio::test]
     async fn a_refused_dog_is_restarted_once_from_the_binary_on_disk() {
         let h = harness(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
@@ -1168,20 +967,13 @@ mod tests {
         );
     }
 
-    /// fails if the daemon restarts a dog it has already restarted — the
-    /// spin G8 exists to forbid. A second refusal proves the binary on disk
-    /// cannot satisfy this daemon either, because the restart already ran
-    /// it, so a third attempt is not optimism.
+    /// fails if the daemon restarts a dog it has already restarted, the spin
+    /// G8 forbids. A second refusal proves the binary on disk cannot satisfy
+    /// this daemon either, since the restart already ran it.
     ///
-    /// Three independent things have to hold, and each catches a different
-    /// mutation. The dog must be REPORTED stale, which a daemon that
-    /// silently stopped restarting would fail. Its pid must not move inside
-    /// a window sized against the restart that really happened earlier in
-    /// this same test — a negative assertion is only as good as its window,
-    /// and a measured one scales with a loaded runner where a fixed number
-    /// would not. And the harness is scripted with exactly the two spawns
-    /// G8 permits, so a third would fail to spawn and take the dog out of
-    /// `Online` even if it somehow beat the window.
+    /// The pid must not move inside a window sized against the restart that
+    /// really happened earlier in this test, and the harness is scripted with
+    /// exactly the two spawns G8 permits.
     #[tokio::test]
     async fn a_twice_refused_dog_is_reported_stale_and_never_restarted_again() {
         let h = harness(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
@@ -1197,9 +989,8 @@ mod tests {
             "the second refusal must be reported, not swallowed"
         );
 
-        // Ten times the restart that DID happen, floored so a machine fast
-        // enough to make the measurement meaningless still watches for a
-        // real interval.
+        // Ten times the restart that did happen, floored so a fast machine
+        // still watches for a real interval.
         let window = (restart_took * 10).max(Duration::from_millis(200));
         tokio::time::sleep(window).await;
 
@@ -1216,11 +1007,8 @@ mod tests {
         );
     }
 
-    /// fails if a dog that got back in stays condemned. The restart G8 owes
-    /// a refused dog is worth nothing if the successful handshake it
-    /// produces does not clear the mark: the dog would be reported stale
-    /// forever while answering perfectly, and a LATER daemon that refused
-    /// it would skip straight past its one restart.
+    /// fails if a dog that got back in stays condemned. Without the mark
+    /// clearing, the dog is reported stale forever while answering perfectly.
     #[tokio::test]
     async fn a_dog_that_handshakes_is_no_longer_stale() {
         let h = harness(vec![]);
@@ -1245,11 +1033,9 @@ mod tests {
         );
     }
 
-    /// fails if an operator running an older `shep` has a dog restarted
-    /// under them. The CLI cannot name a dog — the name travels only on
-    /// `ReconnectingClient`, which no verb uses — so a refusal carrying no
-    /// name must leave the flock exactly as it was, however many of them
-    /// arrive.
+    /// fails if an operator running an older `shep` has a dog restarted under
+    /// them. The CLI cannot name a dog, so a refusal carrying no name must
+    /// leave the flock exactly as it was.
     #[tokio::test]
     async fn a_refused_client_that_is_not_a_dog_touches_nothing() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -1273,45 +1059,12 @@ mod tests {
     /// fails if a dog that is CONNECTED to this shepherd is reported as a
     /// binary that cannot talk to it.
     ///
-    /// # The incident, in full
-    ///
-    /// An operator ran a log-rotation dog under shep. shep rendered it
-    /// `silent`, restarted it once, then said: *the binary on disk cannot
-    /// talk to this shep either, so this dog is stale — rebuild or reinstall
-    /// it*. Every clause after "has still not answered it" was false. The
-    /// dog was connected the whole time and correctly serving `DogConfig`
-    /// and `ListFlock`; it was never refused anything. Its only defect was
-    /// `Client::connect`, which sends `Hello.dog_name: None`, so the
-    /// handshake's `handshook` call never fired. The operator spent two days
-    /// reinstalling, because the message told them to, and reinstalling
-    /// could never have fixed it.
-    ///
-    /// # Why this is not a `DogRefusals` test
-    ///
-    /// Because the isolated logic was already RIGHT. `has_handshook` was
-    /// correctly false, the ladder correctly fired, and the verdict was
-    /// correctly `Stale`. What was wrong was the sentence drawn from it. So
-    /// the case has to run the real pieces end to end — a real socket whose
-    /// peer credentials this daemon really reads, a real `Hello` with no
-    /// `dog_name`, a real request served over that same connection, and the
-    /// real ladder — and then read what the operator would have read.
-    ///
-    /// # Why the harness pins a pid
-    ///
-    /// Peer credentials on a real socket name the process that opened it,
-    /// which here is the test itself. `harness_at_pid` makes the scripted
-    /// dog run at that same pid, so the daemon's two facts — "this dog runs
-    /// at pid P" and "this is what pid P has sent me" — are about one
-    /// process, exactly as they are in production.
-    ///
-    /// # Why this is unix only
-    ///
-    /// The whole case turns on the daemon reading a peer's pid off the
-    /// socket, and only the unix tier does that. On Windows `peer_pid`
-    /// answers `None` by design, `from_pid` answers [`Contact::Unknown`],
-    /// and the ladder reaches `Silence::Unattributed` instead, which is
-    /// covered by `dogs`' own tests on every platform. Running this there
-    /// would assert an attribution that tier deliberately does not make.
+    /// End to end rather than against `DogRefusals`: the ladder's verdict was
+    /// already right and only the sentence drawn from it was wrong.
+    /// `harness_at_pid` runs the scripted dog at this test's own pid, so the
+    /// peer credentials the daemon reads name one process. Unix only:
+    /// `peer_pid` answers `None` on Windows and the ladder reaches
+    /// [`Silence::Unattributed`](crate::dogs::Silence::Unattributed) instead.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_dog_that_connects_without_naming_itself_is_not_called_a_stale_binary() {
@@ -1325,10 +1078,9 @@ mod tests {
             ],
             std::process::id(),
         );
-        // This case drives a real socket, so it cannot pause its clock to
-        // walk the attribution warm-up. It is about what the ladder SAYS
-        // about an anonymous connection, not about the gate in front of it,
-        // and `dogs::a_dog_that_never_calls_still_earns_its_rebuild_after_the_warm_up`
+        // A real socket cannot pause its clock, so the attribution warm-up is
+        // forced rather than walked;
+        // `dogs::a_dog_that_never_calls_still_earns_its_rebuild_after_the_warm_up`
         // covers the boundary.
         h.ctx.peer_contacts.force_warm();
         let dog = start_dog(&h.ctx, "log-rotate").await;
@@ -1342,8 +1094,7 @@ mod tests {
             .clone()
             .expect("a dog's listing resolves its log paths");
 
-        // Exactly what the dog in the incident sent: the current protocol,
-        // a real client version, and no `dog_name` at all.
+        // The current protocol, a real client version, and no `dog_name`.
         let mut client = connected(h.ctx.clone()).await;
         client
             .send(&Hello {
@@ -1355,8 +1106,7 @@ mod tests {
         let ack: HelloReply = client.recv().await;
         ack.expect("an anonymous handshake on the current protocol is ACCEPTED, not refused");
 
-        // And it works. This is the half the old message denied outright,
-        // so the test states it rather than assuming it.
+        // And it serves requests, which is the half the verdict has to admit.
         client
             .send(&Envelope {
                 id: 1,
@@ -1385,9 +1135,9 @@ mod tests {
             "no `dog_name` means no handshake was recorded, which is the whole trap"
         );
 
-        // The real ladder, walked over two whole budgets. Instants rather
-        // than a paused clock: the connection above is a real socket, and a
-        // paused runtime auto-advances whenever it idles.
+        // The real ladder over two whole budgets. Instants rather than a
+        // paused clock: the connection above is a real socket, and a paused
+        // runtime auto-advances whenever it idles.
         let mut seen = crate::dogs::SilentDogs::default();
         let t0 = tokio::time::Instant::now();
         let ladder = async |seen: &mut crate::dogs::SilentDogs, at| {
@@ -1412,9 +1162,8 @@ mod tests {
             "the ladder's verdict is unchanged; what changes is what it SAYS"
         );
 
-        // What the operator reads. The dog's own log, which is the file the
-        // verdict tells them to open and which could not hold a word of this
-        // before.
+        // What the operator reads: the dog's own log, the file the verdict
+        // tells them to open.
         let written = std::fs::read_to_string(&err_log).expect("the narration must reach the log");
         assert!(
             written.contains("[shep]"),

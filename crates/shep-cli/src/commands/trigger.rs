@@ -1,24 +1,12 @@
 //! `trigger`: send a named action to matched sheep over the shepherd channel
 //! and report what each app answered.
 //!
-//! One verb, one call site, so unlike `lifecycle`/`logs`/`query` this module
-//! carries no shared `request_and_render` helper of its own — inlining the
-//! one match `trigger` needs reads more plainly than a generic wrapper
-//! nothing else here would call.
+//! Sent with [`TRIGGER_DEADLINE`], not the client's 5s default: the daemon
+//! waits on every matched sheep's own `AppConfig::action_timeout`, which can
+//! be configured up to 58s.
 //!
-//! Sent with [`TRIGGER_DEADLINE`] rather than the client's 5s default: the
-//! daemon waits on every matched sheep's own `action_timeout`
-//! (`AppConfig::action_timeout`), which can be configured up to 58s, and the
-//! default budget would abandon a reply the daemon is still honestly
-//! building. See that constant's own doc for the exact margin.
-//!
-//! A row's own outcome — `Replied`, `NoChannel`, `Skipped`, `TimedOut` — is
-//! never a request failure: the daemon reports it per matched sheep,
-//! following `Reopen`/`Flush`'s own precedent, so `shep trigger` exits
-//! non-`Success` only when the RPC itself failed (a malformed selector
-//! caught locally, a selector that matched nothing, a daemon this client
-//! could not reach). What each row says is `TriggeredRows`'s job
-//! (`output/rows.rs`), not this module's.
+//! A row's own outcome is never a request failure. `shep trigger` exits
+//! non-`Success` only when the RPC itself failed.
 
 use shep_client::{Client, TRIGGER_DEADLINE};
 use shep_core::protocol::{Request, Response, SelectorSpec};
@@ -31,11 +19,8 @@ use crate::output::{Streams, TriggeredRows, emit, write_outcome};
 /// Sends `args.action` (and `args.params`, if any) to the sheep matching
 /// `args.selector`, and renders one row per match.
 ///
-/// `action`/`params` are carried to the daemon exactly as typed — free-form
-/// and unvalidated on this side, matching the wire's own
-/// `Request::Trigger`, which the daemon never parses either. An app that
-/// does not recognize the action name is expected to say so in its own
-/// reply.
+/// `action` and `params` are carried exactly as typed: neither this side nor
+/// the daemon parses them.
 pub async fn trigger(client: &Client, streams: &mut Streams<'_>, args: &TriggerArgs) -> ExitCode {
     let selector = match parse_selector(streams, &args.selector) {
         Ok(selector) => SelectorSpec::from(&selector),
@@ -87,9 +72,6 @@ mod tests {
     }
 
     /// `"/[/"` is one of the only three inputs the selector grammar rejects.
-    /// A verb that skipped the client-side parse would send it and exit
-    /// `NotFound` instead of `Usage`, and the daemon would see a request it
-    /// never should have.
     #[tokio::test]
     async fn a_malformed_selector_exits_usage_without_a_round_trip() {
         let dir = tempfile::tempdir().unwrap();
@@ -113,11 +95,6 @@ mod tests {
         );
     }
 
-    /// A selector that matched no registered sheep is the one way `trigger`
-    /// fails as a whole request (`shep-daemon`'s own `trigger` returns
-    /// `SupervisorError::NotFound` from `selector_of` exactly as every other
-    /// selector-taking verb does) — distinct from a matched sheep with no
-    /// channel, which is a `NoChannel` *row*, not a failure.
     #[tokio::test]
     async fn a_not_found_reply_exits_not_found_rather_than_being_swallowed() {
         let dir = tempfile::tempdir().unwrap();
@@ -139,15 +116,8 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    /// The envelope's own `body`, not just that the call succeeded: a
-    /// selector converted with the wrong helper, an action silently dropped,
-    /// or `params` mixed up with `action` all still get a reply from the
-    /// fake daemon (it always answers `Pong`) and only this catches them.
-    /// The deadline is asserted alongside for the same reason
-    /// `lifecycle::start_asks_for_the_longer_deadline` checks its own: a
-    /// `trigger` sent with the client's plain 5s default would abandon a
-    /// reply the daemon is still honestly building for a sheep with a long
-    /// `action_timeout`.
+    /// The fake daemon always answers `Pong`; only the captured envelope
+    /// catches a dropped field.
     #[tokio::test]
     async fn the_request_carries_the_selector_action_params_and_trigger_deadline() {
         let dir = tempfile::tempdir().unwrap();
@@ -180,11 +150,8 @@ mod tests {
         );
     }
 
-    /// A response this client does not recognise (the fake daemon's generic
-    /// `Pong`, standing in for a `Response` variant `trigger`'s `match` has
-    /// no arm for) must not be read as any of the four outcomes — it is
-    /// `Internal`, the same rule every other verb's `extract` follows for
-    /// `Response`'s `#[non_exhaustive]`.
+    /// The fake daemon's `Pong` stands in for a `Response` variant this
+    /// `match` has no arm for.
     #[tokio::test]
     async fn an_unrecognised_response_exits_internal() {
         let dir = tempfile::tempdir().unwrap();
