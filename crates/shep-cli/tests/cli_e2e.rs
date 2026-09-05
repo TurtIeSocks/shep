@@ -7541,9 +7541,15 @@ fn a_sudo_startup_without_home_carries_the_target_users_home_not_this_processes(
     assert!(!output.status.success(), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     let target_home = nobody.dir.join(".shep");
+    let refusal = format!(
+        "error[usage]: no directory at {}; create it first (any shep verb run as nobody \
+         creates that user's own ~/.shep), or pass --home with the $SHEP_HOME this unit \
+         should carry",
+        target_home.display()
+    );
     assert!(
-        stderr.contains(target_home.to_str().unwrap()),
-        "the unit's home is nobody's own: {stderr}"
+        stderr.lines().any(|line| line == refusal),
+        "the refusal names nobody's own home and both ways out: {stderr}"
     );
     assert!(
         !stderr.contains(fake_root_home.path().to_str().unwrap()),

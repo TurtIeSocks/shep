@@ -144,6 +144,10 @@ pub fn startup(
         Ok(plan) => plan,
         Err(refusal) => return refuse(streams, refusal.code, &refusal.message),
     };
+    // Created before the privilege and existing-unit checks on purpose.
+    // An unprivileged run prints `sudo ... --home <default>`, which
+    // `ensure_home` refuses unless the default exists. Every other verb
+    // creates it before doing anything, too.
     if let Some(paths) = plan.own_default_home.clone()
         && let Err(refusal) = crate::create_default_home(streams, paths)
     {
