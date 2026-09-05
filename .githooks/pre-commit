@@ -14,12 +14,24 @@
 
 command -v typos >/dev/null 2>&1 || exit 0
 
+# What is staged, not what is in the working tree. The two differ exactly
+# when it matters: an unstaged correction would let a staged misspelling
+# through, and an unstaged misspelling would refuse a clean staged change.
+# `checkout-index` writes the index's own blobs under a temporary prefix
+# and typos reads those, from inside it, so the paths it reports are the
+# repository's own.
+#
 # NUL-delimited end to end. A plain `xargs` splits on every kind of
 # whitespace, and this repository tracks three files with spaces in their
 # names under docs/shep-design/: fed through `printf '%s\n' | xargs`, each
 # one arrived at typos as several fragments, every fragment was "not
 # found", and the commit was refused for a typo that did not exist.
-if git diff --cached -z --name-only --diff-filter=ACMR | grep -qcz .; then
-    git diff --cached -z --name-only --diff-filter=ACMR \
-        | xargs -0 typos --config _typos.toml --
+if ! git diff --cached -z --name-only --diff-filter=ACMR | grep -qz .; then
+    exit 0
 fi
+staged=$(mktemp -d) || exit 0
+trap 'rm -rf "$staged"' EXIT
+git diff --cached -z --name-only --diff-filter=ACMR \
+    | git checkout-index -z --stdin --prefix="$staged/"
+config=$(git rev-parse --show-toplevel)/_typos.toml
+cd "$staged" && find . -type f -print0 | xargs -0 typos --config "$config" --
