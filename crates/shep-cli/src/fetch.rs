@@ -76,9 +76,13 @@ impl fmt::Debug for Target {
 pub enum FetchError {
     /// `url` did not parse as an absolute `http://`/`https://` URL. Carries
     /// a human-readable reason, never the raw bytes of a malformed input.
-    /// The reason usually quotes `url`; the one refusal that does not is
-    /// the `user:pass@` authority, whose whole point is that the text
-    /// carries a credential.
+    ///
+    /// The reason usually quotes `url`, and does not in the two cases
+    /// where the text itself may be the secret: an authority carrying
+    /// `user@` or `user:pass@`, and a url refused on its scheme while
+    /// holding an `@` anywhere. The second is the backstop for the first,
+    /// since [`url_carries_credentials`] reads an authority and a url far
+    /// enough off the grammar is one it can misread.
     Url(String),
     /// The connection failed, the TLS handshake failed, or the response
     /// was not well-formed HTTP: no parseable status line, a header block
