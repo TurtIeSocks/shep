@@ -9153,12 +9153,19 @@ const DIAL_INTERVAL: Duration = Duration::from_millis(5);
 /// disappear, since a rebind would race the predecessor's socket file and
 /// lose whatever connection a client had already made.
 ///
-/// Two probers, because that is two questions and no one instrument answers
-/// both. The dialer asks the property itself: `connect(2)` on the address is
-/// what "still bound" MEANS, it cannot be confused with anything happening
-/// after the connection is up, and every refusal it collects is fatal. The
-/// pinger asks the other half, that a request still gets served, and its
-/// failures are counted rather than read.
+/// Two probers and one file check, because that is three questions and no
+/// one instrument answers them all. The dialer asks whether the address
+/// stays reachable: `connect(2)` on it is what "still bound" MEANS, it
+/// cannot be confused with anything happening after the connection is up,
+/// and every refusal it collects is fatal. What it can see is an outage at
+/// least `DIAL_INTERVAL` wide, and a sustained one is also caught upstream
+/// by `assert_success(&reloaded)`, since the reload's own successor wait
+/// dials the same path. A REBIND at the same path is narrower than that:
+/// unlink and bind again take a microsecond, and a rebind passed the dialer
+/// 10 of 10 when review tried it. So the socket file's inode is compared
+/// before and after, which a fresh bind cannot keep. The pinger asks the
+/// last half, that a request still gets served, and its failures are
+/// counted rather than read.
 ///
 /// Counted because they cannot be read. `shep ping` renders "shepherd
 /// offline" on stdout and exits 5 with an EMPTY stderr for every reason it
@@ -9201,6 +9208,15 @@ fn the_control_socket_accepts_throughout_a_handover() {
     // window.
     let deadline = Instant::now() + Duration::from_secs(8);
     let socket = dir.path().join("run").join("shep.sock");
+    // The file's identity, taken before anything happens to it. A successor
+    // that binds a fresh listener instead of adopting the carried one has to
+    // unlink this file and create it again, which gives it a new inode, and
+    // that is a microsecond of work no poller can be relied on to land in.
+    // The dialer below measures an outage; this measures a rebind.
+    let inode_before = std::fs::metadata(&socket)
+        .expect("the control socket must exist before the handover")
+        .ino();
+    let dial_socket = socket.clone();
     let dialer = std::thread::spawn(move || {
         let mut refused = Vec::new();
         let mut dials = 0_usize;
@@ -9213,7 +9229,7 @@ fn the_control_socket_accepts_throughout_a_handover() {
             // answer wanted here is the syscall's: asking for more of the
             // exchange would put it back in the same bucket as everything
             // else that can go wrong, which is the whole bug being fixed.
-            if let Err(err) = std::os::unix::net::UnixStream::connect(&socket) {
+            if let Err(err) = std::os::unix::net::UnixStream::connect(&dial_socket) {
                 refused.push(format!("dial {dials}: {:?}: {err}", err.kind()));
             }
             std::thread::sleep(DIAL_INTERVAL);
@@ -9266,6 +9282,19 @@ fn the_control_socket_accepts_throughout_a_handover() {
         !reload_aside.contains("starting one instead")
             && !reload_aside.contains("stopping and starting instead"),
         "this case is about the handover arm and the reload took the other one: {reload_aside}"
+    );
+    // Same file, same inode: the successor adopted the carried listener.
+    // Review of this case found that a rebind at the same path (drop the
+    // inherited listener, unlink, bind fresh) passed the dialer 10 of 10,
+    // because the gap it opens is far narrower than `DIAL_INTERVAL`. The
+    // inode is the deterministic reading of the same property.
+    let inode_after = std::fs::metadata(&socket)
+        .expect("the control socket must still exist after the handover")
+        .ino();
+    assert_eq!(
+        inode_after, inode_before,
+        "the successor bound a fresh listener instead of adopting the carried one: \
+         the socket file's inode changed across the handover"
     );
 
     // What the listener crossing the exec actually buys, and what it does
