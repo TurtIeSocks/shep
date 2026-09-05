@@ -39,7 +39,7 @@ use shep_core::protocol::{
 use shep_core::status::ProcStatus;
 
 use super::field::{FieldKind, FieldSet};
-use super::pane::{ConfigPane, Lock, PaneEdit, PanePending, PaneTarget};
+use super::pane::{ConfigPane, FieldValue, Lock, PaneEdit, PanePending, PaneTarget};
 use super::theme::Palette;
 use super::viewport::Viewport;
 use crate::commands::settings::{SettingEdit, SettingField, SettingsSnapshot, settings_field_set};
@@ -542,8 +542,10 @@ pub enum Sent {
         ticket: u64,
         /// The field that moves.
         key: String,
-        /// Its new value, in the shape that field serializes as.
-        value: serde_json::Value,
+        /// Its new value, in the shape that field serializes as. Wrapped,
+        /// so a `{:?}` of this enum cannot print it: `cwd` and `script`
+        /// hold a home directory and `args` holds a token (IR-41).
+        value: FieldValue,
         /// Proof the control gate was open.
         authority: WriteAuthority,
     },
@@ -610,7 +612,10 @@ impl Sent {
             } => Request::SetSheepField {
                 name: name.clone(),
                 key: key.clone(),
-                value: value.clone(),
+                // Unwrapped only here, at the wire. See `FieldValue` for
+                // why the protocol's own field is a bare `Value` while
+                // everything above it is not.
+                value: value.as_value().clone(),
             },
             Self::SetEnv {
                 name, key, value, ..
@@ -7655,6 +7660,53 @@ mod tests {
         assert!(
             notice.to_string().contains("the store is locked"),
             "{notice:?}"
+        );
+    }
+
+    /// fails if the value a write carries reaches a `{:?}` (IR-41).
+    ///
+    /// The leak this closes was one hop outside the boundary drawn when
+    /// `PaneEdit` got a hand-written redaction: the same value travelled on
+    /// into `Sent::ApplyField`, which derives `Debug`, and printed
+    /// `value: String("/home/ada/secret-project")` in the clear. Asserted
+    /// on the whole `Effect`, which is what a diagnostic would print, and
+    /// not on the value alone -- the point is that no wrapper between here
+    /// and there unwraps it.
+    ///
+    /// `Sent::SetEnv` is here for the same reason and was never leaking:
+    /// `EnvValue` has redacted itself since Task 4.
+    #[test]
+    fn a_write_effects_debug_names_no_value() {
+        let mut app = fixtures::app_in_sheep_pane_with_control();
+        pane_to(&mut app, "cwd");
+        let _ = app.update(Msg::Key(KeyPress::Confirm));
+        for _ in 0..40 {
+            let _ = app.update(Msg::Key(KeyPress::TextBackspace));
+        }
+        for typed in "/home/ada/secret-project".chars() {
+            let _ = app.update(Msg::Key(KeyPress::TextChar(typed)));
+        }
+        let _ = app.update(Msg::Key(KeyPress::TextApply));
+        let field = app.update(Msg::Key(KeyPress::Confirm));
+        assert_eq!(
+            format!("{field:?}"),
+            "Send(ApplyField { name: \"web\", ticket: 0, key: \"cwd\", \
+             value: FieldValue(<string>), authority: WriteAuthority(()) })"
+        );
+
+        let mut app = fixtures::app_in_sheep_pane_with_control();
+        pane_to(&mut app, "env");
+        let _ = app.update(Msg::Key(KeyPress::Confirm));
+        let _ = app.update(Msg::Key(KeyPress::Confirm));
+        for typed in "hunter2".chars() {
+            let _ = app.update(Msg::Key(KeyPress::TextChar(typed)));
+        }
+        let _ = app.update(Msg::Key(KeyPress::TextApply));
+        let env = app.update(Msg::Key(KeyPress::Confirm));
+        assert_eq!(
+            format!("{env:?}"),
+            "Send(SetEnv { name: \"web\", ticket: 0, key: \"DB_HOST\", \
+             value: Some(EnvValue(<7 bytes>)), authority: WriteAuthority(()) })"
         );
     }
 

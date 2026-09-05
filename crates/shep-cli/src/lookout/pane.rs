@@ -80,6 +80,63 @@ pub enum PaneRow {
     Field(usize),
 }
 
+/// One config field's new value, on its way out of the pane.
+///
+/// A newtype for the reason [`EnvValue`] is one, and it is the same
+/// argument reaching one hop further than it did. `cwd` and `script`
+/// routinely hold a home directory and `args` holds a token, so
+/// [`ConfigPane`]'s own `Debug` already withholds the map these are lifted
+/// out of. A bare [`Value`] then travelled from [`PaneEdit`] into
+/// `Sent::ApplyField`, which derives `Debug`, and printed
+/// `value: String("/home/ada/secret-project")` in the clear. Two
+/// hand-written redactions on two types, one of which was missed, is what
+/// this replaces: the protection now rides the value wherever it goes.
+///
+/// **The WIRE field is deliberately still a bare [`Value`]**
+/// (`Request::SetSheepField`). `env` is the one field `AppConfig`'s own
+/// `Debug` redacts, and `cwd` is printed in the clear by every request that
+/// carries a whole config, so a newtype there would protect one copy of a
+/// value the protocol prints three other ways. This one guards lookout,
+/// where the rule really is that a live value is never printed.
+///
+/// `Debug` is manual and redacted (IR-41), exact-string-tested below. It
+/// names the JSON TYPE and nothing else, which is what a diagnostic needs
+/// and is not a value.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FieldValue(Value);
+
+impl FieldValue {
+    /// The value, for the request that carries it.
+    #[must_use]
+    pub fn as_value(&self) -> &Value {
+        &self.0
+    }
+}
+
+impl From<Value> for FieldValue {
+    fn from(value: Value) -> Self {
+        Self(value)
+    }
+}
+
+/// Prints the JSON type and never the value -- see the type doc for why.
+/// Exact-string-tested below (`a_field_values_debug_names_no_value`) so a
+/// future `#[derive(Debug)]` fails that test instead of silently reopening
+/// the leak.
+impl core::fmt::Debug for FieldValue {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let kind = match &self.0 {
+            Value::Null => "null",
+            Value::Bool(_) => "bool",
+            Value::Number(_) => "number",
+            Value::String(_) => "string",
+            Value::Array(_) => "array",
+            Value::Object(_) => "object",
+        };
+        write!(f, "FieldValue(<{kind}>)")
+    }
+}
+
 /// One edit, ready to send.
 ///
 /// Two variants, and they leave by their own doors: a [`Self::Set`] as a
@@ -94,22 +151,20 @@ pub enum PaneRow {
 /// vanished from `overridden` the moment it landed and the `*` this pane
 /// draws never appeared for it.
 ///
-/// `Debug` is MANUAL and redacted (IR-41), exact-string-tested below. It
-/// prints the field name and never the value. `value` on a [`Self::Set`] is
-/// a live config value -- `cwd` and `script` routinely carry a home
-/// directory, `args` a token -- which is the same reasoning
-/// [`ConfigPane`]'s own `Debug` already gives for the map this is lifted
-/// out of. [`Self::SetEnv`] is stricter still: the type carries an
-/// [`EnvValue`], so even a derived `Debug` would have redacted it, and this
-/// one does not print it at all.
-#[derive(Clone, PartialEq, Eq)]
+/// `Debug` is DERIVED, and safe because both value types redact themselves:
+/// [`FieldValue`] names a JSON type and [`EnvValue`] names a byte count.
+/// It was manual until 2026-09-05, which protected this type and nothing
+/// downstream of it -- `Sent::ApplyField` held the same value behind a
+/// derived `Debug` and printed it. One mechanism on the value beats two on
+/// the types that carry it; see [`FieldValue`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaneEdit {
     /// Set the config field `key` to `value`.
     Set {
         /// The field.
         key: String,
         /// The new value, already typed to the field's kind.
-        value: Value,
+        value: FieldValue,
     },
     /// Set the env key `key`, or with [`None`] remove it.
     SetEnv {
@@ -118,23 +173,6 @@ pub enum PaneEdit {
         /// The value, or [`None`] to remove the key.
         value: Option<EnvValue>,
     },
-}
-
-/// Prints the key and never the value -- see the type doc for why.
-/// Exact-string-tested below (`a_pane_edits_debug_names_no_value`) so a
-/// future `#[derive(Debug)]` fails that test instead of silently reopening
-/// the leak.
-impl core::fmt::Debug for PaneEdit {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Set { key, .. } => write!(f, "PaneEdit::Set {{ key: {key:?} }}"),
-            Self::SetEnv { key, value } => write!(
-                f,
-                "PaneEdit::SetEnv {{ key: {key:?}, removes: {} }}",
-                value.is_none()
-            ),
-        }
-    }
 }
 
 impl PaneEdit {
@@ -614,7 +652,7 @@ impl ConfigPane {
             Some(PanePending::Armed {
                 edit: PaneEdit::Set { key, value },
                 ..
-            }) if *key == field.key => Some(value),
+            }) if *key == field.key => Some(value.as_value()),
             _ => None,
         };
         let current = armed_here.or_else(|| self.values.get(&field.key));
@@ -635,7 +673,7 @@ impl ConfigPane {
         };
         let edit = PaneEdit::Set {
             key: field.key.clone(),
-            value: next,
+            value: next.into(),
         };
         let text = self.confirm_text(&edit);
         self.pending_edit = Some(PanePending::Armed {
@@ -713,7 +751,10 @@ impl ConfigPane {
             },
             (_, text) => Value::String(text.to_owned()),
         };
-        let edit = PaneEdit::Set { key, value };
+        let edit = PaneEdit::Set {
+            key,
+            value: value.into(),
+        };
         let text = self.confirm_text(&edit);
         self.pending_edit = Some(PanePending::Armed {
             edit,
@@ -822,7 +863,27 @@ impl ConfigPane {
         });
     }
 
-    /// The question an armed edit reads as, in what it costs.
+    /// The question an armed edit reads as.
+    ///
+    /// **It names the field's CLASS, not what this write will do**, and
+    /// the two are not the same thing. `apply_group` is a fact about the
+    /// field; whether a given write reaches the running child is a fact
+    /// about the flock, and only the shepherd has it. A `Live` field parks
+    /// when the config subset it would reach cannot normalize on its own,
+    /// and `autostart` is `NextSpawn` and yet in force the moment it lands.
+    /// This sentence said `web takes it now` about the first of those and
+    /// was then contradicted, one keystroke later, by a status line saying
+    /// it waits for a reload.
+    ///
+    /// Three things speak, and only this one is a prediction. The status
+    /// bar after the reply reports what the shepherd actually did
+    /// ([`super::app::App`]'s own reply handler), and the row's `!` flag is
+    /// the durable answer, read off the shepherd's parked-field list on
+    /// every refresh.
+    ///
+    /// `NeedsRespawn` is the one arm that still promises an outcome,
+    /// because for that group the prediction cannot be wrong: nothing
+    /// carries a respawn-only field to a child that is already running.
     ///
     /// An env sentence names its key and NEVER its value, unlike a field
     /// sentence, which quotes what it is setting. The value has just been
@@ -846,7 +907,7 @@ impl ConfigPane {
             }
             PaneEdit::Set { key, value } => (key, value),
         };
-        let shown = match value {
+        let shown = match value.as_value() {
             Value::Null => "(unset)".to_owned(),
             Value::String(text) => text.clone(),
             other => other.to_string(),
@@ -859,9 +920,9 @@ impl ConfigPane {
         // `begin_typing` both refuse a locked field -- and lands in the
         // same conservative arm if it ever does.
         match self.cost(key) {
-            Some(ApplyGroup::Live) => format!("set {key} = {shown}? {name} takes it now"),
+            Some(ApplyGroup::Live) => format!("set {key} = {shown}? {key} is a live setting"),
             Some(ApplyGroup::NextSpawn) => {
-                format!("set {key} = {shown}? {name} picks it up at its next start")
+                format!("set {key} = {shown}? {key} is read when {name} spawns")
             }
             Some(_) => format!("set {key} = {shown}? {name} is respawned to pick it up"),
             None => format!("set {key} = {shown}? {name} is told, and decides what to reload"),
@@ -1151,30 +1212,58 @@ mod tests {
             panic!("{:?}", pane.pending_edit());
         };
         assert_eq!(key, "autorestart");
-        assert_eq!(*value, serde_json::json!(false));
+        assert_eq!(value.as_value(), &serde_json::json!(false));
         assert!(text.contains("autorestart"), "{text}");
     }
 
-    /// fails if a confirm starts promising a respawn a `Live` field does
-    /// not cost, which is the same claim the test below makes in the
-    /// opposite direction. Pinning only the positive left `confirm_text`
-    /// free to answer `respawn` to everything and stay green.
+    /// fails if the confirm goes back to promising an OUTCOME for a class
+    /// of field that does not always have that outcome.
+    ///
+    /// `apply_group` is a fact about the field and this write's fate is a
+    /// fact about the flock, and only the shepherd has the second. The
+    /// sentence said `web takes it now` for a `Live` field, and `watch` is
+    /// a `Live` field that parks whenever the config subset it would reach
+    /// cannot normalize alone -- so the pane promised, and the status line
+    /// one keystroke later said the opposite. It names the class now.
+    ///
+    /// `NeedsRespawn` is the one arm that may still promise, which the test
+    /// below asserts: nothing carries a respawn-only field to a child that
+    /// is already running, so that prediction cannot be wrong.
     #[test]
-    fn a_live_field_arms_a_confirm_that_promises_no_death() {
+    fn a_live_confirm_names_the_class_and_promises_no_outcome() {
+        for key in ["autorestart", "watch"] {
+            let mut pane = ConfigPane::sheep(web());
+            pane.move_to_key(key);
+            pane.cycle(Instant::now());
+            let Some(PanePending::Armed { text, .. }) = pane.pending_edit() else {
+                panic!("{:?}", pane.pending_edit());
+            };
+            assert_eq!(
+                pane.cost(key),
+                Some(ApplyGroup::Live),
+                "the fixture must keep {key} Live or the test means nothing"
+            );
+            assert!(text.contains("is a live setting"), "{text}");
+            assert!(!text.contains("takes it now"), "{text}");
+            assert!(!text.contains("respawn"), "{text}");
+            assert!(!text.contains("next start"), "{text}");
+        }
+    }
+
+    /// fails if a `NextSpawn` confirm goes back to promising that a restart
+    /// is what it takes. `autostart` is in that group and is in force the
+    /// moment it lands, because the daemon reads it at muster.
+    #[test]
+    fn a_next_spawn_confirm_names_when_the_field_is_read() {
         let mut pane = ConfigPane::sheep(web());
-        pane.move_to_key("autorestart");
+        pane.move_to_key("autostart");
         pane.cycle(Instant::now());
         let Some(PanePending::Armed { text, .. }) = pane.pending_edit() else {
             panic!("{:?}", pane.pending_edit());
         };
-        assert_eq!(
-            pane.cost("autorestart"),
-            Some(ApplyGroup::Live),
-            "the fixture must keep this field Live or the test means nothing"
-        );
-        assert!(text.contains("takes it now"), "{text}");
+        assert_eq!(pane.cost("autostart"), Some(ApplyGroup::NextSpawn));
+        assert!(text.contains("is read when web spawns"), "{text}");
         assert!(!text.contains("respawn"), "{text}");
-        assert!(!text.contains("next start"), "{text}");
     }
 
     /// fails if a field that costs a respawn stops saying so, or stops
@@ -1227,7 +1316,7 @@ mod tests {
         else {
             panic!("{:?}", pane.pending_edit());
         };
-        assert_eq!(*value, serde_json::json!(40));
+        assert_eq!(value.as_value(), &serde_json::json!(40));
     }
 
     /// fails if a typed edit stops carrying the value the field's kind
@@ -1249,9 +1338,9 @@ mod tests {
             panic!("{:?}", pane.pending_edit());
         };
         assert_eq!(key, "max_restarts");
-        assert_eq!(value, serde_json::json!(40));
+        assert_eq!(value.as_value(), &serde_json::json!(40));
         assert!(
-            !matches!(value, serde_json::Value::String(_)),
+            !matches!(value.as_value(), serde_json::Value::String(_)),
             "an integer field must not travel as a string"
         );
     }
@@ -1276,32 +1365,49 @@ mod tests {
         assert_eq!(env.apply_typing(), Some(("A".to_owned(), None)));
     }
 
-    /// fails if [`PaneEdit`] starts printing the value it is about to set
-    /// (IR-41). A `Set` carries a live config value -- `cwd` and `script`
-    /// routinely hold a home directory, `args` a token -- and a `SetEnv`
-    /// carries the most secret-dense thing this client sends.
+    /// fails if a live config value ever reaches a `{:?}` (IR-41).
+    ///
+    /// `cwd` and `script` routinely hold a home directory and `args` holds
+    /// a token, which is why [`ConfigPane`]'s own `Debug` withholds the map
+    /// these come out of. This is the same value one hop further on, and it
+    /// is asserted on [`FieldValue`] itself rather than on the types that
+    /// carry it: `PaneEdit` had a hand-written redaction and
+    /// `Sent::ApplyField`, which holds the same value, did not.
+    #[test]
+    fn a_field_values_debug_names_no_value() {
+        for (value, want) in [
+            (serde_json::json!("/home/ada/secret-project"), "<string>"),
+            (serde_json::json!(40), "<number>"),
+            (serde_json::json!(false), "<bool>"),
+            (serde_json::json!(null), "<null>"),
+            (serde_json::json!(["--token", "hunter2"]), "<array>"),
+            (serde_json::json!({ "a": 1 }), "<object>"),
+        ] {
+            let wrapped: FieldValue = value.into();
+            assert_eq!(format!("{wrapped:?}"), format!("FieldValue({want})"));
+        }
+    }
+
+    /// fails if [`PaneEdit`] starts printing the value it is about to set.
+    /// Derived now, and safe only because both value types redact
+    /// themselves; this pins that it stays that way.
     #[test]
     fn a_pane_edits_debug_names_no_value() {
         let set = PaneEdit::Set {
             key: "cwd".into(),
-            value: serde_json::json!("/home/ada/secret-project"),
+            value: serde_json::json!("/home/ada/secret-project").into(),
         };
-        assert_eq!(format!("{set:?}"), r#"PaneEdit::Set { key: "cwd" }"#);
+        assert_eq!(
+            format!("{set:?}"),
+            r#"Set { key: "cwd", value: FieldValue(<string>) }"#
+        );
         let env = PaneEdit::SetEnv {
             key: "DB_PASSWORD".into(),
             value: Some("hunter2".to_owned().into()),
         };
         assert_eq!(
             format!("{env:?}"),
-            r#"PaneEdit::SetEnv { key: "DB_PASSWORD", removes: false }"#
-        );
-        let removal = PaneEdit::SetEnv {
-            key: "DB_PASSWORD".into(),
-            value: None,
-        };
-        assert_eq!(
-            format!("{removal:?}"),
-            r#"PaneEdit::SetEnv { key: "DB_PASSWORD", removes: true }"#
+            r#"SetEnv { key: "DB_PASSWORD", value: Some(EnvValue(<7 bytes>)) }"#
         );
     }
 
@@ -1322,14 +1428,14 @@ mod tests {
         let armed = PanePending::Armed {
             edit: PaneEdit::Set {
                 key: "cwd".into(),
-                value: serde_json::json!("/home/ada/secret-project"),
+                value: serde_json::json!("/home/ada/secret-project").into(),
             },
             text: "set cwd = /home/ada/secret-project? web takes it now".into(),
             at: Instant::now(),
         };
         assert_eq!(
             format!("{armed:?}"),
-            r#"PanePending::Armed { edit: PaneEdit::Set { key: "cwd" } }"#
+            r#"PanePending::Armed { edit: Set { key: "cwd", value: FieldValue(<string>) } }"#
         );
         let sent = PanePending::Sent {
             ticket: 7,
