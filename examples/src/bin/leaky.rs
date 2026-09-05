@@ -1,10 +1,10 @@
 //! Allocates on a timer and holds the memory, so a Flockfile's `max_memory`
 //! fires.
 //!
-//! Each tick allocates a chunk, writes to every page in it (an untouched
-//! allocation may never become resident, and `max_memory` is enforced against
-//! resident memory), and keeps it — nothing here is ever freed until the
-//! process is restarted.
+//! Each tick allocates a chunk and writes to every page in it. An
+//! untouched allocation may never become resident, and `max_memory`
+//! is enforced against resident memory. Nothing here is ever freed
+//! until the process is restarted.
 //!
 //! # Usage
 //!

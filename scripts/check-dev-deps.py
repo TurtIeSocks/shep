@@ -1,30 +1,12 @@
 #!/usr/bin/env python3
 """Refuse an intra-workspace dev-dependency that carries a version.
 
-`cargo publish` treats the two dependency kinds oppositely. A normal
-dependency has its `path` stripped and NEEDS a `version` to put in its place,
-which is why every entry in the root `[workspace.dependencies]` table carries
-one. A dev-dependency with a version is kept in the published manifest and has
-to resolve; a dev-dependency without one is dropped outright.
-
-So a version on an intra-workspace dev-dependency is never a formality. It is
-a publish-order constraint: packaging crate A now requires crate B to already
-be on crates.io at that exact version. When B depends on A normally, B
-publishes after A and cannot exist yet, and neither crate can go first:
-
-    error: failed to prepare local package for uploading
-    Caused by:
-      failed to select a version for the requirement `shep-client = "^0.2.2"`
-      candidate versions found which didn't match: 0.2.0, 0.1.34, 0.1.33, ...
-      required by package `shep-macros v0.2.2`
-
-That is not hypothetical. It stopped the 0.2.2 release after shep-core and
-shep-daemon had already published, stranding shep-macros, shep-client and shep
-at 0.2.0 while the two halves of the workspace sat at different versions.
-
-The trap is `workspace = true`, which reads as inheriting a path and silently
-inherits the version alongside it. Write such an entry inline instead, with a
-path and no version:
+`cargo publish` keeps a dev-dependency that has a version and has to resolve
+it; one without a version is dropped. A version on an intra-workspace
+dev-dependency is therefore a publish-order constraint: when crate B depends
+on crate A normally and A dev-depends on B with a version, neither can publish
+first. `workspace = true` inherits the version without looking like it does.
+Write such an entry inline, with a path and no version:
 
     shep-client = { path = "../shep-client" }
 

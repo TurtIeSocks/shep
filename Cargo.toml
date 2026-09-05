@@ -7,31 +7,26 @@ members = [
     "crates/shep-macros",
     "crates/shep-cli",
     "crates/shep-cli-redirect",
-    # Small runnable demos of shep's supervision behaviours (probes, restart
-    # policy, memory limits, graceful stop, the log plane). `publish = false`
-    # in its own manifest, and release-plz.toml marks it `release = false`
-    # too — never part of a release.
+    # Runnable demos of shep's supervision behaviors (probes, restarts, memory
+    # limits, graceful stop, logs). Not published: publish = false, and
+    # release-plz.toml marks it release = false too.
     "examples",
 ]
 
 [workspace.package]
 version = "0.2.2"
 edition = "2024"
-# 1.88 forced by serde-saphyr (let-chains, stabilized 1.88) — a current dep,
-# not a future one. Also the floor for ratatui/sysinfo/rmcp in later phases.
+# 1.88: serde-saphyr's let-chains need it; also the floor ratatui, sysinfo
+# and rmcp require.
 rust-version = "1.88"
 repository = "https://github.com/shep-pm/shep"
-# Clean-room implementation — pm2 is feature-list inspiration only (the maintainer, 2026-08-07).
+# Clean-room: pm2 is feature-list inspiration only, no shared code.
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-# `cargo publish` strips `path` from a dependency and needs a version to put
-# in its place, so these four need one even though every consumer in this
-# workspace resolves them by path. There is no `version.workspace = true`
-# form inside a dependency entry, since Cargo only supports that shorthand for
-# the `[package]` table. This literal is not sourced from
-# `workspace.package.version` above and a release bump has to touch both
-# places by hand. If that drifts, `cargo-release` is the mechanical fix.
+# cargo publish strips `path`, so these need a literal version even though
+# every consumer here resolves by path. Not sourced from
+# workspace.package.version above; a release bump touches both by hand.
 shep-core = { path = "crates/shep-core", version = "0.2.2" }
 shep-daemon = { path = "crates/shep-daemon", version = "0.2.2" }
 shep-client = { path = "crates/shep-client", version = "0.2.2" }
@@ -40,72 +35,43 @@ serde = { version = "1", default-features = false, features = ["derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
 serde-saphyr = { version = "1", default-features = false, features = ["deserialize"] }
-# Transitive floor pins (referenced from shep-core, which depends on serde-saphyr and
-# json5) forcing -Z minimal-versions past bugs where a transitive dep under-declares its
-# own true minimum:
-#   - annotate-snippets 0.12.0/0.12.1/0.12.2 lack `Title::element()`, added in 0.12.3.
-#   - annotate-snippets itself under-declares anstyle as "1.0.4"; it actually needs
-#     `impl Display for Style`, added in anstyle 1.0.5.
-#   - encoding_rs_io 0.1.0/0.1.1 lack `DecodeReaderBytesBuilder::bom_override()`, added
-#     in 0.1.2. Both are pulled in by serde-saphyr's `deserialize` feature.
-#   - pest 2.0.0/2.0.1 lack `error::LineColLocation` and `Error::line_col`, which
-#     json5 0.4.0's error.rs uses despite json5 only declaring pest = "2.0"; present
-#     from pest 2.0.2.
-#   - json5's pest_derive 1.0.2 (pulled in by pest_meta as a bootstrap dependency,
-#     unrelated to the pest 2.x line above) under-declares quote as "^0.3" (floor
-#     0.3.0), but its generated code needs `Tokens::append(impl ToString)` and
-#     `Tokens::as_ref()`, added in quote 0.3.15.
-#   - tokio-util's `tracing` dependency chain pulls in tracing-attributes, which
-#     under-declares syn as "1" (floor 1.0.0) but needs `LitInt::base10_parse`,
-#     added in syn 1.0.1.
+# Transitive floor pins: -Z minimal-versions picks a version below what a
+# dependency's own code actually needs.
+#   - annotate-snippets: Title::element() needed, added 0.12.3.
+#   - anstyle (via annotate-snippets): impl Display for Style needed, added 1.0.5.
+#   - encoding_rs_io (via serde-saphyr): DecodeReaderBytesBuilder::bom_override() needed, added 0.1.2.
+#   - pest (via json5's error.rs): error::LineColLocation/Error::line_col needed, added 2.0.2.
+#   - quote (via json5's pest_derive bootstrap dep): Tokens::append/as_ref needed, added 0.3.15.
+#   - syn (via tokio-util's tracing-attributes): LitInt::base10_parse needed, added 1.0.1.
 annotate-snippets = { version = "0.12.3", default-features = false }
 anstyle = { version = "1.0.5", default-features = false }
 encoding_rs_io = { version = "0.1.2", default-features = false }
 pest = { version = "2.0.2", default-features = false }
-# Renamed keys, not the plain names: `shep-macros` needs the CURRENT syn and
-# quote to build a real proc macro, and a workspace dependency key can only be
-# spelled once. These two entries are floors for someone else's under-declared
-# transitive dependency and are never compiled, so they are the pair that gives
-# the names up.
+# Renamed: shep-macros needs the current syn/quote, and a workspace
+# dependency key can only be spelled once, so the floor pins above take
+# these names instead.
 quote-floor = { package = "quote", version = "0.3.15", default-features = false }
 syn-floor = { package = "syn", version = "1.0.1", default-features = false }
-# The current lines of the same two crates, plus proc-macro2, for
-# `shep-macros`. `proc-macro` is what lets a `proc_macro2::TokenStream` become
-# the `proc_macro::TokenStream` a derive has to return, so it is not optional
-# here even though it is not a default.
+# Current syn/quote plus proc-macro2, for shep-macros. `proc-macro` turns a
+# proc_macro2::TokenStream into the proc_macro::TokenStream a derive must
+# return.
 proc-macro2 = { version = "1.0", default-features = false, features = ["proc-macro"] }
 quote = { version = "1.0", default-features = false, features = ["proc-macro"] }
 syn = { version = "2.0", default-features = false }
 json5 = { version = "0.4", default-features = false }
-# regex 1.8.0's compiled-size accounting lets `selector_spec_oversized_regex_is_rejected`'s
-# huge pattern slip under the 1 MiB `size_limit`; 1.9+ rejects it. Floor to 1.9 so the
-# selector-bridge test holds under `-Z minimal-versions`.
+# Floor 1.9: regex 1.8's compiled-size accounting lets
+# `selector_spec_oversized_regex_is_rejected`'s huge pattern slip under the
+# 1 MiB size_limit; 1.9 rejects it.
 regex = { version = "1.9", default-features = false, features = ["std", "unicode-perl"] }
-# Floor 0.4.11: `watch/mod.rs`'s `own_log_ignores` builds an ignore glob out of a real
-# path and calls `globset::escape` to neutralize the metacharacters a tempdir or a user's
-# directory name can contain. That function does not exist before 0.4.11 — `-Z
-# minimal-versions` picks 0.4.0 without this and fails with `cannot find function escape
-# in crate globset`.
+# Floor 0.4.11: `watch/mod.rs`'s `own_log_ignores` calls `globset::escape`,
+# added in 0.4.11.
 globset = { version = "0.4.11", default-features = false }
-# `tokio::task::JoinHandle::is_finished` (shep-daemon's fake.rs cancel-safety test uses
-# it to assert a `wait()` future is genuinely still pending before dropping it) landed in
-# tokio 1.19.0, but shep-daemon's tokio_runner.rs (the real `ProcessRunner`, already
-# landed in Phase 2a but never rehearsed against `-Z minimal-versions` with the `process`
-# feature before Task 2's bus rehearsal caught it) needs two later APIs:
-# `Command::as_std_mut` (added 1.39.1 — 1.39.0 was yanked) and `Command::process_group`
-# losing its `#[cfg(tokio_unstable)]` gate (1.40.0). Floor 1.41: `extras.rs`'s own
-# `mod tests` calls `JoinHandle::id`/`AbortHandle::id` (task IDs), which carried the
-# same `#[cfg(tokio_unstable)]` gate through 1.40.0 and only stabilized in 1.41.0 — CI
-# run 32023586026's `minimal-versions` job caught 1.40 failing to compile `shep-daemon`'s
-# own test target with exactly that gate.
+# Floor 1.41: tokio_runner.rs needs Command::as_std_mut (1.39.1) and
+# Command::process_group without its tokio_unstable gate (1.40.0); extras.rs's
+# tests need JoinHandle::id/AbortHandle::id, stable only from 1.41.0.
 tokio = { version = "1.41", default-features = false }
-# 0.7.0 has a broken minimum floor: it needs a newer tokio (mpsc `reserve_owned`, absent
-# from tokio 1.0.1) and a working log/tracing bridge (`trace!` fails to resolve under
-# minimal deps). Fixed in 0.7.1, which also pulls in a tokio floor high enough to compile.
-# Floor 0.7.9: `rmcp`'s `transport::async_rw` imports `tokio_util::bytes` — a `pub use
-# bytes;` re-export this crate did not carry until 0.7.9 (0.7.1 has no `bytes` item at
-# all). `-Z minimal-versions` picked 0.7.1 for it without this and failed to compile
-# `rmcp` with `unresolved import` (same CI run as the `tokio` floor above).
+# Floor 0.7.9: rmcp's transport::async_rw imports tokio_util::bytes, a
+# `pub use bytes;` re-export not carried before 0.7.9.
 tokio-util = { version = "0.7.9", default-features = false, features = ["codec"] }
 bytes = { version = "1", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
@@ -116,307 +82,163 @@ nix = { version = "0.29", default-features = false, features = ["signal", "proce
 # Only shep-daemon: passes the shepherd-channel socketpair as fd 3 into the spawned child.
 command-fds = { version = "0.3", default-features = false }
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
-# Transitive floor pin: `tracing`'s own Cargo.toml under-declares its `tracing-core`
-# requirement down to versions lacking `impl Value for String`, which shep-daemon's
-# supervisor.rs needs for the bare-field `tracing::debug!(id, name, value, ...)` shorthand
-# (a Phase 2a call site, also caught by Task 2's minimal-versions rehearsal). Missing in
-# 0.1.26/0.1.27; present from 0.1.28.
+# Floor 0.1.28: tracing under-declares tracing-core; supervisor.rs's
+# bare-field `tracing::debug!(id, name, value, ...)` shorthand needs
+# impl Value for String.
 tracing-core = { version = "0.1.28", default-features = false }
-# Option: the daemon's own diagnostics. `env-filter` costs exactly one crate
-# (matchers) and `json` exactly one (tracing-serde); the rest of the tree is
-# already present via regex/globset/serde. The default `tracing-log` bridge is
-# dropped because nothing here uses the `log` crate.
+# env-filter and json feature the daemon's diagnostics; tracing-log bridge
+# dropped since nothing here uses `log`.
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt", "ansi", "env-filter", "json"] }
-# Transitive floor pin: `sharded-slab` (tracing-subscriber's span registry) imports
-# `lazy_static!` by path — `use lazy_static::lazy_static;` — while declaring only
-# `lazy_static = "1"`. That expansion names `__lazy_static_internal`, which a path import
-# can only resolve once the macro is exported `#[macro_export(local_inner_macros)]`. 1.0.0
-# and 1.0.1 export it plainly and fail with `cannot find macro __lazy_static_internal in
-# this scope`; present from 1.0.2.
+# Floor 1.0.2: sharded-slab (tracing-subscriber's span registry) imports
+# `lazy_static!` by path, which needs it exported
+# `#[macro_export(local_inner_macros)]`; absent before 1.0.2.
 lazy_static = { version = "1.0.2", default-features = false }
-# Our `insta::assert_json_snapshot!` calls in shep-core (protocol::request,
-# protocol::events) snapshot newtype/tuple enum variants (the Result-shaped reply
-# payload); 1.18.0 has a JSON-serialization regression with exactly that shape, fixed
-# in 1.18.1.
+# Floor 1.18.1: shep-core's insta::assert_json_snapshot! calls snapshot
+# newtype/tuple enum variants; 1.18.0 has a JSON-serialization regression there.
 insta = { version = "1.18.1", default-features = false, features = ["json"] }
-# Floor 3.10: shep-core's `barks::write_ring` stages the ring through
-# `Builder::permissions`, so the temp file is created at 0600 in the `open` call
-# rather than chmod'ed afterwards. That builder method landed in tempfile
-# 3.10.0 (confirmed against the upstream CHANGELOG, not just a guess this
-# time — 3.9 was one minor short and still let `-Z minimal-versions` pick a
-# `Builder` without it, failing with `no method named permissions found for
-# struct Builder`).
+# Floor 3.10: shep-core's `barks::write_ring` uses `Builder::permissions` to
+# create the ring at 0600 directly, added in tempfile 3.10.0.
 tempfile = { version = "3.10", default-features = false }
 # Only shep-daemon (dev): property tests on the kill ladder / supervisor state machine.
 proptest = { version = "1", default-features = false, features = ["std"] }
-# For the event-bus subscription stream: `broadcast::Receiver` has no poll
-# API, so a hand-rolled `Stream::poll_next` over it either does not compile
-# or busy-spins on `try_recv` (which registers no waker).
-# `wrappers::BroadcastStream` is the upstream answer, gated behind the `sync`
-# feature, which does not exist before 0.1.3 — verified against the
-# crates.io index, where 0.1.0-0.1.2 declare only
-# `default`/`fs`/`io-util`/`net`/`time`. `BroadcastStreamRecvError` is
-# defined at tokio-stream-0.1.3/src/wrappers/broadcast.rs:22, so 0.1.3 is
-# the correct floor.
+# Floor 0.1.3: `broadcast::Receiver` has no poll API for the event-bus
+# subscription stream; `wrappers::BroadcastStream` needs the `sync` feature,
+# absent before 0.1.3.
 tokio-stream = { version = "0.1.3", default-features = false, features = ["sync"] }
-# Windows only, shep-daemon only: the job-object API that stands in for a
-# unix process group (`sys_windows.rs`, the crate's only unsafe surface on
-# that platform). Already present in the lock as a transitive dependency of
-# tokio/mio, so naming it directly adds an edge rather than a crate.
-#
-# `Win32_System_Threading` is `GetCurrentProcess`, for the job-environment
-# report. It also closes a latent hole: `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`
-# already embeds `Threading::IO_COUNTERS`, so the job-object arm has always
-# needed that module and has only ever compiled because tokio/mio ask for it
-# and Cargo unifies features. Naming it here stops that from being luck.
-# `Win32_System_SystemInformation` is `OSVERSIONINFOW` and
-# `Wdk_System_SystemServices` is `RtlGetVersion`, the unshimmed build number —
-# `GetVersionExW` reports 6.2 to an unmanifested binary, which would make a
-# runner and a laptop look identical in exactly the report meant to tell them
-# apart.
+# Windows only, shep-daemon only: the job-object API standing in for a unix
+# process group (sys_windows.rs). Already in the lock via tokio/mio, so this
+# adds an edge, not a crate. `Win32_System_Threading` is GetCurrentProcess
+# for the job-environment report. `Win32_System_SystemInformation` is
+# OSVERSIONINFOW and `Wdk_System_SystemServices` is RtlGetVersion, the
+# unshimmed build number: GetVersionExW reports 6.2 to an unmanifested binary.
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Console", "Win32_System_Threading", "Win32_System_SystemInformation", "Wdk_System_SystemServices"] }
 # Windows only, shep-daemon only: the unguessable half of a shepherd-channel
-# pipe name (`tokio_runner.rs`). A named pipe takes the default security
-# descriptor, which grants every local account read access, and the single
-# `accept` behind it authenticates nobody, so the name itself is what keeps a
-# hostile local account from pre-opening it. Already in the lock under
-# tempfile, so naming it directly adds an edge rather than a crate.
+# pipe name (tokio_runner.rs). The pipe's default security descriptor grants
+# every local account read access and the single accept authenticates
+# nobody, so the name itself keeps a hostile local account from pre-opening
+# it. Already in the lock via tempfile, so this adds an edge, not a crate.
 getrandom = { version = "0.4", default-features = false }
-# `shep-cli`'s dev-dependencies, for Task 12's real-binary e2e tier
-# (`crates/shep-cli/tests/cli_e2e.rs`). Neither crate has any call site yet —
-# this phase's other tasks land the assertions that actually exercise them —
-# so no feature beyond the bare crate is named; the task that writes the
-# first assertion adds whatever feature it needs (`regex`, `diff`, ...) with
-# its own comment. `default-features = false` already matches assert_cmd's
-# real default (neither of its two features, `color`/`color-auto`, is on by
-# default); for predicates it drops the upstream default set (`color`,
-# `diff`, `float-cmp`, `normalize-line-endings`, `regex`) down to nothing.
+# shep-cli's dev-dependencies, for `crates/shep-cli/tests/cli_e2e.rs`.
+# `default-features = false` already matches assert_cmd's real default
+# (neither `color` nor `color-auto` is on by default); for predicates it
+# drops the upstream default set (`color`, `diff`, `float-cmp`,
+# `normalize-line-endings`, `regex`) to nothing.
 assert_cmd = { version = "2", default-features = false }
 predicates = { version = "3", default-features = false }
-# The cron_restart dialect (spec §4). `serde` is croner's only feature and we
-# do not serialize a parsed Cron — the Flockfile carries the pattern string.
+# The cron_restart dialect (spec §4). `serde` is croner's only feature; we do
+# not serialize a parsed Cron, the Flockfile carries the pattern string.
 croner = { version = "3.0.1", default-features = false }
-# croner is generic over chrono::TimeZone; `clock` is what provides Utc::now(),
-# which the daemon's cron worker reads to derive the next occurrence.
+# croner is generic over chrono::TimeZone; `clock` provides Utc::now(), which
+# the daemon's cron worker reads to derive the next occurrence.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Resolves cron_timezone's IANA name to a chrono::TimeZone. croner carries this
 # only as a dev-dependency, so it is ours to declare.
 chrono-tz = { version = "0.10.4", default-features = false, features = ["std"] }
-# Process-table RSS sampling for the polling memory-limit enforcer. Held at the
-# 0.38 line: sysinfo 0.39.0+ declares rust-version = "1.95" and this workspace's
-# MSRV is 1.88 (Cargo.toml:14, and the 1.88 leg of the CI test matrix). 0.38.4
-# carries the identical API this crate uses — refresh_processes_specifics,
-# ProcessRefreshKind::nothing/with_memory, Process::memory/parent, Pid::as_u32.
-# Defaults bring component/disk/network/user, none of which the daemon reads;
-# the `multithread` feature pulls rayon into a daemon whose idle-footprint goal
-# is single-digit MB (spec §14.11) and is not enabled.
+# Process-table RSS sampling for the polling memory-limit enforcer. Held at
+# 0.38: sysinfo 0.39.0+ declares rust-version = "1.95", above this
+# workspace's 1.88 MSRV. Defaults bring component/disk/network/user, none of
+# which the daemon reads; `multithread` pulls in rayon, against the
+# idle-footprint goal (spec §14.11), and is not enabled.
 sysinfo = { version = "0.38.4", default-features = false, features = ["system"] }
 # Filesystem events for watch-restart (spec §4). notify picks its own backend
-# per platform — inotify, ReadDirectoryChangesW — except on macOS, where
-# `macos_fsevent` is a DEFAULT feature: dropping default features without
-# naming it again falls back to the polling watcher, and watch latency on
-# macOS silently becomes seconds.
+# per platform except on macOS, where `macos_fsevent` is a default feature:
+# dropping defaults without naming it again falls back to the polling
+# watcher, and watch latency on macOS silently becomes seconds.
 notify = { version = "8.2.0", default-features = false, features = ["macos_fsevent"] }
 # Coalesces the burst a single editor save produces into one batch. On macOS
 # and Windows it additionally stitches renames through a file-id cache; on
 # Linux `RecommendedCache` is `NoCache` and inotify's own rename cookies do
 # that job.
 notify-debouncer-full = { version = "0.7.0", default-features = false }
-# Transitive floor pin: notify 8.2.0 declares fsevent-sys "4.0.0", but its
-# fsevent.rs needs `FSEventsGetCurrentEventId`,
-# `FSEventStreamGetDeviceBeingWatched` and
-# `FSEventsPurgeEventsForDeviceUpToEventId`, all added in 4.1.0. macOS only,
-# but the pin is unconditional because that is where the rehearsal runs.
+# Floor 4.1.0: notify 8.2.0 declares fsevent-sys "4.0.0", but its fsevent.rs
+# needs FSEventsGetCurrentEventId, FSEventStreamGetDeviceBeingWatched and
+# FSEventsPurgeEventsForDeviceUpToEventId, all added in 4.1.0. macOS only,
+# but unconditional since Cargo resolves one version workspace-wide.
 fsevent-sys = "4.1.0"
-# Bark's sinks are Discord and Slack webhooks, which are HTTPS, so this is
-# the one thing in the workspace that needs TLS. The maintainer's ruling (2026-08-12)
-# is a hand-rolled HTTP/1.1 client over tokio-rustls rather than reqwest:
-# reqwest's default rustls feature costs +93 crates over this workspace's
-# existing 196 and pulls aws-lc-sys, which needs BOTH a C compiler and cmake;
-# tokio-rustls + webpki-roots, named directly, costs +10 crates and needs a C
-# compiler but no cmake. `ring`, not the default `aws_lc_rs`, is the crypto
-# provider, and tokio-rustls's own default features pull aws_lc_rs in unless
-# named away.
+# Bark's sinks are Discord and Slack webhooks (HTTPS), the one thing here
+# needing TLS. tokio-rustls + webpki-roots, not reqwest: reqwest's default
+# rustls pulls in aws-lc-sys, needing both a C compiler and cmake; this
+# pulls fewer crates and needs only a C compiler. `ring`, not the default
+# `aws_lc_rs`, is the crypto provider.
 #
-# What this DOES cost, stated plainly because an earlier version of this
-# comment claimed the opposite: ring's build.rs uses `cc` to compile C and
-# assembly for the target, so building shep-cli for a target needs a C
-# compiler for THAT target. Native builds are unaffected — macOS ships clang,
-# the CI musl job installs musl-tools, and GitHub's windows-latest runners
-# ship the MSVC build tools ring wants for windows-msvc. A CROSS-compile is
-# where it is felt: `--target x86_64-pc-windows-gnu` from macOS needs
-# mingw-w64 installed. Measured 2026-08-13 with it installed, the whole
-# workspace cross-compiles clean —
-#   cargo check --workspace --all-targets --all-features \
-#     --target x86_64-pc-windows-gnu     # EXIT=0, 8.42s
-# — and that check is back in CLAUDE.md's gate section after three phases
-# out. shep-daemon has no ring in its tree, so the Linux cross-check beside
-# it needs no cross C toolchain and is scoped to `-p shep-daemon` for exactly
-# that reason.
+# ring's build.rs uses `cc` to compile C and assembly for the target: a
+# cross-compile needs a C compiler for that target, so
+# `--target x86_64-pc-windows-gnu` from macOS needs mingw-w64 installed.
+# Native builds (macOS clang, CI's musl-tools, Windows MSVC) are unaffected.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 # Mozilla's compiled-in root store. rustls itself is reached through
-# tokio-rustls's own `pub use rustls;` (tokio-rustls-0.26.4/src/lib.rs) — a
-# direct `rustls` dependency is not named in crates/shep-cli/Cargo.toml
-# because nothing there needs to name the crate, only the types it
-# re-exports.
+# tokio-rustls's `pub use rustls;`; not named directly in
+# crates/shep-cli/Cargo.toml since only the re-exported types are needed.
 webpki-roots = "0.26"
-# The lookout TUI (spec §9). A terminal UI is the one thing in this tree that
-# is genuinely not worth hand-rolling — the cell diffing, the resize handling
-# and the cursor arithmetic are the whole cost, and all three are exactly what
-# an established TUI crate has already got right. Same argument that took
-# `rmcp` for whistle, and the opposite of the one that rejected reqwest: this
-# is a rendering library with no protocol, no TLS and no C toolchain behind it.
+# The lookout TUI (spec §9): cell diffing, resize handling and cursor
+# arithmetic are the whole cost of a terminal UI, already solved by an
+# established crate.
 #
-# Features per IR-2. `crossterm_0_29` pins the backend's crossterm line
-# explicitly so it can never skew from our own direct dependency below;
-# `layout-cache` is the memoized layout solver; `underline-color` is what makes
-# a coloured underline expressible without a second style pass. Not
-# `all-widgets` (opts this crate's own `default` list into the calendar
-# widget) and not `macros` (ratatui-macros is sugar; KISS) — though the
-# calendar widget itself is *not* actually avoidable this way: `ratatui`'s
-# own manifest depends on `ratatui-widgets` plainly (no `default-features =
-# false`), and `ratatui-widgets`' OWN default list turns its `calendar`
-# feature on regardless of anything requested here. See the `time` pin below
-# for what that costs under `-Z minimal-versions`.
+# `crossterm_0_29` pins the backend's crossterm line to match the direct
+# dependency below; `layout-cache` is the memoized layout solver;
+# `underline-color` lets a coloured underline skip a second style pass. Not
+# `all-widgets` or `macros` (ratatui-macros is sugar). The calendar widget
+# ships anyway: `ratatui-widgets`' own default list turns its `calendar`
+# feature on regardless of what is requested here (see the `time` pin below).
 ratatui = { version = "0.30", default-features = false, features = ["std", "crossterm_0_29", "layout-cache", "underline-color"] }
-# The backend, named directly rather than reached through ratatui's re-export:
-# `crossterm::event::EventStream` (the async input source the UI loop selects
-# on) lives behind the `event-stream` feature, and a feature can only be
-# enabled by a crate that names the dependency. `events` is the key/resize
-# types. NOT `windows`: both of these sit under
-# `[target.'cfg(unix)'.dependencies]` in shep-cli, because `lookout` is
-# `#[cfg(unix)]` like `commands` and `dog`, and the Windows leg of
-# `main.rs::run` refuses every verb before dispatching to any of them.
+# Named directly, not reached through ratatui's re-export: a feature can
+# only be enabled by a crate that names the dependency, and
+# `crossterm::event::EventStream` needs `event-stream`. `events` is the
+# key/resize types. Not `windows`: this sits under
+# `[target.'cfg(unix)'.dependencies]` in shep-cli, since lookout is
+# `#[cfg(unix)]`.
 crossterm = { version = "0.29", default-features = false, features = ["events", "event-stream"] }
-# Not used directly anywhere in this workspace — pinned only to force the
-# resolved floor. `ratatui-widgets` (pulled in unconditionally by `ratatui`,
-# see the comment above) declares `time = "0.3"`, i.e. accepts 0.3.0, but its
-# own `calendar.rs` calls two methods `time` added well after that:
-# `Date::replace_day` (0.3.9) and `Month::length` (0.3.37, confirmed against
-# `time`'s own source — 0.3.36 has no such method). `-Z minimal-versions`
-# picked 0.3.0 for it without this pin and failed to compile
-# `ratatui-widgets`, first on the earlier method and then, once that alone
-# was fixed, on the later one (CI run 32023586026 only caught the first;
-# the second showed up rehearsing the fix locally). Floor to whichever of
-# the two lands later — currently `Month::length`.
+# Floor 0.3.37: not used directly, pinned only to force the resolved floor.
+# ratatui-widgets' calendar.rs needs Date::replace_day (0.3.9) and
+# Month::length (0.3.37), the later of the two.
 time = { version = "0.3.37", default-features = false }
-# Also not used directly — same reasoning and same crate as the `time` pin
-# above. `ratatui` 0.30.0 declares `instability = "0.3"`, i.e. accepts
-# 0.3.0, but its own `widgets.rs` applies `#[instability::unstable(...)]`
-# to a braced `pub use { A, B };` re-export — an item shape `instability`'s
-# macro could not handle at all until 0.3.4 (confirmed against its source:
-# 0.3.0's expansion match has no `Item::Use` arm and panics with
-# "unsupported item type" on anything it does not recognize; 0.3.4 adds
-# that arm). `-Z minimal-versions` picked 0.3.0 and hit exactly that panic.
+# Floor 0.3.4: not used directly, same reasoning as the `time` pin above.
+# ratatui's widgets.rs applies `#[instability::unstable(...)]` to a braced
+# `pub use { A, B };` re-export, a shape the macro can't handle before 0.3.4.
 instability = { version = "0.3.4", default-features = false }
-# The MCP SDK, for `shep whistle` (spec §8, §9). The maintainer's ruling (2026-08-14),
-# taken against a hand-rolled stdio JSON-RPC loop: MCP is an evolving
-# protocol, and tracking an SDK beats owning a parser for something whose
-# wire format is still moving. Deliberately the opposite of the `serve`
-# ruling, where axum was overruled in favour of hand-rolling on the HTTP
-# surface the metrics dog already has — a settled protocol with one
-# endpoint is the case for hand-rolling, and this is not that case.
+# The MCP SDK, for `shep whistle` (spec §8, §9): MCP is an evolving
+# protocol, and tracking an SDK beats owning a parser for a wire format
+# still moving.
 #
-# MEASURED, not estimated (12a's ratatui bill came in at +48 against an
-# estimate of 18-24, and that is the reason this comment carries numbers):
-#   compiled: +14 crates  — rmcp, rmcp-macros, pastey, schemars,
-#     schemars_derive, serde_derive_internals, dyn-clone, ref-cast,
-#     ref-cast-impl, futures, futures-channel, futures-executor, futures-io,
-#     futures-macro. All fourteen build on macOS and Linux; none builds C or
-#     needs cmake; the highest MSRV among them is rmcp's own 1.88, which is
-#     this workspace's MSRV exactly.
-#   Cargo.lock: 326 -> 340, i.e. the same +14: rmcp's feature table does
-#     name `reqwest?/rustls` and three siblings, but cargo only locks a
-#     weakly-referenced optional dependency when the feature CONTAINING the
-#     reference is enabled, and none of those four features is on here.
-#     Contrast ratatui, where `ratatui-termwiz?/underline-color` sits inside
-#     the `underline-color` feature this workspace DOES enable, which is why
-#     `grep -c '^name = "termwiz"$' Cargo.lock` prints 1 for a backend
-#     nothing builds.
-#
-# `schemars` is what generates each tool's input and output schema. rmcp's
-# `server` feature requires it, so it costs no extra crate — but it is
-# declared separately below because it is a DIRECT dependency of ours:
-# `#[derive(JsonSchema)]` emits absolute `schemars::` paths, and rmcp only
-# re-exports the crate (`pub use schemars;`, rmcp-3.1.2/src/lib.rs:38-39).
-#
-# Version 3.1.2, not "3": CI runs `-Z minimal-versions`, which resolves a
-# bare "3" to 3.0.0, an API nobody here has compiled. 3.1.2 is the newest
-# published version, its rust-version is 1.88 (this workspace's MSRV
-# exactly), and every API this phase uses was read out of its source — see
-# the plan's "Every rmcp API this plan names" table for the file:line list.
+# Version 3.1.2, not "3": -Z minimal-versions resolves a bare "3" to 3.0.0,
+# an API nobody here has compiled.
 rmcp = { version = "3.1.2", default-features = false, features = ["server", "macros", "transport-io"] }
-# The JSON Schema generator behind every whistle tool's declared input and
-# output shape. Not a transitive we happen to get: `src/whistle/facts.rs` and
-# `src/whistle/read.rs` derive `JsonSchema` on our own types, and that derive
-# expands to `schemars::…` paths, so the crate has to be nameable. rmcp
-# re-exports it, which is not the same thing — a re-export does not put the
-# crate in our extern prelude, and routing the derive through
-# `rmcp::schemars` is not an option because the derive writes the paths.
+# Generates each whistle tool's input/output schema. Costs no extra crate:
+# rmcp's `server` feature already requires it. Declared directly because
+# `#[derive(JsonSchema)]` emits absolute `schemars::` paths, and rmcp only
+# re-exports the crate.
 #
-# Pinned exactly, same reason as rmcp: `-Z minimal-versions` would take a
-# bare "1" down to 1.0.0. rmcp declares `schemars = "1.0"` with
-# `features = ["chrono04"]`; 1.2.2 satisfies it and the re-resolved lockfile
-# carries exactly ONE schemars package, which is the property that matters —
-# two schemars majors would mean two `JsonSchema` traits and a derive
-# implementing the wrong one. `chrono04` is a renamed optional dep of
-# schemars (`[dependencies.chrono04] package = "chrono"`); chrono is already
-# in this workspace, so it costs nothing.
-#
-# `derive` and `std` ARE schemars' own defaults; they are named per IR-2
-# because a crate that uses a feature says so.
+# Pinned exactly: rmcp declares `schemars = "1.0"` with `chrono04`; 1.2.2
+# satisfies it and keeps exactly one schemars package in the lockfile, since
+# two schemars majors would mean two `JsonSchema` traits. `derive` and `std`
+# are schemars' own defaults, named because a crate that uses a feature says so.
 schemars = { version = "1.2.2", default-features = false, features = ["derive", "std"] }
 
-# Most debuginfo in `target/` is not ours: the default `debug = true` emits
-# full DWARF for every dependency and links a copy into each of the
-# workspace's test binaries. Line tables carry the backtraces a panicking
-# test prints; dependencies need none at all, since we do not step through
-# them.
+# Debuginfo in `target/` is mostly dependencies: default `debug = true`
+# emits full DWARF for every crate and links a copy into each test binary.
+# Line tables keep the backtraces a panicking test prints; dependencies need
+# none, since we never step through them.
 #
-# Measured on a clean build of this workspace (2026-08-08, 91 crates):
-# `target/debug` 899M -> 596M, a third smaller. Wall clock was 13s -> 12s,
-# i.e. noise at this size — the win here is disk, not time. Expect the gap
-# to widen as phases 4-6 add ratatui, sysinfo, rmcp and axum.
-#
-# Separately: a `target/` that has grown to tens of GB is accumulation
-# across feature combos and extra target dirs (`llvm-cov-target`,
-# `x86_64-pc-windows-gnu`), not one build. These settings do not shrink
-# that; `cargo clean` does.
+# Does not shrink a `target/` that has grown across feature combos and extra
+# target dirs; that needs `cargo clean`.
 [profile.dev]
 debug = "line-tables-only"
 
 [profile.dev.package."*"]
 debug = false
 
-# Cargo's default release profile optimizes each crate on its own, and the
+# Cargo's default release profile optimizes each crate on its own, but the
 # daemon's hot paths cross crate boundaries on every log line: the pump is in
-# shep-daemon, the codec and `BusEvent` in shep-core, the channels and the
-# timer wheel in tokio.
+# shep-daemon, the codec and `BusEvent` in shep-core, the channels and timer
+# wheel in tokio. `lto = "thin"`: a quarter smaller binary, and this
+# workload is bound by syscalls and wakeups rather than inlinable code, so
+# thin and fat LTO run the same speed.
 #
-# Measured 2026-08-28, clean `cargo build --release -p shep`, and the runtime
-# column against a sheep emitting 7,315 lines/s of 70 bytes with nothing
-# subscribed (two 30 s windows per binary, run round-robin so they share one
-# machine state):
+# Not `panic = "abort"`: shep-client's spawn.rs calls `JoinError::is_panic`
+# and `resume_unwind` to re-raise a panicked task in its caller, which needs
+# a runtime that unwinds.
 #
-#   default          28.8 s   18.60 MiB   1.62 us/line
-#   thin + cgu=1     68.3 s   14.23 MiB   1.57 us/line
-#   fat  + cgu=1     94.2 s   13.21 MiB   1.53 us/line
-#
-# The size column is the reason to set this at all: a quarter off the shipped
-# binary. The runtime column is nearly flat because this workload is bound by
-# syscalls and task wakeups rather than by inlinable code, and the gap between
-# thin and fat is inside the noise -- an earlier round had them equal. So
-# `lto = "thin"`, which leaves 26 s of build time on the table for 1.0 MiB
-# nobody has asked for.
-#
-# Not `panic = "abort"`, and that is a correctness limit rather than a
-# preference: `shep-client`'s `spawn.rs` calls `JoinError::is_panic` and
-# `resume_unwind` to re-raise a panicked task in its caller, which needs a
-# runtime that unwinds.
-#
-# Not `strip`: symbols are what let `sample(1)` name a frame, and the fix that
-# took 1.57 us/line down to 0.82 was found by profiling a binary built with
-# exactly this profile. 1.4 MiB is not worth giving that up.
+# Not `strip`: symbols are what let `sample(1)` name a frame during profiling.
 [profile.release]
 lto = "thin"
 codegen-units = 1
@@ -427,9 +249,5 @@ missing_debug_implementations = "deny"
 
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"
-# Enabled 2026-08-09 after auditing the workspace with this lint at `warn`
-# and finding zero existing violations — every
-# pub `Result`-returning item already carries a `# Errors` section per
-# docs/idiomatic-rust.md IR-28, this just makes CI enforce it going forward
-# instead of relying on review to catch drift.
+# Every pub `Result`-returning item needs a `# Errors` section.
 missing_errors_doc = "deny"

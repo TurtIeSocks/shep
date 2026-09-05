@@ -1,22 +1,14 @@
 //! The `DogConfig` derive, and nothing else.
 //!
-//! A dog (a plugin process the shepherd supervises) publishes a JSON Schema
-//! for its own config so shep can render a settings pane for it. One kind of
-//! field needs marking: a credential, such as the webhook URL in a bark sink,
-//! which a pane shows as `<set>` rather than as its value.
+//! A dog publishes a JSON Schema for its config so shep can render a
+//! settings pane. One field kind needs marking: a credential, shown
+//! as `<set>` rather than its value. `schemars` can mark that by hand
+//! with `#[schemars(extend("x-shep-secret" = true))]`. But the key is
+//! a string an author can misspell silently. This derive turns that
+//! into a compile error.
 //!
-//! `schemars` can express that by hand, with
-//! `#[schemars(extend("x-shep-secret" = true))]`. This crate exists because
-//! `x-shep-secret` is then a string the author types: transpose two of its
-//! letters and it compiles, the schema validates, the field is not marked,
-//! and the credential is painted on screen. Nothing fails and nothing warns.
-//! It cannot be linted either, because `schemars` takes a string literal for
-//! the extension key, so no exported constant can go in that position. The
-//! derive is what turns that into a compile error.
-//!
-//! Depend on `shep-client`, not on this crate directly. It re-exports the
-//! derive next to the `DogConfig` trait the derive implements, so a dog takes
-//! one dependency.
+//! Depend on `shep-client`, not this crate: it re-exports the derive
+//! next to the `DogConfig` trait it implements.
 
 #![forbid(unsafe_code)]
 
@@ -60,17 +52,17 @@ const SECRET: &str = "secret";
 /// assert_eq!(Sink::SECRET_FIELDS, ["url"]);
 /// ```
 ///
-/// That example runs, which needs `shep-client` as a dev-dependency of this
-/// crate: a cycle on paper, allowed because dev-dependencies sit outside the
-/// library build graph. The derive's behaviour is tested in `shep-client`,
-/// where the marking happens and where a real schema can be looked at.
+/// That example runs, which needs `shep-client` as a dev-dependency
+/// of this crate. A cycle on paper, allowed since dev-dependencies
+/// sit outside the library build graph. The derive's behaviour is
+/// tested in `shep-client`, where the marking happens.
 ///
 /// # What it expands to
 ///
 /// An `impl shep_client::dogs::DogConfig`, carrying the names of the marked
 /// fields and the extension key that marks them. The key comes from
-/// `shep_core::dogs::SECRET_KEY` by way of `shep_client`'s re-export, so it is
-/// never spelled out here or in the dog:
+/// `shep_core::dogs::SECRET_KEY` by way of `shep_client`'s re-export.
+/// It is never spelled out here or in the dog:
 ///
 /// ```rust,ignore
 /// impl ::shep_client::dogs::DogConfig for Sink {
@@ -79,38 +71,39 @@ const SECRET: &str = "secret";
 /// }
 /// ```
 ///
-/// One `"url"`, not two, for the two variants above: the list is names, and a
-/// name repeated across variants is one name. The schema `schemars` builds
-/// for a tagged enum is a `oneOf` of one object per variant, each with its own
-/// `properties`, so whatever marks a field has to reach every occurrence of
-/// the name rather than a single top-level property.
+/// One `"url"`, not two, for the two variants above. The list is
+/// names, and a name repeated across variants is one name.
+/// `schemars` builds a `oneOf`, one object per variant with its own
+/// `properties`, for a tagged enum. A mark has to reach every
+/// occurrence of the name, not a single top-level property.
 ///
 /// # Renames
 ///
-/// A field is named here by its Rust identifier. A `#[serde(rename)]` on a
-/// marked field changes what the schema calls it, and the marker would then
-/// have no property to land on. That is caught where the marking happens, in
-/// `shep_client`, which refuses a name it cannot find rather than passing an
-/// unmarked credential on.
+/// A field is named here by its Rust identifier. A
+/// `#[serde(rename)]` on a marked field changes what the schema
+/// calls it. The marker would then have no property to land on.
+/// That is caught where the marking happens, in `shep_client`. It
+/// refuses a name it cannot find rather than passing an unmarked
+/// credential on.
 ///
-/// A `#[serde(rename_all)]` on a tagged enum renames the VARIANTS, not their
-/// fields, so a `url` inside one stays `url`. Measured against `schemars`
-/// 1.2.2 rather than assumed.
+/// A `#[serde(rename_all)]` on a tagged enum renames the variants,
+/// not their fields, so a `url` inside one stays `url`.
 ///
 /// # Compile errors
 ///
 /// Deliberate refusals, each with its own message:
 ///
-/// - `#[shep(secret)]` on a field with no name, in a tuple struct or a tuple
-///   variant, where a schema has no named property for it to mark;
+/// - `#[shep(secret)]` on an unnamed field (tuple struct or variant),
+///   with no schema property to mark;
 /// - `#[shep(...)]` on the type or on a variant, neither of which is a field;
 /// - a union, which has no serde representation to build a schema from;
 /// - any option other than `secret`, which is the misspelling this crate is
 ///   here to catch.
 ///
-/// Everything else is accepted and simply carries no marks: a struct or a
-/// variant with no fields, an unmarked tuple, an enum of plain unit variants.
-/// A dog whose config holds no credential still wants the impl.
+/// Everything else is accepted and carries no marks. That covers a
+/// struct or variant with no fields, an unmarked tuple, and
+/// unit-variant enums. A dog whose config holds no credential still
+/// wants the impl.
 #[proc_macro_derive(DogConfig, attributes(shep))]
 pub fn derive_dog_config(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -144,9 +137,10 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
             ));
         };
         let name = ident.to_string();
-        // Deduped rather than pushed blind: an internally tagged enum repeats
-        // a field name across its variants, the way a bark sink repeats
-        // `url`, and the list is names to look for rather than places to look.
+        // Deduped rather than pushed blind. An internally tagged
+        // enum repeats a field name across variants, like a bark
+        // sink's `url`. The list holds names to look for, not
+        // places to look.
         if !secrets.contains(&name) {
             secrets.push(name);
         }
@@ -162,14 +156,15 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
     })
 }
 
-/// Every field the type has, a struct's directly and an enum's gathered from
-/// its variants.
+/// Every field the type has, a struct's directly and an enum's
+/// gathered from its variants.
 ///
-/// Shapes that cannot hold a named field are not refused here, only left
-/// empty. A unit variant has nothing to mark, and an unmarked tuple is a
-/// config type someone wrote for other reasons. What is refused is a mark
-/// that cannot land, and [`expand`] does that once it knows which fields
-/// carry one, so the rule stays the same wherever the field came from.
+/// Shapes that cannot hold a named field are not refused here, only
+/// left empty. A unit variant has nothing to mark. An unmarked tuple
+/// is a config type someone wrote for other reasons. What is refused
+/// is a mark that cannot land. [`expand`] checks that once it knows
+/// which fields carry one. The rule is the same wherever the field
+/// came from.
 fn fields_of(input: &DeriveInput) -> syn::Result<Vec<&Field>> {
     match &input.data {
         Data::Struct(data) => Ok(data.fields.iter().collect()),
@@ -197,9 +192,9 @@ fn fields_of(input: &DeriveInput) -> syn::Result<Vec<&Field>> {
 
 /// Whether a field carries `#[shep(secret)]`.
 ///
-/// Repeating the attribute on one field is accepted and marks it once. It is
-/// redundant rather than wrong, and a second error message for it would be
-/// noise next to the one that matters, which is a misspelled option.
+/// Repeating the attribute on one field is accepted and marks it
+/// once. It is redundant rather than wrong. A second error message
+/// would be noise next to the one that matters: a misspelled option.
 fn is_secret(field: &Field) -> syn::Result<bool> {
     let mut secret = false;
     for attr in &field.attrs {

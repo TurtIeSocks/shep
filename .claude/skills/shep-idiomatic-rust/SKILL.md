@@ -25,6 +25,7 @@ These are the rules agents violate when writing "good" Rust from instinct. Check
 | New dep: `default-features = false`; new feature: additive + `# Option:` comment | IR-2, IR-3 |
 | `#[must_use]` only where discarding is a plausible bug | IR-17 |
 | Don't widen accepted input formats beyond the spec (no bonus unit spellings, no lenient whitespace) without a map.md/goals.md basis | spec fidelity |
+| Comments say only what the code cannot: no history, no rejected alternatives, no paraphrase; `//` under four lines, `///` under twelve | IR-47 |
 
 ## Sheep terminology
 

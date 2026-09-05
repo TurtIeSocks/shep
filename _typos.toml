@@ -1,97 +1,60 @@
 # Exceptions for `crate-ci/typos` (CI job `typos`, `.github/workflows/test.yml`).
-# Every entry here was read in context, not defaulted — see CI run 32023586026
-# (commit 86157b9), the repo's first public run, which is what surfaced all of
-# these at once. Two real misspellings it also caught (`unparsable`-adjacent
-# false alarms aside) were fixed in source instead of allowed here: see the
-# commit that added this file for what changed.
+# Every entry here was read in context, not defaulted.
 
 [default.extend-words]
-# The maintainer's name (and its lowercase form, as it appears inside example
-# shell paths like `~/GitHub/...`) — not a typo of "ring"/"rain"/etc.
-
-# The real TUI crate this project depends on and documents throughout
-# `shep lookout` (crates/shep-cli/src/lookout, docs/lookout). Not "ratatouille".
+# The TUI crate this project depends on, throughout `shep lookout`
+# (crates/shep-cli/src/lookout, docs/lookout). Not "ratatouille".
 ratatui = "ratatui"
 
-# `toml::ser` — serde's real serialize-module path, quoted in a plan doc's
-# code fence. Not a typo of "set".
+# `toml::ser`, serde's real serialize-module path. Not a typo of "set".
 ser = "ser"
 
-# `flate2`, the real compression crate named in the read-only trace docs
+# `flate2`, the real compression crate named in the trace docs
 # (docs/systematic-refactor/refactor-workspace/trace/_all-rust_map.md).
 flate = "flate"
 
-# Verb-ified I/O syscall name: `kill.rs`/`bleats.rs` already coin `` `stat`ed ``
-# for the stat(2) call in the same sentences as this one ("opened, `stat`ed,
-# seeked, or read") — "seeked" names seek(2) the same way, not the English
-# verb "sought".
+# Verb-ified seek(2), matching `kill.rs`/`bleats.rs`'s `` `stat`ed `` for
+# stat(2). Not the English verb "sought".
 seeked = "seeked"
 
-# This project's own consistent spelling, used in every crate (25 sites) for
-# "cannot be parsed": an accepted alternative to "unparsable", not a slip —
-# renaming 25 sites for a dictionary preference that both forms satisfy
-# would be pure churn.
+# Consistent spelling across 25 sites for "cannot be parsed"; an accepted
+# alternative to "unparsable", not a slip.
 unparseable = "unparseable"
 
-# Hyphenated prefix, as in "a mis-read pid" / "dangerous mis-wiring" — typos
+# Hyphenated prefix, as in "a mis-read pid" / "dangerous mis-wiring": typos
 # tokenizes across the hyphen, so "mis" alone looks like a word rather than
 # the prefix it is.
 mis = "mis"
 
-# `allow_contro` is deliberately truncated test fixture data: the tests it
-# appears in (crates/shep-core/src/config/daemon.rs) exist specifically to
-# prove what error message a truncated/misspelled TOML key produces. The
-# typo is the point of the test, not an accident in our prose.
+# `allow_contro`: a truncated test fixture in config/daemon.rs, proving the
+# error message for a truncated TOML key.
 contro = "contro"
 
-# `instnace` is the same shape as `contro` above: a deliberate misspelling that
-# the template grammar's own tests and docs depend on. `{{instnace}}` is the
-# typo'd token used to prove an unknown token is refused BY NAME, so the
-# assertions check the rendered error contains "instnace" and hand it back to
-# the operator. Correcting the spelling would make those tests assert nothing.
-# All 14 sites are that one example: the tests in config/normalize.rs and
-# config/template.rs, the two design documents quoting them, and the sample
-# error on the first-flockfile docs page.
+# `instnace`: deliberate misspelling. `{{instnace}}` proves an unknown
+# template token is refused by name; tests in config/normalize.rs and
+# config/template.rs assert the error names it.
 instnace = "instnace"
 
-# `retsarts` is the same shape as `contro` and `instnace` above: a deliberate
-# misspelling of `restarts` that a test depends on BY NAME. The bark dog's
-# rule parser must refuse an unknown key and say which one, so
-# `a_misspelled_trigger_field_is_refused_with_the_bad_key_named` asserts the
-# error string contains "retsarts". Correcting the spelling would make that
-# test assert nothing at all. Three sites, all in
-# crates/shep-cli/src/dog/bark/rules.rs: the test's doc comment, its TOML
-# fixture, and the assertion that reads the error back.
+# `retsarts`: deliberate misspelling of `restarts`, asserted by name in
+# dog/bark/rules.rs's `a_misspelled_trigger_field_is_refused_with_the_bad_key_named`.
 retsarts = "retsarts"
 
-# Triggered by "marketing PNGs" (docs/systematic-refactor/.../assessment.md):
-# typos splits the plural acronym into "PN" + "Gs" and flags the first half
-# as a typo of "ON". A real word, not a real word, either way not a mistake
-# here.
+# Triggered by "marketing PNGs": typos splits the plural acronym into "PN" +
+# "Gs" and flags "PN" as a typo of "ON".
 pn = "pn"
 
-# The next five are the ORIGINAL pm2 source's own spellings/names, quoted
-# verbatim in the read-only trace docs (docs/systematic-refactor/refactor-
-# workspace/trace/) that this port's specs are built from. Per this repo's
-# clean-room rule, those docs quote pm2's real identifiers and filenames
-# exactly — correcting the spelling here would misquote the source, and
-# `aux.md`'s own line already marks the first one "(sic, typo'd export)".
-gracefull = "gracefull" # trace/rpc.md:14 — pm2's own `gracefullExit`
-instanciate = "instanciate" # trace/cli.md:95 — pm2's own `Runtime.instanciate`
-knonw = "knonw" # trace/aux-plumbing.md:9 — pm2's own `knonwConfigFileExtensions`
-formated = "formated" # trace/core.md:23 — pm2's own `getFormatedProcesses`
-shouldnot = "shouldnot" # trace/tests.md:13 — pm2's own test helper name
-resurect = "resurect" # trace/tests.md:48 — pm2's own `resurect_state.mocha.js`
+# The next five are pm2's own spellings, quoted verbatim in the read-only
+# trace docs this port's specs are built from; correcting them would misquote
+# the source.
+gracefull = "gracefull" # trace/rpc.md:14, pm2's own `gracefullExit`
+instanciate = "instanciate" # trace/cli.md:95, pm2's own `Runtime.instanciate`
+knonw = "knonw" # trace/aux-plumbing.md:9, pm2's own `knonwConfigFileExtensions`
+formated = "formated" # trace/core.md:23, pm2's own `getFormatedProcesses`
+shouldnot = "shouldnot" # trace/tests.md:13, pm2's own test helper name
+resurect = "resurect" # trace/tests.md:48, pm2's own `resurect_state.mocha.js`
 
-# `sheeps`/`childs`: read every hit (crates/shep-daemon, shep-cli, shep-core,
-# and the plan docs that already shipped these names) before allowing them.
-# None of the ~20 occurrences is the plural CLAUDE.md bans ("the plural is
-# always flock, never sheep(s)") — every one is a singular possessive with
-# the apostrophe dropped, because Rust identifiers cannot carry one:
-# `a_running_sheeps_uptime_advances_with_the_heartbeat` reads "a running
-# sheep's uptime advances...", `a_childs_metric_reaches_a_channel_subscriber`
-# reads "a child's metric reaches...". Renaming ~20 shipped test names and
-# their references across already-merged phase docs would be pure churn for
-# a false positive, not a terminology fix.
+# `sheeps`/`childs`: singular possessives with the apostrophe dropped, since
+# Rust identifiers cannot carry one (`a_running_sheeps_uptime_...` reads "a
+# running sheep's uptime..."). Not the plural CLAUDE.md bans.
 sheeps = "sheeps"
 childs = "childs"
