@@ -321,11 +321,14 @@ fn scalar_view(snapshot: &SettingsSnapshot, field: SettingField) -> &ScalarView 
 /// `pub(super)`: `status::status_line`'s own editor-line branch names the
 /// field being typed with this same word, so the status bar and the body
 /// pane never disagree about what to call `socket` or `max_cron_sleep`.
-pub(super) fn field_label(settings: &Settings, field: SettingField) -> &str {
-    settings
-        .fields()
-        .by_key(field.key())
-        .map_or(field.key(), |f| f.key.as_str())
+///
+/// Delegates rather than matching a second time: the label and the TOML key
+/// are the same word for all six, which is what
+/// [`SettingField::key`] already answers. It briefly read the label off the
+/// `FieldSet` instead, which could only ever echo its own argument back --
+/// the lookup was keyed on `field.key()` and returned the key it found.
+pub(super) const fn field_label(field: SettingField) -> &'static str {
+    field.key()
 }
 
 /// What applying this field costs, decision 6 of the design spec's own
@@ -482,14 +485,9 @@ fn scalar_widths(width: u16, columns: &[ScalarColumn]) -> (u16, u16) {
 }
 
 /// One scalar cell's text.
-fn scalar_cell(
-    settings: &Settings,
-    field: SettingField,
-    view: &ScalarView,
-    column: ScalarColumn,
-) -> String {
+fn scalar_cell(field: SettingField, view: &ScalarView, column: ScalarColumn) -> String {
     match column {
-        ScalarColumn::Name => field_label(settings, field).to_owned(),
+        ScalarColumn::Name => field_label(field).to_owned(),
         ScalarColumn::Value => view.value.clone(),
         ScalarColumn::Source => view.source.to_string(),
         ScalarColumn::Cost => apply_cost(field, view.source).to_string(),
@@ -499,7 +497,6 @@ fn scalar_cell(
 /// One scalar row: name, value, source, apply cost, as many of those as
 /// `width` (a BODY width) can pay for.
 fn scalar_line(
-    settings: &Settings,
     field: SettingField,
     view: &ScalarView,
     selected: bool,
@@ -518,10 +515,7 @@ fn scalar_line(
             ScalarColumn::Source => SCALAR_SOURCE_W,
             ScalarColumn::Cost => cost_width,
         };
-        text.push_str(&fit(
-            &scalar_cell(settings, field, view, *column),
-            cell_width,
-        ));
+        text.push_str(&fit(&scalar_cell(field, view, *column), cell_width));
     }
     Line::from(Span::raw(text))
 }
@@ -671,7 +665,6 @@ fn body_from(
         }
         lines.append(&mut pending_header);
         lines.push(scalar_line(
-            settings,
             field,
             scalar_view(snapshot, field),
             cursor == Some(row),
@@ -785,7 +778,7 @@ fn body_from(
                     fit(
                         &format!(
                             "editing {}: {buffer}\u{258f}   enter applies   esc cancels",
-                            field_label(settings, *field)
+                            field_label(*field)
                         ),
                         table_width,
                     )

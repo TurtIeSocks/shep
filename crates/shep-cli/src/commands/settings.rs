@@ -82,7 +82,7 @@ impl SettingField {
     /// The TOML key, which is also what a [`crate::lookout::field::Field::key`]
     /// carries for the same scalar.
     #[must_use]
-    pub fn key(self) -> &'static str {
+    pub const fn key(self) -> &'static str {
         match self {
             Self::LogLevel => "log_level",
             Self::LogJson => "log_json",

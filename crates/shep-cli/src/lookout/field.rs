@@ -1,5 +1,5 @@
-// Nothing in the crate calls this yet: the settings screen reads it from
-// task 3 and the config panes from task 5. The allow leaves with task 5.
+// The settings screen reads `section_for` off this; the config panes in
+// task 5 are what reach the rest. The allow leaves with them.
 #![allow(dead_code)]
 
 //! A form's shape, read off a JSON Schema.
