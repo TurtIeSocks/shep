@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # No toolchain and no cargo. The check reads the manifests with tomllib
       # and never resolves anything, so it wants a Python and nothing else.
       # ubuntu-latest ships 3.12; tomllib landed in 3.11.

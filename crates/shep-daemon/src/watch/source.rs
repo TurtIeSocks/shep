@@ -233,14 +233,6 @@ mod tests {
             .expect("canonicalize tempdir root")
     }
 
-    /// Waits up to [`SMOKE_DEADLINE`] for the next batch.
-    async fn expect_batch(rx: &mut UnboundedReceiver<WatchBatch>) -> WatchBatch {
-        timeout(SMOKE_DEADLINE, rx.recv())
-            .await
-            .expect("no batch arrived within the deadline")
-            .expect("watch source ended before a batch arrived")
-    }
-
     /// Waits up to `within` for a batch satisfying `wanted`, returning every
     /// batch delivered up to and including it.
     ///
@@ -409,6 +401,8 @@ mod tests {
     mod slow {
         use super::*;
 
+        // Not the first batch alone: FSEvents can deliver the arm-time event
+        // for the root by itself, ahead of the write. See `batches_until`.
         #[tokio::test]
         async fn a_file_created_under_the_root_produces_a_batch_containing_it() {
             let dir = tempfile::tempdir().unwrap();
@@ -418,11 +412,10 @@ mod tests {
             let file = root.join("created.txt");
             std::fs::write(&file, b"hello").unwrap();
 
-            let batch = expect_batch(&mut rx).await;
-            assert!(
-                batch.paths.contains(&file),
-                "expected {file:?} in the batch, got {batch:?}"
-            );
+            batches_until(&mut rx, SMOKE_DEADLINE, &format!("{file:?}"), |batch| {
+                batch.paths.contains(&file)
+            })
+            .await;
         }
 
         // fails if `RecursiveMode::NonRecursive` was passed instead of `Recursive`
@@ -437,7 +430,7 @@ mod tests {
             let file = nested.join("created.txt");
             std::fs::write(&file, b"hello").unwrap();
 
-            // Not `expect_batch`: on inotify the first batch is often the two
+            // Not the first batch alone: on inotify it is often the two
             // directories rather than the file, with the file arriving later.
             // See `batches_until`.
             batches_until(&mut rx, SMOKE_DEADLINE, &format!("{file:?}"), |batch| {
@@ -457,8 +450,15 @@ mod tests {
 
             // Prove the watch is live first, so a failure below can't be
             // confused with "this watch never worked in the first place".
-            std::fs::write(root.join("first.txt"), b"hello").unwrap();
-            expect_batch(&mut rx).await;
+            // On the write itself, not the first batch: on FSEvents that can
+            // be the arm-time root event, and dropping the source on it would
+            // read `first.txt`'s own late batch as a leak.
+            let first = root.join("first.txt");
+            std::fs::write(&first, b"hello").unwrap();
+            batches_until(&mut rx, SMOKE_DEADLINE, &format!("{first:?}"), |batch| {
+                batch.paths.contains(&first)
+            })
+            .await;
 
             drop(source);
             std::fs::write(root.join("second.txt"), b"hello").unwrap();
@@ -547,11 +547,13 @@ mod tests {
 
             std::fs::remove_file(&file).unwrap();
 
-            let batch = expect_batch(&mut rx).await;
-            assert!(
-                batch.paths.contains(&file),
-                "expected the deleted path {file:?} in the batch, got {batch:?}"
-            );
+            // Not the first batch alone, for the reason the root-level write
+            // case above gives: FSEvents' arm-time event for the root can be
+            // a batch of its own ahead of the removal.
+            batches_until(&mut rx, SMOKE_DEADLINE, &format!("{file:?}"), |batch| {
+                batch.paths.contains(&file)
+            })
+            .await;
         }
 
         // fails if a caller can assume delivered paths share root's own
@@ -569,16 +571,23 @@ mod tests {
             let (_source, mut rx) = watch_tree(&link, TEST_DELAY).unwrap();
             crate::testing::touch(&link, "through-the-link.txt").unwrap();
 
-            let batch = expect_batch(&mut rx).await;
+            // Every batch up to the one naming the file, and the literal-form
+            // check runs over all of them: a root-only batch spelled through
+            // the link would be the same trap one batch earlier.
             let resolved_file = resolved_target.join("through-the-link.txt");
-            assert!(
-                batch.paths.contains(&resolved_file),
-                "expected the resolved path {resolved_file:?} in {batch:?}"
-            );
-            assert!(
-                !batch.paths.iter().any(|p| p.starts_with(&link)),
-                "expected no path under the symlink itself, got {batch:?}"
-            );
+            let batches = batches_until(
+                &mut rx,
+                SMOKE_DEADLINE,
+                &format!("{resolved_file:?}"),
+                |batch| batch.paths.contains(&resolved_file),
+            )
+            .await;
+            for batch in &batches {
+                assert!(
+                    !batch.paths.iter().any(|p| p.starts_with(&link)),
+                    "expected no path under the symlink itself, got {batch:?}"
+                );
+            }
         }
     }
 }

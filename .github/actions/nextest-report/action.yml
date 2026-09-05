@@ -1,0 +1,81 @@
+name: nextest report
+description: >-
+  Reads the junit nextest wrote for one profile, annotates every test that
+  passed only on retry, and keeps the file as an artifact.
+# One composite action rather than the same two steps in six jobs. A test
+# that passed only on retry is a green job with a defect in it; this makes
+# it a warning on the run and a row in the summary. `shell: python`: every
+# hosted runner has `python` on PATH, and windows-latest's `python3` is a shim.
+inputs:
+  profile:
+    description: The nextest profile whose junit to read.
+    default: ci
+  name:
+    description: The artifact name; unique per job and per matrix leg.
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: python
+      env:
+        JUNIT: target/nextest/${{ inputs.profile }}/junit.xml
+      run: |
+        # nextest marks a pass-after-retry with <flakyFailure>/<flakyError>
+        # and a fail-every-retry with <rerunFailure>/<rerunError>. Always
+        # exits 0: the test step gave the verdict, this is the report.
+        import os
+        import sys
+        import xml.etree.ElementTree as ET
+
+        path = os.environ["JUNIT"]
+        if not os.path.exists(path):
+            print(f"::notice::no junit at {path}; nothing to report")
+            sys.exit(0)
+        try:
+            root = ET.parse(path).getroot()
+        except ET.ParseError as error:
+            print(f"::warning::could not parse {path}: {error}")
+            sys.exit(0)
+
+        retried = []
+        exhausted = []
+        for case in root.iter("testcase"):
+            name = f"{case.get('classname', '?')}::{case.get('name', '?')}"
+            failed_first = sum(
+                1 for tag in ("flakyFailure", "flakyError") for _ in case.iter(tag)
+            )
+            if failed_first:
+                retried.append((name, failed_first))
+            if any(True for tag in ("rerunFailure", "rerunError") for _ in case.iter(tag)):
+                exhausted.append(name)
+
+        for name, count in retried:
+            times = "once" if count == 1 else f"{count} times"
+            print(
+                f"::warning title=Passed only on retry::{name} failed {times} "
+                "before passing. Read the failure before shrugging at it: a "
+                "retry hides a defect as readily as a flake."
+            )
+
+        summary = os.environ.get("GITHUB_STEP_SUMMARY")
+        if summary and (retried or exhausted):
+            with open(summary, "a", encoding="utf-8") as out:
+                out.write("### Retried tests\n\n")
+                if retried:
+                    out.write("| Passed only on retry | Failed first |\n|---|---|\n")
+                    for name, count in retried:
+                        out.write(f"| `{name}` | {count} |\n")
+                    out.write("\n")
+                if exhausted:
+                    out.write("Failed on every retry:\n\n")
+                    for name in exhausted:
+                        out.write(f"- `{name}`\n")
+                    out.write("\n")
+        if not retried and not exhausted:
+            print(f"no retried tests in {path}")
+    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: ${{ inputs.name }}
+        path: target/nextest/${{ inputs.profile }}/junit.xml
+        if-no-files-found: ignore
+        retention-days: 14

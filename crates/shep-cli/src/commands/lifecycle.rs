@@ -3681,6 +3681,9 @@ mod tests {
     /// takes single-digit milliseconds idle and over a second at
     /// `--test-threads=64`. The node case needs a real node to start and
     /// exit inside the budget, which is a claim about the machine.
+    /// The node case climbs a ladder of budgets: the pipe wait spends the
+    /// whole budget, so one number cannot be both cheap and enough. See
+    /// `BUDGETS`.
     mod slow {
         /// A probe budget no contention can exhaust
         ///
@@ -3985,6 +3988,21 @@ mod tests {
             );
         }
 
+        /// A module that exports its config and leaves a detached node
+        /// holding the pipes shep reads. The holder outlives `budget`
+        /// threefold, or the reads would finish and the case pass for the
+        /// wrong reason.
+        fn held_pipe_module(budget: Duration) -> String {
+            format!(
+                "require('child_process')\
+                 .spawn(process.execPath, ['-e', 'setTimeout(()=>{{}},{})'], \
+                 {{ detached: true, stdio: 'inherit' }})\
+                 .unref(); \
+                 module.exports = {{ app: [] }};",
+                (budget * 3).as_millis()
+            )
+        }
+
         /// node itself exits here: `detached` plus `unref` takes the child
         /// off node's event loop, and `stdio: inherit` hands it the pipes
         /// shep is reading, so only the reads run out of budget.
@@ -3995,35 +4013,41 @@ mod tests {
             }
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("flock.js");
-            std::fs::write(
-                &path,
-                // The pipe-holder is a second node, not `sleep`: node exists
-                // wherever this test runs.
-                "require('child_process')\
-                 .spawn(process.execPath, ['-e', 'setTimeout(()=>{},30000)'], \
-                 { detached: true, stdio: 'inherit' })\
-                 .unref(); \
-                 module.exports = { app: [] };",
-            )
-            .unwrap();
 
-            // Both ends are load-bearing: the slowest observed run took
-            // 11.41s, and the pipe-holder above lives 30 seconds, past which
-            // the child exits on its own and the case passes wrongly.
-            const HELD_PIPE_BUDGET: Duration = Duration::from_secs(20);
+            // A ladder, not one number: `run_bounded` waits for node and then
+            // spends the rest on the held pipe, so the budget is this case's
+            // runtime. A `Killed` verdict is read as a slow machine and retried
+            // with more room; the last rung falls through.
+            const BUDGETS: [Duration; 3] = [
+                Duration::from_secs(5),
+                Duration::from_secs(20),
+                Duration::from_secs(80),
+            ];
 
-            let err = evaluate_js_flockfile(&path, HELD_PIPE_BUDGET).unwrap_err();
+            for (attempt, budget) in BUDGETS.iter().copied().enumerate() {
+                std::fs::write(&path, held_pipe_module(budget)).unwrap();
+                let err = evaluate_js_flockfile(&path, budget).unwrap_err();
+                let message = err.to_string();
 
-            assert_eq!(target_exit_code(&err), ExitCode::InvalidConfig);
-            let message = err.to_string();
-            assert!(
-                message.contains("left behind still holds the output"),
-                "got: {message}"
-            );
-            assert!(
-                !message.contains("killed"),
-                "node exited on its own, so nothing was killed: {message}"
-            );
+                // node never got as far as exiting, so there was nothing
+                // holding a pipe yet to say anything about. Give it more
+                // room. The last rung falls through instead, so a machine
+                // that cannot do it in 80s fails with the message it earned.
+                if message.contains("still running") && attempt + 1 < BUDGETS.len() {
+                    continue;
+                }
+
+                assert_eq!(target_exit_code(&err), ExitCode::InvalidConfig);
+                assert!(
+                    message.contains("left behind still holds the output"),
+                    "got: {message}"
+                );
+                assert!(
+                    !message.contains("killed"),
+                    "node exited on its own, so nothing was killed: {message}"
+                );
+                return;
+            }
         }
     }
 }

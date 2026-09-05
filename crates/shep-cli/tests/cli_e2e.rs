@@ -98,6 +98,17 @@ const FLOCK_DEADLINE: Duration = Duration::from_secs(10);
 /// Gap between [`poll_flock`]'s attempts.
 const FLOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// `RequestError::Closed`: the reply a client loses when the image on the
+/// other end of its request was replaced by a handover. An accepted
+/// connection is `FD_CLOEXEC` and dies at the `execve`; the handover spec's
+/// H2 table rules that the client sees the drop.
+const DROPPED_REPLY: &str = "the connection closed before a reply arrived";
+
+/// `ConnectError::HandshakeClosed`: the same exec, caught between the accept
+/// and the `HelloReply`. A shepherd that is gone prints "could not connect"
+/// instead, so neither is reachable from a dead one.
+const DROPPED_HANDSHAKE: &str = "the daemon closed the connection during the handshake";
+
 /// How long [`poll_metrics`] keeps retrying a `/metrics` scrape.
 ///
 /// `shep enable metrics` returns once the `EnableDog` RPC is accepted, before
@@ -1008,12 +1019,47 @@ fn bleats_no_follow_until(home: &Path, args: &[&str], done: impl Fn(&str) -> boo
 /// Returning rather than panicking on expiry keeps the failure the caller's
 /// own assertion. The deadline is a parameter because the two real-clock cases
 /// need one an order of magnitude past [`FLOCK_DEADLINE`].
+/// Every attempt must succeed; the one case that signals a handover itself
+/// polls through [`poll_flock_data_across_a_handover`].
 fn poll_flock_data(
     home: &Path,
     deadline: Duration,
     done: impl Fn(&serde_json::Value) -> bool,
 ) -> serde_json::Value {
+    poll_flock_until(home, deadline, false, done)
+}
+
+/// [`poll_flock_data`] for the one case that signals a handover itself and
+/// then polls the shepherd being replaced.
+///
+/// The attempt whose reply is in flight at the `execve` fails with
+/// [`DROPPED_REPLY`]; asserting on it turns a tolerated event into a panic.
+/// One drop, and a second is still fatal: the poll is serial and the exec
+/// happens once, so at most one accepted connection is open at the swap.
+#[cfg(unix)]
+fn poll_flock_data_across_a_handover(
+    home: &Path,
+    deadline: Duration,
+    done: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    poll_flock_until(home, deadline, true, done)
+}
+
+/// The loop the two above share. `tolerate_one_drop` lets one attempt fail
+/// with a connection the shepherd closed after accepting it.
+///
+/// A tolerated attempt costs a retry and nothing else: it consults neither
+/// `done` nor `deadline`. The retry can land after `deadline` by one poll
+/// interval and one command, and that is wanted: a drop at the edge that
+/// ended the poll would be the flake this closes, one window narrower.
+fn poll_flock_until(
+    home: &Path,
+    deadline: Duration,
+    tolerate_one_drop: bool,
+    done: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
     let start = Instant::now();
+    let mut tolerance = tolerate_one_drop;
     loop {
         let output = shep(home)
             .arg("--format")
@@ -1021,6 +1067,11 @@ fn poll_flock_data(
             .arg("flock")
             .output()
             .unwrap();
+        if tolerance && !output.status.success() && closed_by_a_handover(&output) {
+            tolerance = false;
+            std::thread::sleep(FLOCK_POLL_INTERVAL);
+            continue;
+        }
         assert_success(&output);
         let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
             .unwrap_or_else(|e| panic!("flock stdout was not JSON: {e}"));
@@ -1030,6 +1081,14 @@ fn poll_flock_data(
         }
         std::thread::sleep(FLOCK_POLL_INTERVAL);
     }
+}
+
+/// Whether `output` is a client whose connection the shepherd had accepted
+/// when it replaced its own image. The two sentences and nothing else, so a
+/// shepherd that is gone or refusing still fails the caller.
+fn closed_by_a_handover(output: &Output) -> bool {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stderr.contains(DROPPED_REPLY) || stderr.contains(DROPPED_HANDSHAKE)
 }
 
 /// [`poll_flock_data`] for the single-sheep cases: waits [`FLOCK_DEADLINE`]
@@ -7221,12 +7280,33 @@ fn a_flock_of_every_carried_kind_survives_a_daemon_reload() {
     graceful_kill(dir.path());
 }
 
+/// Gap between the dials [`the_control_socket_accepts_throughout_a_handover`]
+/// makes at the control address. A dial is a `connect(2)` and a close, so
+/// this decides how narrow an outage the case can see, not what it costs:
+/// every real way the address goes away spans a daemon teardown or a fresh
+/// bind, hundreds of milliseconds.
+#[cfg(unix)]
+const DIAL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// `ExitCode::DaemonUnreachable`, the one failing exit `shep ping` has,
+/// whatever the reason. Any other failing exit is a usage error or a
+/// refusal, which no handover produces, and the prober refuses it rather
+/// than counting it as the one drop the exec is allowed.
+#[cfg(unix)]
+const PING_OFFLINE: i32 = 5;
+
 /// The control socket answers throughout a handover.
 ///
 /// The successor inherits the listening descriptor rather than binding the
 /// address again, so a client that connects mid-replacement waits in the
 /// kernel's backlog. Nothing may be refused, and the socket file may never
 /// disappear: a rebind would race the predecessor's socket file.
+///
+/// Two probers and one file check. A `connect(2)` dialer sees an outage at
+/// least `DIAL_INTERVAL` wide; the socket file's inode sees a rebind, which
+/// is too brief for any poller; a ping loop sees a request still served.
+/// Ping failures are counted, not read: `shep ping` prints nothing on
+/// stderr and exits `DaemonUnreachable` for every reason it has.
 #[cfg(unix)]
 #[test]
 fn the_control_socket_accepts_throughout_a_handover() {
@@ -7245,30 +7325,78 @@ fn the_control_socket_accepts_throughout_a_handover() {
     assert_success(&started);
     let _ = poll_flock(dir.path(), |info| info["status"] == "online");
 
+    // One deadline for both threads, so the two answers describe the same
+    // window.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let socket = dir.path().join("run").join("shep.sock");
+    // The file's identity before anything happens to it. A successor that
+    // binds fresh instead of adopting must unlink and recreate the file,
+    // which changes the inode; that takes a microsecond no poller can see.
+    let inode_before = std::fs::metadata(&socket)
+        .expect("the control socket must exist before the handover")
+        .ino();
+    let dial_socket = socket.clone();
+    let dialer = std::thread::spawn(move || {
+        let mut refused = Vec::new();
+        let mut dials = 0_usize;
+        while Instant::now() < deadline {
+            dials += 1;
+            // Dropped where the `if let` ends: the daemon's accept loop meets
+            // an EOF and logs it at `debug!`. The answer wanted is the
+            // syscall's; anything more would be the bucket this case fixes.
+            if let Err(err) = std::os::unix::net::UnixStream::connect(&dial_socket) {
+                refused.push(format!("dial {dials}: {:?}: {err}", err.kind()));
+            }
+            std::thread::sleep(DIAL_INTERVAL);
+        }
+        (refused, dials)
+    });
+
     let home = dir.path().to_path_buf();
     // The prober says when it is really probing, and the reload waits for
     // that. Without the handshake the reload could finish before the first
     // `ping` ran, and every probe would be served by the successor alone.
     let (probing, started_probing) = std::sync::mpsc::channel();
     let prober = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(8);
-        let mut refused = Vec::new();
+        let mut before_reload = Vec::new();
+        let mut dropped = Vec::new();
+        let mut pings = 0_usize;
         let mut announced = false;
         while Instant::now() < deadline {
+            pings += 1;
             let out = shep(&home).arg("ping").output().unwrap();
-            if !out.status.success() {
-                refused.push(format!(
-                    "exit {:?}: {}",
+            let served = out.status.success();
+            if !served {
+                // The failure has to be the one shape a handover can cause.
+                // Its reason cannot be read (see the case's doc), but its
+                // exit can: anything but `DaemonUnreachable` is a different
+                // defect wearing the tolerated drop's clothes.
+                assert_eq!(
                     out.status.code(),
+                    Some(PING_OFFLINE),
+                    "ping {pings} failed for a reason no handover produces: {}{}",
+                    String::from_utf8_lossy(&out.stdout),
                     String::from_utf8_lossy(&out.stderr)
-                ));
+                );
             }
             if !announced {
-                announced = true;
-                let _ = probing.send(());
+                // The reload waits for a ping the predecessor ANSWERED. A
+                // failure before that has no exec to blame, since none has
+                // been asked for, and it must not spend the one drop the
+                // exec is allowed: it is kept apart and refused below.
+                if served {
+                    announced = true;
+                    let _ = probing.send(());
+                } else {
+                    before_reload.push(pings);
+                }
+                continue;
+            }
+            if !served {
+                dropped.push(pings);
             }
         }
-        refused
+        (before_reload, dropped, pings)
     });
     started_probing
         .recv_timeout(FLOCK_DEADLINE)
@@ -7280,22 +7408,49 @@ fn the_control_socket_accepts_throughout_a_handover() {
         .output()
         .unwrap();
     assert_success(&reloaded);
+    // The premise, checked. A reload that fell back to stopping and starting
+    // really did unbind the address, and the dialer would report that as
+    // the defect. Both fallback arms say so on stderr (`commands/daemon.rs`'s
+    // two `aside("reload", ...)` calls).
+    let reload_aside = String::from_utf8_lossy(&reloaded.stderr);
+    assert!(
+        !reload_aside.contains("starting one instead")
+            && !reload_aside.contains("stopping and starting instead"),
+        "this case is about the handover arm and the reload took the other one: {reload_aside}"
+    );
+    // Same file, same inode: the successor adopted the carried listener. A
+    // rebind at the same path passed the dialer 10 of 10; the inode is the
+    // deterministic reading of the same property.
+    let inode_after = std::fs::metadata(&socket)
+        .expect("the control socket must still exist after the handover")
+        .ino();
+    assert_eq!(
+        inode_after, inode_before,
+        "the successor bound a fresh listener instead of adopting the carried one: \
+         the socket file's inode changed across the handover"
+    );
 
     // The listener's descriptor is carried, so no client ever finds the
-    // address unbound; an accepted connection is not carried, since the
-    // successor cannot rebuild a half-read frame's state. So a reply in flight
-    // at the exec may fail, but a ping that cannot connect at all may not.
-    let refused = prober.join().unwrap();
-    let (dropped, unreachable): (Vec<_>, Vec<_>) = refused
-        .into_iter()
-        .partition(|line| line.contains("the connection closed before a reply arrived"));
+    // address unbound; an accepted connection is not, so the one reply in
+    // flight at the exec may fail. One at most: the prober is sequential.
+    let (refused, dials) = dialer.join().unwrap();
+    let (before_reload, dropped, pings) = prober.join().unwrap();
     assert!(
-        unreachable.is_empty(),
-        "the control address must stay bound across the handover: {unreachable:?}"
+        before_reload.is_empty(),
+        "a ping failed before any reload was asked for, at {before_reload:?} of \
+         {pings}: the predecessor was not answering, which is not the handover's \
+         doing"
+    );
+    assert!(
+        refused.is_empty(),
+        "the control address must stay bound across the handover, \
+         {} of {dials} dials refused: {refused:?}",
+        refused.len()
     );
     assert!(
         dropped.len() <= 1,
-        "at most the one request in flight at the exec may drop, got {}: {dropped:?}",
+        "at most the one request in flight at the exec may drop, got {} of {pings} \
+         pings, at {dropped:?}",
         dropped.len()
     );
 
@@ -7326,11 +7481,12 @@ fn roll_recording(roll: &Path, want: usize) -> Vec<u8> {
 /// A boot either installs the flock it was handed or restores the roll, and
 /// what decides is whether it was handed a flock at all, not how large.
 ///
-/// SIGHUP directly, not `shep daemon reload`, which would start `ghost` through
-/// `shep muster` whatever the boot decided. SIGHUP can also fail to exec, after
-/// which a fresh shepherd does restore the roll, so the pid check says a
-/// successor answered. The final wait is for a sheep to appear, so asserting
-/// none did cannot pass by looking too early.
+/// SIGHUP directly, not `shep daemon reload`, which would start `ghost`
+/// through `shep muster` whatever the boot decided. A failed exec leaves no
+/// shepherd, so the poll fails on its own `assert_success` and the pid check
+/// says a successor answered. The wait is for a sheep to appear, so asserting
+/// none did cannot pass by looking too early; it goes through
+/// [`poll_flock_data_across_a_handover`] since the raw signal can drop one reply.
 #[cfg(unix)]
 #[test]
 fn a_successor_inheriting_an_empty_flock_does_not_restore_the_roll() {
@@ -7377,7 +7533,7 @@ fn a_successor_inheriting_an_empty_flock_does_not_restore_the_roll() {
 
     nix::sys::signal::kill(shepherd, nix::sys::signal::Signal::SIGHUP).unwrap();
 
-    let after = poll_flock_data(home, FLOCK_DEADLINE, |data| {
+    let after = poll_flock_data_across_a_handover(home, FLOCK_DEADLINE, |data| {
         data.as_array().is_some_and(|rows| !rows.is_empty())
     });
     assert_eq!(
