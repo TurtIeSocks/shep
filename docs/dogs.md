@@ -657,14 +657,17 @@ operator hand-edits. Nothing else changes.
 ## What a schema buys: the settings pane
 
 `s` in `shep lookout`, then `e` on the dog's row, opens a form over its
-`[<name>]` section. One row per property, the value in force beside it, and
-`<set>` where a field is marked as a credential. It writes as well, behind
+`[<name>]` section. One row per property, the value the section sets beside
+it, `(unset)` where it sets none, and `<set>` where a field is marked as a
+credential. A property the schema gives a default still reads `(unset)`: the
+pane shows the file, not the dog's own fallback. It writes as well, behind
 `--allow-control`, and it writes the section whole, so the comments in
 `dogs.toml` survive an edit shep made.
 
 The pane is flat, with no section headers, and its cost column is empty on
 every row. shep does not know what a dog's field costs; the dog does. The
-foot of the pane says so once rather than guessing per row:
+foot of the pane says so once, naming the dog, rather than guessing per
+row:
 
 ```
 shep publishes the change; bark decides what to reload

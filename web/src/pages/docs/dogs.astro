@@ -833,8 +833,11 @@ shep-dog 0.1.24`}</CodeBlock>
       What answering buys is a settings pane. <code>s</code> in{" "}
       <code>shep lookout</code>, then <code>e</code> on the dog's row, opens
       a form over its <code>[&lt;name&gt;]</code> section: one row per
-      property, the value in force beside it, and{" "}
-      <code>&lt;set&gt;</code> where a field is marked as a credential. It
+      property, the value the section sets beside it,{" "}
+      <code>(unset)</code> where it sets none, and{" "}
+      <code>&lt;set&gt;</code> where a field is marked as a credential. A
+      property the schema gives a default still reads <code>(unset)</code>:
+      the pane shows the file, not the dog's own fallback. It
       writes too, behind <code>--allow-control</code>, and it writes the
       section whole, so the comments in <code>dogs.toml</code> survive an
       edit shep made. <a href="/docs/lookout">The lookout page</a> has the
