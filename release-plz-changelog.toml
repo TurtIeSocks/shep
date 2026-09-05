@@ -1,14 +1,9 @@
 # release-plz changelog template, extending git-cliff's config.
 # Docs: https://git-cliff.org/docs/configuration
 #
-# Copied from zendriver-rs on 2026-08-27, with the header reworded to match
-# what these four changelogs already say. Only the header differs.
-#
-# `filter_unconventional` plus `filter_commits` and the skips below are what
-# make generation safe to turn on here. Without them a generated section
-# restates every docs and chore commit alongside the hand-written entry that
-# already covers the work, which is what 576 lines of duplication looked like
-# the first time release-plz ran on this repository.
+# `filter_unconventional` plus `filter_commits` and the skips below keep a
+# generated section from restating every docs and chore commit alongside the
+# hand-written entry that already covers the same work.
 
 [changelog]
 header = """
@@ -44,9 +39,8 @@ commit_parsers = [
     { message = "^fix", group = "Fixed" },
     { message = "^perf", group = "Performance" },
     { message = "^refactor", group = "Changed" },
-    # Label release-plz's synthetic dependency-only-bump commit (first-match-wins,
-    # so it must precede the generic ^chore skip) instead of leaving a pure
-    # lockstep version bump as a silent, contentless version header.
+    # Must precede the generic ^chore skip (first-match-wins), or a lockstep
+    # version bump leaves a silent, contentless version header.
     { message = '^chore: update Cargo\.(toml|lock) dependencies$', group = "Internal" },
     { message = "^docs", skip = true },
     { message = "^test", skip = true },
@@ -55,8 +49,7 @@ commit_parsers = [
     { message = "^style", skip = true },
 ]
 filter_commits = true
-# The skips above drop `^chore`, which would also drop a breaking `chore!:`
-# commit: exactly the one that must never go missing from a changelog. This
-# keeps any commit marked breaking regardless of which parser matched it.
+# Keeps any commit marked breaking regardless of which parser matched it, so
+# the `^chore` skip above never drops a breaking `chore!:` commit.
 protect_breaking_commits = true
 tag_pattern = "v[0-9].*"

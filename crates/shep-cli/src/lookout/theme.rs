@@ -1,22 +1,15 @@
 //! The design language's semantic colours, mapped onto a terminal.
 //!
-//! `docs/shep-design/README.md` assigns meaning to four tokens — `--meadow`
-//! for online and healthy, `--bark` for errored and refused and destructive
-//! and nothing else, `--butter` for attention, `--ink-3` for muted labels and
-//! captions — and states one rule this module exists to keep: *errors get a
-//! colour, not a face*. A terminal has 16 or 256 colours rather than hex
-//! tokens, so this maps rather than quotes.
+//! Maps `--meadow` (online, healthy), `--bark` (errored, refused,
+//! destructive), `--butter` (attention) and `--ink-3` (muted) onto 16 or
+//! 256 terminal colours, per `docs/shep-design/README.md`.
 //!
-//! Two things are deliberately NOT mapped. `--paper` is the design language's
-//! page background; painting it here would fight the operator's own terminal
-//! theme and lose on half of them, so no background is painted at all and
-//! ordinary text is [`Color::Reset`]. `--barn` is scenery-only in the design
-//! language's own words, and there is no scenery in a dashboard.
+//! `--paper` is never painted: it would fight the operator's own terminal
+//! background, so ordinary text stays [`Color::Reset`]. `--barn` is
+//! scenery-only and has no analog here.
 //!
-//! **Colour is always redundant with text here.** Every coloured cell is a cell
-//! whose text already says the same thing: the STATUS column prints `errored`
-//! and `--bark` sits on top of that word. That is what makes both downgrades
-//! below losses of decoration rather than losses of information.
+//! Every coloured cell's text already says the same thing, so `NO_COLOR`
+//! costs decoration, never information.
 
 use ratatui::style::{Color, Style};
 use std::ffi::OsStr;
@@ -27,9 +20,8 @@ use crate::vocabulary::Reported;
 
 /// The four semantic colours, resolved for one terminal.
 ///
-/// Constructed once at startup — by `super::mod`'s `lookout`, from
-/// `Palette::detect` — and carried in `super::app::App`; never re-derived per
-/// frame.
+/// Constructed once at startup by `lookout`, from `Palette::detect`, and
+/// carried in `super::app::App`. Never re-derived per frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
     meadow: Option<Color>,
@@ -40,25 +32,12 @@ pub struct Palette {
 
 impl Palette {
     /// Resolves the palette from the environment, taken as arguments rather
-    /// than read here.
+    /// than read here so callers can test it without touching `std::env`.
     ///
-    /// A pure function over its inputs, the same shape (and for the same
-    /// testability reason) as `crate::commands::daemon::ansi_enabled`: the
-    /// caller in `super::mod` does the `std::env` reads.
-    ///
-    /// - `no_color` set and **non-empty** flattens everything. An empty
-    ///   `NO_COLOR=` is an unset one — the cross-ecosystem convention, and the
-    ///   one already pinned for the shepherd's own log output. Calls
-    ///   [`crate::style::no_color_set`], the one copy of the rule both this
-    ///   binding and `output::paint`'s share, since `mod lookout` is
-    ///   `#[cfg(unix)]` and `crate::style` is not.
-    /// - `colorterm` containing `truecolor` or `24bit`, or `term` containing
-    ///   `256color`, gets the 256-colour indices -- also
-    ///   [`crate::style::deep_colour_terminal`] now, for the same reason.
-    /// - Anything else gets the 16 named colours. Erring narrow is the
-    ///   recoverable direction: a deep terminal shown 16 colours looks
-    ///   flatter, while a shallow one sent `\x1b[38;5;166m` can print the
-    ///   escape as literal text.
+    /// An empty `NO_COLOR=` counts as unset, the cross-ecosystem convention.
+    /// A terminal claiming truecolor, 24-bit or 256-colour support gets the
+    /// indexed colours; anything else gets the 16 named ones, since a
+    /// shallow terminal fed a 256-colour escape can print it as literal text.
     #[must_use]
     pub fn detect(
         no_color: Option<&OsStr>,
@@ -97,30 +76,25 @@ impl Palette {
     }
 
     /// The style for a group row's STATUS cell, where only a bare
-    /// `ProcStatus` is available -- see [`super::app::App::group_status_text`]'s
-    /// own doc for why a group row is never [`Reported::Silent`].
+    /// `ProcStatus` is available.
     ///
     /// `Errored` is the only status that gets `--bark`; `waiting-restart` is
-    /// `--butter`, because it is a state to watch rather than damage that has
-    /// happened. `Stopping` and `Stopped` are muted: a sheep that was asked to
-    /// go and went is not a problem.
+    /// `--butter`, a state to watch rather than damage that happened.
+    /// `Stopping` and `Stopped` are muted.
     #[must_use]
     pub fn status(self, status: ProcStatus) -> Style {
         self.role_style(crate::vocabulary::role_of(status))
     }
 
-    /// The style for one row's STATUS cell, sheep or dog -- what
-    /// [`super::view::flock`] and [`super::view::detail`] use for every real
-    /// row, so a silent dog wears `--butter` there exactly as it does in
-    /// `shep flock`'s own table.
+    /// The style for one row's STATUS cell, sheep or dog. A silent dog wears
+    /// `--butter` here exactly as it does in `shep flock`'s own table.
     #[must_use]
     pub fn reported(self, reported: Reported) -> Style {
         self.role_style(reported.role())
     }
 
     /// The mapping lives in `crate::vocabulary`, so the CLI's table and this
-    /// pane cannot drift. This is the ratatui BINDING of it, and nothing
-    /// more.
+    /// pane cannot drift.
     fn role_style(self, role: crate::vocabulary::Role) -> Style {
         Self::fg(match role {
             crate::vocabulary::Role::Meadow => self.meadow,
@@ -142,8 +116,8 @@ impl Palette {
         Self::fg(self.bark)
     }
 
-    /// A refused action. `--bark`'s third permitted use, per the design
-    /// language's own list — errored, refused, destructive.
+    /// A refused action: `--bark`'s third permitted use, alongside errored
+    /// and destructive.
     #[must_use]
     pub fn refusal(self) -> Style {
         Self::fg(self.bark)
@@ -166,12 +140,6 @@ mod tests {
     use super::*;
     use std::ffi::OsStr;
 
-    /// fails if `NO_COLOR` stops being honoured, or if an EMPTY `NO_COLOR=`
-    /// starts being treated as set. The empty case is the one that regresses
-    /// silently: a user who exports `NO_COLOR=` with no value would lose every
-    /// colour in the dashboard and have nothing to blame it on. Same rule
-    /// `commands::daemon::ansi_enabled` already pins for the shepherd's own
-    /// log output.
     #[test]
     fn no_color_flattens_the_palette_and_an_empty_one_does_not() {
         let off = Palette::detect(Some(OsStr::new("1")), None, None);
@@ -186,10 +154,8 @@ mod tests {
         assert_ne!(empty.status(ProcStatus::Errored), Style::default());
     }
 
-    /// fails if an unknown terminal starts being handed 256-colour indices.
-    /// The recoverable direction is the narrow one: a 256-colour terminal shown
-    /// 16 colours looks flatter, while a 16-colour terminal sent
-    /// `\x1b[38;5;166m` can print the escape as literal text.
+    /// A 16-colour terminal sent an unrecognized escape can print it as
+    /// literal text, which is worse than a flatter palette.
     #[test]
     fn an_unknown_terminal_gets_the_sixteen_colour_palette() {
         let sixteen = Palette::detect(None, Some(OsStr::new("vt100")), None);
@@ -213,11 +179,8 @@ mod tests {
         );
     }
 
-    /// fails if `--bark` leaks onto anything that is not errored, refused or
-    /// destructive. The design language reserves that colour and says so in
-    /// those words; `waiting-restart` is the live temptation, because it is a
-    /// state an operator worries about — and it is `--butter`, attention, not
-    /// damage.
+    /// `waiting-restart` is the live temptation: it is `--butter`, attention,
+    /// not damage.
     #[test]
     fn bark_is_reserved_for_errored_and_nothing_else() {
         let p = Palette::detect(None, Some(OsStr::new("xterm-256color")), None);
@@ -241,11 +204,6 @@ mod tests {
         assert_eq!(p.refusal().fg, bark);
     }
 
-    /// fails if a status stops being distinguishable by TEXT alone. Colour in
-    /// this dashboard is always redundant with the word beside it — that is
-    /// what makes `NO_COLOR` a loss of decoration rather than a loss of
-    /// information, and it is the house rule that the theme never costs
-    /// clarity. This test is the rule, written where it can fail.
     #[test]
     fn every_status_is_legible_with_no_colour_at_all() {
         let off = Palette::detect(Some(OsStr::new("1")), None, None);
@@ -267,15 +225,10 @@ mod tests {
         assert_eq!(seen.len(), 6);
     }
 
-    /// The design spec's own rule (§6, "the two renderings agree by
-    /// construction"): this binding and `output::paint`'s -- the CLI
-    /// table's own binding of the same roles -- must resolve every role to
-    /// the same underlying colour, at both tiers. Extracts the numeric
-    /// index or name from each side and compares those directly, rather
-    /// than re-hardcoding one shared literal in both this test and
-    /// `paint`'s own: a renumbering on one side that forgets the other
-    /// fails this, which two independently-chosen matching literals would
-    /// not catch.
+    /// This binding and `output::paint`'s must resolve every role to the
+    /// same colour, at both tiers. Compares the extracted index or name
+    /// rather than a shared literal, so a renumbering on one side that
+    /// forgets the other still fails this.
     #[test]
     fn the_anstyle_binding_agrees_with_this_ones_colours() {
         use crate::vocabulary::Role;
@@ -332,8 +285,8 @@ mod tests {
     }
 
     /// A colour-family name independent of either crate's own enum spelling,
-    /// so `ratatui::style::Color::DarkGray` and `anstyle::AnsiColor::BrightBlack`
-    /// -- the same ANSI code 90 under two different names -- compare equal.
+    /// so `ratatui::style::Color::DarkGray` and
+    /// `anstyle::AnsiColor::BrightBlack` compare equal.
     fn named_colour(c: Color) -> &'static str {
         match c {
             Color::Green => "green",

@@ -2,26 +2,13 @@
 //! that turns a bus event or a reconciliation poll into zero or more
 //! [`Firing`]s.
 //!
-//! **The bus drops events.** `tokio::sync::broadcast` drops what a lagging
-//! subscriber cannot keep up with rather than queueing it — the daemon
-//! surfaces that as `BusEvent::Dropped` — so a dog that only listens to
-//! [`Rules::on_event`] will miss some. [`Rules::on_poll`] is how bark
-//! reconciles: it evaluates the same rule set against a *level* (the
-//! flock's current [`ProcessInfo`] snapshot) rather than an *edge* (one bus
-//! event), so a firing the bus lost still lands the next time the dog
-//! polls. The two routes share one piece of state — [`Rules`]'s own
-//! `subjects` map — keyed by subject name, which is what lets a rule that
-//! fired off the bus and would also fire off the very next poll fire only
-//! once: the debounce it records covers both routes, because it does not
-//! know or care which one recorded it.
+//! [`Rules::on_poll`] catches what the bus drops: it evaluates the same
+//! rules against the flock's current state instead of one event. Both
+//! routes share one per-subject debounce in [`Rules`]'s `subjects` map, so
+//! a rule fired by one route is not fired again by the other.
 //!
-//! **Debounce is per rule per subject, never global.** A global debounce
-//! means the second sheep to go down during an incident is silent, and
-//! that is the incident's most interesting fact.
-//!
-//! [`super::run_loop`] (Task 21) is what actually calls `on_event` and
-//! `on_poll`, wiring this module and [`super::sinks`] together into a
-//! running dog.
+//! Debounce is per rule per subject, never global: a global debounce would
+//! silence the second sheep to go down during an incident.
 
 use core::fmt;
 use std::collections::BTreeMap;
@@ -49,15 +36,9 @@ fn default_debounce() -> UpDuration {
 /// key, never a silently ignored setting. See
 /// [`BarkConfig`](super::BarkConfig)'s own doc for why that posture
 /// matters.
-// The attribute enforcing that sits on `Trigger` rather than here, and it
-// cannot sit here: serde does not support `deny_unknown_fields` alongside
-// `#[serde(flatten)]` on one struct. The flattened field has to collect
-// whatever keys this struct's own named fields do not claim, and
-// `deny_unknown_fields` rejects exactly those before the flattened field
-// ever sees them, so every key of a real rule, `on` included, reads as
-// unknown from `Rule`'s point of view. Everything `sinks` and `debounce`
-// do not consume flows into `Trigger`'s deserialize instead, which catches
-// the typo one level down from where the attribute used to sit.
+// deny_unknown_fields cannot sit here: serde refuses it alongside
+// #[serde(flatten)]. Keys `sinks` and `debounce` don't claim flow into
+// Trigger's own deserialize instead, which is where a typo is caught.
 #[derive(Debug, Clone, PartialEq, Deserialize, schemars::JsonSchema)]
 pub struct Rule {
     /// What fires it.
@@ -93,17 +74,9 @@ pub enum Trigger {
     /// missed — the app is down and staying down — and because it cannot
     /// disagree with the shepherd: it is keyed to the shepherd's own
     /// decision rather than to a threshold bark chose.
-    // An empty struct variant rather than a bare unit variant,
-    // deliberately, and load-bearing for the `deny_unknown_fields` above.
-    // An internally tagged UNIT variant deserializes through a path that
-    // never visits the rest of the map, so a stray key beside
-    // `on = "gave_up"` (a misspelled `debounce`, say) parsed silently even
-    // with the attribute set. Measured, not assumed, and covered by
-    // `tests::a_misspelled_field_next_to_gave_up_is_still_refused` below.
-    // A struct variant, even an empty one, goes through the same
-    // field-checking visitor every other variant here already used. The
-    // wire shape is identical either way: `on = "gave_up"` on its own
-    // still parses to this variant.
+    // A struct variant, not a unit variant: an internally tagged unit
+    // variant skips field checking entirely, so deny_unknown_fields would
+    // not catch a typo beside `on = "gave_up"`.
     GaveUp {},
     /// The early warning: `restarts` restarts within `within`. Opt-in,
     /// because it is the one that pages at 3am for a blip, and the
@@ -136,14 +109,10 @@ fn trigger_name(when: &Trigger) -> &'static str {
     }
 }
 
-/// `kind`'s wire spelling — the same string `[dog.bark.rules]`'s `kinds`
-/// list names it by. Reads it off `ProcessEventKind`'s own
-/// `Serialize` (`rename_all = "snake_case"`) rather than hand-listing the
-/// variants a second time, so a new variant never needs this file updated
-/// to be matchable. Never fails in practice — every variant serializes to
-/// a bare string — and falls back to an empty string, which cannot equal
-/// any configured kind, rather than panicking, on the day that stops being
-/// true.
+/// `kind`'s wire spelling, the string `kinds` in a rule names it by. Reads
+/// `ProcessEventKind`'s own `Serialize` rather than hand-listing variants,
+/// falling back to an empty string, which matches nothing, if that ever
+/// fails.
 fn wire_spelling(kind: ProcessEventKind) -> String {
     serde_json::to_value(kind)
         .ok()
@@ -248,18 +217,14 @@ impl Rules {
     /// Builds the engine, refusing a configuration that cannot work.
     ///
     /// # Errors
-    /// - [`RulesError::UnknownSink`] — a rule routes to a sink name
-    ///   `[dog.bark.sinks]` does not define. Refused at startup rather than
-    ///   at 3am: the rule would fire correctly and deliver nowhere.
-    /// - [`RulesError::NoSinks`] — a rule routes to none at all.
-    /// - [`RulesError::UnknownKind`] — an `Event` rule names an event kind
-    ///   that is not on the wire, which is a typo and not a future event:
-    ///   bark and the shepherd ship in one binary.
-    /// - [`RulesError::InsecureSink`] — a `[dog.bark.sinks]` entry is a
-    ///   Discord or Slack webhook configured with `http://`. Checked
-    ///   against every sink, whether or not any rule currently routes to
-    ///   it — an unused insecure sink is still sitting in the config as a
-    ///   footgun for the next rule that does.
+    /// - [`RulesError::UnknownSink`]: a rule routes to a sink
+    ///   `[dog.bark.sinks]` does not define.
+    /// - [`RulesError::NoSinks`]: a rule routes to no sink.
+    /// - [`RulesError::UnknownKind`]: an `Event` rule names a kind that is
+    ///   not on the wire.
+    /// - [`RulesError::InsecureSink`]: a `[dog.bark.sinks]` entry is a
+    ///   Discord or Slack webhook using `http://`, checked whether or not
+    ///   any rule routes to it.
     pub fn new(rules: Vec<Rule>, sinks: &BTreeMap<String, Sink>) -> Result<Self, RulesError> {
         for (name, sink) in sinks {
             sinks::require_secure_scheme(name, sink)?;
@@ -304,10 +269,9 @@ impl Rules {
         }]
     }
 
-    /// Whether rule `idx` may fire for `subject` right now, and records the
-    /// firing when it can. The one piece of state a bus-route firing and a
-    /// poll-route firing both consult — the mechanism behind "an `Errored`
-    /// seen by both routes fires once."
+    /// Whether rule `idx` may fire for `subject` now, recording the firing
+    /// when it can. Shared by the bus route and the poll route, so an
+    /// event both see fires once.
     fn try_fire(&mut self, idx: usize, subject: &str, now_ms: u64, debounce: UpDuration) -> bool {
         let state = self.subjects.entry(subject.to_owned()).or_default();
         let ready = state
@@ -320,20 +284,14 @@ impl Rules {
         ready
     }
 
-    /// Whether a `RestartRate` rule's window has accumulated `threshold` or
-    /// more restarts for `subject`, sliding the window forward once
-    /// `within` has elapsed since it opened.
+    /// Whether a `RestartRate` rule has accumulated `threshold` or more
+    /// restarts for `subject` since the window opened, sliding the window
+    /// forward once `within` has elapsed.
     ///
-    /// The window's baseline restart count starts at zero the first time a
-    /// subject is observed by this rule — bark cannot know when restarts
-    /// that predate its own first poll happened, and for an early-warning
-    /// rule the conservative reading of unknown history is to count it,
-    /// not discount it. From then on the window only carries restarts that
-    /// happened inside it: once `within` has passed since the window
-    /// opened with no new firing, the next poll resets the baseline to the
-    /// count it already saw, so a sheep that stopped flapping stops
-    /// re-triggering the rule just because the old count is still above
-    /// threshold.
+    /// The baseline starts at zero on first observation, so restarts from
+    /// before bark's own first poll count toward it. Once `within` elapses
+    /// with no new firing, the baseline resets to the current count, so a
+    /// sheep that stopped flapping stops re-triggering the rule.
     fn restart_window_crossed(
         &mut self,
         idx: usize,
@@ -398,10 +356,9 @@ impl Rules {
     /// carried and did not, plus the level-triggered rules that have no bus
     /// event at all.
     ///
-    /// Reads `ProcessInfo::restarts` — the shepherd's own count — rather
-    /// than a tally bark kept. A private tally drifts from the number the
-    /// shepherd acts on, and the operator would be told a different story
-    /// from the one the supervisor believes.
+    /// Reads `ProcessInfo::restarts`, the shepherd's own count, rather
+    /// than tallying restarts itself: a private tally could drift from
+    /// what the shepherd acts on.
     #[must_use]
     pub fn on_poll(&mut self, flock: &[ProcessInfo], now_ms: u64) -> Vec<Firing> {
         let mut firings = Vec::new();
@@ -463,10 +420,8 @@ impl Rules {
 /// One rule firing for one subject: the bark to write and where to send it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Firing {
-    /// The record, with [`Bark::sinks`] still EMPTY: what each sink made of
-    /// it is not known until it has been tried, and the loop fills that in
-    /// before the record is written. A `Firing` carrying delivery outcomes
-    /// would be claiming a delivery that has not happened.
+    /// The record, with [`Bark::sinks`] still empty until delivery fills
+    /// it in.
     pub bark: Bark,
     /// The sink names it routes to.
     pub sinks: Vec<String>,
@@ -556,10 +511,6 @@ mod tests {
         }
     }
 
-    /// fails if the same `Errored` fires twice when both routes see it —
-    /// once off the bus, once off the poll a second later. An operator
-    /// paged twice for one outage stops trusting the page, and this is the
-    /// shape reconciliation introduces the moment it exists.
     #[test]
     fn an_errored_seen_by_both_routes_fires_once() {
         let mut rules = gave_up_rules();
@@ -569,8 +520,6 @@ mod tests {
         assert!(second.is_empty(), "the debounce covers the other route");
     }
 
-    /// fails if the poll cannot fire what the bus never delivered — which
-    /// is the entire reason bark polls at all.
     #[test]
     fn the_poll_fires_what_the_bus_never_carried() {
         let mut rules = gave_up_rules();
@@ -579,9 +528,6 @@ mod tests {
         assert_eq!(fired[0].bark.subject, "web");
     }
 
-    /// fails if the debounce is global rather than per subject. The second
-    /// sheep to go down during an incident is the incident's most
-    /// interesting fact, and a global debounce silences it.
     #[test]
     fn one_flapping_sheep_does_not_mute_another_going_down() {
         let mut rules = gave_up_rules();
@@ -590,12 +536,9 @@ mod tests {
         assert!(rules.on_event(&errored_event("web"), 1_200).is_empty());
     }
 
-    /// fails if bark keeps its own restart tally. The shepherd's count is
-    /// the number it acts on; a private one drifts, and the operator is
-    /// told a different story from the one the supervisor believes. The
-    /// fixture makes them DISAGREE — the info says 9, and bark has seen
-    /// three events — so an implementation reading either one passes only
-    /// if it reads the right one.
+    /// `info.restarts` says 9; only 3 restart events are fed through
+    /// `on_event`, so passing requires reading `info.restarts` rather than
+    /// a tally kept from the events.
     #[test]
     fn the_early_warning_counts_the_shepherds_restarts_and_not_its_own() {
         let mut rules = restart_rate_rules(5, UpDuration::from_millis(60_000));
@@ -612,28 +555,18 @@ mod tests {
         );
     }
 
-    /// fails if a rule routed at a sink nobody defined is accepted. It
-    /// would fire correctly for months and deliver nowhere, and the first
-    /// time anyone finds out is the incident it was written for.
     #[test]
     fn a_rule_routed_at_a_sink_that_does_not_exist_is_refused_at_startup() {
         let err = Rules::new(vec![rule_to("pager")], &BTreeMap::new()).unwrap_err();
         assert!(matches!(err, RulesError::UnknownSink { .. }));
-        // Exact, not a `contains`, because the sink name is not the part
-        // that drifted. This sentence reaches an operator's terminal
-        // through `Display` rather than through an `eprintln!` literal,
-        // which is how it kept sending them to `[dog.bark.sinks]` for a
-        // whole branch after that section moved to `[bark.sinks]` in
-        // dogs.toml: the sweep that fixed the literals could not see it.
+        // Exact, not a `contains`: this string reaches an operator through
+        // `Display`.
         assert_eq!(
             err.to_string(),
             "rule 0 routes to sink \"pager\", which [bark.sinks] in dogs.toml does not define"
         );
     }
 
-    /// fails if a `[bark]` with sinks and no rules alerts on nothing.
-    /// "The shepherd gave up" is on by default with nothing to tune — that
-    /// is what makes it the alert that cannot be missed.
     #[test]
     fn a_bark_with_sinks_and_no_rules_still_alerts_when_the_shepherd_gives_up() {
         let sinks = one_sink("ops");
@@ -643,10 +576,6 @@ mod tests {
         assert_eq!(rules[0].sinks, vec!["ops"]);
     }
 
-    /// fails if a rule with an empty `sinks` list is accepted — the same
-    /// half of the "routes nowhere" contract `UnknownSink` does not cover:
-    /// an empty list names no *nonexistent* sink to complain about, so it
-    /// needs its own check.
     #[test]
     fn a_rule_with_no_sinks_at_all_is_refused_at_startup() {
         let rule = Rule {
@@ -658,10 +587,6 @@ mod tests {
         assert!(matches!(err, RulesError::NoSinks { .. }));
     }
 
-    /// fails if a typo'd event kind is accepted rather than refused at
-    /// startup — the same "found during an incident, not before" failure
-    /// mode `UnknownSink` guards against, for the other half of a rule's
-    /// configuration.
     #[test]
     fn an_event_rule_naming_an_unknown_kind_is_refused_at_startup() {
         let rule = Rule {
@@ -676,9 +601,6 @@ mod tests {
         assert!(err.to_string().contains("not_a_real_kind"));
     }
 
-    /// fails if an `Event` rule fires on a kind it was not configured
-    /// with — the negative half of kind matching, which has no test of its
-    /// own if only the positive match is checked.
     #[test]
     fn an_event_rule_does_not_fire_on_a_kind_it_was_not_given() {
         let sinks = one_sink("ops");
@@ -699,9 +621,6 @@ mod tests {
         assert_eq!(exit.len(), 1, "exit was, and should still fire");
     }
 
-    /// fails if `RestartRate` fires below its own threshold, or fails to
-    /// fire exactly at it — the boundary on both sides, not just a value
-    /// comfortably past it.
     #[test]
     fn restart_rate_fires_at_the_threshold_and_not_one_below_it() {
         let mut rules = restart_rate_rules(5, UpDuration::from_millis(60_000));
@@ -720,11 +639,7 @@ mod tests {
         );
     }
 
-    /// fails if a `RestartRate` window never slides: once `within` has
-    /// elapsed with no new restarts, a sheep that stopped flapping should
-    /// stop re-tripping the rule just because the old count is still past
-    /// threshold — debounce is zeroed here so only the window's own logic
-    /// can be what keeps it quiet.
+    /// Debounce is zeroed: only the window's own logic keeps this quiet.
     #[test]
     fn restart_rate_window_slides_once_it_elapses() {
         let sinks = one_sink("ops");
@@ -749,9 +664,8 @@ mod tests {
             "5 restarts opens the window past threshold"
         );
 
-        // Window elapsed (2_000ms > 1_000ms since it opened at 0), and the
-        // count did not move — the window resets and there is nothing new
-        // to warn about.
+        // Window elapsed and the count did not move: it resets, with
+        // nothing new to warn about.
         assert!(
             rules.on_poll(&[info.clone()], 2_000).is_empty(),
             "no new restarts since the window reset"
@@ -766,8 +680,6 @@ mod tests {
         );
     }
 
-    /// fails if `MemoryAbove` fires on a level below its own ceiling, or
-    /// fails to fire exactly at it.
     #[test]
     fn memory_above_fires_at_the_ceiling_and_not_one_byte_below_it() {
         let sinks = one_sink("ops");
@@ -795,9 +707,8 @@ mod tests {
         assert_eq!(rules.on_poll(&[at], 1_100).len(), 1, "1000 meets 1000");
     }
 
-    /// fails if `MemoryAbove` fires (or panics) on a sheep whose memory is
-    /// unknown — a stopped sheep, or one the daemon hasn't sampled yet.
-    /// Unknown must read as "cannot alert", never as zero.
+    /// Unknown memory (a stopped sheep, or one not yet sampled) must read
+    /// as "cannot alert", never as zero.
     #[test]
     fn memory_above_does_not_fire_when_usage_is_unknown() {
         let sinks = one_sink("ops");
@@ -817,16 +728,6 @@ mod tests {
         assert!(rules.on_poll(&[info], 1_000).is_empty());
     }
 
-    /// fails if `GaveUp` fires on the bus route for anything other than
-    /// `Errored` — the quiet half of "the alert that must not be missed".
-    /// `GaveUp` is on by default with no configuration at all; a rule that
-    /// fires on every event kind is as useless as one that never fires,
-    /// because it trains an operator to ignore it. Proven by mutating the
-    /// `on_event` match arm from `Trigger::GaveUp {} if kind ==
-    /// ProcessEventKind::Errored` to an unconditional `Trigger::GaveUp {}`:
-    /// before this test existed, all 14 other `rules::` tests stayed green
-    /// under that mutation because none of them fed `gave_up_rules()`
-    /// anything but an `Errored` event or status.
     #[test]
     fn gave_up_does_not_fire_on_event_for_a_non_errored_kind() {
         let mut rules = gave_up_rules();
@@ -836,11 +737,6 @@ mod tests {
         assert!(restart.is_empty(), "GaveUp fires on Errored only");
     }
 
-    /// fails if `GaveUp` fires on the poll route for a status other than
-    /// `Errored` — the same quiet half as
-    /// [`gave_up_does_not_fire_on_event_for_a_non_errored_kind`], for the
-    /// route that has exactly the same `info.status ==
-    /// ProcStatus::Errored` guard and exactly the same gap without a test.
     #[test]
     fn gave_up_does_not_fire_on_poll_for_a_non_errored_status() {
         let mut rules = gave_up_rules();
@@ -848,9 +744,6 @@ mod tests {
         assert!(fired.is_empty(), "GaveUp fires when status is Errored only");
     }
 
-    /// fails if the debounce boundary is off by one in either direction:
-    /// one millisecond short of it must still be quiet, and exactly at it
-    /// must fire again.
     #[test]
     fn debounce_boundary_is_inclusive_at_exactly_its_own_duration() {
         let mut rules = gave_up_rules();
@@ -869,17 +762,11 @@ mod tests {
         );
     }
 
-    // The tests above all build `Rule`/`Trigger` as Rust values, which
-    // never runs `Deserialize` at all and is exactly how the shipped bug
-    // passed every one of them: `Rule`'s `#[serde(flatten)]` combined with
-    // `#[serde(deny_unknown_fields)]` made every `[[dog.bark.rules]]` entry
-    // refuse to parse, and nothing here noticed. The tests below parse
-    // real TOML strings instead — see `Rule`'s and `Trigger`'s own docs
-    // for the fix these prove.
+    // The tests above build `Rule`/`Trigger` as Rust values, never running
+    // `Deserialize`. The tests below parse real TOML strings.
 
-    /// fails if the docs' own `on = "gave_up"` rule cannot be parsed from
-    /// TOML — the exact shape `docs/dogs.md` and
-    /// `web/src/pages/docs/dogs.astro` publish as copy-pasteable.
+    /// The exact shape `docs/dogs.md` and `web/src/pages/docs/dogs.astro`
+    /// publish as copy-pasteable.
     #[test]
     fn the_docs_gave_up_rule_parses_from_toml() {
         let rule: Rule = toml::from_str(
@@ -894,10 +781,7 @@ sinks = ["oncall", "audit"]
         assert_eq!(rule.debounce, default_debounce(), "no override in the TOML");
     }
 
-    /// fails if the docs' own `on = "restart_rate"` rule cannot be parsed
-    /// from TOML, or if `within`'s `"2m"` string form (the same
-    /// [`UpDuration`] grammar every other duration field in `shep.toml`
-    /// accepts) is not honored inside a flattened [`Trigger`].
+    /// `within`'s `"2m"` form uses [`UpDuration`]'s own duration grammar.
     #[test]
     fn the_docs_restart_rate_rule_parses_from_toml() {
         let rule: Rule = toml::from_str(
@@ -918,10 +802,8 @@ sinks = ["oncall"]
         );
     }
 
-    /// fails if an `event` rule cannot be parsed from TOML — not shown in
-    /// the published docs, but a real `Trigger` variant a `[[bark.rules]]`
-    /// entry can name, and the same flatten mechanism the docs' two forms
-    /// exercise.
+    /// Not in the published docs, but a real `Trigger` variant a rule can
+    /// name.
     #[test]
     fn an_event_rule_parses_from_toml() {
         let rule: Rule = toml::from_str(
@@ -940,11 +822,7 @@ sinks = ["oncall"]
         );
     }
 
-    /// fails if a `memory_above` rule cannot be parsed from TOML, or if
-    /// `bytes`'s `"512M"` string form ([`MemSize`]'s own grammar) is not
-    /// honored inside a flattened [`Trigger`] — the fourth and last
-    /// variant, rounding out coverage of every rule form this parser
-    /// accepts.
+    /// `bytes`'s `"512M"` form uses [`MemSize`]'s own grammar.
     #[test]
     fn a_memory_above_rule_parses_from_toml() {
         let rule: Rule = toml::from_str(
@@ -958,17 +836,12 @@ sinks = ["oncall"]
         assert_eq!(
             rule.when,
             Trigger::MemoryAbove {
-                // Binary units — MemSize's grammar is MiB, not MB.
+                // Binary units: MemSize's grammar is MiB, not MB.
                 bytes: MemSize::from_bytes(512 * 1024 * 1024),
             }
         );
     }
 
-    /// fails if a rule's own `debounce` override does not survive parsing
-    /// alongside a flattened `Trigger` — [`Rule`]'s one other field beyond
-    /// `sinks`, and the one most likely to silently regress if a future
-    /// change reshuffles which fields `Rule` claims directly versus
-    /// forwards to `Trigger`.
     #[test]
     fn a_rule_s_debounce_override_parses_from_toml() {
         let rule: Rule = toml::from_str(
@@ -982,11 +855,6 @@ debounce = "10m"
         assert_eq!(rule.debounce, UpDuration::from_millis(10 * 60_000));
     }
 
-    /// fails if a misspelled key inside a trigger with its own fields
-    /// (`restarts` typo'd as `retsarts`) is silently accepted rather than
-    /// refused with the bad key named — the protection
-    /// `#[serde(deny_unknown_fields)]` exists for, now living on
-    /// [`Trigger`] rather than [`Rule`]. See [`Rule`]'s own doc for why.
     #[test]
     fn a_misspelled_trigger_field_is_refused_with_the_bad_key_named() {
         let err = toml::from_str::<Rule>(
@@ -1004,16 +872,8 @@ sinks = ["oncall"]
         );
     }
 
-    /// fails if a misspelled key sitting next to `on = "gave_up"` is
-    /// silently accepted — the exact gap a bare `Trigger::GaveUp` unit
-    /// variant left even with `deny_unknown_fields` set, because `serde`
-    /// deserializes an internally tagged unit variant through a path that
-    /// never inspects the rest of the map. Proven by mutating `GaveUp {}`
-    /// (an empty *struct* variant) back to a bare `GaveUp` unit variant:
-    /// every other test in this file still passes, since none of them
-    /// parses a misspelled field next to `on = "gave_up"` — this is the
-    /// one that would have caught the exact way the shipped fix's own
-    /// protection could still leak.
+    /// A bare `GaveUp` unit variant would skip field checking for the rest
+    /// of the map, missing exactly this typo.
     #[test]
     fn a_misspelled_field_next_to_gave_up_is_still_refused() {
         let err = toml::from_str::<Rule>(
@@ -1030,13 +890,9 @@ debuonce = "10m"
         );
     }
 
-    /// fails if a misspelled `sinks` is accepted rather than refused. The
-    /// error names the field that is now missing (`sinks`, required with
-    /// no default) rather than the typo'd key itself (`sinsk` never
-    /// matches any field `Rule` or `Trigger` know about, so it is simply
-    /// absent from both) — still a startup refusal an operator can act on,
-    /// just phrased from the other direction than the trigger-field and
-    /// `GaveUp`-neighbor cases above.
+    /// `sinsk` matches no field on `Rule` or `Trigger`, so it is simply
+    /// absent, and the error names the missing `sinks` field instead of
+    /// the typo.
     #[test]
     fn a_misspelled_sinks_field_is_refused_as_a_missing_field() {
         let err = toml::from_str::<Rule>(
@@ -1052,8 +908,6 @@ sinsk = ["oncall"]
         );
     }
 
-    /// fails if an unknown `on` variant is accepted rather than refused
-    /// with the bad value and the known ones both named.
     #[test]
     fn an_unknown_on_variant_is_refused_with_the_bad_value_named() {
         let err = toml::from_str::<Rule>(

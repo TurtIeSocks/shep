@@ -22,17 +22,14 @@ use shep_core::protocol::BusEvent;
 
 /// Live bus events for one [`crate::Client::subscribe`] call.
 ///
-/// Named rather than `impl Stream` (IR-15): an anonymous `impl Trait`
-/// return type from a *method* cannot be spelled in a struct field or a
-/// function's own return type, both of which a caller holding onto a
-/// subscription routinely needs.
+/// Named rather than `impl Stream`: an anonymous return type from a
+/// method can't be spelled in a struct field or a function's own return
+/// type, both of which a caller holding a subscription needs.
 ///
-/// Each item is `Ok(`[`BusEvent`]`)` for a normal event, or
-/// `Err(`[`Lagged`]`)` when this stream's own local buffer fell behind —
-/// see [`Lagged`]'s doc for how that differs from
-/// [`BusEvent::Dropped`]. The stream ends (yields `None`) once the
-/// connection it was subscribed over closes; nothing about a `Lagged` item
-/// ends it — a lagging consumer keeps yielding events after catching up.
+/// Each item is `Ok(`[`BusEvent`]`)`, or `Err(`[`Lagged`]`)` when this
+/// stream's own local buffer fell behind (see [`Lagged`]'s doc for how
+/// that differs from [`BusEvent::Dropped`]). The stream ends once the
+/// connection closes; a `Lagged` item does not end it.
 #[derive(Debug)]
 pub struct EventStream {
     inner: BroadcastStream<BusEvent>,
@@ -48,11 +45,8 @@ impl EventStream {
 
     /// Returns the next event, or `None` once the subscription ends.
     ///
-    /// Inherent so a caller needs no `StreamExt` import: an inherent method
-    /// wins name resolution over a trait method of the same name, so
-    /// `stream.next()` resolves here even when `futures_util::StreamExt` is
-    /// nowhere in scope. For combinators beyond a single `next()`, the
-    /// [`Stream`] implementation is also re-exported from the crate root.
+    /// Inherent so a caller needs no `StreamExt` import: an inherent
+    /// method wins name resolution over a trait method of the same name.
     pub async fn next(&mut self) -> Option<Result<BusEvent, Lagged>> {
         StreamExt::next(self).await
     }
@@ -62,10 +56,8 @@ impl Stream for EventStream {
     type Item = Result<BusEvent, Lagged>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // `BroadcastStreamRecvError` has exactly one variant today (verified
-        // against tokio-stream 0.1.19) and is not `#[non_exhaustive]`, so this
-        // match has no wildcard arm on purpose: a variant added upstream
-        // should fail this build loudly rather than silently fall through.
+        // `BroadcastStreamRecvError` has exactly one variant and is not
+        // `#[non_exhaustive]`; no wildcard arm, so a new variant fails this build.
         match Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(event))) => Poll::Ready(Some(Ok(event))),
             Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(count)))) => {
@@ -80,15 +72,11 @@ impl Stream for EventStream {
 /// The local [`broadcast::Receiver`] behind an [`EventStream`] fell behind
 /// and discarded events before this stream could read them.
 ///
-/// Distinct from [`BusEvent::Dropped`], which is the *daemon's* own
-/// per-subscriber queue overflowing before an event ever reached this
-/// client — that condition arrives as an ordinary `Ok(BusEvent::Dropped {
-/// .. })` item on this same stream, no different from any other
-/// [`BusEvent`]. `Lagged` is the opposite failure: the event made it across
-/// the wire and into this connection's local broadcast channel just fine,
-/// but the [`EventStream`] reading from it was not polled quickly enough to
-/// keep up against the channel's own bounded capacity, and the channel
-/// discarded its oldest entries to make room.
+/// Distinct from [`BusEvent::Dropped`], which is the daemon's own
+/// per-subscriber queue overflowing before an event reaches this client:
+/// that arrives as an ordinary `Ok(BusEvent::Dropped { .. })` item on this
+/// same stream. `Lagged` is the local channel discarding entries because
+/// the [`EventStream`] wasn't polled quickly enough to keep up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lagged {
     /// How many events were discarded since this stream's last successful
@@ -108,20 +96,15 @@ impl core::error::Error for Lagged {}
 mod tests {
     use super::*;
 
-    /// `Lagged` is the error half of
-    /// `EventStream`'s `Item` — public API — but implemented neither
-    /// `Display` nor `core::error::Error`, the sole exception among this
-    /// crate's error types (`ConnectError`, `RequestError`, `SpawnError` all
-    /// have both). A consumer could neither print it nor `?` it into
-    /// `anyhow`.
+    /// `Lagged` implements `Display` and `core::error::Error` like this
+    /// crate's other error types, so a consumer can print it or `?` it
+    /// into `anyhow`.
     #[test]
     fn lagged_is_printable_and_a_real_error() {
         let lagged = Lagged { count: 7 };
         assert_eq!(lagged.to_string(), "7 events dropped locally (lagged)");
 
-        // Compiles only if `Lagged: core::error::Error` — the regression
-        // this test actually guards against; `to_string()` alone only needs
-        // `Display`.
+        // compiles only if `Lagged: core::error::Error`; `to_string()` alone needs only `Display`
         let _: &dyn core::error::Error = &lagged;
     }
 }

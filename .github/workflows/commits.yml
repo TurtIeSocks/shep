@@ -1,24 +1,13 @@
 name: commits
-# Rejects a pull request carrying a commit subject release-plz cannot read.
+# Rejects a pull request carrying a commit subject release-plz cannot parse.
 #
-# This is a release-correctness gate wearing a lint's clothes. release-plz
-# walks the INDIVIDUAL commits on a branch and `filter_unconventional = true`
-# in release-plz-changelog.toml drops anything that does not parse, so an
-# unreadable subject contributes nothing to its crate's changelog and nothing
-# to the version bump. A breaking change in such a commit ships inside a
-# semver-compatible version, with an empty changelog section, and no step
-# anywhere fails.
+# release-plz's `filter_unconventional = true` (release-plz-changelog.toml)
+# drops any commit whose subject does not parse: no changelog entry, no
+# version bump, even for a breaking change. `semver_check = true` does not
+# catch that either; it has no lint for a changed return type.
 #
-# Measured before this existed: of the 31 commits on the branch that became
-# shep-core 0.2.1, 19 were unreadable. One of those 19 changed a public
-# signature. 0.2.1 went to crates.io as a patch, with an empty changelog
-# section for that crate. `semver_check = true` did not catch it either; run
-# by hand against origin/main it reported 196 passing checks and no update
-# required, because it has no lint for a changed inherent-method return type.
-#
-# `.githooks/commit-msg` runs the same rule locally, but core.hooksPath is
-# per-clone and a fresh clone or worktree has it unset, so that hook is a
-# convenience and this job is the gate.
+# `.githooks/commit-msg` enforces the same rule locally, but core.hooksPath
+# is per-clone, so this job is the actual gate.
 
 on:
   pull_request:
@@ -32,8 +21,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      # The full range, because a subject is only checkable if it is fetched.
-      - uses: actions/checkout@v4
+      # Full history: a subject is only checkable if it is fetched.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Check every commit subject on this branch
@@ -42,30 +31,28 @@ jobs:
           HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           set -eu
-          # --no-merges: a merge subject is git's own wording, and release-plz
-          # ignores merge commits anyway, which is the whole reason a `!` in a
-          # pull request title buys nothing.
+          # --no-merges: release-plz ignores merge commits, so a `!` on a PR
+          # title or merge subject never reaches it.
           #
-          # Nothing is exempt here, unlike the local hook. `fixup!`, `squash!`
-          # and `amend!` are fine to create locally and are consumed by
-          # `git rebase --autosquash`; one reaching a pull request head was
-          # never squashed and would be dropped like any other unreadable
-          # subject. `Revert "..."`, which `git revert` writes, parses as
-          # nothing and is dropped too.
+          # No exemptions here, unlike the local hook: an unsquashed
+          # fixup!/squash!/amend! commit and a `git revert` subject both parse
+          # as nothing and get dropped like any other unreadable subject.
           #
-          # The nine accepted types are what release-plz-changelog.toml
-          # actually handles, not the conventional-commits list. Measured with
-          # git-cliff 2.14.1 against that config: feat, fix, perf and refactor
-          # produce entries; docs, test, ci, chore and style are `skip = true`
-          # and dropped on purpose; revert and build match NO parser, so
-          # `filter_commits = true` discards them silently. Those last two are
-          # the trap, since they are real conventional types that look correct
-          # and contribute nothing. Give one a parser in that config before
-          # adding it here.
+          # git-cliff (release-plz-changelog.toml) gives feat/fix/perf/refactor
+          # an entry, skips docs/test/ci/chore/style unless breaking, and
+          # silently drops revert/build: neither matches a parser at all.
+          #
+          # `protect_breaking_commits` rescues a `!` on docs/chore as BREAKING,
+          # but not on revert/build, which match no parser regardless of `!`;
+          # refuse those two rather than accept a breaking change that would
+          # be silently dropped.
+          #
+          # Scope allows any character except parentheses, per
+          # git-conventional, so `feat(API): ...` is valid.
           bad=0
           while IFS= read -r subject; do
             [ -z "$subject" ] && continue
-            if printf '%s' "$subject" | grep -qE '^(feat|fix|perf|refactor|docs|test|ci|chore|style)(\([a-z0-9 ._/-]+\))?!?: .+'; then
+            if printf '%s' "$subject" | grep -qE '^(feat|fix|perf|refactor|docs|test|ci|chore|style)(\([^()]+\))?!?: .+'; then
               printf '  ok      %s\n' "$subject"
             else
               printf '  DROPPED %s\n' "$subject"

@@ -2,20 +2,12 @@
 //! talks to it over the control socket with shep-core's own codec, and
 //! drives real child processes.
 //!
-//! Real time throughout, by necessity: these tests own real sockets and real
-//! children, and a paused clock's auto-advance would expire timeouts before
-//! IO wakeups arrive. IR-38 deviation deliberate — behavioral OS tests need
-//! their own binary so the unit tier stays paused-clock pure.
+//! Real time throughout: a paused clock's auto-advance would expire timeouts
+//! before IO wakeups arrive.
 
-// Part of this file's cases are `#[cfg(unix)]` — `/bin/sh` fixtures, process
-// groups, signal delivery — and their helpers go with them, so on Windows
-// those items compile unreachable. Same shape, and same reasoning, as
-// `shep-cli`'s `cli_e2e.rs`.
+// Many cases here are `#[cfg(unix)]`, so on Windows those items are unreached.
 #![cfg_attr(windows, allow(dead_code))]
-// Most of this file's cases are `#[cfg(unix)]` (their fixtures are `/bin/sh`
-// scripts), so on Windows the imports only those cases use are unread. The
-// gate belongs on the cases, which state their own reason, not on twenty
-// import lines.
+// And so are the imports only those cases use.
 #![cfg_attr(windows, allow(unused_imports))]
 
 use std::io::ErrorKind;
@@ -47,41 +39,28 @@ const RECV_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A booted daemon on its own `$SHEP_HOME`, with its run loop spawned.
 ///
-/// `run`/`dir` are `Option`-wrapped, not moved out directly, so this type
-/// can carry a [`Drop`] impl (see below) without every existing partial
-/// move (`fixture.run`, `fixture.dir`) turning into a compile error —
-/// Rust forbids moving a single field out of a value whose type implements
-/// `Drop`; going through `Option::take` on a `&mut self` method sidesteps
-/// that without touching every call site's shape.
+/// `run`/`dir` are `Option`-wrapped so this type can carry a [`Drop`] impl:
+/// a field cannot be moved out of a value whose type implements `Drop`.
 struct Fixture {
     dir: Option<tempfile::TempDir>,
     paths: ShepPaths,
     ctx: RpcContext,
     run: Option<tokio::task::JoinHandle<Result<(), BootError>>>,
-    // Real OS pids this fixture is responsible for on the panic path — every
-    // `Client::request` sharing this `Arc` records one here whenever a reply
-    // carries live `ProcessInfo`s (`Started`/`Flock`/`Described`/`Restarted`/
-    // `Stopped`). See `Drop` below for why this exists at all.
+    // Real OS pids this fixture must reap on the panic path.
     spawned: std::sync::Arc<std::sync::Mutex<Vec<i32>>>,
 }
 
 impl Fixture {
     async fn boot(dir: tempfile::TempDir, restore: bool) -> Self {
         // $SHEP_HOME is the tempdir root itself: `sun_path` caps the socket
-        // path at 104 bytes on macOS and 108 on Linux, and macOS temp paths
-        // are already long — so the tighter number is the one to build
-        // against, and it is the platform this runs on most.
+        // path at 104 bytes on macOS, and macOS temp paths are already long.
         let home = dir.path().to_path_buf();
         let paths = ShepPaths::resolve(
             &|key| (key == "SHEP_HOME").then(|| home.display().to_string()),
             std::path::Path::new("/nonexistent"),
         );
-        // Bounded like every other wait in this file. `boot` binds the
-        // control address, which on Windows is a machine-global pipe
-        // name rather than a path under `dir`, so it is the one step
-        // here that can block on something outside this test's own
-        // tempdir. Unbounded, that is a silent CI hang; bounded, it is a
-        // named panic.
+        // Bounded: `boot` binds the control address, which on Windows is a
+        // machine-global pipe name rather than a path under `dir`.
         let daemon = tokio::time::timeout(
             RECV_TIMEOUT,
             boot(
@@ -108,9 +87,8 @@ impl Fixture {
     }
 
     async fn connect(&self) -> Client {
-        // `transport::connect` retries ERROR_PIPE_BUSY forever, and its
-        // own doc says that is safe only because every caller bounds it.
-        // This one is a caller.
+        // `transport::connect` retries ERROR_PIPE_BUSY forever, and is safe
+        // only because every caller bounds it.
         let stream = tokio::time::timeout(RECV_TIMEOUT, transport::connect(&self.paths.socket))
             .await
             .expect("connect must not hang: the pipe stayed busy")
@@ -147,65 +125,19 @@ impl Fixture {
     }
 }
 
-/// Last-resort net for a test that PANICS before reaching its own
-/// `Fixture::shutdown()` (or, in the crash-simulation test, before
-/// deliberately skipping it).
-///
-/// On every success path this is a no-op: `shutdown()`'s kill ladder (or,
-/// in `kill_daemon_shuts_the_flock_down_and_unlinks_the_socket`, the
-/// test's own explicit ESRCH poll) already reaped every tracked pid before
-/// `Fixture` drops, so `kill()` below just hits ESRCH and is ignored. It
-/// only does real work on the panic path — proven, not assumed, by
-/// deliberately failing a test mid-run and checking for orphans (see
-/// task-11-report.md's "Drop-prevents-leak experiment"): a `current_thread`
-/// `#[tokio::test]` runtime that unwinds out from under a panic does NOT
-/// keep polling the background `run` task to let its own async teardown
-/// (the kill ladder in `RunningDaemon::run`) finish, so `ctx.shutdown()`
-/// alone is not sufficient — this sends `SIGKILL` directly, synchronously,
-/// with no dependency on the runtime still being alive to schedule anything.
-///
-/// SIGKILLs the whole process GROUP (`-pid`, not `pid`): `TokioRunner`
-/// spawns every child leader in its own group (see `tokio_runner.rs`'s own
-/// doc) specifically so a group signal also reaches a `sleep 1`
-/// grandchild a leader-only signal would miss.
+/// Last-resort net for a test that panics before [`Fixture::shutdown`].
 impl Drop for Fixture {
-    /// Stops the daemon a panicking test never got to shut down, then
-    /// reaps what a unix sheep leaves behind.
-    ///
-    /// # The shutdown
-    ///
-    /// A test that panics skips its own `fixture.shutdown()`, so the daemon
-    /// task this fixture spawned is still running, still holding its
-    /// listener, when the next test in this binary starts. On Windows that
-    /// listener is a name in a machine-global namespace rather than a path
-    /// under this test's own tempdir, which is the one resource here that a
-    /// later test could contend for.
-    ///
-    /// **This is tidiness, not a fix for anything.** It was written as a fix
-    /// for the seventeen-minute `windows-latest` hang in
-    /// `reopen_moves_a_running_sheeps_log_onto_the_recreated_path`, on the
-    /// theory that dropping a current-thread runtime with a live daemon task
-    /// blocks and swallows the panic. A control run disproved it: with this
-    /// `shutdown()` removed, an injected panic in that same test still
-    /// reports in 1.74s and libtest still prints the message. Whatever hangs
-    /// on the runner is not this.
+    /// Stops the daemon a panicking test never shut down, then reaps what a
+    /// unix sheep leaves behind.
     ///
     /// `shutdown()` on the context alone, not a join: this runs during an
-    /// unwind and must not itself be able to block.
+    /// unwind and must not block. A `current_thread` runtime unwinding stops
+    /// polling `run`, so its kill ladder never finishes and the pids are
+    /// signalled here, by process group to reach a `sleep 1` grandchild.
     ///
-    /// # The pid sweep, on unix only
-    ///
-    /// A unix sheep that outlives its daemon is reparented to init, so only
-    /// an explicit `kill(-pgid)` reaps it, which is why the fixture bothers
-    /// to record every pid a reply carried. On Windows every sheep is
-    /// assigned to a job object it cannot leave
-    /// (`shep_daemon::sys_windows`), so the daemon going down takes the whole
-    /// flock with it, transitively. There is no orphan class there for a
-    /// sweep to catch. `real_runner_windows.rs` is where that containment is
-    /// actually asserted, and mutation-checked.
+    /// Unix only: a Windows sheep cannot leave its job object.
     fn drop(&mut self) {
-        // `run` is `None` once `shutdown()` has taken it, so this is the
-        // panic path and nothing else.
+        // `None` only once `shutdown()` has taken it: the panic path.
         if self.run.is_some() {
             self.ctx.shutdown();
         }
@@ -226,36 +158,21 @@ impl Drop for Fixture {
 }
 
 /// A handshaken connection to a booted [`Fixture`], speaking shep-core's own
-/// length-delimited/JSON codec directly — this tier proves the wire
-/// protocol itself, not a client crate built on top of it.
+/// length-delimited/JSON codec directly rather than through a client crate.
 struct Client {
     frames: Framed<ClientStream, LengthDelimitedCodec>,
     next_id: u64,
     hello_ack: Option<HelloAck>,
-    // Frames read off the wire but not the one the CURRENT call was looking
-    // for — buffered (never discarded) so a LATER call still sees them, in
-    // original arrival order. Load-bearing, not defensive: the supervisor
-    // actor emits a sheep's `Start`/`Online`/`Stop` bus event SYNCHRONOUSLY,
-    // strictly before it resolves the RPC reply for the very command that
-    // caused it (`spawn_fresh`/`handle_exited`, `supervisor.rs`) — so that
-    // event routinely reaches this socket while `request` below is still
-    // reading frames waiting for its own reply, race-ordered against it with
-    // no scheduling guarantee either way. A `request` that silently dropped
-    // non-reply frames would make a later `await_process_event` for that
-    // exact event hang for the full `RECV_TIMEOUT` on genuinely correct
-    // daemon behavior — reproduced empirically while writing this file: the
-    // first version discarded them and hung waiting for `process.stop` after
-    // a `Stop` reply that had already raced past it.
+    // Frames the current call was not looking for, in arrival order. A bus
+    // event is emitted before the reply to the command that caused it, so
+    // discarding one would hang a later `await_process_event`.
     pending: std::collections::VecDeque<ServerFrame>,
-    // Shared with the owning `Fixture` — see its own doc and `Drop` impl.
-    // `request` below is the one place this gets written to.
+    // Shared with the owning `Fixture`.
     spawned: std::sync::Arc<std::sync::Mutex<Vec<i32>>>,
 }
 
 impl Client {
-    /// The daemon's handshake answer. Every [`Client`] in this file comes
-    /// from [`Fixture::connect`], which always shakes hands before handing
-    /// one back, so this is only ever called after that has happened.
+    /// The daemon's handshake answer, set by [`Fixture::connect`].
     fn hello_ack(&self) -> &HelloAck {
         self.hello_ack
             .as_ref()
@@ -270,7 +187,7 @@ impl Client {
     }
 
     /// Reads and decodes the next frame as `T`, timing out rather than
-    /// hanging forever (IR-39's no-sleeps, event-driven rule).
+    /// hanging forever.
     async fn recv_as<T: DeserializeOwned>(&mut self) -> T {
         let frame = tokio::time::timeout(RECV_TIMEOUT, self.frames.next())
             .await
@@ -280,17 +197,11 @@ impl Client {
         decode_frame(&frame).unwrap()
     }
 
-    /// The next frame of any kind: whatever an earlier call already read but
-    /// didn't consume, oldest first, else the next one off the wire.
+    /// The next frame of any kind: whatever an earlier call read but didn't
+    /// consume, oldest first, else the next one off the wire.
     ///
-    /// Every process event that passes through records its pid for `Fixture`'s
-    /// panic-path cleanup, the same way [`track_spawned`] records a reply's.
-    /// One choke point covers every wait in this file, which matters for the
-    /// one process no reply ever names in time: a reload's replacement is
-    /// spawned, and can be left an orphan by a panic, well before any reply a
-    /// test asks for carries its pid. Observed, not theorised — a deliberately
-    /// broken kill ladder timed a reload measurement out and left one
-    /// `reuse_port_sheep` reparented to init.
+    /// Records every process event's pid: a reload's replacement can be
+    /// orphaned by a panic before any reply carries it.
     async fn next_frame(&mut self) -> ServerFrame {
         let frame = match self.pending.pop_front() {
             Some(frame) => frame,
@@ -303,8 +214,7 @@ impl Client {
     }
 
     /// Sends one request, then reads frames until its `Reply` arrives,
-    /// re-queueing (never discarding — see [`Self::pending`]'s doc) any bus
-    /// events that arrive in between for a later call to consume.
+    /// re-queueing any bus events that arrive in between for a later call.
     async fn request(&mut self, body: Request) -> Reply {
         let id = self.next_id;
         self.next_id += 1;
@@ -314,17 +224,12 @@ impl Client {
             body,
         })
         .await;
-        // Bounded like every other wait in this file: an unbounded one here
-        // would turn a daemon that never answers into a silent hang with no
-        // diagnostic output, rather than a named failure.
+        // Bounded: a daemon that never answers must fail by name, not hang.
         let mut skipped = Vec::new();
         let reply = tokio::time::timeout(RECV_TIMEOUT, async {
             loop {
                 match self.next_frame().await {
                     ServerFrame::Reply(reply) if reply.id == id => break reply,
-                    // Anything else (a bus event, an unrelated reply, or a
-                    // future frame kind this client doesn't know about) is set
-                    // aside rather than dropped — see `pending`'s own doc.
                     other => skipped.push(other),
                 }
             }
@@ -336,14 +241,12 @@ impl Client {
         reply
     }
 
-    /// Sends a hand-built request body, past [`Request`]'s own types and so
-    /// past every validating newtype on them, and answers with the reply if
-    /// one arrives — `None` when the daemon ended the connection instead,
-    /// which is what it does with any body it cannot decode.
+    /// Sends a hand-built request body, past every validating newtype on
+    /// [`Request`]. `None` when the daemon ended the connection instead,
+    /// which is what it does with a body it cannot decode.
     ///
-    /// Deliberately does not go through [`Self::next_frame`]: that one panics
-    /// on a closed connection, and a closed connection is one of the two
-    /// answers a caller here is asking about.
+    /// Reads the wire directly: [`Self::next_frame`] panics on a closed
+    /// connection, one of the two answers wanted here.
     async fn request_raw(&mut self, body: serde_json::Value) -> Option<Reply> {
         let id = self.next_id;
         self.next_id += 1;
@@ -371,7 +274,7 @@ impl Client {
     }
 
     /// Reads frames until a `Process` event of `kind` for `id` arrives,
-    /// re-queueing (never discarding) everything else — see `pending`'s doc.
+    /// re-queueing everything else.
     async fn await_process_event(&mut self, id: u32, kind: ProcessEventKind) -> ProcessInfo {
         let mut skipped = Vec::new();
         let info = loop {
@@ -389,14 +292,9 @@ impl Client {
     }
 
     /// Reads frames until a `Process` event of one of `kinds` arrives, and
-    /// answers with WHICH — the ordering question neither sibling below can
-    /// be asked.
+    /// answers with which one.
     ///
-    /// They search: each passes over what it does not want and re-queues it,
-    /// so asking for a `Delete` and then a `Start` finds both whichever order
-    /// they were emitted in. A case whose subject IS the order has to read the
-    /// stream once, in the order the daemon wrote it, and stop at the first
-    /// event that answers the question.
+    /// Stops at the first match, for a case whose subject is the order.
     async fn next_process_event_of(
         &mut self,
         kinds: &[ProcessEventKind],
@@ -415,13 +313,11 @@ impl Client {
         found
     }
 
-    /// Reads frames until a `Process` event of `kind` arrives for ANY sheep,
-    /// re-queueing (never discarding) everything else — see `pending`'s doc.
+    /// Reads frames until a `Process` event of `kind` arrives for any sheep,
+    /// re-queueing everything else.
     ///
-    /// The id-blind twin of [`Self::await_process_event`], for the one event
-    /// whose subject a caller cannot name in advance: a reload's replacement
-    /// is allocated a fresh id that first reaches the client on the event
-    /// itself.
+    /// For a reload's replacement, whose fresh id first reaches the client on
+    /// the event itself.
     async fn await_any_process_event(&mut self, kind: ProcessEventKind) -> ProcessInfo {
         let mut skipped = Vec::new();
         let info = loop {
@@ -438,17 +334,10 @@ impl Client {
     }
 
     /// Reads frames until a `LogOut` event for `id` arrives, re-queueing
-    /// (never discarding) everything else — see `pending`'s doc — bounded by
-    /// one overall [`RECV_TIMEOUT`], not merely `recv_as`'s own per-frame
-    /// one, so a daemon that keeps emitting OTHER frames forever without
-    /// ever emitting a `log.*` event for `id` cannot spin this loop past its
-    /// budget. (Task 11 fix: the original version of this loop lived inline
-    /// in the one test that needs it, called `next_frame` directly, and so
-    /// silently discarded every non-matching frame with no deadline of its
-    /// own — contradicting this exact discipline. Nothing after this call
-    /// in that test reads the connection again, so discarding was harmless
-    /// in practice, but the requeue treatment costs nothing and keeps every
-    /// `Client` method in this file honest about the same rule.)
+    /// everything else.
+    ///
+    /// One overall [`RECV_TIMEOUT`], not `recv_as`'s per-frame one: a daemon
+    /// emitting other frames forever must not spin this loop.
     async fn await_log_line(&mut self, id: u32) -> String {
         tokio::time::timeout(RECV_TIMEOUT, async {
             let mut skipped = Vec::new();
@@ -469,13 +358,8 @@ impl Client {
     }
 }
 
-/// The interpreter a test fixture's inline script is written for, and the
-/// flag that makes it read one.
-///
-/// `/bin/sh -c` on unix, `cmd /C` on Windows. Every fixture below builds its
-/// app through one of the helpers here rather than naming an interpreter
-/// itself, so a case reads as what the sheep DOES rather than as which shell
-/// happens to run it.
+/// The interpreter a fixture's inline script is written for, and the flag
+/// that makes it read one: `/bin/sh -c` on unix, `cmd /C` on Windows.
 fn shell() -> (&'static str, &'static str) {
     #[cfg(unix)]
     {
@@ -489,9 +373,8 @@ fn shell() -> (&'static str, &'static str) {
 
 /// An [`AppConfig`] running `script` under [`shell`].
 ///
-/// `interpreter = "none"` on every one of these: the script is already
-/// written for a shell, so shep must not additionally resolve an interpreter
-/// from the program's extension.
+/// `interpreter = "none"`: the script is already written for a shell, so shep
+/// must not also resolve one from the program's extension.
 fn shell_app(name: &str, script: String) -> AppConfig {
     let (program, flag) = shell();
     let mut app = AppConfig::minimal(name, program);
@@ -502,10 +385,8 @@ fn shell_app(name: &str, script: String) -> AppConfig {
 
 /// A sheep that stays up until something stops it.
 ///
-/// `ping` rather than a sleep loop on Windows: `timeout.exe` refuses to run
-/// with stdin redirected (which every sheep's is), and `cmd` has no `sleep`
-/// at all. One long `ping` is the idiom, and it is a single process rather
-/// than a loop spawning one per second.
+/// `ping` on Windows: `timeout.exe` refuses to run with stdin redirected,
+/// which every sheep's is, and `cmd` has no `sleep`.
 fn forever_app(name: &str) -> AppConfig {
     #[cfg(unix)]
     let script = "while :; do sleep 1; done".to_string();
@@ -526,21 +407,10 @@ fn announce_app(name: &str, line: &str) -> AppConfig {
 
 /// A sheep that sends one `ready` on the shepherd channel, then stays up.
 ///
-/// **The two platforms reach the channel completely differently, which is
-/// the whole reason this is a helper rather than an inline string.** On unix
-/// it is fd 3, inherited, so a shell redirect `>&3` is the entire contract —
-/// the one `docs/shepherd-channel.md` publishes. Windows has no fd-3
-/// inheritance: the daemon exports the channel's pipe name as
-/// `%SHEP_CHANNEL_PIPE%` and the app opens it by name, which `cmd`'s own `>`
-/// redirect does directly.
-///
-/// So this fixture is the shortest end-to-end proof that the replacement
-/// contract is usable from a plain script rather than only from a program
-/// that links a pipe client — which was the open question when the fd-3
-/// contract had to be abandoned.
-///
-/// The caller still sets `wait_ready`: that is what makes `assemble` open
-/// the channel at all.
+/// fd 3 on unix, so a `>&3` redirect is the whole contract. Windows has no
+/// fd-3 inheritance: the daemon exports the pipe name as
+/// `%SHEP_CHANNEL_PIPE%`. The caller still sets `wait_ready`, which is what
+/// makes `assemble` open the channel.
 fn ready_app(name: &str, dir: &std::path::Path) -> AppConfig {
     #[cfg(unix)]
     {
@@ -552,19 +422,12 @@ fn ready_app(name: &str, dir: &std::path::Path) -> AppConfig {
                 .to_string(),
         )
     }
-    // A `.cmd` FILE, not `cmd /C <script>`, and that is load-bearing.
-    // `std::process::Command` escapes an argument's inner quotes as `\"` --
-    // the MSVC C runtime convention, which `cmd.exe` does not share. cmd
-    // takes the backslash literally, so the redirect target arrives
-    // malformed and the line never reaches the pipe. Measured: the inline
-    // form failed with "The filename, directory name, or volume label syntax
-    // is incorrect". A script file's CONTENTS go through no such escaping.
+    // A `.cmd` file, not `cmd /C <script>`: `std::process::Command` escapes an
+    // argument's inner quotes as `\"`, which `cmd.exe` takes literally, so the
+    // redirect target arrives malformed.
     #[cfg(windows)]
     {
         let script = dir.join(format!("{name}-ready.cmd"));
-        // Built with `push` rather than a joined literal: a CRLF escape
-        // inside a string literal proved easy to mangle through tooling,
-        // and a `.cmd` that ends up holding a bare CR does not parse.
         let mut body = String::new();
         for line in [
             "@echo off",
@@ -583,7 +446,7 @@ fn ready_app(name: &str, dir: &std::path::Path) -> AppConfig {
 }
 
 /// A sheep that writes `before`, waits for `marker` to appear, writes
-/// `after`, then stays up — the fixture the log-rotation cases drive.
+/// `after`, then stays up. The fixture the log-rotation cases drive.
 fn gated_announce_app(name: &str, marker: &std::path::Path) -> AppConfig {
     #[cfg(unix)]
     {
@@ -595,28 +458,9 @@ fn gated_announce_app(name: &str, marker: &std::path::Path) -> AppConfig {
         app.autorestart = false;
         app
     }
-    // A batch FILE, and the two things it is not are both deliberate.
-    //
-    // Not a `cmd /C` one-liner: `cmd /C` takes a single command string
-    // and `goto` needs labels, which exist only in a file, so an inline
-    // loop silently does not loop. Measured, as a fixture that printed
-    // `before` and `after` back to back and never waited for the marker.
-    //
-    // Not `powershell -Command` either, which is what that measurement
-    // led to last time and what hung `windows-latest` for four runs. An
-    // out-of-process probe finally caught the sheep in the act: nine
-    // threads, every one in `Wait`, and 0.28s of CPU between them, all of
-    // it PowerShell's own startup. It was not polling for the marker. It
-    // was not running at all. Every other fixture in this file drives
-    // `cmd` and every one of them passes.
-    //
-    // `cmd`'s `echo` also writes a line at a time with nothing held back,
-    // which retires the separate question of what PowerShell buffers on a
-    // redirected stdout.
-    //
-    // `ping -n 2` is the sleep, for the reason `forever_app` gives:
-    // `timeout.exe` refuses to run with stdin redirected, and every
-    // sheep's is.
+    // A batch file, not a `cmd /C` one-liner: `goto` needs labels, which exist
+    // only in a file, so an inline loop does not loop. `ping -n 2` is the
+    // sleep, for `forever_app`'s reason.
     #[cfg(windows)]
     {
         const CRLF: &str = "\r\n";
@@ -636,22 +480,18 @@ fn gated_announce_app(name: &str, marker: &std::path::Path) -> AppConfig {
         std::fs::write(&script, body.join(CRLF))
             .expect("the gated fixture script must be writable");
         let mut app = shell_app(name, script.display().to_string());
-        // The script exits, and `autorestart` is on by default, so
-        // without this the daemon restarts the sheep five seconds after
-        // it finishes and the log gains a second `before` and a second
-        // `after` that the assertions do not expect.
+        // The script exits and `autorestart` is on by default, so without this
+        // the log gains a second `before` and `after`.
         app.autorestart = false;
         app
     }
 }
 
-/// the rebooted client.
-/// Records every live pid a reply's `ProcessInfo`s carry — see `Fixture`'s
-/// `spawned` field and `Drop` impl for why. Every `Response` variant that
-/// can carry a real spawned/listed pid is covered, not just `Started`: a
-/// muster restore's fresh pids, for one, are only ever observed here via a
-/// post-reboot `ListFlock` (`Response::Flock`), never a `Started` reply on
-/// the rebooted client.
+/// Records every live pid a reply's `ProcessInfo`s carry, for `Fixture`'s
+/// panic-path cleanup.
+///
+/// Every variant that can carry a pid, not just `Started`: a muster restore's
+/// fresh pids are only ever seen via a post-reboot `ListFlock`.
 fn track_spawned(spawned: &std::sync::Arc<std::sync::Mutex<Vec<i32>>>, reply: &Reply) {
     let Ok(response) = &reply.result else {
         return;
@@ -672,8 +512,7 @@ fn track_spawned(spawned: &std::sync::Arc<std::sync::Mutex<Vec<i32>>>, reply: &R
     }
 }
 
-/// Records one `ProcessInfo`'s pid, if it has one. The single writer behind
-/// both [`track_spawned`] and every process event [`Client::next_frame`] sees.
+/// Records one `ProcessInfo`'s pid, if it has one.
 fn track_pid(spawned: &std::sync::Arc<std::sync::Mutex<Vec<i32>>>, info: &ProcessInfo) {
     if let Some(pid) = info.pid
         && let Ok(pid) = i32::try_from(pid)
@@ -685,10 +524,8 @@ fn track_pid(spawned: &std::sync::Arc<std::sync::Mutex<Vec<i32>>>, info: &Proces
     }
 }
 
-/// Restores frames a call read but didn't want back onto the front of
-/// `pending`, in their original arrival order, so the next call to
-/// [`Client::next_frame`] sees them before reading anything new off the
-/// wire.
+/// Restores frames a call read but didn't want to the front of `pending`, in
+/// arrival order, so [`Client::next_frame`] sees them before the wire.
 fn requeue(pending: &mut std::collections::VecDeque<ServerFrame>, skipped: Vec<ServerFrame>) {
     for frame in skipped.into_iter().rev() {
         pending.push_front(frame);
@@ -702,7 +539,7 @@ async fn handshake_then_start_list_and_stop_a_real_sheep() {
     assert_eq!(client.hello_ack().pid, std::process::id());
     assert_eq!(client.hello_ack().protocol, PROTOCOL_VERSION);
 
-    // Subscribe BEFORE starting: the bus delivers from the moment you join.
+    // Subscribe before starting: the bus delivers from the moment you join.
     let subscribed = client
         .request(Request::Subscribe {
             topics: vec!["process.*".to_string()],
@@ -740,7 +577,7 @@ async fn handshake_then_start_list_and_stop_a_real_sheep() {
     let Response::Stopped(gone) = stopped.result.unwrap() else {
         panic!("expected stopped")
     };
-    // The reply is deferred until the kill ladder finished, so this is terminal.
+    // The reply is deferred until the kill ladder finished: terminal.
     assert_eq!(gone[0].status, ProcStatus::Stopped);
     client.await_process_event(id, ProcessEventKind::Stop).await;
 
@@ -772,13 +609,9 @@ async fn log_lines_reach_a_log_subscriber() {
     fixture.shutdown().await;
 }
 
-/// A log file's contents with the daemon's per-line timestamp taken back
-/// off, so an assertion is about what the SHEEP wrote.
+/// A log file's contents with the daemon's per-line timestamp taken off.
 ///
-/// Through `shep_core::logstamp::strip`, the same call `shep bleats` makes
-/// when it reads one of these files. A missing or unreadable file is the
-/// empty string, which is what the poll below wants from one that has not
-/// been created yet.
+/// A missing or unreadable file reads as the empty string.
 fn unstamped_file(path: &std::path::Path) -> String {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let mut out = String::new();
@@ -791,12 +624,8 @@ fn unstamped_file(path: &std::path::Path) -> String {
 
 /// Waits for `path` to hold exactly `expected`, failing at [`RECV_TIMEOUT`].
 ///
-/// Polls rather than sleeping a fixed guess. A line observed on the bus has
-/// had its file write ISSUED, not necessarily completed — `tokio::fs`
-/// dispatches the real `write(2)` to the blocking pool — so this waits for
-/// the write to land instead of assuming it already has. Duplicated from
-/// `real_runner.rs` rather than shared: integration binaries are separate
-/// crates, as that file's own helpers already note.
+/// Polls: a line seen on the bus has had its write issued, not completed,
+/// since `tokio::fs` dispatches the real `write(2)` to the blocking pool.
 async fn await_file_contents(path: &std::path::Path, expected: &str) {
     let settled = tokio::time::timeout(RECV_TIMEOUT, async {
         while unstamped_file(path) != expected {
@@ -812,39 +641,15 @@ async fn await_file_contents(path: &std::path::Path, expected: &str) {
     );
 }
 
-/// `create`-mode rotation, end to end: rename the live log, ask the daemon
-/// over its own socket, and watch the sheep's next line land on the
-/// recreated path.
-///
-/// Fails if the request never reaches the sheep's log pump — which is the
-/// whole of this verb, and which the engine tier cannot show: the scripted
-/// fake writes no files, so there every wiring that answers `Ok` looks
-/// alike. Here a `Reopen` that resolved the selector and pushed nothing
-/// leaves the pump on the renamed inode, the live path missing, and the
-/// second line invisible to anything reading the log.
-///
-/// Both halves are asserted for the reason `real_runner.rs`'s own reopen
-/// case gives: a pump that opened a second handle without dropping the
-/// first would grow the new file too, and only the archive standing still
-/// rules that out.
-///
-/// The sheep's own log path is read off the `Started` reply rather than
-/// derived here, so the test cannot disagree with the daemon about which
-/// file it is looking at.
-// Ran ignored on Windows for four commits while this hung `windows-latest`
-// for twenty minutes a run, reporting one line and no location. It was
-// never this test: `gated_announce_app` drove a PowerShell sheep, and an
-// out-of-process probe on the runner caught that sheep with every thread
-// in `Wait` and 0.28s of CPU between them, all of it startup. It never ran
-// the loop it was written to run, so the marker this case writes was never
-// seen and `after` was never printed. The fixture is `cmd` now.
+/// Both halves are asserted: a pump that opened a second handle without
+/// dropping the first would grow the new file too, and only the archive
+/// standing still rules that out.
 #[tokio::test]
 async fn reopen_moves_a_running_sheeps_log_onto_the_recreated_path() {
     let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
     let mut client = fixture.connect().await;
 
-    // Subscribe BEFORE starting: a connection gets no forwarder task, and so
-    // no events at all, until it does.
+    // Subscribe before starting: a connection gets no events until it does.
     let subscribed = client
         .request(Request::Subscribe {
             topics: vec!["log.*".to_string()],
@@ -852,10 +657,7 @@ async fn reopen_moves_a_running_sheeps_log_onto_the_recreated_path() {
         .await;
     assert_eq!(subscribed.result.unwrap(), Response::Subscribed);
 
-    // The marker lets the test decide when the second line happens, so
-    // "after the reopen" is a fact rather than a timing bet. `sleep`'s only
-    // portable argument is a whole number of seconds (POSIX), which is why
-    // the poll is that coarse.
+    // The marker makes "after the reopen" a fact rather than a timing bet.
     let marker = fixture.paths.home.join("go");
     let app = gated_announce_app("rotator", &marker);
     let started = client.request(Request::Start { apps: vec![app] }).await;
@@ -888,8 +690,8 @@ async fn reopen_moves_a_running_sheeps_log_onto_the_recreated_path() {
     assert_eq!(matched.len(), 1);
     assert_eq!(matched[0].id, id);
 
-    // The reply is the barrier: it lands only after the pump has flushed
-    // the old handle and opened the path again, so neither of these polls.
+    // The reply is the barrier: the pump has flushed the old handle and
+    // opened the path again, so neither of these polls.
     assert_eq!(unstamped_file(&out_file), "");
     assert_eq!(unstamped_file(&archive), "before\n");
 
@@ -906,43 +708,19 @@ async fn reopen_moves_a_running_sheeps_log_onto_the_recreated_path() {
 }
 
 #[cfg(unix)]
-/// A reopen asked for over the socket puts a REMOVED log directory back at
-/// [`DIR_MODE`], the mode every directory shep creates is worth — the case a
-/// rotator that moves the directory aside rather than the files produces.
+/// The case a rotator that moves the directory aside rather than the files
+/// produces.
 ///
-/// Fails if the pump's own directory creation stops asking `mkdir` for the
-/// mode: swapping `open_append`'s `DirBuilder::new().mode(DIR_MODE)` back to
-/// a plain `create_dir_all` recreates the directory at `0o777` narrowed by
-/// whatever the ambient umask strips — `0o755` under the common `umask 022` —
-/// and the mode assertion below reddens on the difference. Dropping the
-/// creation altogether reddens the assertions around it instead: the reopen
-/// answers `ReopenFailed` for a path whose parent is gone, and the sheep's
-/// next line has nowhere to land.
-///
-/// One umask cannot be distinguished. Under `umask 0o077` a plain
-/// `create_dir_all` lands `0o700` unaided and both implementations look
-/// alike here. That is a property of the ambient umask rather than of the
-/// code, and the only way to remove it is for the test to set a process-wide
-/// umask — `unsafe`, and it would leak into every other case in this binary.
-///
-/// The mode assertion needs no `#[cfg]` of its own: this file is
-/// `#![cfg(unix)]` at its root, so `DIR_MODE` and `PermissionsExt` are only
-/// ever compiled where they mean something and `--all-targets` never builds
-/// this binary on the Windows leg.
-///
-/// No `ScriptedRunner`, so there are no scripts to size — this tier runs the
-/// real runner, and the fixture is ONE sheep needing ONE real spawn. The
-/// scripted fake is not merely awkward here but blind: it writes no files, so
-/// its pump answers a reopen `Ok` whether or not any directory exists.
+/// Under `umask 0o077` a plain `create_dir_all` lands `0o700` unaided and both
+/// implementations look alike here; narrowing that would take a process-wide
+/// umask, which is `unsafe` and leaks into every other case in this binary.
 #[tokio::test]
 async fn reopen_recreates_a_removed_log_directory_owner_only() {
     let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
     let mut client = fixture.connect().await;
 
-    // The marker lives beside the log directory, not inside it, so removing
-    // that directory below cannot disturb it. `sleep`'s only portable
-    // argument is a whole number of seconds (POSIX), which is why the sheep's
-    // own poll is that coarse.
+    // The marker lives beside the log directory, not inside it: removing that
+    // directory must not disturb it.
     let marker = fixture.paths.home.join("go");
     let app = gated_announce_app("rotator", &marker);
     let started = client.request(Request::Start { apps: vec![app] }).await;
@@ -958,10 +736,8 @@ async fn reopen_recreates_a_removed_log_directory_owner_only() {
     );
     await_file_contents(&out_file, "before\n").await;
 
-    // The whole directory, not the file. That is what a rotator moving
-    // `logs/` aside leaves behind, and it is the only shape in which the mode
-    // of a freshly created directory is observable at all — `mkdir`'s mode
-    // governs the directories a call creates, never one already there.
+    // The whole directory, not the file: `mkdir`'s mode governs only the
+    // directories a call creates.
     std::fs::remove_dir_all(&fixture.paths.logs).unwrap();
     assert!(
         !fixture.paths.logs.exists(),
@@ -989,9 +765,8 @@ async fn reopen_recreates_a_removed_log_directory_owner_only() {
         "the recreated log directory must be {DIR_MODE:o}, found {mode:o}"
     );
 
-    // The reply is the barrier — both handles are open on the recreated path
-    // by the time it lands — so the sheep's next line is what says the
-    // directory is usable and not merely present.
+    // The reply is the barrier: both handles are open on the recreated path,
+    // so the next line says the directory is usable and not merely present.
     std::fs::write(&marker, "").unwrap();
     await_file_contents(&out_file, "after\n").await;
 
@@ -999,41 +774,18 @@ async fn reopen_recreates_a_removed_log_directory_owner_only() {
 }
 
 /// What the flush case writes at the live log path after renaming the real
-/// one away — standing in for the file a `create`-mode rotator leaves behind,
-/// and the thing that must be gone afterwards.
-///
-/// One owner: the case asserts both that this is gone from one file and that
-/// it never reached the other, and a second copy could drift between them.
+/// one away, standing in for the file a `create`-mode rotator leaves behind.
 const STRAY_CONTENT: &str = "what the recreated log holds\n";
 
-/// `flush` resolves to the RECORDED PATH, never to the inode the pump is
-/// holding — the one thing about this verb that only a real pump on a real
-/// file can show.
-///
-/// The rename is what separates the two. Afterwards the sheep's log pump
-/// still has the archive open (nothing reopened it), while the path the
-/// daemon recorded at registration now names a different file. An
-/// implementation that emptied the pump's own handle — by `set_len(0)` on it,
-/// or by asking the pump to truncate what it holds — would empty the ARCHIVE
-/// and leave the live log untouched: the exact opposite of what was asked,
-/// exiting 0 while doing it. That is the shape of failure this case exists
-/// for, and both assertions are needed to catch it, since either one alone
-/// still passes under the inversion.
-///
-/// The stray content is written at the live path deliberately. Without it the
-/// live path would simply be missing after the rename, the truncate would be
-/// the documented no-op, and an inode-chasing implementation would look
-/// identical from the outside.
-///
-/// The paths are read off the `Started` reply rather than derived here, so
-/// the test cannot disagree with the daemon about which file it is renaming.
+/// [`STRAY_CONTENT`] keeps the recorded path and the pump's inode
+/// distinguishable: without it the live path would simply be missing and the
+/// truncate would be the documented no-op.
 #[tokio::test]
 async fn flush_empties_the_recorded_path_and_leaves_a_renamed_archive_alone() {
     let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
     let mut client = fixture.connect().await;
 
-    // Subscribe BEFORE starting: a connection gets no forwarder task, and so
-    // no events at all, until it does.
+    // Subscribe before starting: a connection gets no events until it does.
     let subscribed = client
         .request(Request::Subscribe {
             topics: vec!["log.*".to_string()],
@@ -1057,8 +809,7 @@ async fn flush_empties_the_recorded_path_and_leaves_a_renamed_archive_alone() {
     assert_eq!(client.await_log_line(id).await, "before");
     await_file_contents(&out_file, "before\n").await;
 
-    // From here the pump's handle and the recorded path name different
-    // files, which is the whole point of the case.
+    // From here the pump's handle and the recorded path name different files.
     let archive = out_file.with_extension("log.1");
     std::fs::rename(&out_file, &archive).unwrap();
     std::fs::write(&out_file, STRAY_CONTENT).unwrap();
@@ -1074,9 +825,8 @@ async fn flush_empties_the_recorded_path_and_leaves_a_renamed_archive_alone() {
     assert_eq!(matched.len(), 1);
     assert_eq!(matched[0].id, id);
 
-    // The reply is the barrier: it lands only once every matched pump has
-    // answered and every recorded path has been truncated, so neither of
-    // these polls.
+    // The reply is the barrier: every matched pump has answered, so neither
+    // of these polls.
     assert_eq!(
         unstamped_file(&out_file),
         "",
@@ -1092,36 +842,23 @@ async fn flush_empties_the_recorded_path_and_leaves_a_renamed_archive_alone() {
     fixture.shutdown().await;
 }
 
-/// How long this test waits for the gated sheep's `Online`. Generous for a
-/// loaded runner, but a small fraction of the `listen_timeout` below — the
-/// gap between the two is the whole assertion.
+/// How long this test waits for the gated sheep's `Online`. A small fraction
+/// of the `listen_timeout` below: the gap between the two is the assertion.
 const READY_DEADLINE: Duration = Duration::from_secs(5);
 
-/// A `wait_ready` sheep must go online off its OWN `{"kind":"ready"}` write,
-/// not off the deadline that follows it.
+/// The only case that drives a real child's fd 3 through `run_sheep`'s
+/// `ChildMessage::Ready -> Msg::Ready` forward.
 ///
-/// This is the only test in the workspace that drives a real child's fd 3
-/// all the way through `run_sheep`'s `ChildMessage::Ready -> Msg::Ready`
-/// forward to the readiness wait. The unit tier pushes `Msg::Ready` into the
-/// actor's mailbox directly — downstream of that forward — so deleting the
-/// forward leaves the whole unit tier green while every `wait_ready` app in
-/// production sits at `starting` for its entire `listen_timeout`.
-///
-/// `listen_timeout` is set two orders of magnitude past [`READY_DEADLINE`]
-/// on purpose. A gated sheep reaches `online` eventually either way (an
-/// elapsed readiness deadline brings the sheep online rather than failing it —
-/// see the supervisor's `handle_ready_result`), so only an `Online` that
-/// arrives EARLY can tell a forwarded ready message apart from an expired one.
-/// Nothing else can, in this tier: the deadline's own `warn!` is rendered only
-/// by the subscriber `shep-cli`'s `daemon` subcommand installs, and this file
-/// boots the library directly, so the two paths produce the same event, the
-/// same status, and no output either way.
+/// `listen_timeout` is two orders of magnitude past [`READY_DEADLINE`]: an
+/// elapsed readiness deadline brings the sheep online rather than failing it,
+/// so only an early `Online` tells a forwarded ready message from an expired
+/// one.
 #[tokio::test]
 async fn a_wait_ready_sheep_goes_online_on_its_own_channel_message() {
     let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
     let mut client = fixture.connect().await;
 
-    // Subscribe BEFORE starting: the bus delivers from the moment you join.
+    // Subscribe before starting: the bus delivers from the moment you join.
     let subscribed = client
         .request(Request::Subscribe {
             topics: vec!["process.*".to_string()],
@@ -1130,8 +867,7 @@ async fn a_wait_ready_sheep_goes_online_on_its_own_channel_message() {
     assert_eq!(subscribed.result.unwrap(), Response::Subscribed);
 
     let mut app = ready_app("greeter", &fixture.paths.home);
-    // `wait_ready` is what makes `assemble` open the channel at all, so the
-    // same flag arms the gate and gives the child something to write to.
+    // `wait_ready` both arms the gate and makes `assemble` open the channel.
     app.wait_ready = true;
     app.listen_timeout = UpDuration::from_millis(600_000);
 
@@ -1163,37 +899,12 @@ async fn a_wait_ready_sheep_goes_online_on_its_own_channel_message() {
     fixture.shutdown().await;
 }
 
-/// A real child answers a triggered action over its own fd 3, twice in a
-/// row.
+/// Two round trips, not one: a single reply can land by winning a
+/// spawn-timing race. The child echoes a counter, so the two are
+/// distinguishable.
 ///
-/// The paused-clock tier cannot reach this at all: `ScriptedRunner`
-/// (`fake.rs`) is driven entirely off in-process `tokio::sync::mpsc`
-/// channels, so nothing there ever crosses a real socketpair, and nothing
-/// there can catch a regression in the fd-3 wiring itself — the
-/// `SHEP_CHANNEL_FD`/`fd_mappings` half in `tokio_runner.rs`, or the
-/// newline-JSON framing `spawn_channel_pumps` puts on the wire. This is the
-/// one place in the workspace that can.
-///
-/// Two round trips, not one, because a single exchange is not evidence: it
-/// was measured, while fixing the fd-3 blocking bug this test now guards,
-/// that a one-round-trip version of this test ran 25/25 green against the
-/// UNFIXED daemon — a single reply can land by winning a spawn-timing race
-/// even on a build that cannot really do this at all. A second exchange on
-/// the SAME live channel is what a race cannot fake twice.
-///
-/// The child echoes a counter rather than a fixed string, so the two
-/// replies are also distinguishable from each other — a build that answered
-/// every trigger with whatever the child happened to have buffered first
-/// would still pass a same-body assertion.
-///
-/// # What this does NOT try to prove
-///
-/// That a successful `to_child.send()` is delivery. It measurably is not —
-/// see `begin_action`'s own doc in `supervisor.rs`: the first send after a
-/// child has died is accepted and discarded, and only the second one
-/// errors. So nothing here ever asserts on a send's own `Ok`/`Err`; the only
-/// proof either round trip landed is the `Replied` row itself, read back off
-/// the RPC reply.
+/// A successful `to_child.send()` is not delivery: the first send after a
+/// child has died is accepted and discarded. The `Replied` row is the proof.
 // `cfg(unix)` because its fixture is a `/bin/sh` script.
 #[cfg(unix)]
 #[tokio::test]
@@ -1203,8 +914,7 @@ async fn a_triggered_action_reaches_a_real_child_and_answers_it_twice() {
 
     let mut app = AppConfig::minimal("responder", "/bin/sh");
     app.interpreter = Some("none".to_string());
-    // `channel` is what `assemble()` needs to open fd 3 at all here — unlike
-    // the `wait_ready` fixture above, this app never gates readiness on it.
+    // `channel` is what opens fd 3 here; this app gates no readiness on it.
     app.channel = true;
     app.args = vec![
         "-c".to_string(),
@@ -1242,14 +952,6 @@ async fn a_triggered_action_reaches_a_real_child_and_answers_it_twice() {
     fixture.shutdown().await;
 }
 
-/// A real pipe, a real child, a real socket. The child echoes what it reads,
-/// so the `log.out` line coming back is proof the line went all the way
-/// down and the app's answer came all the way up — the one claim no tier
-/// below this can make.
-///
-/// Bounded (IR-46) at both ends: `Client::request` bounds each frame it
-/// reads via `recv_as`'s own `RECV_TIMEOUT`, and `await_log_line` carries
-/// the same bound around its own wait.
 // `cfg(unix)` because its fixture is a `/bin/sh` script.
 #[cfg(unix)]
 #[tokio::test]
@@ -1257,8 +959,7 @@ async fn a_line_written_to_a_real_sheeps_stdin_comes_back_on_its_stdout() {
     let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
     let mut client = fixture.connect().await;
 
-    // Subscribe BEFORE starting: the bus delivers from the moment you join,
-    // same rule `log_lines_reach_a_log_subscriber` follows.
+    // Subscribe before starting: the bus delivers from the moment you join.
     let subscribed = client
         .request(Request::Subscribe {
             topics: vec!["log.*".to_string()],
@@ -1292,19 +993,13 @@ async fn a_line_written_to_a_real_sheeps_stdin_comes_back_on_its_stdout() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].outcome, LineOutcome::Sent);
 
-    // `Sent` only claims the bytes reached the pipe. This is the half that
-    // proves the app actually read them.
+    // `Sent` only claims the bytes reached the pipe; this proves a read.
     let echoed = client.await_log_line(id).await;
     assert_eq!(echoed, "got ping");
 
     fixture.shutdown().await;
 }
 
-/// A real child writing on a real fd 3, observed by a real subscriber over a
-/// real socket. The engine-tier cases prove the actor forwards; only this
-/// proves the whole path — socketpair, newline framing, the bus, the topic
-/// filter, and the frame encoder — carries a `channel.metric` to a client that
-/// asked for `channel.*` and nothing else.
 // `cfg(unix)` because its fixture is a `/bin/sh` script.
 #[cfg(unix)]
 #[tokio::test]
@@ -1312,7 +1007,7 @@ async fn a_childs_metric_reaches_a_channel_subscriber_over_the_socket() {
     let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
     let mut client = fixture.connect().await;
 
-    // Subscribe BEFORE starting: the bus delivers from the moment you join.
+    // Subscribe before starting: the bus delivers from the moment you join.
     let subscribed = client
         .request(Request::Subscribe {
             topics: vec!["channel.*".to_string()],
@@ -1323,16 +1018,14 @@ async fn a_childs_metric_reaches_a_channel_subscriber_over_the_socket() {
     let mut app = AppConfig::minimal("chatty", "/bin/sh");
     app.interpreter = Some("none".to_string());
     app.channel = true;
-    // Writes one metric on fd 3 and then sleeps, so the sheep is still alive
-    // when the assertion runs.
+    // Sleeps after the metric: the sheep must outlive the assertion.
     app.args = vec![
         "-c".to_string(),
         r#"printf '{"kind":"metric","name":"rps","value":42}\n' >&3; sleep 30"#.to_string(),
     ];
     client.request(Request::Start { apps: vec![app] }).await;
 
-    // Bounded (IR-46): a subscriber that never receives would otherwise hang
-    // this test rather than fail it.
+    // Bounded: a subscriber that never receives must fail, not hang.
     let frame = tokio::time::timeout(RECV_TIMEOUT, async {
         loop {
             if let ServerFrame::Event(BusEvent::Channel { message, .. }) = client.next_frame().await
@@ -1355,26 +1048,9 @@ async fn a_childs_metric_reaches_a_channel_subscriber_over_the_socket() {
     fixture.shutdown().await;
 }
 
-/// A trigger against a sheep with no shepherd channel is refused per-row,
-/// naming the missing channel, rather than waiting out a timeout for a
-/// reply that was never coming.
-///
-/// `AppConfig::minimal` leaves `channel`, `wait_ready`, and
-/// `shutdown_with_message` all false — the only three things `assemble()`
-/// ORs together to decide whether a sheep gets fd 3 at all
-/// (`assemble.rs`'s own doc) — so this app is spawned with no channel from
-/// the start.
-///
-/// Only the real runner can show what this test is actually about: with
-/// `spec.channel == false`, `tokio_runner.rs` never spawns a writer task for
-/// this sheep and drops the send side's receiving end at spawn
-/// (`drop(from_child_tx); drop(to_child_rx);`), so `spawn_action_task`'s own
-/// `to_child.send()` fails AT ONCE and the row comes back `NoChannel`
-/// without ever arming a wait. The paused-clock tier can only assert the
-/// same OUTCOME by building a `SheepSlot` with `to_child: None` by hand
-/// (`supervisor.rs`'s `a_sheep_with_no_channel_is_refused_in_its_own_row`
-/// and its siblings) — which proves the row-aggregation logic but not this
-/// send-fails-fast wiring underneath it.
+/// `AppConfig::minimal` leaves `channel`, `wait_ready` and
+/// `shutdown_with_message` false, the three `assemble()` ors together to
+/// decide whether a sheep gets fd 3.
 #[tokio::test]
 async fn a_trigger_against_a_channelless_sheep_names_the_missing_channel() {
     let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
@@ -1408,23 +1084,12 @@ async fn a_trigger_against_a_channelless_sheep_names_the_missing_channel() {
     fixture.shutdown().await;
 }
 
-/// A trigger against a child that reads its action and then says nothing
-/// gets the daemon's own `TimedOut` row back — never a client-side
-/// `DeadlineExceeded`, which would name no sheep at all.
+/// `action_timeout` is set under both [`RECV_TIMEOUT`] and `rpc.rs`'s
+/// `DEFAULT_DEADLINE_MS` (5s), the budget every `Client::request` here gets.
 ///
-/// `action_timeout` is set well under both this file's own [`RECV_TIMEOUT`]
-/// and `rpc.rs`'s `DEFAULT_DEADLINE_MS` (5s) — the budget every
-/// `Client::request` in this file gets, since none of them ever send a
-/// deadline of their own. That ordering is what `rpc.rs`'s own
-/// `an_oversized_action_timeout_loses_the_race` pins at the paused-clock
-/// tier; here it costs real wall-clock time, so the value is kept small
-/// deliberately rather than left at the 3s spec default.
-///
-/// The child reads (and discards) the action before falling silent, rather
-/// than never touching fd 3 at all — a fixture that never reads still leaves
-/// the message sitting in the socket's own kernel buffer, which times out
-/// exactly the same way for a reason this test is not about. Reading first
-/// is what makes the silence itself the fact under test.
+/// The child reads the action before falling silent: a fixture that never
+/// reads leaves the message in the kernel buffer, which times out the same
+/// way for a different reason.
 // `cfg(unix)` because its fixture is a `/bin/sh` script.
 #[cfg(unix)]
 #[tokio::test]
@@ -1471,9 +1136,7 @@ async fn a_trigger_against_a_silent_child_times_out_rather_than_hitting_the_rpc_
 async fn protocol_skew_is_refused_over_the_real_socket() {
     let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
 
-    // Built by hand, not through `Fixture::connect`: that helper always
-    // sends a MATCHING protocol, and this test needs to send a mismatched
-    // one instead.
+    // By hand: `Fixture::connect` always sends a matching protocol.
     let stream = transport::connect(&fixture.paths.socket).await.unwrap();
     let mut frames = Framed::new(stream, codec());
     frames
@@ -1557,29 +1220,14 @@ async fn kill_daemon_shuts_the_flock_down_and_unlinks_the_socket() {
         "the pidfile must be removed on teardown"
     );
 
-    // What this proves: the daemon's kill ladder REAPED both DIRECT
-    // children -- the two `/bin/sh` leaders `pids` holds -- not merely
-    // signaled them. `kill(pid, None)` still returns `Ok` for a zombie
-    // (exited but not yet `wait()`ed by its parent — the pid stays in the
-    // process table until reaped), so only a transition all the way to
-    // ESRCH proves the daemon's own `wait()` actually ran, which is what
-    // `assert_reaped` polls for instead of sleeping a fixed guess.
-    //
-    // What this does NOT prove: that their `sleep 1` GRANDCHILDREN are
-    // also gone. Neither `pids` nor anything else in this test ever learns
-    // those pids (spec §7's shepherd channel never reports grandchild
-    // pids either), so this loop cannot poll them directly — the kill
-    // ladder reaches them via the process-GROUP signals both its rungs send
-    // (`tokio_runner.rs`'s `signal_group`), which this test does not
-    // independently verify. `real_runner.rs`'s
-    // `a_graceful_stop_reaches_a_forked_grandchild` is where that is proven,
-    // against a pid it learns from the wrapper itself.
+    // Reaped, not merely signalled: `kill(pid, None)` still returns `Ok` for a
+    // zombie, so only ESRCH proves the daemon's own `wait()` ran. The `sleep 1`
+    // grandchildren are out of reach here; `real_runner.rs` covers them.
     for pid in pids {
         assert_reaped(pid).await;
     }
 
-    // Engine unreachable: a fresh connect on the now-unlinked socket path
-    // must fail, not hang or succeed against a daemon that never really left.
+    // A fresh connect on the unlinked path must fail, not hang.
     assert!(
         transport::connect(&socket).await.is_err(),
         "the daemon must not still be answering after KillDaemon"
@@ -1587,10 +1235,8 @@ async fn kill_daemon_shuts_the_flock_down_and_unlinks_the_socket() {
 }
 
 #[cfg(unix)]
-/// Polls `kill(pid, None)` for ESRCH (no such process) instead of sleeping a
-/// fixed guess — see the comment at this fn's one multi-line call site
-/// (`kill_daemon_shuts_the_flock_down_and_unlinks_the_socket`) for exactly
-/// what a transition to ESRCH does and does not prove.
+/// Polls `kill(pid, None)` for ESRCH, no such process, rather than sleeping a
+/// fixed guess.
 async fn assert_reaped(pid: i32) {
     let reaped = tokio::time::timeout(RECV_TIMEOUT, async {
         loop {
@@ -1607,49 +1253,17 @@ async fn assert_reaped(pid: i32) {
     );
 }
 
-/// Waits until `socket` is stale in the sense `bind_socket` means it —
-/// nothing answers a connection there — failing at [`RECV_TIMEOUT`].
+/// Waits until nothing answers a connection at `socket`, failing at
+/// [`RECV_TIMEOUT`].
 ///
-/// Polls rather than sleeping a fixed guess, and bounded rather than
-/// unbounded (IR-39): the descriptor this waits on belongs to another
-/// process, so there is no event to subscribe to, only a question to keep
-/// asking until the deadline answers it.
-///
-/// Dropping a daemon's `UnixListener` stops THAT daemon accepting, but does
-/// not on its own unbind the socket: a socket lives exactly as long as its
-/// last descriptor, and `fork` hands the child a copy of every descriptor
-/// open at that instant. A child parked between `fork` and `exec` therefore
-/// keeps a dead daemon's listening socket bound, and connectable, for as
-/// long as that window lasts — close-on-exec clears the copy, but not until
-/// the `exec`. `bind_socket`'s stale-socket probe reads a socket that
-/// answers as a live daemon and refuses the boot with `AlreadyRunning`, so
-/// a reboot landing inside that window is turned away by a daemon that no
-/// longer exists.
-///
-/// The window is reachable here because this tier runs many daemons inside
-/// ONE process, concurrently with tests that spawn real children: a reboot
-/// on one home can land inside an unrelated test's fork. Waiting for the
-/// refusal makes the precondition a stale-socket reboot rests on asserted
-/// rather than assumed. Not theorised — a child whose `pre_exec` sleeps
-/// holds a just-crashed daemon's socket open by exactly this route, and a
-/// reboot racing one is refused on every single run without this wait.
-///
-/// A daemon that is genuinely serving can never satisfy this wait: it
-/// accepts, so every probe connects and the budget runs out. Only a socket
-/// with nothing behind it refuses — because its last descriptor closed, or
-/// because these probes filled a backlog nobody is draining, which some
-/// Unixes report as a refusal too. Both are the answer `bind_socket` acts
-/// on, which is what makes either an honest stopping point.
+/// Dropping a `UnixListener` does not unbind the socket: it lives as long as
+/// its last descriptor, and a child parked between `fork` and `exec` holds a
+/// copy until close-on-exec clears it. `bind_socket` reads such a socket as a
+/// live daemon and refuses the boot with `AlreadyRunning`.
 async fn await_stale_socket(socket: &std::path::Path) {
     let refused = tokio::time::timeout(RECV_TIMEOUT, async {
-        // tokio's connector, not `std`'s blocking one, and that is
-        // load-bearing rather than stylistic: nothing accepts on the socket
-        // this waits out, so every probe leaves a connection queued, and a
-        // full backlog is reported differently across Unixes — some refuse
-        // it, some park the caller until a slot frees. A blocking `connect`
-        // that parks holds the runtime thread inside a syscall no timer can
-        // interrupt, and this fn would then outlive the very budget it
-        // exists to enforce.
+        // tokio's connector, not `std`'s: a full backlog parks the caller on
+        // some Unixes, inside a syscall no timer can interrupt.
         while !matches!(
             transport::connect(socket).await,
             Err(err) if matches!(err.kind(), ErrorKind::ConnectionRefused | ErrorKind::NotFound)
@@ -1665,18 +1279,16 @@ async fn await_stale_socket(socket: &std::path::Path) {
     );
 }
 
-// `cfg(unix)` because it asserts recovery from a leftover socket FILE, which a named pipe never leaves.
+// `cfg(unix)`: a leftover socket file, which a named pipe never leaves.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_socket_left_behind_by_a_crash_does_not_block_the_next_boot() {
     let mut fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
     let socket = fixture.paths.socket.clone();
 
-    // Simulate a crash: abort the run loop instead of asking for its
-    // ordered teardown, so neither the socket file nor the pidfile is ever
-    // unlinked. Awaiting the now-aborted handle (rather than a fixed sleep)
-    // is what makes the DROP deterministic: it only resolves once the task
-    // — and the `UnixListener` it owned — has actually finished dropping.
+    // Simulate a crash: aborting the run loop unlinks neither the socket file
+    // nor the pidfile. Awaiting the handle resolves once the task, and the
+    // `UnixListener` it owned, has finished dropping.
     let run = fixture.run.take().expect("run is only ever taken once");
     run.abort();
     let outcome = run.await;
@@ -1688,17 +1300,12 @@ async fn a_socket_left_behind_by_a_crash_does_not_block_the_next_boot() {
         socket.exists(),
         "sanity: a crash leaves the socket file behind"
     );
-    // Dropping that listener is not the same as the socket going dead, and
-    // the reboot below needs the second: see `await_stale_socket`'s own doc
-    // for what else can hold a crashed daemon's socket open, and why
-    // awaiting the aborted task does not by itself rule it out.
+    // Dropping that listener is not the socket going dead; the reboot needs
+    // the second.
     await_stale_socket(&socket).await;
 
-    // Same `$SHEP_HOME`: `dir` is taken out of `fixture` here rather than
-    // dropped alongside it, so the directory (and the leftover socket file
-    // inside it) survives into the reboot. No processes were ever started
-    // on this fixture, so its `Drop` (see `Fixture`'s own doc) has nothing
-    // to reap when it goes out of scope at the end of this fn.
+    // Same `$SHEP_HOME`: taking `dir` out of `fixture` keeps the leftover
+    // socket file alive into the reboot.
     let dir = fixture.dir.take().expect("dir is only ever taken once");
     let rebooted = Fixture::boot(dir, false).await;
     let mut client = rebooted.connect().await;
@@ -1743,14 +1350,8 @@ async fn muster_restores_the_flock_across_a_daemon_lifetime() {
 
     let dir = fixture.shutdown().await; // same $SHEP_HOME survives the reboot
 
-    // shutdown()'s kill ladder must have actually reaped the pre-reboot
-    // flock, not merely recorded it in the roll as it was — test 4
-    // (kill_daemon_shuts_the_flock_down_and_unlinks_the_socket) already
-    // proves teardown's kill ladder in general; this confirms it held for
-    // THIS fixture's own three sheep too, before trusting the "a restored
-    // sheep gets a fresh pid" assertion below to mean anything (a stale
-    // pid the OS happened not to reuse yet would make that assertion pass
-    // for the wrong reason).
+    // Reaped, not merely recorded in the roll: a stale pid the OS had not
+    // reused would pass the fresh-pid assertion for the wrong reason.
     for &pid in &old_pids {
         assert_reaped(i32::try_from(pid).unwrap()).await;
     }
@@ -1777,30 +1378,10 @@ async fn muster_restores_the_flock_across_a_daemon_lifetime() {
     rebooted.shutdown().await;
 }
 
-/// RAII guard: prepends `dir` to the current `PATH` for one test's
-/// duration, restoring the exact original value on drop (including on
-/// panic).
+/// Prepends `dir` to `PATH` for one test, restoring the original on drop.
 ///
-/// Prepending, never REPLACING, is what keeps this safe under this file's
-/// own parallel test harness: unlike `real_runner.rs`'s `PathGuard` (whose
-/// other tests hand-build a `SpawnSpec` with an empty `env` and so never
-/// read `PATH` at all), every OTHER test in `daemon_e2e.rs` boots a real
-/// daemon that calls `assemble()`'s `base_env()`, which DOES read `PATH` —
-/// a concurrently-running sleeper's `/bin/sh -c "while :; do sleep 1; done"`
-/// needs `sleep` (an external binary, resolved through the CHILD shell's own
-/// inherited `PATH`) to still be findable while this guard is active.
-/// Prepending keeps every real entry reachable throughout; only replacing
-/// the whole value would starve another test's concurrent spawn.
-///
-/// # Why `unsafe` here doesn't touch the crate's own `#![deny(unsafe_code)]`
-///
-/// `tests/daemon_e2e.rs` compiles as its own crate root, not part of the
-/// `shep-daemon` library `lib.rs` gates. `std::env::set_var`/`remove_var`'s
-/// documented hazard is an OS thread doing a raw, std-UNSYNCHRONIZED
-/// `getenv` at the same instant; every read of `PATH` anywhere in this
-/// binary goes through `std::env::var`, which std itself serializes against
-/// `set_var`/`remove_var` internally — nothing here (or in any dependency
-/// this test exercises) calls a raw, unsynchronized libc `getenv`.
+/// Prepending, never replacing: a concurrently spawned sleeper's `/bin/sh`
+/// has to keep finding `sleep` while this guard is active.
 struct PathGuard {
     original: Option<String>,
 }
@@ -1812,7 +1393,9 @@ impl PathGuard {
             Some(existing) => format!("{}:{existing}", dir.display()),
             None => dir.display().to_string(),
         };
-        // SAFETY: see struct doc.
+        // SAFETY: `set_var`'s hazard is a concurrent raw `getenv`. Every read
+        // of `PATH` in this binary goes through `std::env::var`, which std
+        // serializes against `set_var`/`remove_var`.
         unsafe { std::env::set_var("PATH", combined) };
         Self { original }
     }
@@ -1821,9 +1404,11 @@ impl PathGuard {
 impl Drop for PathGuard {
     fn drop(&mut self) {
         match &self.original {
-            // SAFETY: see struct doc.
+            // SAFETY: every `PATH` read in this binary goes through
+            // `std::env::var`, which std serializes against `set_var`.
             Some(value) => unsafe { std::env::set_var("PATH", value) },
-            // SAFETY: see struct doc.
+            // SAFETY: every `PATH` read in this binary goes through
+            // `std::env::var`, which std serializes against `remove_var`.
             None => unsafe { std::env::remove_var("PATH") },
         }
     }
@@ -1834,22 +1419,9 @@ impl Drop for PathGuard {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_bare_interpreter_resolves_via_the_inherited_path() {
-    // Deviation from the brief's literal bare-`"sh"` version (adversarial
-    // finding #1 regression test): empirically confirmed (`rustc`-compiled
-    // probe, `Command::new("sh")` + `env_clear()`, no PATH key at all —
-    // still exits 0) that a bare `"sh"` resolves via glibc/libSystem's
-    // `execvp` OS-level fallback (`_PATH_DEFPATH`, `/usr/bin:/bin` on
-    // macOS/BSD) whenever PATH is ABSENT from the child's env — exactly the
-    // env `tokio_runner.rs` hands the child if `assemble()`'s `base_env()`
-    // fix regresses. That means a literal bare `"sh"` test would stay GREEN
-    // even with the fix reverted: the same pitfall `real_runner.rs`'s own
-    // `a_bare_interpreter_resolves_via_the_seeded_path` already discovered
-    // and fixed for the assemble()+runner tier (see that test's own doc). A
-    // throwaway-tempdir shim, never on that OS default path, is the only
-    // interpreter name that can make this test fail if the fix regresses —
-    // this is the same technique, now proven through the FULL daemon RPC
-    // stack (Start-over-socket -> supervisor -> assemble() -> TokioRunner)
-    // rather than calling assemble()+TokioRunner directly.
+    // A throwaway-tempdir shim, not a bare `"sh"`: `execvp` falls back to
+    // `_PATH_DEFPATH` when PATH is absent from the child's env, so a bare name
+    // would resolve even with `base_env()`'s seeding reverted.
     use std::os::unix::fs::PermissionsExt as _;
 
     let shim_home = tempfile::tempdir().unwrap();
@@ -1861,17 +1433,12 @@ async fn a_bare_interpreter_resolves_via_the_inherited_path() {
     perms.set_mode(0o755);
     std::fs::set_permissions(&shim_path, perms).unwrap();
 
-    // This test is the only one in this binary that mutates PATH; see
-    // PathGuard's own doc for why prepending (not replacing) is safe
-    // alongside every other, concurrently-running test here.
+    // The only test in this binary that mutates PATH.
     let _path_guard = PathGuard::prepend(&shim_dir);
 
     let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
     let mut client = fixture.connect().await;
-    // Subscribe BEFORE starting (as test 1 does): a connection gets no
-    // forwarder task, and so no events at all, until it does. The brief's
-    // own version of this test omitted this and would hang the same way —
-    // caught empirically, not assumed, while writing this file.
+    // Subscribe before starting: a connection gets no events until it does.
     let subscribed = client
         .request(Request::Subscribe {
             topics: vec!["process.*".to_string()],
@@ -1888,9 +1455,7 @@ async fn a_bare_interpreter_resolves_via_the_inherited_path() {
     };
     let id = infos[0].id;
 
-    // A failed exec (ENOENT from a PATH that never reaches the shim) lands
-    // the sheep in Errored, never Online — reaching Online is the
-    // load-bearing assertion.
+    // A failed exec lands the sheep in Errored, so Online is the assertion.
     let online = client
         .await_process_event(id, ProcessEventKind::Online)
         .await;
@@ -1899,59 +1464,43 @@ async fn a_bare_interpreter_resolves_via_the_inherited_path() {
     fixture.shutdown().await;
 }
 
-/// Serializes this file's two reload measurements against each other.
+/// Serializes this file's reload measurements: each hands a fixed port to a
+/// child that binds it twice over, so the two cannot interleave.
 ///
-/// Each hands a FIXED port to a child that has to bind it twice over — the
-/// instance being replaced and its replacement, at once — so the two cannot be
-/// allowed to interleave, and `cargo test` runs the tests inside one binary in
-/// parallel by default. This is `boot.rs`'s `SIGNAL_TEST_LOCK` again, for the
-/// same class of reason its own doc records: a process-wide resource one test
-/// owns silently reaching another and deciding its result. `tokio::sync::Mutex`
-/// for that doc's reason too — the guard is held across `.await` points, where
-/// clippy's `await_holding_lock` correctly denies a blocking guard.
-///
-/// It does not serialize against other test BINARIES, which cargo also runs
-/// concurrently. Nothing else in the workspace has a child bind a port, and
-/// each measurement takes a port the OS handed out moments earlier; the
-/// residual risk is [`free_port`]'s own.
+/// `tokio::sync::Mutex` because the guard is held across `.await`, where
+/// clippy's `await_holding_lock` denies a blocking guard. It does not
+/// serialize against other test binaries, which cargo also runs concurrently.
 static RELOAD_PORT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// How long [`reuse_port_sheep`] holds a connection before answering it.
 ///
-/// A reply is not instant because a handover's cost is mostly what happens to
-/// work already in hand: at [`CONNECT_INTERVAL`] this keeps around fifteen
-/// connections open at every instant, which is what an instance killed
-/// mid-flight destroys and a draining one finishes.
+/// At [`CONNECT_INTERVAL`] this keeps around fifteen connections open at every
+/// instant, which an instance killed mid-flight destroys.
 const HOLD_MS: u64 = 60;
 
 /// One new connection every 4ms for as long as a reload lasts.
 ///
-/// A rate, not a wait — IR-39's no-sleeps rule is about waiting for a
-/// condition by guessing how long it takes, and this is the load the
-/// measurement is made under. Fast enough that the window between the drainee
-/// emptying its accept queue and closing its listener is a real chance to lose
-/// something, slow enough that a loss is never the fixture's queue overflowing.
+/// Fast enough that the window between the drainee emptying its accept queue
+/// and closing its listener is a real chance to lose something, slow enough
+/// that a loss is never the fixture's queue overflowing.
 const CONNECT_INTERVAL: Duration = Duration::from_millis(4);
 
 /// How long one connection gets before it counts as lost. Two orders of
-/// magnitude over [`HOLD_MS`]: an answer that is coming arrives in milliseconds
-/// and this is slack for a loaded runner, not an expected duration.
+/// magnitude over [`HOLD_MS`]: slack for a loaded runner, not an expected
+/// duration.
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The `AwaitReady` window a replacement gets, as `listen_timeout`.
 ///
-/// The fixture signals no readiness, so this app is the `Heuristic` case: the
-/// deadline elapsing IS the readiness verdict, and it is what holds the
-/// drainee's kill ladder back until the replacement has had time to bind. Half
-/// a second against a process that binds in single-digit milliseconds — the
-/// margin is the point, since the measurement must not be a race between exec
-/// and a stop signal.
+/// The fixture signals no readiness, so this is the `Heuristic` case: the
+/// deadline elapsing is the verdict, and it holds the drainee's kill ladder
+/// back until the replacement has bound. Half a second against a process that
+/// binds in single-digit milliseconds.
 const READY_WINDOW: UpDuration = UpDuration::from_millis(500);
 
-/// The drain window a replaced instance gets, as `graceful_timeout` — and, for
-/// an instance that will not take its stop signal, exactly how long it is
-/// before `SIGKILL`. Short only because nothing here needs longer; the spec
-/// default is 8s and a test that waited it out twice would pay it for nothing.
+/// The drain window a replaced instance gets, as `graceful_timeout`, and for
+/// an instance that will not take its stop signal, how long it is before
+/// `SIGKILL`. Short because nothing here needs longer; the spec default is 8s.
 const DRAIN_WINDOW: UpDuration = UpDuration::from_millis(1_000);
 
 /// Connections opened at once before a reload and again after it, to establish
@@ -1961,21 +1510,16 @@ const BURST: usize = 10;
 /// What one connection to the fixture got.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Attempt {
-    /// Answered, by the process with this pid. The pid is the whole reason the
-    /// fixture replies with one: it attributes every served connection to a
-    /// process, so "the port answered" and "the process I think is serving
-    /// answered" are separate claims here.
+    /// Answered, by the process with this pid, which keeps "the port
+    /// answered" and "that process answered" separate claims.
     Served(u32),
-    /// Refused, reset, timed out, or closed with nothing on it — carrying the
-    /// reason so a failure message names it. A connection ACCEPTED into a
-    /// listener's backlog and never answered because that listener closed
-    /// arrives here as an empty answer, not as a connect error: the handshake
-    /// completed, the reset came later.
+    /// Refused, reset, timed out, or closed with nothing on it, carrying the
+    /// reason. A connection accepted into a backlog whose listener then closed
+    /// arrives as an empty answer, not a connect error.
     Failed(String),
 }
 
 impl Attempt {
-    /// Whether this attempt got no answer — the thing the measurement counts.
     fn failed(&self) -> bool {
         matches!(self, Self::Failed(_))
     }
@@ -2030,10 +1574,8 @@ impl Hammer {
                     set.spawn(attempt(port));
                     tokio::time::sleep(CONNECT_INTERVAL).await;
                 }
-                // Every connection already open is waited out rather than
-                // abandoned: the ones in flight when the swap finishes are
-                // precisely the ones an instance killed mid-answer loses, and
-                // dropping them here would drop the measurement with them.
+                // Connections already open are waited out: those in flight at
+                // the swap are the ones an instance killed mid-answer loses.
                 let mut attempts = Vec::new();
                 while let Some(outcome) = set.join_next().await {
                     attempts.push(outcome.expect("an attempt cannot panic"));
@@ -2044,16 +1586,14 @@ impl Hammer {
         Self { stop, task }
     }
 
-    /// Stops connecting and reports every attempt made, in-flight ones
-    /// included.
+    /// Stops connecting and reports every attempt, in-flight ones included.
     async fn finish(self) -> Vec<Attempt> {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         self.task.await.expect("the hammer cannot panic")
     }
 }
 
-/// A one-line tally of a run of attempts, so a failure message names the
-/// reasons instead of dumping several hundred outcomes.
+/// A one-line tally of a run of attempts, for a failure message.
 fn tally(attempts: &[Attempt]) -> String {
     let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for attempt in attempts {
@@ -2073,13 +1613,8 @@ fn tally(attempts: &[Attempt]) -> String {
 /// Waits for `pid` to be the process answering `port`, failing at
 /// [`RECV_TIMEOUT`].
 ///
-/// The bus cannot say when a sheep has bound: the daemon arms a readiness wait
-/// for a `Channel` or `Probe` app only, so this app — which configures neither
-/// — is `Online` from the moment it is spawned, exec included. Polling the port
-/// is what can, and it is the condition the measurement depends on rather than
-/// a proxy for it. A replacement is a different matter and needs no poll: a
-/// reload gates readiness for every app, which is what holds the drainee's
-/// ladder back (`spawn_replacement`'s own doc).
+/// The bus cannot say when this sheep has bound: it configures neither a
+/// channel nor a probe, so it is `Online` from the moment it is spawned.
 async fn await_serving(port: u16, pid: u32) {
     let serving = tokio::time::timeout(RECV_TIMEOUT, async {
         while attempt(port).await != Attempt::Served(pid) {
@@ -2093,16 +1628,11 @@ async fn await_serving(port: u16, pid: u32) {
     );
 }
 
-/// Polls `ListFlock` until `id` is `Online`, for a case that cannot wait on
-/// the event.
+/// Polls `ListFlock` until `id` is `Online`.
 ///
-/// A probed app reaches `Online` a probe interval AFTER it starts answering,
-/// so [`await_serving`] returning is not the same fact — and a reload arriving
-/// in that gap finds nothing replaceable and quietly does nothing. The
-/// obvious wait, `await_process_event(id, Online)`, is unavailable to the two
-/// cases that need this: they read the event stream in emission order, so they
-/// subscribe only once the app is up, which is precisely the moment this is
-/// establishing.
+/// A probed app reaches `Online` a probe interval after it starts answering,
+/// so [`await_serving`] returning is not the same fact, and a reload arriving
+/// in that gap finds nothing replaceable.
 #[cfg(unix)]
 async fn await_online(client: &mut Client, id: u32) {
     let online = tokio::time::timeout(RECV_TIMEOUT, async {
@@ -2126,14 +1656,8 @@ async fn await_online(client: &mut Client, id: u32) {
 
 /// A port with nothing on it: bind `:0`, read what the OS chose, release it.
 ///
-/// The repo's existing idiom (`supervisor.rs`, `boot.rs` and `extras.rs` all do
-/// this) and inherently a check-then-use — a stranger can take the port between
-/// the release here and the fixture's own bind. That loss is loud rather than
-/// quiet: the fixture panics with the bind error into its own stderr log and
-/// never reaches `Online`, so the wait for it fails instead of the measurement
-/// quietly measuring something else. What cannot happen is the port still being
-/// held by this file's other measurement — [`RELOAD_PORT_LOCK`] covers that,
-/// and each measurement takes a fresh port regardless.
+/// Check-then-use: a stranger can take the port before the fixture binds it.
+/// That loss is loud, since the fixture panics with the bind error.
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .expect("the OS must have a free loopback port")
@@ -2142,15 +1666,11 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// The fixture server's binary — see `examples/reuse_port_sheep.rs` for what it
-/// is and why it is an example.
+/// The fixture server's binary, built as `examples/reuse_port_sheep.rs`.
 ///
-/// Located rather than named: `env!("CARGO_BIN_EXE_<name>")` covers a package's
-/// `[[bin]]` targets and nothing else. Cargo puts an example at
-/// `<target>/<triple?>/<profile>/examples/<name>` and this test binary at the
-/// sibling `.../deps/<name>-<hash>`, so it is two levels up and back down — a
-/// shape that survives `--target` (the musl leg of CI runs these tests) and a
-/// custom `CARGO_TARGET_DIR`, since both move the whole tree together.
+/// Located rather than named: `env!("CARGO_BIN_EXE_<name>")` covers `[[bin]]`
+/// targets only. Cargo puts an example at `<profile>/examples/<name>` and this
+/// test binary at the sibling `deps/<name>-<hash>`.
 fn reuse_port_sheep() -> std::path::PathBuf {
     let test_binary = std::env::current_exe().expect("a running test knows its own path");
     let path = test_binary
@@ -2172,10 +1692,9 @@ fn reuse_port_sheep() -> std::path::PathBuf {
 /// Reloads one `reuse_port_sheep` while a caller connects continuously, and
 /// hands back every attempt made between the request and the swap finishing.
 ///
-/// Asserts what holds whatever the app does with its stop signal, and on every
-/// platform: the swap completes, the replacement is what answers the port
-/// afterwards, and the instance it replaced is gone. The counting is the
-/// caller's, because that is the part the two behaviours disagree about.
+/// Asserts what holds whatever the app does with its stop signal: the swap
+/// completes, the replacement answers the port, and the instance it replaced
+/// is gone. The counting is the caller's.
 async fn reload_under_load(name: &str, defiant: bool) -> Vec<Attempt> {
     let _port_guard = RELOAD_PORT_LOCK.lock().await;
     let port = free_port();
@@ -2200,14 +1719,12 @@ async fn reload_under_load(name: &str, defiant: bool) -> Vec<Attempt> {
     }
     app.listen_timeout = READY_WINDOW;
     app.graceful_timeout = DRAIN_WINDOW;
-    // Teardown's ladder, not the reload's. A defiant replacement has to be
-    // SIGKILLed at the end of the test as well, and the spec's 1.6s default
-    // would be 1.6s of waiting for a process that is never going to answer.
+    // Teardown's ladder, not the reload's: a defiant replacement is SIGKILLed
+    // at the end of the test too, and the spec's 1.6s default would be spent
+    // waiting for a process that never answers.
     app.kill_timeout = DRAIN_WINDOW;
     // Nothing may respawn behind the measurement: a restart would put a third
-    // process on this port and every count below would be about the wrong two.
-    // The drainee's own exit is a claimed manual stop and would not restart
-    // regardless — this covers everything else.
+    // process on this port.
     app.autorestart = false;
 
     let started = client.request(Request::Start { apps: vec![app] }).await;
@@ -2221,10 +1738,8 @@ async fn reload_under_load(name: &str, defiant: bool) -> Vec<Attempt> {
         .await;
     await_serving(port, drainee_pid).await;
 
-    // The port answers, and it answers as the process this test thinks is on
-    // it. Both halves are load-bearing: this is what rules out a stranger, a
-    // leftover from the sibling measurement, or a client of this test's own
-    // making being the reason any later attempt fails.
+    // Answering as the process this test thinks is on the port rules out a
+    // stranger or a leftover being the reason a later attempt fails.
     let before = burst(port).await;
     assert_eq!(
         tally(&before),
@@ -2243,9 +1758,7 @@ async fn reload_under_load(name: &str, defiant: bool) -> Vec<Attempt> {
     };
     assert_eq!(accepted.len(), 1);
 
-    // `Reloaded` is the one event that says a swap SUCCEEDED, and it carries
-    // the replacement. Waiting for it — rather than for a duration — is what
-    // makes the window measured below exactly the reload.
+    // `Reloaded` rather than a duration bounds the window to the reload.
     let replacement = client
         .await_any_process_event(ProcessEventKind::Reloaded)
         .await;
@@ -2255,23 +1768,19 @@ async fn reload_under_load(name: &str, defiant: bool) -> Vec<Attempt> {
     assert_reaped(i32::try_from(drainee_pid).unwrap()).await;
 
     // One row, the replacement's: the drainee's registration went with the
-    // process rather than leaving a second entry in an instance slot its
-    // replacement now holds.
+    // process.
     let listed = client.request(Request::ListFlock).await;
     let Response::Flock(flock) = listed.result.unwrap() else {
         panic!("expected flock")
     };
     assert_eq!(flock.len(), 1);
     assert_eq!(flock[0].id, replacement.id);
-    // The status is the sharpest assertion in this function, and the one that
-    // catches a swap committed before its replacement could prove anything —
-    // see `a_reload_costs_a_draining_app_no_connections`'s second "fails if",
-    // where that mutation costs no connections at all and shows up only here.
+    // The status catches a swap committed before its replacement could prove
+    // anything, which costs no connections.
     assert_eq!(flock[0].status, ProcStatus::Online);
 
-    // The replacement serves, on the same port, under the same instance slot —
-    // the fixture derives its port from `SHEP_INSTANCE`, so a replacement put
-    // in a different slot would be answering somewhere else entirely.
+    // The fixture derives its port from `SHEP_INSTANCE`: a replacement in
+    // another slot would answer somewhere else.
     let after = burst(port).await;
     assert_eq!(
         tally(&after),
@@ -2287,72 +1796,19 @@ async fn reload_under_load(name: &str, defiant: bool) -> Vec<Attempt> {
 }
 
 #[cfg(unix)]
-/// A reload of an app that drains costs a caller connecting continuously
-/// nothing.
+/// shep promises the overlap, not zero downtime: a listener's accept backlog
+/// is reset when it closes, so what is queued and unaccepted is lost unless
+/// the app drains inside `graceful_timeout`.
 ///
-/// # What shep promises here, and what it does not
-///
-/// The overlap, not zero downtime. Mid-swap both instances are bound to the
-/// same port and both are serving, which is the window an application needs in
-/// order to hand over — but a listener's accept backlog is RESET when it
-/// closes, so what is queued and not yet accepted is lost unless the app itself
-/// drains inside `graceful_timeout`. Zero downtime is the application's
-/// achievement; the window is shep's. This measures a cooperating app's side of
-/// that bargain, `a_reload_costs_a_defiant_app_the_work_it_will_not_finish`
-/// measures the other, and the gap between the two counts is the finding
-/// neither of them states alone.
-///
-/// # Why the count is asserted on Linux only
-///
-/// Because the two platforms do not share the mechanism the count is about.
-/// The assertion below only requires more than 20 connection attempts across
-/// the reload -- that is the actual invariant. Below is how one of this
-/// test's own runs split those attempts between the two listeners,
-/// illustrative rather than something enforced:
-///
-/// - **Linux** load-balances new connections over every listener in the
-///   `SO_REUSEPORT` group, so the instance being replaced keeps taking a share
-///   of them right up until it closes — 47 to the drainee, 48 to its
-///   replacement. Zero here says the drainee carried half the traffic through
-///   the whole overlap and handed every connection over.
-/// - **macOS** gives every new connection to the LAST socket to bind, so the
-///   drainee stops receiving them the moment its replacement is up — 1 to the
-///   drainee, 93 to its replacement. There is almost nothing left for a zero
-///   here to be about, and the mutation below proves it: a drain that waits
-///   nothing before `SIGKILL` still costs macOS zero connections.
-///
-/// So macOS asserts what it can still see, which is what `reload_under_load`
-/// asserts for both: the swap completes, the replacement is what answers the
-/// port afterwards, and the instance it replaced is gone.
-///
-/// # Fails if
-///
-/// **The drain stops waiting** (Linux). `LadderCap::of`'s `Drain` arm returning
-/// `Duration::ZERO` — a ladder that signals and `SIGKILL`s in the same breath —
-/// takes this to 5 lost of 89, every one of them a connection the drainee had
-/// accepted and not yet answered. The same mutation on macOS: 0 lost of 94,
-/// which is the platform statement above made concrete.
-///
-/// **The swap is committed before the replacement can serve** (both platforms),
-/// which is a reload degenerating into a restart. Calling `begin_drain` from
-/// `spawn_replacement`'s success arm instead of leaving it to the replacement's
-/// readiness result reddens the flock check inside `reload_under_load` — the
-/// swap reports `Reloaded` with its replacement still `Starting`. Measured, and
-/// worth recording because the guess was wrong: it does NOT show up in the
-/// count on either platform (0 lost of 11 on Linux, 0 of 13 on macOS). The
-/// drainee's own drain outlasts its replacement's exec, so the port is never
-/// actually unserved — the loss the mutation causes is to the meaning of
-/// `Reloaded`, not to any connection.
-///
-/// Nothing else in the suite reaches either: the engine tier's runner has no
-/// sockets, so there a swap that keeps its ordering and one that drops it
-/// produce the same events.
+/// The count is asserted on Linux only. Linux load-balances new connections
+/// over every listener in the `SO_REUSEPORT` group, so the drainee keeps a
+/// share until it closes; macOS gives every new connection to the last
+/// socket to bind, so only the duration is asserted there.
 #[tokio::test]
 async fn a_reload_costs_a_draining_app_no_connections() {
     let during = reload_under_load("drainer", false).await;
     let failures = during.iter().filter(|attempt| attempt.failed()).count();
-    // Printed on every platform, asserted on one: the count is the finding, and
-    // it is what the sibling measurement's own count is worth reading against.
+    // Printed on every platform, asserted on one.
     println!(
         "draining app, {} attempts across the reload, {failures} lost: {}",
         during.len(),
@@ -2373,39 +1829,14 @@ async fn a_reload_costs_a_draining_app_no_connections() {
 }
 
 #[cfg(unix)]
-/// A reload of an app that ignores its stop signal loses the caller work, and
-/// shep completes the swap anyway.
+/// An instance that will not stop accepting, finish what it has, and exit
+/// inside `graceful_timeout` reaches the end of that window still holding
+/// work, and `SIGKILL` takes the work with it. No supervisor can give that
+/// app zero downtime.
 ///
-/// The honest half of the pair. shep's contribution is the overlap; an instance
-/// that will not stop accepting, finish what it has, and exit inside
-/// `graceful_timeout` reaches the end of that window still holding work, and
-/// `SIGKILL` takes the work with it. No supervisor can give that app zero
-/// downtime, and a suite that shipped only the cooperating fixture would be
-/// asserting a promise shep does not make.
-///
-/// # Why the count is asserted on Linux only
-///
-/// Because only Linux can produce it, for the reason the sibling test's doc
-/// records: there the defiant instance is still being handed a share of every
-/// new connection, and still holding some unanswered, at the moment `SIGKILL`
-/// lands. Measured across five runs each — Linux 5, 7, 5, 7 and 8 lost of
-/// ~260; macOS 0 of ~280, every run. On macOS the defiant instance is handed
-/// nothing from the moment its replacement binds, so it is killed empty, and
-/// asserting non-zero there would be asserting a bug that platform cannot have.
-///
-/// # Fails if
-///
-/// **The application cooperates** (Linux) — which is the whole point of
-/// counting rather than asserting a boolean. Dropping `SHEEP_DEFIANT` from this
-/// app's environment takes the same reload, under the same load, from 5 lost to
-/// 0 lost of 95, with the drainee still carrying half the connections (50 to
-/// it, 45 to its replacement). Nothing about shep changed.
-///
-/// **The ladder stops escalating** (both platforms). Removing `kill_process`'s
-/// `SIGKILL` rung leaves a sheep that never exits, so no `Reloaded` ever
-/// reaches the bus and the wait for it times out at 10s — the shared
-/// assertions in `reload_under_load` are what catch that, and for this app
-/// "the drainee is gone" can only mean the escalation happened.
+/// The count is asserted on Linux only, for the sibling case's reason: there
+/// the defiant instance is still being handed a share of every new connection
+/// when `SIGKILL` lands, while on macOS it is killed empty.
 #[tokio::test]
 async fn a_reload_costs_a_defiant_app_the_work_it_will_not_finish() {
     let during = reload_under_load("defier", true).await;
@@ -2434,9 +1865,6 @@ const SMIT: &str = "\u{25b2} main@a1b2c3";
 
 /// Starts one long-lived real sheep under `name` and answers with its id.
 async fn start_sheep(client: &mut Client, name: &str) -> u32 {
-    // `forever_app`, not an inline `/bin/sh` fixture: these three cases
-    // are about what a second client sees on the socket, and the shell
-    // that keeps the sheep alive is incidental to every one of them.
     let app = forever_app(name);
     let started = client.request(Request::Start { apps: vec![app] }).await;
     let Response::Started(infos) = started.result.expect("the sheep must start") else {
@@ -2445,9 +1873,8 @@ async fn start_sheep(client: &mut Client, name: &str) -> u32 {
     infos[0].id
 }
 
-/// What `shep flock` would paint for `name` right now, read over the socket
-/// rather than out of the daemon's memory: the whole point of these cases is
-/// what a SECOND client sees.
+/// `name`'s smit as `shep flock` would paint it, read over the socket rather
+/// than out of the daemon's memory.
 async fn smit_of(client: &mut Client, name: &str) -> Option<String> {
     let listed = client.request(Request::ListFlock).await;
     let Response::Flock(flock) = listed.result.expect("the flock must list") else {
@@ -2462,10 +1889,7 @@ async fn smit_of(client: &mut Client, name: &str) -> Option<String> {
 
 /// Waits for `name`'s smit to clear, answering `false` at [`RECV_TIMEOUT`].
 ///
-/// Polls rather than sleeping a fixed guess, exactly as
-/// [`await_file_contents`] does: the daemon learns of a closed socket
-/// asynchronously, so a bare sleep here is the flake this suite has already
-/// paid for elsewhere.
+/// Polls: the daemon learns of a closed socket asynchronously.
 async fn await_smit_cleared(client: &mut Client, name: &str) -> bool {
     tokio::time::timeout(RECV_TIMEOUT, async {
         while smit_of(client, name).await.is_some() {
@@ -2476,21 +1900,12 @@ async fn await_smit_cleared(client: &mut Client, name: &str) -> bool {
     .is_ok()
 }
 
-/// fails if a smit outlives the connection that painted it.
-///
-/// This is the whole lifecycle decision and it cannot be unit-tested: a
-/// supervisor test that calls the forget path proves only that the function
-/// it just wrote does what it says. What has to hold is that CLOSING A REAL
-/// SOCKET reaches it — through `handle_conn`'s tail, the actor's mailbox,
-/// and `to_info`. Persisting a smit means `shep flock` shows a mark
-/// attributed to a dog that no longer exists, forever, with nothing to clear
-/// it but a daemon restart.
+/// What has to hold is that closing a real socket reaches the forget path,
+/// through `handle_conn`'s tail, the actor's mailbox and `to_info`.
 #[tokio::test]
 async fn a_smit_dies_with_the_connection_that_painted_it() {
     let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
-    // The observer outlives the painter, deliberately: the question is what a
-    // DIFFERENT client sees before and after, so it must not be the
-    // connection whose closing is under test.
+    // The observer must not be the connection whose closing is under test.
     let mut looker = fixture.connect().await;
     start_sheep(&mut looker, "web").await;
 
@@ -2522,12 +1937,8 @@ async fn a_smit_dies_with_the_connection_that_painted_it() {
     fixture.shutdown().await;
 }
 
-/// fails if one dog's disconnect clears another dog's smit, or if a dog can
-/// clear a smit it did not paint.
-///
-/// Without this case, connection scoping is indistinguishable from "any
-/// disconnect wipes everything", which is not the rule and would make a
-/// second dog's mark disappear whenever the first one restarted.
+/// Also fails if a dog can clear a smit it did not paint: connection scoping
+/// is otherwise indistinguishable from "any disconnect wipes everything".
 #[tokio::test]
 async fn one_dogs_disconnect_leaves_another_dogs_smit_alone() {
     let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
@@ -2582,18 +1993,12 @@ async fn one_dogs_disconnect_leaves_another_dogs_smit_alone() {
     fixture.shutdown().await;
 }
 
-/// fails if a smit can drive an operator's terminal. The renderer is NOT the
-/// guard: `output::width::sanitize_cell` deliberately keeps a well-formed
-/// CSI sequence, because shep's own colouring is made of them. The daemon
-/// refusing is what makes every downstream reader safe without each of them
-/// remembering.
+/// The renderer is not the guard: `output::width::sanitize_cell` keeps a
+/// well-formed CSI sequence, since shep's own colouring is made of them.
 ///
-/// The frame is built past the `Smit` parser deliberately, so this tests the
-/// DAEMON's refusal rather than the client's: `docs/dogs.md` tells dog
-/// authors to speak this wire directly, and a hand-rolled dog in another
-/// language never runs our parser. A malformed body is refused the way every
-/// other one on this socket is — the connection ends, with no reply — so
-/// either answer is a refusal and neither is a stored smit.
+/// The frame is built past the `Smit` parser, so this is the daemon's refusal
+/// rather than the client's. A malformed body ends the connection with no
+/// reply, so either answer is a refusal and neither is a stored smit.
 #[tokio::test]
 async fn a_smit_carrying_an_escape_is_refused_at_the_daemon() {
     let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
@@ -2619,25 +2024,19 @@ async fn a_smit_carrying_an_escape_is_refused_at_the_daemon() {
 
 // --- Reload: a probed app's replacement answers for itself ---
 
-/// `#[cfg(unix)]` for the reason `reload_under_load` is: these two drive
-/// `reuse_port_sheep`, whose Windows build is a stub that binds nothing and is
-/// not even found under that name (the binary is `reuse_port_sheep.exe`), so
-/// `reuse_port_sheep`'s own `is_file` assert is what fails first.
+/// The `AwaitReady` window a probed reload gets, as `listen_timeout`.
 ///
-/// The `AwaitReady` window a probed reload gets here, as `listen_timeout`.
+/// Both directions matter: a replacement that will serve has to bind inside
+/// it, and one that will not costs the case its whole length before the
+/// abandonment lands.
 ///
-/// Both directions matter, which is why it is not simply "short". A
-/// replacement that WILL serve has to bind inside it, and one that will not
-/// costs the case its whole length before the abandonment lands — so this is
-/// the failing case's own runtime, twice over (the start's heuristic wait and
-/// the reload's probe).
+/// `cfg(unix)`: `reuse_port_sheep` has no Windows build under that name.
 #[cfg(unix)]
 const PROBED_READY_WINDOW: UpDuration = UpDuration::from_millis(800);
 
 /// One `reuse_port_sheep` on `port`, gated on a TCP probe against the port it
-/// binds — the arrangement in which "is the new instance ready" and "is
-/// SOMETHING listening" are the same question, and so the one an overlapping
-/// reload could answer with the wrong process.
+/// binds: the arrangement in which "is the new instance ready" and "is
+/// something listening" are the same question.
 #[cfg(unix)]
 fn probed_sheep(name: &str, port: u16, mute_file: &std::path::Path) -> AppConfig {
     let mut app = AppConfig::minimal(name, &reuse_port_sheep().display().to_string());
@@ -2660,27 +2059,16 @@ fn probed_sheep(name: &str, port: u16, mute_file: &std::path::Path) -> AppConfig
     app.graceful_timeout = DRAIN_WINDOW;
     app.kill_timeout = DRAIN_WINDOW;
     // Nothing may respawn behind the case: a restart would put a third process
-    // on this port and every assertion below would be about the wrong two.
+    // on this port.
     app.autorestart = false;
     app
 }
 
-/// The control for the case below: a probed app whose replacement DOES serve
-/// still reloads, over a real daemon and a real probe.
+/// The control for the case below: without it, an implementation that
+/// abandoned every probed reload would pass the failure case and look correct.
 ///
-/// Serialising a probed reload buys an honest readiness answer by giving up the
-/// overlap, and the thing to check about a trade like that is not only what it
-/// bought. This is the other half — the swap still completes, the replacement
-/// still lands in the same instance slot, and it still owns the port
-/// afterwards. Without it, an implementation that abandoned EVERY probed
-/// reload would pass the failure case and look correct.
-///
-/// # Fails if
-///
-/// **The serial spawn stops inheriting the drainee's instance slot** — the
-/// fixture derives its port from `SHEP_INSTANCE`, so a replacement in another
-/// slot binds somewhere else, never answers this probe, and the reload is
-/// abandoned instead of finishing.
+/// The replacement must land in the drainee's instance slot, since the fixture
+/// derives its port from `SHEP_INSTANCE`.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_probed_reload_of_a_working_release_still_finishes() {
@@ -2705,10 +2093,8 @@ async fn a_probed_reload_of_a_working_release_still_finishes() {
     await_serving(port, drainee_pid).await;
     await_online(&mut client, drainee_id).await;
 
-    // Subscribed AFTER the app is up, deliberately. The cases below read the
-    // event stream in the order the daemon wrote it, and a subscription taken
-    // earlier would put the app's own `Start` in front of the reload's — an
-    // event from before the question was asked, answering it wrongly.
+    // Subscribed after the app is up: this case reads the event stream in
+    // emission order, and an earlier subscription would put `Start` in front.
     let subscribed = client
         .request(Request::Subscribe {
             topics: vec!["process.*".to_string()],
@@ -2726,9 +2112,8 @@ async fn a_probed_reload_of_a_working_release_still_finishes() {
     };
     assert_eq!(accepted.len(), 1);
 
-    // In order, because the question is which of the two endings the reload
-    // reached, and searching for one of them would find it whatever else had
-    // already been said.
+    // In order: the question is which of the two endings the reload reached,
+    // and a search would find one whatever else had already been said.
     let (ending, replacement) = client
         .next_process_event_of(&[
             ProcessEventKind::Reloaded,
@@ -2754,35 +2139,14 @@ async fn a_probed_reload_of_a_working_release_still_finishes() {
     drop(dir);
 }
 
-/// fails if a release that starts and never serves is reported as a successful
-/// reload, when the instance it replaced could still answer the probe.
+/// Both instances run the same command; the second finds `SHEEP_MUTE_FILE` in
+/// place and binds nothing, which is what a release whose listener moved to
+/// the wrong port does. Its first probe is otherwise answered by the
+/// instance still bound to that address.
 ///
-/// This is the production bug of 2026-08-28, reduced. Both instances run the
-/// same command; the second finds `SHEEP_MUTE_FILE` in place and binds
-/// nothing, which is what a release whose listener moved to the wrong port
-/// does. Under the old ordering the replacement's very first probe was
-/// answered by the instance still bound to that address, the swap committed on
-/// the strength of it, the drainee was killed, and `shep reload` reported
-/// success over a dead port.
-///
-/// What must happen instead: no `Reloaded`, an abandonment, and a flock whose
-/// one row is NOT `online` — the last of those being what a deploy tool reads,
-/// and therefore what turns this from a log line into a rollback.
-///
-/// # Fails if
-///
-/// **Both defences go at once.** Checked, and the AND is the finding rather
-/// than a caveat: with `ReloadMode::of` forced to `Overlap` this case still
-/// passes, because the post-drain probe then applies to it and catches the
-/// same release one step later. Only with `post_drain_probe` also returning
-/// `None` does it go red, on `left: Reloaded`, which is the production
-/// behaviour exactly. Two independent mechanisms cover a single-instance
-/// probed app, and each is enough on its own.
-///
-/// **`reload_ready_result`'s `TimedOut` arm goes back to marking the
-/// replacement `Online`** — the abandonment still reaches the bus, and the
-/// status assertion is the only thing left that reddens. That is the shape of
-/// the original bug: an event nobody was reading, over a status that lied.
+/// Two independent mechanisms cover a single-instance probed app and each is
+/// enough alone: the serial reload mode, and the post-drain probe. The flock
+/// row's status is what a deploy tool reads, so it is asserted too.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_replacement_that_serves_nothing_is_refused_not_reported_reloaded() {
@@ -2807,10 +2171,8 @@ async fn a_replacement_that_serves_nothing_is_refused_not_reported_reloaded() {
     await_serving(port, drainee_pid).await;
     await_online(&mut client, drainee_id).await;
 
-    // Subscribed AFTER the app is up, deliberately. The cases below read the
-    // event stream in the order the daemon wrote it, and a subscription taken
-    // earlier would put the app's own `Start` in front of the reload's — an
-    // event from before the question was asked, answering it wrongly.
+    // Subscribed after the app is up: this case reads the event stream in
+    // emission order, and an earlier subscription would put `Start` in front.
     let subscribed = client
         .request(Request::Subscribe {
             topics: vec!["process.*".to_string()],
@@ -2831,9 +2193,7 @@ async fn a_replacement_that_serves_nothing_is_refused_not_reported_reloaded() {
     };
     assert_eq!(accepted.len(), 1);
 
-    // In order again, because the question is which of the two endings the
-    // reload reached, and searching for one of them would find it whatever
-    // else had already been said.
+    // In order again, for the reason the control case gives.
     let (ending, info) = client
         .next_process_event_of(&[
             ProcessEventKind::Reloaded,

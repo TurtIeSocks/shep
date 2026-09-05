@@ -1,22 +1,15 @@
-//! The settings screen: `[daemon]`, `[whistle]`, `[style]` then `[dogs]`,
-//! drawn straight into the buffer rather than composed as a `Vec<Line>` the
-//! way the dashboard's own panes are (this screen owns the whole body
-//! between the title and the status bar, so there is no outer `draw` left to
-//! hand lines to).
+//! The settings screen: `[daemon]`, `[whistle]`, `[style]`, then `[dogs]`,
+//! drawn straight into the buffer since this screen owns the whole body
+//! between the title and the status bar.
 //!
-//! Every row goes through [`fit`], the same truncation `view::flock` uses:
-//! a value cut short says so with the same trailing `…`, rather than
-//! spilling into the column beside it.
+//! Every row goes through [`fit`]: a value cut short ends in `…` rather
+//! than spilling into the next column.
 //!
-//! All six scalars are editable. Four (`log_level`, `log_json`,
-//! `allow_control`, `style level`) cycle, and their armed candidate is what
-//! one extra line under the dogs table shows, when there is one. `socket`
-//! and `max_cron_sleep` are free text instead: `Enter` on either row opens
-//! an editor in that same slot ([`Settings::typing`]), and both are the
-//! only two fields an empty buffer can unset. The dogs table's own
-//! enable/disable is editable as well, and its RUNNING column
-//! ([`dog_rows`]) joins the file's own `enabled`/`SOURCE` pair against the
-//! live flock, which is the only one of the three that can drift from it.
+//! Four scalars (`log_level`, `log_json`, `allow_control`, `style level`)
+//! cycle; `socket` and `max_cron_sleep` are free text via
+//! [`Settings::typing`], the only two fields an empty buffer can unset. The
+//! dogs table's RUNNING column ([`dog_rows`]) joins the file's own
+//! `enabled`/`SOURCE` against the live flock.
 
 use std::path::PathBuf;
 
@@ -32,30 +25,21 @@ use crate::commands::settings::{ScalarView, SettingField, SettingsSnapshot};
 use crate::style::StyleSource;
 use crate::vocabulary::Reported;
 
-/// The dogs caption, verbatim. Not "space applies": this screen arms and
-/// confirms like every other action in lookout (`x`, `R`, `L`), and a
-/// caption claiming otherwise would be wrong on screen rather than merely
-/// wrong in a doc.
+/// The dogs caption, verbatim: arms and confirms like every other lookout
+/// action (`x`, `R`, `L`).
 const DOGS_CAPTION: &str = "space arms, Enter applies; a dog needs no reload";
 
-/// The floor on the dogs table's NAME column, matching
-/// [`super::flock::NAME_MIN`]'s own reasoning: whatever the fixed columns
-/// leave, NAME never shrinks below a name worth reading.
+/// The floor on the dogs table's NAME column, mirroring
+/// [`super::flock::NAME_MIN`]: never shrinks below a name worth reading.
 const DOG_NAME_MIN: u16 = 8;
 
-/// The columns every line on this screen spends on the selection mark and
-/// the space after it, before any cell is drawn.
+/// Columns spent on the selection mark and the space after it, before any
+/// cell is drawn.
 ///
-/// [`super::flock::GUTTER`]'s twin, and it exists for the reason that one
-/// does: a budget that forgets it is a budget every line overruns. Both the
-/// dogs table and the scalar rows draw [`mark`] plus a space, so the width
-/// a tier is chosen for and the width its cells are fitted into is the
-/// terminal MINUS this, never the terminal itself. Leaving it out put every
-/// dogs line two columns over its budget at every width -- 122 columns
-/// drawn into a 120-column terminal -- with `Buffer::set_line` clipping the
-/// overflow in silence. RUNNING is last, so what got clipped was always the
-/// diagnostic half: `waiting-restart` is exactly 15 characters in a 15-wide
-/// column, so it drew as `waiting-resta` with no ellipsis to say so.
+/// Both the dogs table and the scalar rows draw [`mark`] plus a space, so
+/// the width a tier is chosen for, and its cells fitted into, is the
+/// terminal minus this, never the terminal itself. Mirrors
+/// [`super::flock::GUTTER`].
 const GUTTER: u16 = 2;
 
 /// The width the rows themselves are laid out in: the terminal minus
@@ -66,22 +50,18 @@ const fn body_width(width: u16) -> u16 {
 
 /// One column of the dogs table.
 ///
-/// `Debug` is derived rather than redacted (IR-41): a bare variant name,
-/// nothing a `{:?}` could leak.
+/// `Debug` is derived, not redacted: a bare variant name leaks nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DogColumn {
     /// The dog's name. The flexible column.
     Name,
-    /// Whether `[daemon] enabled_dogs` names it -- a fact about the file,
-    /// never about whether the shepherd has actually started it.
+    /// Whether `[daemon] enabled_dogs` names it, not whether the shepherd
+    /// has started it.
     InFile,
     /// `built-in`, or the adopted binary's path.
     Source,
-    /// The join against the live flock: whether the dog is actually up.
-    /// [`dog_rows`] supplies the word this cell shows -- the same one
-    /// [`super::flock::Column::Status`] would print for a sheep of that
-    /// name, off [`crate::vocabulary::Reported`] -- or [`None`] when no
-    /// dog of this name is running, which reads `not running`.
+    /// Whether the dog is up: [`dog_rows`] joins it against the live
+    /// flock, reading `not running` when no dog by that name is running.
     Running,
 }
 
@@ -97,22 +77,17 @@ impl DogColumn {
         }
     }
 
-    /// The fixed width of this column's cells. `Name` reports `0` -- see
-    /// [`super::flock::Column::width`]'s own doc for why.
+    /// The fixed width of this column's cells. `Name` reports `0`; see
+    /// [`super::flock::Column::width`].
     #[must_use]
     const fn width(self) -> u16 {
         match self {
             Self::Name => 0,
-            // 7: `IN FILE`, its own header -- `yes`/`no` cells are shorter.
+            // `IN FILE` header; yes/no cells are shorter.
             Self::InFile => 7,
-            // 24: an adopted binary's path can run long, and this is the
-            // column that shows it whole up to that budget before `fit`
-            // truncates it.
+            // budget for an adopted binary's path before `fit` truncates.
             Self::Source => 24,
-            // 15, matching `super::flock::Column::Status`'s own width and
-            // reasoning: task 9's join is expected to report the same kind
-            // of word (`online`, `silent`, `not running`) the flock table's
-            // STATUS column does.
+            // matches `super::flock::Column::Status`'s width.
             Self::Running => 15,
         }
     }
@@ -127,27 +102,18 @@ const ALL_DOG_COLUMNS: &[DogColumn] = &[
 const NO_SOURCE: &[DogColumn] = &[DogColumn::Name, DogColumn::InFile, DogColumn::Running];
 const FLOOR_DOG_COLUMNS: &[DogColumn] = &[DogColumn::Name, DogColumn::Running];
 
-/// The narrowest the dogs TABLE will draw into: [`DogColumn::Running`] plus
+/// The narrowest the dogs table will draw into: [`DogColumn::Running`] plus
 /// [`DOG_NAME_MIN`] plus one gap.
 ///
-/// The table's floor, not the terminal's, exactly as
-/// [`super::flock::MIN_WIDTH`] is: a terminal also has to pay [`GUTTER`]
-/// for the selection mark, so the narrowest TERMINAL this table fits is
-/// `DOG_MIN_WIDTH + GUTTER`. Every threshold in [`DOG_TIERS`] is a table
-/// width and is compared against [`body_width`], never against the raw
+/// A table width, not a terminal width, like [`super::flock::MIN_WIDTH`]:
+/// the narrowest terminal this table fits is `DOG_MIN_WIDTH + GUTTER`.
+/// [`DOG_TIERS`]'s thresholds compare against [`body_width`], never the raw
 /// terminal.
 const DOG_MIN_WIDTH: u16 = DogColumn::Running.width() + DOG_NAME_MIN + 2;
 
-/// Width thresholds, widest first, mirroring [`super::flock::TIERS`]'s own
-/// shape and the reasoning it argues at length: least-diagnostic first.
-///
-/// SOURCE goes first because it is the widest column here and an adopted
-/// path can run long -- the same reasoning `flock::TIERS` gives for SMIT,
-/// its own widest column. IN FILE goes second: it says what the document
-/// declares, which RUNNING (once task 9 wires it) answers a sharper version
-/// of -- "is it up" rather than "is it named". NAME and RUNNING are the
-/// floor for the same reason ID/NAME/STATUS is the flock table's: those two
-/// are the pane.
+/// Width thresholds, widest first, mirroring [`super::flock::TIERS`]:
+/// least-diagnostic column drops first. SOURCE (widest) drops before IN
+/// FILE; NAME and RUNNING are the floor.
 const DOG_TIERS: &[(u16, &[DogColumn])] = &[
     (61, ALL_DOG_COLUMNS),
     (34, NO_SOURCE),
@@ -156,8 +122,8 @@ const DOG_TIERS: &[(u16, &[DogColumn])] = &[
 
 /// The widest dogs-table column set that fits `width`.
 ///
-/// Includes [`DogColumn::Running`] in every tier -- it is the floor,
-/// alongside NAME, and `draw_settings` renders every column this returns.
+/// Includes [`DogColumn::Running`] in every tier, alongside NAME: it is the
+/// floor, and `draw_settings` renders every column this returns.
 #[must_use]
 pub fn columns_for(width: u16) -> &'static [DogColumn] {
     DOG_TIERS
@@ -177,23 +143,18 @@ fn dog_name_width(width: u16, columns: &[DogColumn]) -> u16 {
         .max(DOG_NAME_MIN)
 }
 
-/// One row of the dogs table, with the file and the live flock joined by
-/// name. Declared here rather than in the [`SettingsSnapshot`] task's own
-/// module because the join is this one's whole subject: that snapshot
-/// carries [`crate::commands::settings::DogView`]'s `enabled` and
-/// `adopted_path` alone, and [`Self::running`] is what [`dog_rows`] adds.
+/// One row of the dogs table: the file joined against the live flock, by
+/// name. [`DogView`](crate::commands::settings::DogView) supplies `enabled`
+/// and `adopted_path`; [`dog_rows`] adds `running`.
 ///
-/// `Debug` is derived rather than redacted (IR-41): a name, a bool, a
-/// rendered word and a path, none of which is a secret -- a dog's own
-/// config, which can be, lives in `dogs.toml` and neither this type nor the
-/// [`DogView`](crate::commands::settings::DogView) it is built from ever
-/// touches it.
+/// `Debug` is derived, not redacted: name, bool, word and path, none of it
+/// a secret. A dog's own config lives in `dogs.toml`, never here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DogRow {
     /// The dog's name.
     pub name: String,
-    /// Whether `[daemon] enabled_dogs` names it -- a fact about the file,
-    /// never about whether the shepherd has actually started it.
+    /// Whether `[daemon] enabled_dogs` names it, not whether the shepherd
+    /// has started it.
     pub enabled: bool,
     /// The word the flock table would show for this dog's own row, or
     /// `None` when no dog of this name is running.
@@ -205,19 +166,15 @@ pub struct DogRow {
 /// The dogs table's rows: `app`'s settings snapshot joined against its own
 /// live flock, by name.
 ///
-/// `app` rather than `Settings` alone: the file half
-/// ([`SettingsSnapshot::dogs`]) and the join's other half
-/// (`App::all_rows`, the live flock) live on two different types, and this
-/// is the one function that reads both. Returns the empty vector when the
-/// settings screen is not open -- `draw_settings` never calls this while it
-/// is closed, but a caller that did gets no rows rather than a panic.
+/// Takes `app` rather than `Settings` alone: the file half
+/// ([`SettingsSnapshot::dogs`]) and the live flock (`App::all_rows`) live on
+/// two different types. Returns an empty vector when the settings screen
+/// is not open.
 #[must_use]
 pub fn dog_rows(app: &App, width: u16) -> Vec<DogRow> {
-    // Not read: every dogs-table tier keeps `DogColumn::Running`, so there
-    // is no width where the join this function does would go unrendered --
-    // see `columns_for`'s own doc. Kept in the signature to match every
-    // other view function in this file, which takes the render width it is
-    // about to be fit into.
+    // unused: every dogs-table tier keeps `DogColumn::Running`, so no width
+    // leaves the join unrendered. Kept for signature parity with the other
+    // view functions.
     let _ = width;
     let Some(settings) = app.settings() else {
         return Vec::new();
@@ -317,35 +274,23 @@ fn scalar_view(snapshot: &SettingsSnapshot, field: SettingField) -> &ScalarView 
     }
 }
 
-/// The name printed in the NAME cell -- the document's own key, except
+/// The name printed in the NAME cell: the document's own key, except
 /// `[style] level`, which drops the `style_` a section header already says.
-/// `pub(super)`: `status::status_line`'s own editor-line branch names the
-/// field being typed with this same word, so the status bar and the body
-/// pane never disagree about what to call `socket` or `max_cron_sleep`.
 ///
-/// Delegates rather than matching a second time: the label and the TOML key
-/// are the same word for all six, which is what
-/// [`SettingField::key`] already answers. It briefly read the label off the
-/// `FieldSet` instead, which could only ever echo its own argument back --
-/// the lookup was keyed on `field.key()` and returned the key it found.
+/// `pub(super)`: `status::status_line` names the field being typed with
+/// this same word, so the status bar and body pane agree.
 pub(super) const fn field_label(field: SettingField) -> &'static str {
     field.key()
 }
 
-/// What applying this field costs, decision 6 of the design spec's own
-/// table. `log_level`, `log_json` and `max_cron_sleep` all need a daemon
-/// reload; `socket` needs a full stop and start, since a reload never moves
-/// the listening socket; `allow_control` needs whistle restarted rather
-/// than the daemon, because a dog toggle and a whistle setting are both
-/// read by a process the daemon itself never touches.
+/// What applying this field costs. `log_level`, `log_json` and
+/// `max_cron_sleep` need a daemon reload; `socket` needs a stop and start,
+/// since reload never moves the listening socket; `allow_control` needs
+/// whistle restarted, not the daemon.
 ///
-/// `style level` is the one cell that reads `source` as well as the field.
-/// It costs nothing when the file is what decides -- lookout re-resolves it
-/// on its own next command -- but `--style` and `$SHEP_STYLE` outrank the
-/// file, and under either of those "the next command reads it" is simply
-/// untrue. The SOURCE cell two columns left already names the layer, so
-/// this cell says what that layer does rather than repeating its name. The
-/// confirm says it at length; see `app::style_confirm_text`.
+/// `style level` reads `source` too: costs nothing when the file decides,
+/// since lookout re-resolves it next command, but `--style` and
+/// `$SHEP_STYLE` outrank the file and make that untrue.
 const fn apply_cost(field: SettingField, source: StyleSource) -> &'static str {
     match field {
         SettingField::LogLevel | SettingField::LogJson | SettingField::MaxCronSleep => {
@@ -364,10 +309,9 @@ const fn apply_cost(field: SettingField, source: StyleSource) -> &'static str {
 /// column of padding.
 const SCALAR_NAME_W: u16 = 15;
 /// VALUE column width where the terminal can afford it: fits
-/// `/home/ada/.shep/run/shep.sock` (29 columns), an ordinary absolute
-/// socket path, whole. A cap rather than a fixed width -- a narrow terminal
-/// gets [`SCALAR_VALUE_MIN`] instead, and a value past whatever budget it
-/// lands on truncates through [`fit`].
+/// `/home/ada/.shep/run/shep.sock` (29 columns) whole. A cap, not a fixed
+/// width: a narrow terminal gets [`SCALAR_VALUE_MIN`] instead, and anything
+/// wider truncates through [`fit`].
 const SCALAR_VALUE_W: u16 = 30;
 /// The floor on VALUE: enough for `not set`, `waiting`, a level name or the
 /// tail of a path, never a whole socket path. Below this the row stops
@@ -382,8 +326,7 @@ const SCALAR_COST_MIN: u16 = 8;
 
 /// One column of a scalar row.
 ///
-/// `Debug` is derived rather than redacted (IR-41): a bare variant name,
-/// nothing a `{:?}` could leak.
+/// `Debug` is derived, not redacted: a bare variant name leaks nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScalarColumn {
     /// The document's own key for this field.
@@ -420,23 +363,9 @@ const SCALAR_MIN_WIDTH: u16 = SCALAR_NAME_W + 2 + SCALAR_VALUE_MIN;
 /// Width thresholds for the scalar rows, widest first, the same shape
 /// [`DOG_TIERS`] and [`super::flock::TIERS`] both use.
 ///
-/// The apply cost drops first, and SOURCE second, which is the reverse of
-/// the dogs table's order and is deliberate. The cost is the widest cell
-/// here (a whole sentence), and it is the one fact this screen says TWICE:
-/// arming a field puts it verbatim in the confirm, in the status bar, on a
-/// row the body pane's `.take(area.height)` cannot reach. SOURCE appears
-/// nowhere else at all, and it is the column decision 4 of the design spec
-/// exists for: it is what separates "the operator wrote this" from "nobody
-/// ever did", which is the state a fresh `$SHEP_HOME` opens in. NAME and
-/// VALUE are the floor for the reason ID/NAME/STATUS is the flock table's:
-/// those two are the pane.
-///
-/// This table did not exist until a whole-branch review found the rows
-/// drawn at fixed widths summing to 72 while the screen draws from
-/// [`super::MIN_TERM_WIDTH`] (33) up. At 40 columns SOURCE and the cost
-/// were gone with no marker; at 60 the cost cell clipped mid-word to
-/// `the defau`. The dogs table directly beneath had tiered properly the
-/// whole time.
+/// The apply cost drops first, then SOURCE, the reverse of the dogs
+/// table's order: the cost also shows in the confirm and the status bar,
+/// while SOURCE appears nowhere else. NAME and VALUE are the floor.
 const SCALAR_TIERS: &[(u16, &[ScalarColumn])] = &[
     (
         SCALAR_NAME_W + 2 + SCALAR_VALUE_MIN + 2 + SCALAR_SOURCE_W + 2 + SCALAR_COST_MIN,
@@ -533,30 +462,21 @@ fn section_for(settings: &Settings, field: SettingField) -> &str {
 /// Every line of the screen's body, top to bottom: `[daemon]`'s four rows,
 /// `[whistle]`'s one, `[style]`'s one, then `[dogs]`'s caption and table.
 ///
-/// Walks [`Settings::rows`] itself rather than hand-listing the six scalars
-/// a second time in this function's own order: two lists that happen to
-/// agree today would silently desync the moment either one reordered, and
-/// the cursor -- which [`Settings::rows`] alone defines -- would then land
+/// Walks [`Settings::rows`] rather than hand-listing the six scalars again:
+/// the cursor, which [`Settings::rows`] alone defines, would otherwise land
 /// on a row this function drew somewhere else.
 ///
-/// Takes `app` as well as `settings`, unlike every scalar row above it:
-/// [`dog_rows`] is the one read here that needs the live flock, which lives
-/// on `App` and not on `Settings` alone.
+/// Takes `app` as well as `settings`: [`dog_rows`] needs the live flock,
+/// which lives on `App`, not on `Settings`.
 ///
-/// `height` is the body's own row count, and no more lines than that ever
-/// come back. [`Viewport`] scrolls in DATA rows while the height it was
-/// given counts LINES, so its offset alone cannot know what the section
-/// headers, the dogs caption, the dog column header and the two markers
-/// cost -- and every one of those used to be pushed uncounted, which is how
-/// the cursor's own row ended up past the height on a short terminal. The
-/// offset it hands over is a starting point here, walked down one row at a
-/// time until the cursor's row fits.
+/// `height` is the body's row budget; zero means unlimited, for a test
+/// with no real terminal. [`Viewport`] scrolls in data rows while height
+/// counts lines, so its offset is only a starting point: this walks
+/// forward from it until the cursor's row fits, through
+/// [`super::scroll::to_cursor`], shared with the config pane.
 ///
-/// The walk itself is [`super::scroll::to_cursor`], shared with the config
-/// pane, and so is its last resort: a four-line body has no room for the
-/// `[dogs]` block above a dog row, and at `view::MIN_HEIGHT` that is the
-/// whole budget, so [`cursor_only`] draws that one row without its section
-/// chrome. Zero means unlimited, for a test with no terminal behind it.
+/// [`cursor_only`] is that walk's last resort, for a body too short for
+/// even one row's own chrome.
 ///
 /// [`Viewport`]: crate::lookout::viewport::Viewport
 fn content_lines(
@@ -692,10 +612,8 @@ fn body_from(
     let mut row_index = 0usize;
     let mut full = false;
 
-    // The six scalar rows always sort first in `Settings::rows`, ahead of
-    // every `SettingsRow::Dog` -- see its own doc -- so this loop's `break`
-    // on the first non-scalar row is exactly "stop once the scalars end",
-    // never "stop at the first dog that happens to come early".
+    // The scalar rows sort first in `Settings::rows`, ahead of every
+    // `SettingsRow::Dog`, so `break` here stops once the scalars end.
     for row in rows.iter().copied() {
         let SettingsRow::Scalar(field) = row else {
             break;
@@ -730,16 +648,12 @@ fn body_from(
     }
 
     // `body_width`, not `width`: every line below draws `mark`'s own two
-    // columns before its first cell, so the table is laid out in what is
-    // left after them. `view::mod`'s own `draw` does the same for the flock
-    // table, and this pane had not.
+    // columns before its first cell.
     let table_width = body_width(width);
     if !full {
         let mut dogs_header = vec![Line::default(), section_header("[dogs]", palette)];
-        // Fitted rather than printed raw: the caption is 48 columns and the
-        // screen draws from `view::MIN_TERM_WIDTH` (33) up, so on a narrow
-        // terminal it was cut mid-word by `Buffer::set_line` with nothing
-        // saying it had been cut.
+        // fitted: the caption is 48 columns and the screen draws from
+        // `view::MIN_TERM_WIDTH` (33) up.
         dogs_header.push(Line::from(Span::styled(
             format!("  {}", fit(DOGS_CAPTION, table_width)),
             palette.muted(),
@@ -750,9 +664,8 @@ fn body_from(
         let dogs = dog_rows(app, table_width);
         if dogs.is_empty() {
             // Nothing to gate a header this function will never draw
-            // otherwise -- the empty flock still gets to say "[dogs]",
-            // the same reason `flock::render_table` prints its header row
-            // for an empty payload.
+            // otherwise: the empty flock still gets to say "[dogs]", same
+            // as `flock::render_table`'s own header for an empty payload.
             if lines.len() + dogs_header.len() + above <= budget {
                 lines.append(&mut dogs_header);
             }
@@ -776,8 +689,8 @@ fn body_from(
 
     // Counted off what this pass actually drew, not off `Viewport`'s own
     // arithmetic: the viewport hides rows against a line budget it cannot
-    // see spent, so its answer and this one disagree the moment the chrome
-    // costs anything.
+    // see spent, so its answer and this one disagree once the chrome costs
+    // anything.
     let hidden_below = total_rows.saturating_sub(offset + drawn);
     if hidden_below > 0 {
         lines.push(Line::from(Span::styled(
@@ -795,17 +708,10 @@ fn body_from(
         );
     }
 
-    // One prompt line under the table, echoing the status bar's own Slot 1
-    // (`view::status::status_line`'s own doc): a question styled
-    // `attention` while it waits on `Enter`, an in-flight sentence once it
-    // has gone out. The status bar is the line of record now -- it is a
-    // fixed row outside this body, where this echo used to be the ONLY
-    // place an armed candidate showed at all, and the first thing a short
-    // terminal cut. Kept here too, for the same reason the free-text editor
-    // line below is kept in both places: when there is room, seeing the
-    // confirm sit right under the row it names is worth the redundancy.
-    // "When there is room" is now literal -- both branches cost two lines
-    // and neither is pushed unless the budget has them.
+    // One prompt line under the table, echoing the status bar's Slot 1
+    // (`view::status::status_line`): `attention` styled while it waits on
+    // `Enter`, an in-flight sentence once it has gone out. Both branches
+    // cost two lines, so neither is pushed unless the budget has them.
     if lines.len() + 2 <= budget {
         if let Some(prompt) = settings.pending() {
             lines.push(Line::default());
@@ -819,14 +725,9 @@ fn body_from(
                 palette.attention(),
             )));
         } else if let Some((field, buffer)) = settings.typing() {
-            // The free-text editor's own line, in the same slot the prompt
-            // above uses -- the two never coexist ([`Settings::pending`]
-            // returns `None` for `Pending::Typing`), so this is an `else if`
-            // rather than a second, always-checked block. The cursor is a
-            // character rather than a style, the same call the status bar's
-            // own filter box already makes: the ANSI gallery renders
-            // foregrounds only, so a reversed cell would come out unstyled
-            // there.
+            // The cursor is a character, not a style: the ANSI gallery
+            // renders foregrounds only, so a reversed cell would come out
+            // unstyled.
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(
                 format!(
@@ -882,9 +783,8 @@ mod tests {
     use crate::output::width::visible_width;
     use crate::style::StyleSource;
 
-    /// The whole screen at a comfortable width. The snapshot is the
-    /// assertion: it pins the section order, every row's four columns and
-    /// the dogs table underneath them.
+    /// The snapshot pins the section order, every row's four columns, and
+    /// the dogs table underneath.
     #[test]
     fn settings_at_a_comfortable_width() {
         let app = fixtures::app_in_settings();
@@ -895,8 +795,7 @@ mod tests {
         insta::assert_snapshot!(render_text(terminal.backend().buffer()));
     }
 
-    /// SOURCE is the widest column and the first to go, the same reasoning
-    /// `flock::TIERS` gives for SMIT.
+    /// SOURCE is the widest column, so it drops first.
     #[test]
     fn the_dogs_source_column_drops_before_the_rest() {
         assert!(columns_for(120).contains(&DogColumn::Source));
@@ -907,19 +806,8 @@ mod tests {
         );
     }
 
-    /// fails if a dogs-table tier can render wider than the terminal it was
-    /// chosen for -- the same claim `flock`'s own
-    /// `every_tier_fits_the_width_it_claims` makes for the flock table.
-    ///
-    /// Measures the RENDERED lines rather than summing the declared widths,
-    /// which is what the arithmetic version of this test did and why it
-    /// could not fail. Every row and the header carry `mark`'s own
-    /// two-column prefix, and the sum left it out exactly as the code did,
-    /// so the test agreed with the bug: every dogs line came out two
-    /// columns over its budget at every width, `Buffer::set_line` clipped
-    /// the overflow in silence, and RUNNING is the last column, so
-    /// `waiting-restart` (15 characters in a 15-wide column) always drew as
-    /// `waiting-resta` with no ellipsis to say it had been cut.
+    /// Measures the rendered lines, not the declared widths: each line
+    /// carries `mark`'s own two-column prefix, which a width sum would miss.
     #[test]
     fn every_dogs_tier_fits_the_width_it_claims() {
         let app = fixtures::app_in_settings_with_dog_drift();
@@ -946,13 +834,8 @@ mod tests {
         }
     }
 
-    /// fails if the scalar rows stop tiering, or start dropping the wrong
-    /// column first.
-    ///
-    /// The cost sentence goes first because arming the field repeats it
-    /// verbatim in the status bar; SOURCE goes second because it appears
-    /// nowhere else on the screen at all. Widths are BODY widths, two
-    /// columns narrower than the terminal -- see `GUTTER`.
+    /// Widths here are BODY widths, [`GUTTER`] columns narrower than the
+    /// terminal.
     #[test]
     fn the_scalar_apply_cost_drops_before_its_source() {
         assert!(scalar_columns_for(118).contains(&ScalarColumn::Cost));
@@ -968,18 +851,6 @@ mod tests {
         );
     }
 
-    /// fails if ANY line of the settings screen renders wider than the
-    /// terminal it was drawn for -- the scalar rows included, which is the
-    /// half `every_dogs_tier_fits_the_width_it_claims` above does not
-    /// reach.
-    ///
-    /// The scalar rows had no width adaptation at all: fixed widths of 15,
-    /// 30 and 11 with only the trailing cost column clamped, so the
-    /// narrowest row they could draw was 72 columns while the screen draws
-    /// from `MIN_TERM_WIDTH` (33) up. At 40 columns SOURCE and the cost
-    /// were gone with no marker, and at 60 the cost cell clipped mid-word
-    /// to `the defau`, both silently, because `Buffer::set_line` clips
-    /// without saying so.
     #[test]
     fn every_settings_line_fits_the_terminal_it_was_drawn_for() {
         let app = fixtures::app_in_settings_with_dog_drift();
@@ -997,9 +868,6 @@ mod tests {
         }
     }
 
-    /// fails if the dogs caption starts claiming space applies rather than
-    /// arms. This screen arms and confirms like every other action in
-    /// lookout, and a caption that says otherwise is wrong on screen.
     #[test]
     fn the_dogs_caption_says_arms_not_applies() {
         assert_eq!(
@@ -1008,8 +876,6 @@ mod tests {
         );
     }
 
-    /// fails if the cursor mark stops landing on the row `Settings::cursor`
-    /// actually points at, or lands on more than one.
     #[test]
     fn the_cursor_mark_sits_on_exactly_the_selected_row() {
         let app = fixtures::app_in_settings();
@@ -1041,12 +907,9 @@ mod tests {
     /// the cursor off the bottom of the drawn window, or draws past
     /// `note_body_rows`' own count without saying anything was cut.
     ///
-    /// Both halves were live bugs. `Viewport` scrolls in DATA rows, and the
-    /// height it is handed counts LINES, so the section headers, the blank
-    /// separators, the `[dogs]` caption and the dog column header all used
-    /// to be pushed uncounted: at ten rows the body came back thirteen
-    /// lines long, `draw_settings` clipped the tail, and the cursor's own
-    /// row was in the part that got clipped.
+    /// `Viewport` scrolls in data rows while the height it is handed counts
+    /// lines, so the section headers, blank separators, `[dogs]` caption
+    /// and dog column header all have to be counted here too.
     #[test]
     fn a_short_terminal_scrolls_and_says_what_it_hid() {
         let mut app = fixtures::app_in_settings();
@@ -1099,13 +962,8 @@ mod tests {
     /// fails if any single step of a walk to the bottom and back loses the
     /// cursor, at any height this screen says it can draw.
     ///
-    /// The two tests either side of this one each sit at one position and
-    /// never drive the walk, which is the part that can go wrong: the
-    /// offset moves one row per step, and whether the cursor's row fits
-    /// depends on how much section chrome that particular step drags with
-    /// it. Six is `view::MIN_HEIGHT`, four lines of body, where a dog row
-    /// costs six lines to draw in place and the screen falls back to
-    /// drawing that row alone.
+    /// Six is `view::MIN_HEIGHT`: four lines of body, where a dog row
+    /// costs six lines to draw in place and falls back to drawing alone.
     #[test]
     fn the_cursor_survives_every_step_of_a_walk_down_and_back_up() {
         for height in [6u16, 7, 8, 10, 14, 20] {
@@ -1128,10 +986,9 @@ mod tests {
     /// the section it opened in.
     ///
     /// `settings_short` exercises this only in its mild form: it opens at
-    /// `[style]`, whose one row IS the section, so the header sits where it
+    /// `[style]`, whose one row is the section, so the header sits where it
     /// would anyway. This opens inside `[daemon]`, three rows past that
-    /// header, and the header still has to be drawn -- what rule 3 means by
-    /// "the header labels a scrolled view".
+    /// header, which still has to be drawn.
     #[test]
     fn a_window_opening_mid_section_still_draws_the_header_it_scrolled_past() {
         let mut app = fixtures::app_in_settings_on(SettingField::MaxCronSleep);
@@ -1153,9 +1010,7 @@ mod tests {
     }
 
     /// fails if the marker that says rows were cut is itself the row that
-    /// gets cut. It is pushed last, so it was the first line
-    /// `draw_settings`' own clip dropped -- the screen hid rows and said
-    /// nothing.
+    /// gets cut: it is pushed last, so a clip drops it first.
     #[test]
     fn the_below_marker_survives_the_height_that_made_it_necessary() {
         let mut app = fixtures::app_in_settings();
@@ -1178,13 +1033,8 @@ mod tests {
         );
     }
 
-    /// fails if `SCALAR_SOURCE_W` stops fitting the widest word this column
-    /// ever prints. `"the default"` is what a fresh `$SHEP_HOME` shows for
-    /// every scalar -- the state most operators open this screen in -- and
-    /// no fixture anywhere in this tree renders it: `settings_snapshot`
-    /// gives every scalar `StyleSource::Config`, which is one column
-    /// shorter (`"shep.toml"`) and would not catch the column shrinking out
-    /// from under the longer word.
+    /// No fixture in this file renders `Default`: `settings_snapshot` gives
+    /// every scalar `StyleSource::Config`, one column shorter.
     #[test]
     fn the_default_source_label_fits_the_column_it_was_sized_for() {
         let rendered = fit(&StyleSource::Default.to_string(), SCALAR_SOURCE_W);
@@ -1199,12 +1049,6 @@ mod tests {
         );
     }
 
-    /// fails if the style row keeps claiming the next command reads it
-    /// while a layer above the file is set.
-    ///
-    /// The row's own SOURCE cell already says `$SHEP_STYLE`, so the cost
-    /// cell beside it saying "the next command reads it" is the same frame
-    /// contradicting itself: the next command reads `$SHEP_STYLE`.
     #[test]
     fn the_style_cost_cell_stops_promising_the_next_command_when_it_is_outranked() {
         let app = fixtures::app_in_settings_with_shadowed_style(StyleSource::Env);
@@ -1226,10 +1070,6 @@ mod tests {
         assert!(!row.contains("the next command reads it"), "got: {row:?}");
     }
 
-    /// fails if the free-text editor stops showing what is being typed, or
-    /// stops naming the field it belongs to -- the same claim
-    /// `the_cursor_mark_sits_on_exactly_the_selected_row` makes for the
-    /// cursor, aimed at task 8's own line instead.
     #[test]
     fn the_editor_line_names_its_field_and_shows_the_buffer() {
         let mut app = fixtures::app_in_settings_on(SettingField::Socket);
@@ -1265,8 +1105,7 @@ mod tests {
         assert_eq!(ledger.running, None);
     }
 
-    /// Phase 3b: a dog that never completed a handshake reads `silent`, not
-    /// `online`, and this table must not undo that.
+    /// A dog that never completed a handshake reads `silent`, not `online`.
     #[test]
     fn a_dog_that_never_handshook_reads_silent_here_too() {
         let app = fixtures::app_in_settings_with_silent_dog();

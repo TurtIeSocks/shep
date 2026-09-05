@@ -1,12 +1,9 @@
-//! Lifecycle verbs: `start`, `stop`, `restart`, `delete` — the first verbs a
-//! user types, and the first to exercise the whole client stack end to end.
+//! Lifecycle verbs: `start`, `stop`, `restart`, `delete`.
 //!
-//! Every verb here receives an already-connected [`Client`]; `main` decides
-//! how it got one (`connect_or_spawn` for `start`, `Client::connect` for
-//! everything else) before dispatching — see that module's own doc. `start`
-//! alone resolves a target into [`AppConfig`]s before anything reaches the
-//! wire; [`resolve_target`] is that resolution, kept pure and separate from
-//! the RPC so it stays fast and hermetic to test.
+//! Every verb here receives an already-connected [`Client`]. `start` alone
+//! resolves a target into [`AppConfig`]s before anything reaches the wire;
+//! [`resolve_target`] is that resolution, kept out of the RPC so it stays
+//! pure.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read as _;
@@ -30,20 +27,16 @@ use crate::commands::selector::parse_selector;
 use crate::exit::ExitCode;
 use crate::output::{DeletedIds, FlockRows, Render, Streams, emit, emit_flock, write_outcome};
 
-/// What [`resolve_target`] can fail with. Module-scoped per IR-18, and named
-/// for the function rather than the verb on purpose: `start`'s own
-/// daemon-side failures are `shep_client::RequestError` and
-/// `shep_client::spawn::SpawnError`, which `exit.rs` already converts. There
-/// is no `impl From<&TargetError> for ExitCode` — the mapping is
-/// [`target_exit_code`], a plain `match` inside this module, so `exit.rs`
-/// stays owned entirely by the CLI skeleton task.
+/// What [`resolve_target`] can fail with
+///
+/// Mapped to exit codes by [`target_exit_code`], not by a `From` impl.
+/// `start`'s daemon-side failures are `shep_client`'s errors instead.
 #[derive(Debug)]
 pub enum TargetError {
-    /// `target` was `-`, but `stdin` was not valid UTF-8 — or, in `start`
-    /// itself, the real read of the process's stdin failed outright.
+    /// `target` was `-` and stdin was not valid UTF-8, or the read failed.
     Stdin(std::io::Error),
-    /// `target`'s extension named a recognised Flockfile format, but the
-    /// file itself could not be read.
+    /// The extension named a recognised Flockfile format, but the file
+    /// could not be read.
     Read {
         /// The path that failed to read.
         path: PathBuf,
@@ -55,8 +48,7 @@ pub enum TargetError {
     /// `target` named nothing at any tier of `start`'s precedence: no sheep
     /// by id or name, no fold, no Flockfile, and no path on disk.
     Unresolvable {
-        /// The raw target string, verbatim, so the reported message names
-        /// exactly what was tried.
+        /// The raw target string.
         target: String,
     },
     /// `--flockfile` was given for a path whose extension names no format
@@ -66,14 +58,8 @@ pub enum TargetError {
         path: PathBuf,
     },
     /// A `.js` Flockfile could not be evaluated. `node_missing` separates
-    /// "install node" from "your config threw", because they are different
-    /// problems with different fixes and different exit codes.
-    ///
-    /// Carries no separate `path` field: every `detail` string below is
-    /// already built with the path baked in (decision 3's own sentences),
-    /// so a second copy would be dead weight — literally, `cargo clippy -D
-    /// warnings` flags an unread `path` field here, because
-    /// `#[derive(Debug)]` does not count as a read for dead-code analysis.
+    /// "install node" from "your config threw", which exit differently.
+    /// No `path` field: every `detail` already names it.
     Js {
         /// What went wrong, already phrased for the operator.
         detail: String,
@@ -123,12 +109,7 @@ impl From<FlockfileError> for TargetError {
     }
 }
 
-/// `start`'s mapping from a resolution failure to the exit code that
-/// reports it.
-///
-/// `pub(crate)`, not private: `commands::runtime` shares this mapping for
-/// its own call to [`resolve_target`] rather than inventing a second one —
-/// the same failure ought to mean the same exit code whichever verb hit it.
+/// `start`'s mapping from a resolution failure to the exit code that reports it
 pub(crate) fn target_exit_code(err: &TargetError) -> ExitCode {
     match err {
         TargetError::Stdin(_) => ExitCode::Failure,
@@ -146,51 +127,25 @@ pub(crate) fn target_exit_code(err: &TargetError) -> ExitCode {
 }
 
 /// How long node gets to hand back a `.js` Flockfile's JSON before shep
-/// kills it.
+/// kills it
 ///
-/// 30s, against the ~60ms `node -e` spends requiring a small module on this
-/// machine and the couple of seconds a large dependency tree costs on a cold
-/// filesystem. It is not a performance dial: nothing waits on this except a
-/// config that has already gone wrong, so it is set far enough out that no
-/// honest module can reach it and near enough that an unattended `shep
-/// start` still ends.
+/// 30s, against ~60ms to require a small module and the couple of seconds a
+/// large dependency tree costs on a cold filesystem.
 const JS_EVAL_BUDGET: Duration = Duration::from_secs(30);
 
-/// The script handed to `node -e`. Wraps the `require` in its own
-/// `try`/`catch` rather than letting an uncaught exception crash node and
-/// relying on node's own crash-dump formatting — see this function's doc for
-/// why.
-/// The filename [`evaluate_js_flockfile`] writes [`JS_BRIDGE_SCRIPT`] to.
+/// The filename [`evaluate_js_flockfile`] writes [`JS_BRIDGE_SCRIPT`] to
 ///
-/// Deliberately plain ASCII with no spaces: it is passed to node as a bare
-/// relative argument, and the whole point of the file is that nothing
-/// needing quoting ever reaches a command line.
+/// Plain ASCII with no spaces: it reaches node as a bare relative argument,
+/// so nothing needing quoting reaches a command line.
 const JS_BRIDGE_FILE: &str = "shep-flockfile-bridge.js";
 
 /// The bridge run by [`evaluate_js_flockfile`], written to a file rather
-/// than passed to `node -e`.
+/// than passed to `node -e`
 ///
-/// **It was `node -e <script>` and that did not survive Windows CI.** The
-/// symptom was node failing with `EISDIR: illegal operation on a directory,
-/// lstat 'C:'`, unchanged across two different ways of handing it the path,
-/// which is what ruled the path out as the cause: an identical message after
-/// changing the mechanism means the mechanism was not what broke.
-///
-/// The remaining suspect is this script itself crossing a command line. It
-/// contains `&&`, which is a `cmd.exe` operator, so a `node` that resolves
-/// to a `.cmd` shim rather than a real `node.exe` would have cmd re-parse
-/// and truncate it. That was never confirmed, because a machine with a real
-/// `node.exe` does not reproduce it.
-///
-/// Writing the script to a file removes the question rather than answering
-/// it. A file's contents cross no parser: not the MSVC C runtime's argument
-/// escaping, not `cmd.exe`'s, not any shim's. The only argument left is
-/// [`JS_BRIDGE_FILE`], a bare relative name with nothing in it to quote.
-///
-/// The path is still read from the environment and still never interpolated
-/// into the source, so the injection argument holds: a Flockfile path
-/// containing `'`, `\` or a newline cannot escape a string literal here,
-/// because there is no string literal for it to escape.
+/// A `node` resolving to a `.cmd` shim has `cmd.exe` re-parse a `-e`
+/// argument, and this script contains `&&`. A file's contents cross no
+/// parser. The path comes from the environment, so a Flockfile path
+/// containing `'`, `\` or a newline has no string literal to escape.
 const JS_BRIDGE_SCRIPT: &str = "try { \
      process.stdout.write(JSON.stringify(require(process.env.SHEP_FLOCKFILE_PATH))); \
  } catch (err) { \
@@ -198,89 +153,25 @@ const JS_BRIDGE_SCRIPT: &str = "try { \
      process.exitCode = 1; \
  }";
 
-/// Evaluates a `.js` Flockfile through node and returns its JSON.
+/// Evaluates a `.js` Flockfile through node and returns its JSON
 ///
-/// The script is written to a file and run as `node <file>` from that
-/// file's own directory; see [`JS_BRIDGE_SCRIPT`] for why it is not
-/// `node -e`.
-///
-/// The path is passed in the **environment**, as `SHEP_FLOCKFILE_PATH`, and
-/// never interpolated into the JavaScript source: a path containing `'`,
-/// `\` or a newline would otherwise escape the string literal, and adding a
-/// second way to inject code into a file whose own code we are already
-/// about to run is gratuitous.
-///
-/// It used to be an argument, read back as `process.argv[1]`. That is
-/// correct on unix and against a plain `node.exe`, and it broke on the
-/// Windows CI runner: node reached `require` with `C:` and failed with
-/// `EISDIR: illegal operation on a directory, lstat 'C:'`, so the path was
-/// re-parsed somewhere between this `Command` and node's own argv. A `.cmd`
-/// shim earlier on `PATH` than the real binary is the likeliest culprit,
-/// since `cmd.exe` does not use the argument-escaping convention
-/// `std::process::Command` writes for. The fix does not depend on settling
-/// which layer did it: an environment variable is not a command line, so
-/// nothing in between can re-split it.
-///
-/// The path must be absolute — `require("x.js")` with no leading `./` is a
-/// *package* specifier and resolves against `node_modules`, not the cwd.
-///
-/// stdin is `/dev/null` so a config module that reads stdin cannot eat the
-/// operator's terminal; stdout and stderr are captured so node's own message
-/// can be quoted back.
-///
-/// **Runs `-e` with an in-script `try`/`catch`, not `-p` bare.** Letting
-/// `require` throw uncaught and scraping node's own crash-dump formatting
-/// was tried first and does not work on a current node: verified empirically
-/// against v26.5.0, the crash dump always ends with a trailing `Node.js
-/// vX.Y.Z` banner line, so "the last non-blank line of stderr" — the
-/// extraction this module used to use — quotes the banner, or a stack frame,
-/// never the message. `err.message` is written to stderr ourselves instead,
-/// which is what makes the sentence below actually name the failure. This
-/// stays inside the same mechanic the design calls for (`-p` / `-e` both put
-/// the path in the environment, never in the source), so it is a narrower
-/// implementation choice, not a different design.
-///
-/// **`budget` bounds the whole evaluation**, and node is killed the moment it
-/// runs out. What has to happen inside it is node EXITING, not `require`
-/// returning: a module that leaves a server listening or a timer armed can
-/// assign `module.exports` and return while node's event loop stays alive, so
-/// this used to hang until somebody pressed Ctrl-C. That is a fair answer at
-/// a terminal and no answer at all for the CI job or provisioning script
-/// running `shep start` with nobody watching. [`run_bounded`] is the
-/// mechanism; [`JS_EVAL_BUDGET`] is what every caller passes.
-///
-/// The `node_missing` sentence is pinned by `cli_e2e`'s
-/// `a_js_flockfile_without_node_says_so_and_says_what_to_do`, not a unit
-/// test: producing it needs a `PATH` without node, and a unit test would
-/// have to mutate its own process via `std::env::set_var`, which is
-/// `unsafe` in edition 2024 inside a crate that forbids unsafe. The e2e
-/// tier runs shep as a subprocess, and `Command::env` sets the child's
-/// environment alone.
-///
-/// `docs/migration.md` still quotes this sentence for an operator without
-/// node installed, and that quote is still kept in step by hand, so update it
-/// in the same commit if this `format!` changes.
+/// `SHEP_FLOCKFILE_PATH` carries the path, absolute: `require("x.js")`
+/// without `./` resolves against `node_modules`. `budget` bounds node
+/// exiting, not `require` returning. `docs/migration.md` quotes the
+/// `node_missing` sentence by hand.
 ///
 /// # Errors
-///
-/// - [`TargetError::Read`] — the path could not be canonicalized.
-/// - [`TargetError::Js`] with `node_missing` — node is not on `PATH`.
-/// - [`TargetError::Js`] — node ran and failed, could not be spawned, was
-///   still running when `budget` ran out, or exited leaving a process of its
-///   own holding the output shep was reading.
+/// - [`TargetError::Read`] if the path could not be canonicalized.
+/// - [`TargetError::Js`] with `node_missing` if node is not on `PATH`.
+/// - [`TargetError::Js`] if node failed, could not be spawned, ran past
+///   `budget`, or left a process holding the output.
 fn evaluate_js_flockfile(path: &Path, budget: Duration) -> Result<String, TargetError> {
     let absolute = std::fs::canonicalize(path).map_err(|source| TargetError::Read {
         path: path.to_path_buf(),
         source,
     })?;
-    // The bridge is written to a file and run as `node loader.js` from that
-    // file's own directory, so the only argument node ever receives is a
-    // bare relative filename: no path, no quotes, no shell metacharacters.
-    // See [`JS_BRIDGE_SCRIPT`] for what this is defending against.
-    //
-    // `scratch` stays bound until this function returns, because dropping a
-    // `TempDir` deletes it: node has to still be able to read the loader for
-    // as long as `run_bounded` is waiting on it.
+    // Bound until this function returns: dropping a `TempDir` deletes the
+    // loader node is still reading.
     let scratch = tempfile::Builder::new()
         .prefix("shep-js-bridge")
         .tempdir()
@@ -362,44 +253,18 @@ fn evaluate_js_flockfile(path: &Path, budget: Duration) -> Result<String, Target
     })
 }
 
-/// Resolves `target` into the [`AppConfig`]s `start` should register, in
-/// this fixed order — do not widen it (spec fidelity; input-format widening
-/// is a top drift risk):
+/// Resolves `target` into the [`AppConfig`]s `start` should register
 ///
-/// 1. `target == "-"` — `stdin` is Flockfile JSON. `as_flockfile` is ignored
-///    here; stdin is already a Flockfile by construction.
-/// 2. `as_flockfile` is set — read by extension: a format
-///    [`FlockFormat::from_path`] recognises parses as it does today; `.js`
-///    goes through the node bridge ([`evaluate_js_flockfile`]); anything
-///    else is [`TargetError::UnknownFlockfileFormat`], naming the
-///    extensions accepted.
-/// 3. `target`'s extension is one [`FlockFormat::from_path`] recognises —
-///    read and [`Flockfile::parse`] it in that format.
-/// 4. Any other existing path — one [`AppConfig::minimal`], named `name` if
-///    given, else the path's file stem, with `target` itself as the script.
-/// 5. Nothing matched — [`TargetError::Unresolvable`], naming `target`.
-///
-/// With `as_flockfile` false, every branch behaves exactly as it did before
-/// this parameter existed — that property is what Task 1's mutations check.
-///
-/// `stdin` is bytes the caller already read, never read here — `start`
-/// reads the real process stdin only when `target == "-"` and hands the
-/// result in, which is what keeps this function pure and hermetically
-/// testable.
+/// Fixed precedence, do not widen: `-` is Flockfile JSON on `stdin`, then
+/// `as_flockfile` or a recognised extension, then any path that exists.
 ///
 /// # Errors
-///
-/// - [`TargetError::Stdin`] — `target` is `-` and `stdin` is not valid UTF-8.
-/// - [`TargetError::Read`] — `target`'s extension names a recognised format,
-///   but the file could not be read.
-/// - [`TargetError::Flockfile`] — the source read fine but failed Flockfile
-///   validation.
-/// - [`TargetError::UnknownFlockfileFormat`] — `as_flockfile` is set and
-///   `target`'s extension names no readable format.
-/// - [`TargetError::Js`] — `as_flockfile` is set, `target` is a `.js` file,
-///   and node could not be run, could not evaluate it, or was still at it
-///   after [`JS_EVAL_BUDGET`].
-/// - [`TargetError::Unresolvable`] — `target` matched none of the above.
+/// - [`TargetError::Stdin`] if `target` is `-` and `stdin` is not UTF-8.
+/// - [`TargetError::Read`] if the file could not be read.
+/// - [`TargetError::Flockfile`] if the source failed Flockfile validation.
+/// - [`TargetError::UnknownFlockfileFormat`] under `as_flockfile`, bad extension.
+/// - [`TargetError::Js`] if node failed or ran past [`JS_EVAL_BUDGET`].
+/// - [`TargetError::Unresolvable`] if `target` matched none of the above.
 pub fn resolve_target(
     target: &str,
     name: Option<&str>,
@@ -412,31 +277,16 @@ pub fn resolve_target(
         .collect())
 }
 
-/// [`resolve_target`], keeping the keys each app's document literally wrote.
+/// [`resolve_target`], keeping the keys each app's document literally wrote
 ///
-/// The same five tiers in the same order, resolved once: [`resolve_target`]
-/// is this function with the key sets dropped, so the two cannot disagree
-/// about what a target means.
-///
-/// A key set exists to answer what a template CLAIMS rather than what its
-/// values are, and only a document makes a claim. The four Flockfile tiers
-/// therefore go through [`Flockfile::parse_declared`], and tier 4 -- a bare
-/// script path, where the command line rather than a document supplied every
-/// value -- reports an EMPTY set. `start` reads that emptiness as "nothing
-/// here asks to be applied", which is the honest reading of both cases it
-/// covers: a command line is not a template, and a document that declared no
-/// keys has nothing to apply either.
-///
-/// A defaulted `cwd` is deliberately NOT declared. [`default_cwd_to_flockfile_dir`]
-/// fills the field so a fresh start lands in the right directory, but the
-/// document did not ask for it, and a load that established `cwd` on every
-/// app would overwrite a `shep start --cwd` an operator set since. Same for
-/// `--cwd`, `--fold` and `--interpreter`, which `start` folds on afterwards:
-/// they change what a FRESH app is registered with and claim nothing about
-/// an app the flock already has.
+/// A key set answers what a template claims, and only a document makes a
+/// claim: the Flockfile tiers go through [`Flockfile::parse_declared`], and
+/// a bare script path reports an empty set. A defaulted `cwd` is not
+/// declared, nor are `--cwd`, `--fold` and `--interpreter`: they change what
+/// a fresh app is registered with and claim nothing about an app the flock
+/// already has.
 ///
 /// # Errors
-///
 /// Every error [`resolve_target`] returns, for the same inputs.
 fn resolve_target_declared(
     target: &str,
@@ -481,20 +331,12 @@ fn resolve_target_declared(
             let apps = Flockfile::parse_declared(&source, format)?;
             Ok(default_cwd_to_flockfile_dir(apps, path))
         }
-        // Absolutised against the CLI's cwd, which is the cwd the `exists`
-        // check just above was answered from. Without this the check and the
-        // use disagree: the CLI confirms `./bin/thing` is there, the daemon
-        // resolves the same string against ITS cwd -- wherever it happened
-        // to be spawned -- and reports `No such file or directory` for a
-        // path the operator can see with their own eyes. The check passing
-        // is what makes that error baffling.
+        // Absolutised against the CLI's cwd, which is where `exists` is
+        // answered. The daemon would otherwise resolve it against its own.
         _ if path.exists() => {
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(target);
-            // Only a RELATIVE path is rewritten. An absolute one is left
-            // exactly as typed: `canonicalize` also resolves symlinks, so on
-            // macOS it turns the `/var/...` an operator wrote into
-            // `/private/var/...`, and a listing that echoes back a path
-            // nobody typed is the same species of surprise this is fixing.
+            // Relative only: `canonicalize` resolves symlinks, so an
+            // absolute `/var/...` comes back as `/private/var/...` on macOS.
             let script = if path.is_absolute() {
                 target.to_string()
             } else {
@@ -507,22 +349,13 @@ fn resolve_target_declared(
                     .unwrap_or_else(|_| target.to_string())
             };
             let mut app = AppConfig::minimal(name.unwrap_or(stem), &script);
-            // Where the operator ran `shep start`, not where the shepherd
-            // happens to live. An unset `cwd` leaves the child inheriting the
-            // daemon's directory, which is invisible from the command line
-            // and is whatever the shepherd was spawned from -- so a service
-            // that reads a config file beside itself breaks in a quieter way
-            // than a missing binary does. `normalize` already refuses `watch`
-            // for this exact reason (`WatchWithoutCwd`: defaulting to the
-            // daemon's cwd "risks watching the whole filesystem under a
-            // systemd unit"); this generalises that caution to every app
-            // started by path.
+            // Where the operator ran `shep start`: an unset `cwd` leaves
+            // the child inheriting whatever the shepherd was spawned from.
             app.cwd = std::env::current_dir()
                 .ok()
                 .map(|dir| dir.to_string_lossy().into_owned());
-            // EMPTY key sets, and this function's own doc says why: the
-            // command line is not a template, so there is nothing here a
-            // load could apply to a sheep the flock already has.
+            // Empty key sets: the command line is not a template, so a load
+            // has nothing to apply to a sheep the flock already has.
             Ok(vec![DeclaredApp {
                 config: app,
                 declared: BTreeSet::new(),
@@ -535,19 +368,11 @@ fn resolve_target_declared(
     }
 }
 
-/// Sends `body` with `deadline` (`None` defers to the client's own default),
-/// renders whatever the daemon answers through [`render_outcome`], and maps
-/// every way that can go wrong to its exit code.
+/// Sends `body`, renders the answer through [`render_outcome`], and maps
+/// every failure to its exit code
 ///
-/// `stock` is the only caller. It renders the flock afterwards for the same
-/// reason every other verb in this file does -- see [`render_outcome`] -- and
-/// its `extract` still names the narrow payload, because that is what
-/// `--format json` gets.
-///
-/// `extract` pulls the verb's own payload out of `Response`; `Response` is
-/// `#[non_exhaustive]` (Global Constraints), so an answer `extract` does not
-/// recognise — a variant this client predates, or simply the wrong one for
-/// this verb — maps to [`ExitCode::Internal`] rather than panicking.
+/// `None` for `deadline` defers to the client's default. An answer `extract`
+/// does not recognise maps to [`ExitCode::Internal`].
 async fn request_and_render<T, F>(
     client: &Client,
     streams: &mut Streams<'_>,
@@ -575,10 +400,10 @@ where
     }
 }
 
-/// Parses every selector the invocation named, refusing on the first bad one.
+/// Parses every selector the invocation named, refusing on the first bad one
 ///
-/// All-or-nothing on purpose: a typo in the third target should not be
-/// discovered after the first two have already been acted on.
+/// All-or-nothing: a typo in the third target must not be discovered after
+/// the first two were acted on.
 fn parse_selectors(
     streams: &mut Streams<'_>,
     raw: &[String],
@@ -590,20 +415,11 @@ fn parse_selectors(
     Ok(parsed)
 }
 
-/// Sends one request per selector and collects what each returned.
+/// Sends one request per selector and collects what each returned
 ///
-/// The CLI loops rather than the wire carrying a list, which is a deliberate
-/// trade recorded here because it is invisible from the command line: the
-/// selectors are not applied atomically. `shep stop a b c` where `b` matches
-/// nothing still stops `a` and `c`, and says what happened to `b`. Swapping
-/// this for a batched request later changes no command and breaks no script,
-/// because the CLI surface does not encode which it is.
-///
-/// Every selector is attempted -- stopping at the first failure would leave
-/// the operator guessing which of their targets were touched -- and the
-/// returned code is the FIRST failure, so a partial success is never reported
-/// as a whole one. Errors are rendered as they happen, so the operator sees
-/// which target failed rather than a count.
+/// Not atomic: `shep stop a b c` where `b` matches nothing still stops `a`
+/// and `c`. Every selector is attempted, errors are rendered as they
+/// happen, and the returned code is the first failure.
 async fn request_each<I, B, F>(
     client: &Client,
     streams: &mut Streams<'_>,
@@ -641,32 +457,14 @@ where
     (collected, failure)
 }
 
-/// Which sheep in `flock` a `start` target names, under the precedence
-/// [`start_one`] documents.
+/// Which sheep in `flock` a `start` target names
 ///
-/// # The two tiers this function is
+/// A `Name` token is tried as an exact sheep name first and as a fold name
+/// second, so `shep start backed` reaches a fold called `backed`.
 ///
-/// A `Name` token is tried as an exact sheep name first and as a FOLD name
-/// second, which is what makes `shep start backed` reach a fold called
-/// `backed` without the `fold:` prefix. Every other selector form means one
-/// thing already and is matched as itself.
-///
-/// # Dogs
-///
-/// A wildcard passes a dog by; an exact selector reaches it. The same rule
-/// [`ProcessSelector::is_exact`] states for the daemon's own matching, and for
-/// the same reason: a dog is a process an operator installed, not a member of
-/// the flock `all` means. The fold fallback counts as a wildcard even though
-/// it came from a `Name` token, because the operator named a group rather than
-/// a process.
-///
-/// The two tiers are keyed off [`ProcessSelector::is_exact`] rather than off a
-/// list of variants written out here. An earlier version enumerated `Name` and
-/// `Id` and sent everything else through the wildcard tier, which silently put
-/// `name:slot` on the wrong side of the rule the moment that form was added:
-/// `shep start metrics:0` filtered the dog out and then reported that no
-/// instance 0 of `metrics` was registered, about a process that was. One
-/// predicate, one place, so the two cannot drift again.
+/// A wildcard passes a dog by and an exact selector reaches it, keyed off
+/// [`ProcessSelector::is_exact`] so a form like `name:slot` cannot land on
+/// the wrong side. The fold fallback counts as a wildcard.
 fn flock_matches(selector: &ProcessSelector, flock: &[ProcessInfo]) -> Vec<ProcessInfo> {
     let sheep_only = |flock: &[ProcessInfo], keep: &dyn Fn(&ProcessInfo) -> bool| {
         flock
@@ -700,27 +498,19 @@ fn flock_matches(selector: &ProcessSelector, flock: &[ProcessInfo]) -> Vec<Proce
 }
 
 /// Whether `target` carries a marker that makes it unmistakably a selector,
-/// and so what to say when it matched nothing.
+/// and so what to say when it matched nothing
 ///
-/// Only the message differs. `start` still falls through to the Flockfile and
-/// path tiers for every token, because a marker being present does not make a
-/// file of that name stop existing -- `/srv/app/` parses as a `/regex/` and is
-/// also a real directory somebody might type. What this decides is whether
-/// `shep start fold:typo` reports "no sheep is in a fold called typo" or the
-/// baffling "fold:typo is not a sheep, a fold, `-`, a recognised Flockfile, or
-/// an existing path" that sent an operator looking for a file by that name.
+/// Only the message differs. `start` still falls through to the Flockfile
+/// and path tiers for every token: `/srv/app/` parses as a `/regex/` and is
+/// also a directory somebody might have.
 fn selector_miss(
     target: &str,
     selector: &ProcessSelector,
     flock: &[ProcessInfo],
 ) -> Option<String> {
     match selector {
-        // Phrased off the SHEEP count, never off `flock.is_empty()`.
-        // `flock_matches` passes a dog by for every wildcard, so `all`
-        // matching nothing means there are no sheep -- which is not the same
-        // as an empty flock, and saying "the flock is empty" while
-        // `shep flock` prints dog rows on the same machine is a plain
-        // contradiction an operator would have to reconcile themselves.
+        // Phrased off the sheep count, not `flock.is_empty()`: a wildcard
+        // passes dogs by, so `all` matching nothing means no sheep.
         ProcessSelector::All if flock.iter().any(|info| info.dog.is_some()) => Some(
             "no sheep in the flock; there is nothing to start. The dogs listed \
              by `shep dogs` are not sheep and `all` never reaches them"
@@ -730,26 +520,21 @@ fn selector_miss(
         ProcessSelector::Fold(fold) => Some(format!("no sheep is in a fold called {fold}")),
         ProcessSelector::Regex(_) => Some(format!("no sheep matched {target}")),
         // A colon is not a path character, so `name:slot` is a marker the
-        // same way `fold:` is one, not a filename that could exist instead.
+        // same way `fold:` is, not a filename that could exist instead.
         ProcessSelector::Instance { name, slot } => {
             Some(format!("no instance {slot} of {name} is registered"))
         }
-        // A bare name or id carries no marker, so it may equally have been
-        // meant as a filename. The unresolvable message names every tier.
+        // A bare name or id carries no marker and may have meant a
+        // filename, so the unresolvable message naming every tier stands.
         ProcessSelector::Name(_) | ProcessSelector::Id(_) => None,
     }
 }
 
-/// Whether `target` could name a sheep or a fold at all.
+/// Whether `target` could name a sheep or a fold at all
 ///
 /// A sheep name may not contain a path separator and may not be `.` or `..`
-/// (`shep_core::config::normalize`), so a token carrying one cannot be a
-/// sheep however the flock is configured. Making that a rule rather than a
-/// coincidence is what gives an operator whose fold shares a name with a file
-/// a way to say which they meant: `./backed` is the file, always.
-///
-/// Applied to the `Name` form only. `/regex/`, `fold:`, `all` and a glob are
-/// markers rather than names, and `/web/` legitimately contains slashes.
+/// (`shep_core::config::normalize`), so `./backed` is always the file.
+/// Applied to the `Name` form only: `/web/` is a regex full of slashes.
 fn is_reachable_as_a_name(selector: &ProcessSelector) -> bool {
     match selector {
         ProcessSelector::Name(name) => !name.contains(['/', '\\']) && name != "." && name != "..",
@@ -757,54 +542,18 @@ fn is_reachable_as_a_name(selector: &ProcessSelector) -> bool {
     }
 }
 
-/// Renders what a lifecycle verb should leave on the operator's screen: the
-/// rows it touched under `--format json`, and the WHOLE flock as a table
-/// otherwise.
+/// Renders what a lifecycle verb leaves on screen: the rows it touched
+/// under `--format json`, the whole flock as a table otherwise
 ///
-/// # Why the whole flock, and why only in a table
+/// The table costs one extra `ListFlock` round trip. `--format json` keeps
+/// the narrow payload, so a script reads `data[0]` to learn what it touched.
 ///
-/// The question an operator has after starting one app is almost never "did
-/// that one app start" -- the exit code already answered that -- it is
-/// "what does the flock look like now", which is the question `shep flock`
-/// exists for and which a one-row table cannot answer. Every lifecycle verb
-/// here prints exactly what `shep flock` would print, so the answer is the
-/// same shape whichever verb asked it.
-///
-/// `--format json` keeps the narrow payload, deliberately, and this is the
-/// one place the two surfaces diverge on purpose. A script that runs
-/// `shep stop web --format json` asked about `web` and wants the rows for
-/// `web`; widening its `data` to the whole flock would break every consumer
-/// reading `data[0]` to learn what it just stopped, for no gain -- a script
-/// that wants the flock has `shep flock --format json`. So the rule is: the
-/// human surface answers "what now", the machine surface answers "what did I
-/// just touch".
-///
-/// # The cost
-///
-/// One extra `ListFlock` round trip per lifecycle verb in table form. The
-/// reply a lifecycle verb gets back carries only the rows it touched, and
-/// widening those responses would be a wire change -- a bigger decision than
-/// this behaviour needs, and one that would still leave `delete` unable to
-/// describe a flock it had just removed rows from. A fresh listing needs no
-/// protocol change and is the same request `shep flock` already makes.
-///
-/// # Dogs
-///
-/// In table form only: routed through [`emit_flock`], not [`emit`], so a dog
-/// renders through the dogs table with its `SOURCE` column rather than
-/// through the sheep table with an ID, a face, and a `FOLD` and `SMIT` it can
-/// never fill, and `shep restart log-rotate` draws the same dog the same way
-/// regardless of which verb asked. `--format json` gives a dog's row no such
-/// treatment -- it goes through [`emit`] like any other row in `narrow`.
+/// In table form a dog goes through [`emit_flock`], not [`emit`], so it
+/// renders in the dogs table with its `SOURCE` column.
 ///
 /// # Errors
-///
-/// Never returns a listing failure as this verb's failure. The verb already
-/// did its work and already reported its own outcome; failing the command
-/// because the receipt could not be fetched would turn a successful restart
-/// into a non-zero exit. An unreachable or unrecognised listing prints
-/// nothing extra and reports success, the same call [`flock_now`] makes for
-/// its own reasons.
+/// Never returns a listing failure as this verb's failure: an unreachable or
+/// unrecognised listing prints nothing extra and reports success.
 async fn render_outcome<T: Render>(
     client: &Client,
     streams: &mut Streams<'_>,
@@ -836,36 +585,7 @@ fn fail_target(streams: &mut Streams<'_>, err: &TargetError) -> ExitCode {
     streams.fail(code, &err.to_string())
 }
 
-/// Starts one or more sheep, resolved from `args.target` — see
-/// [`resolve_target`].
-///
-/// Sends `Request::Start` with `START_DEADLINE` rather than the client's
-/// default: a cold spawn plus a readiness probe routinely outruns 5
-/// seconds, and a client-side abandonment there would report failure for a
-/// sheep that came up fine.
-/// `shep start <name>` against a sheep the flock already has.
-///
-/// A sheep that is already up is reported and left alone. Restarting a live
-/// service because someone typed `start` would be a genuinely bad surprise --
-/// `restart` is right there and says what it does -- so this refuses to be
-/// clever about it.
-///
-/// Anything not up is started. The wire has no start-by-name: `Request::Start`
-/// carries configs to register, and the sheep is already registered. `Restart`
-/// is the request that takes a selector and brings a stopped sheep up, which
-/// is what `shep restart <name>` has always done to one.
-///
-/// A respawn that fails to spawn still answers `Response::Restarted` with an
-/// `Ok` -- the daemon's aggregation reply for `Restart` has no per-id error
-/// slot (`shep-daemon/src/supervisor.rs`'s `respawn`, `Err` arm), so a
-/// failed spawn comes back as an ordinary `errored` row rather than an RPC
-/// error. `shep start <path>`'s own `Request::Start` does not share that
-/// gap (`do_start` returns `Err(SpawnFailed)` straight from the same
-/// failure), which is what let `shep start <name>` against a sheep that
-/// cannot spawn exit 0 and print nothing, while `shep start <path>` against
-/// the identical broken script reported `error[spawn_failed]` -- reproduced
-/// live and fixed here, since this is the one place that turns a `Restart`
-/// answer into `start`'s own exit code.
+/// Whether `info` names a sheep `start` must leave alone rather than bring up
 fn is_live(info: &ProcessInfo) -> bool {
     use shep_core::status::ProcStatus;
     matches!(
@@ -875,44 +595,16 @@ fn is_live(info: &ProcessInfo) -> bool {
 }
 
 /// Brings every sheep in `matched` up, and reports the ones that were already
-/// up rather than replacing them.
+/// up rather than replacing them
 ///
-/// `selector` is the operator's own token when the match came from the
-/// selector tier, and `None` when it came from a path or Flockfile that
-/// resolved to apps the flock already has. The distinction is the difference
-/// between a suggestion that works and one that does not: `shep restart
-/// fold:backed` is a command, and `shep restart ./rotom.sh` is not, because
-/// `restart` takes selectors and a path is not one. So the token is quoted
-/// back whenever there is one, and a path or Flockfile falls back to listing
-/// the names.
+/// `selector` is the operator's own token, `None` when the match came from
+/// a path or Flockfile. Only a token can be quoted back as a remedy, so a
+/// path falls back to listing the names. One notice for the whole
+/// already-up set.
 ///
-/// The already-up set gets ONE notice however large it is. `shep start all`
-/// against a healthy thirteen-app flock would otherwise print thirteen
-/// notices saying the same thing.
-///
-/// # Respawns are issued per ROW, by id
-///
-/// They used to be issued per NAME, deduped, because `Request::Restart` with
-/// a name selector reaches every instance of a clustered app in one request
-/// and a fold holding a four-instance app would otherwise send four. The
-/// saving was real and the widening it bought was not worth it: a name
-/// selector reaches every instance whether or not this function matched them,
-/// so collapsing to names hands the daemon a WIDER set than the one the
-/// operator's own selector picked out. Two ways that bit:
-///
-/// - `shep start 0` against ten instances named `zam` restarted all ten.
-///   `Id` is the only selector form that can name a subset of one name's
-///   rows, so it was the only form the collapse could widen -- which is
-///   exactly the form an operator reaches for to name ONE of a clustered
-///   app's instances.
-/// - Worse, and for every selector form: the `live`/`asleep` partition above
-///   promises not to replace a sheep that is already up, and a name selector
-///   walked straight back over it. One online instance among nine stopped
-///   ones was restarted by the request meant for the other nine.
-///
-/// So the id of each row is what goes on the wire, and no dedup is needed --
-/// a row is one instance and appears once. The cost is the round trip the
-/// old shape was saving, one per instance rather than one per name.
+/// Respawns go out per row, by id: a name selector reaches every instance
+/// the name has, which would widen `shep start 0` to the whole app and walk
+/// back over the `live`/`asleep` partition.
 async fn resume_all(
     client: &Client,
     streams: &mut Streams<'_>,
@@ -926,9 +618,8 @@ async fn resume_all(
     match live.as_slice() {
         [] => {}
         [one] => {
-            // The operator's own token, not the sheep's name: `shep start 0`
-            // asked about one instance, and answering it with `shep restart
-            // zam` would suggest a command that replaces all ten.
+            // The operator's own token, not the sheep's name: `shep restart
+            // zam` for a `shep start 0` would replace every instance.
             let retype = selector.unwrap_or(one.name.as_str());
             let message = format!(
                 "{} is already {}; `shep restart {retype}` replaces it.",
@@ -947,11 +638,8 @@ async fn resume_all(
         }
     }
 
-    // Every row is attempted and the FIRST failure is what the verb returns,
-    // the discipline `request_each` states for the selector-taking verbs:
-    // stopping at the first failure leaves the operator guessing which of the
-    // rest were touched. This returned early, so one app in a fold failing to
-    // spawn abandoned the fold's remaining apps in silence.
+    // Every row is attempted and the first failure is what the verb
+    // returns, as `request_each` does for the selector-taking verbs.
     let mut failure: Option<ExitCode> = None;
     for sheep in asleep {
         let code = resume(client, streams, sheep, started).await;
@@ -962,28 +650,11 @@ async fn resume_all(
     failure.unwrap_or(ExitCode::Success)
 }
 
-/// Reports the sheep `shep add` found already registered, and changes
-/// nothing.
+/// Reports the sheep `shep add` found already registered, and changes nothing
 ///
-/// `add`'s answer to what [`resume_all`] answers for `start`, and a much
-/// shorter one: `start` has to decide what to bring up, and `add` has
-/// nothing left to do at all. Registration is the whole of what the verb
-/// promises, and the flock already has these.
-///
-/// Always [`ExitCode::Success`]. Re-running a template against a flock that
-/// already holds its apps is the ordinary case, not an error, and a deploy
-/// script that ran `shep add Flockfile.toml` twice must not fail the second
-/// time.
-///
-/// ONE notice however large the set is, matching [`resume_all`]: `shep add
-/// all` against a thirteen-app flock would otherwise print thirteen lines
-/// saying the same thing.
-///
-/// No remedy is suggested, and that is deliberate rather than an omission.
-/// `shep start <name>` is the right next command for a row that is stopped
-/// and the wrong one for a row that is up, and this arm holds both -- so
-/// naming one would be advice that is wrong half the time, in the one place
-/// an operator has no reason to doubt it.
+/// Always [`ExitCode::Success`]: a deploy script running `shep add
+/// Flockfile.toml` twice must not fail the second time. No remedy is named,
+/// since this arm holds both stopped and running rows.
 fn already_registered(streams: &mut Streams<'_>, matched: &[ProcessInfo]) -> ExitCode {
     let refs: Vec<&ProcessInfo> = matched.iter().collect();
     let names = unique_names(&refs);
@@ -999,21 +670,12 @@ fn already_registered(streams: &mut Streams<'_>, matched: &[ProcessInfo]) -> Exi
     ExitCode::Success
 }
 
-/// Every distinct name in `infos`, in the order they first appear.
+/// Every distinct name in `infos`, in the order they first appear
 ///
-/// Feeds the already-running notice and nothing else -- never the respawn
-/// targets, which must stay per-row and per-id; see [`resume_all`]'s own
-/// doc for why. A notice reads as a list of apps, so collapsing to names is
-/// right for this and only this.
-///
-/// Order-INDEPENDENT: it compares against every name kept so far, not
-/// against the previous one, so a caller handing over rows in a Flockfile's
-/// own order gets the same answer as one handing over the daemon's sorted
-/// listing.
-///
-/// A `Vec` scan rather than a `HashSet`: this runs over the sheep one
-/// selector matched, which is tens of rows, and it has to preserve first-seen
-/// order for the notice it feeds.
+/// Feeds the already-running notice, never the respawn targets, which stay
+/// per-row and per-id; see [`resume_all`]. Compares against every name kept
+/// so far, not the previous one, so an unsorted listing gives the same
+/// answer as a sorted one.
 fn unique_names<'a>(infos: &[&'a ProcessInfo]) -> Vec<&'a str> {
     let mut names: Vec<&str> = Vec::with_capacity(infos.len());
     for info in infos {
@@ -1042,21 +704,12 @@ async fn resume(
         },
     )
     .await;
-    // See this function's own doc: an `Ok` reply can still carry a sheep
-    // that came back `errored`, and that is a `start` failure by any
-    // definition an operator would recognise. Reported and returned WITHOUT
-    // extending `started` -- `shep start <path>`'s own failure leaves
-    // `started` empty too (its `Request::Start` never reaches the `Ok` arm
-    // `request_each` collects from), and `start`'s caller only prints a
-    // table when `started` is non-empty. Populating it here would print a
-    // table on a path that is supposed to fail exactly like the by-path one
-    // does: an error on stderr and nothing on stdout.
+    // The `Restart` reply has no per-id error slot, so an `Ok` can carry an
+    // `errored` sheep, which is a `start` failure. Returned without
+    // extending `started`, so a failing verb leaves stdout empty.
     if any_restart_failed(&procs) {
-        // Named by id as well as by name, because this reports one ROW:
-        // without the id, four instances of one app failing would print
-        // four identical messages, naming a sheep the operator cannot tell
-        // apart. The id is also what makes the `bleats` suggestion
-        // reach the instance that actually failed.
+        // By id as well as by name: this reports one row, and four failing
+        // instances would otherwise print four identical messages.
         let (name, id) = (&sheep.name, sheep.id);
         let message = format!(
             "{name} (id {id}) could not be started; see `shep bleats {id}` or its log files for why"
@@ -1067,39 +720,25 @@ async fn resume(
     failure.unwrap_or(ExitCode::Success)
 }
 
-/// Whether any row in a `Request::Restart` reply came back `errored` -- see
-/// [`resume`]'s own doc for why that can happen inside an `Ok` reply.
+/// Whether any row in a `Request::Restart` reply came back `errored`
+///
+/// The reply has no per-id error slot, so a failed respawn arrives inside
+/// an `Ok`.
 fn any_restart_failed(procs: &[shep_core::protocol::ProcessInfo]) -> bool {
     procs
         .iter()
         .any(|info| info.status == shep_core::status::ProcStatus::Errored)
 }
 
-/// Gives every app that set no `cwd` the Flockfile's own directory.
+/// Gives every app that set no `cwd` the Flockfile's own directory
 ///
-/// Fills the field and does NOT add `cwd` to the app's declared key set. The
+/// Fills the field without adding `cwd` to the declared key set: the
 /// document did not ask for this directory, so a load must not establish it
-/// on a sheep the flock already has, which would overwrite a `--cwd` an
-/// operator set since. A fresh app still starts in the right place, which is
-/// the whole of what this was added for.
-///
-/// A Flockfile is a file you commit. Before this, an app with a relative
-/// `script` and no `cwd` resolved that script against the DAEMON's working
-/// directory -- whatever directory the shepherd happened to be autostarted
-/// from -- so the same committed file worked on the machine where that was
-/// right and failed on the next one, with an error naming neither cause.
-/// Measured 2026-08-19 with three distinct directories; `deferred.md` carries
-/// the evidence. The maintainer's call was to default the cwd rather than resolve the
-/// script alone, because the rule then fits in one sentence an operator can
-/// read.
+/// on a sheep the flock already has and overwrite a `--cwd` set since.
 ///
 /// Absolute, via `canonicalize`, because the daemon resolves a relative cwd
-/// against itself and would land back where this started.
-///
-/// Silent no-op if the path cannot be canonicalised: the caller is about to
-/// fail on reading the file anyway, and inventing a directory here would
-/// bury that error under a stranger one. An app that sets its own `cwd`
-/// keeps it -- this only fills a blank.
+/// against its own. A path that cannot be canonicalised is a silent no-op,
+/// and an app that sets its own `cwd` keeps it.
 fn default_cwd_to_flockfile_dir(apps: Vec<DeclaredApp>, flockfile: &Path) -> Vec<DeclaredApp> {
     let Some(dir) = std::fs::canonicalize(flockfile)
         .ok()
@@ -1120,17 +759,12 @@ fn default_cwd_to_flockfile_dir(apps: Vec<DeclaredApp>, flockfile: &Path) -> Vec
 }
 
 /// The flock as it stands, for deciding whether a target names a sheep that
-/// already exists.
+/// already exists
 ///
 /// A name is unique across a flock, so a target naming one can never have
-/// meant "add another" -- there is no room for a second. Fetched ONCE per
-/// invocation and matched locally: a Flockfile naming ten apps asks ten
-/// questions of one listing, not for ten listings.
-///
-/// An unreachable or unexpected answer yields an empty flock rather than an
-/// error. Failing `start` because the listing could not be read would trade a
-/// working command for a defensive one, and the `Start` below reports its own
-/// failures.
+/// meant "add another". Fetched once per invocation and matched locally.
+/// An unreachable or unexpected answer yields an empty flock; the `Start`
+/// that follows reports its own failures.
 async fn flock_now(client: &Client) -> Vec<shep_core::protocol::ProcessInfo> {
     match client.request(Request::ListFlock).await {
         Ok(Response::Flock(procs)) => procs,
@@ -1139,39 +773,17 @@ async fn flock_now(client: &Client) -> Vec<shep_core::protocol::ProcessInfo> {
 }
 
 /// Merges the Flockfile's declaration into each app the flock already has,
-/// and tells the operator what that did.
+/// and tells the operator what that did
 ///
-/// The defect this exists for: an operator edits `cwd` on two apps, re-runs
-/// `shep start`, and both keep running the old one. `Request::Start` on a
-/// name the flock already has adds instances rather than reconciling config,
-/// which is what `shep stock` depends on, so the edit was simply not
-/// applied. This is the request that applies it.
+/// `Request::Start` on a name the flock already has adds instances rather
+/// than reconciling config, so this is the request that applies an edited
+/// file to a running app.
 ///
-/// Additive, and that is the whole security argument for doing it by default
-/// at all. A Flockfile arrives from the app's own repository, so a load
-/// appends what nobody has established and leaves everything an operator set
-/// since alone; `--reset` is what widens that, and it is something the
-/// operator types.
-///
-/// Only apps whose document DECLARED something are sent. A bare script
-/// target reports an empty key set ([`resolve_target_declared`]), so `shep
-/// start ./thing` against a running `thing` still applies nothing: the
-/// command line is not a template.
-///
-/// Field NAMES only, never values: this reaches an operator's terminal and
-/// `env` carries secrets, so an applied `env` says `env` and stops (IR-41).
-/// [`SheepApplied`] is where that rule is enforced.
-///
-/// Silent on nothing, unlike the drift warning it replaces. A daemon that
-/// could not be reached, answered something else, or is too old to know the
-/// request is REPORTED, because the operator's edit did not land and the
-/// whole point of this verb is that such an edit stops vanishing without a
-/// word. It does not change the exit code: the resumes below it are what
-/// `start` was asked to do, and they still happen.
-///
-/// One request for the whole invocation, not one per app. The rows beside
-/// each app go unread: a merge is a comparison between two CONFIGS, and
-/// every instance of a clustered app shares one.
+/// Additive: a Flockfile arrives from the app's own repository, so a load
+/// appends what nobody has established and leaves alone what an operator
+/// set since. `--reset` widens that. Only apps whose document declared
+/// something are sent, so `shep start ./thing` applies nothing. Field names
+/// only, never values, since `env` carries secrets.
 async fn apply_declared(
     client: &Client,
     streams: &mut Streams<'_>,
@@ -1193,19 +805,15 @@ async fn apply_declared(
     {
         Ok(Response::Applied(report)) => report,
         // `Response` is `#[non_exhaustive]`, so an answer this client does
-        // not recognise is a daemon-side fault rather than a bad file --
-        // `request_and_render` calls the same case `Internal` for the same
-        // reason.
+        // not recognise is a daemon-side fault rather than a bad file.
         Ok(_other) => {
             let message = "the daemon answered the config load with a response this client does \
                  not understand; the Flockfile's edits are not in effect";
             return streams.fail(ExitCode::Internal, message);
         }
         // The code the class of failure already has: an unreachable daemon
-        // is `DaemonUnreachable`, an expired deadline is `DeadlineExceeded`,
-        // a daemon-side refusal is whatever its `RpcErrorCode` maps to.
-        // Inventing one here would answer a transport question with a
-        // configuration answer.
+        // is `DaemonUnreachable`, an expired deadline `DeadlineExceeded`, a
+        // daemon-side refusal whatever its `RpcErrorCode` maps to.
         Err(err) => {
             let message = format!(
                 "the Flockfile's edits could not be applied, so they are not in effect: {err}"
@@ -1215,26 +823,15 @@ async fn apply_declared(
     };
     let mut failure: Option<ExitCode> = None;
     for sheep in report {
-        // An app with nothing to say prints nothing. A deploy re-runs the
-        // same unchanged Flockfile over and over, and eleven "nothing to
-        // apply" lines every time would train an operator to stop reading
-        // the ones that matter.
+        // An app with nothing to say prints nothing: a deploy re-runs the
+        // same unchanged Flockfile every time.
         let Some(message) = applied_line(&sheep) else {
             continue;
         };
         if sheep.refused.is_some() {
-            // Reported as an ERROR and not as an aside, and the exit code
-            // follows it out. A refusal means some of the config the
-            // operator declared did not land, and a load that refused three
-            // apps and exited 0 tells `shep start F.toml && deploy` to carry
-            // on -- the silent-edit failure this verb exists to fix,
-            // arriving through the report instead of through the merge.
-            // `shep stock`'s partial scale-up is the same shape and has
-            // returned non-zero since it shipped.
-            //
-            // Every app is reported before the code is returned, matching
-            // `resume_all`: stopping at the first refusal would leave the
-            // operator guessing about the rest of the file.
+            // Config the operator declared did not land, so exiting 0 would
+            // tell `shep start F.toml && deploy` to carry on. Every app is
+            // reported before the code is returned.
             failure = failure.or(Some(streams.fail(REFUSED_EXIT, &message)));
         } else {
             streams.aside(mode.verb(), &message);
@@ -1243,32 +840,17 @@ async fn apply_declared(
     failure.unwrap_or(ExitCode::Success)
 }
 
-/// What a per-app refusal inside an otherwise successful load exits with.
+/// What a per-app refusal inside an otherwise successful load exits with
 ///
-/// ONE code for every refusal, and that is a limit of the wire rather than a
-/// judgement that they are all the same thing. [`SheepApplied::refused`]
-/// carries a SENTENCE, deliberately -- the daemon's refusals are prose an
-/// operator reads, and several of them name the remedy -- so a client cannot
-/// recover which class a refusal belongs to without matching on that prose,
-/// which would couple this file to the daemon's exact wording and break the
-/// moment anybody improved it.
-///
-/// `InvalidConfig` is the honest single answer: every refusal means the
-/// daemon would not put some part of the declared configuration into effect,
-/// and that is what code 4 says everywhere else in this CLI. It is not right
-/// for all of them -- a scale-up that ran out of room part-way is the same
-/// event `Request::Scale` answers with `SpawnFailed`, and a store that could
-/// not be read is a daemon-side fault -- and closing that gap needs a
-/// machine-readable class beside the sentence on the wire, which is a
-/// protocol addition rather than a client fix.
+/// One code for every refusal: [`SheepApplied::refused`] carries a sentence
+/// and nothing machine-readable, so the class cannot be recovered without
+/// matching on the daemon's prose.
 const REFUSED_EXIT: ExitCode = ExitCode::InvalidConfig;
 
-/// The first of two codes to have failed, `Success` when neither did.
+/// The first of two codes to have failed, `Success` when neither did
 ///
-/// `start` does its work in order and reports the FIRST thing that went
-/// wrong, the discipline `request_each` states for the selector-taking
-/// verbs: a later failure overwriting an earlier one leaves the operator
-/// reading about the symptom instead of the cause.
+/// `start` works in order, so a later failure overwriting an earlier one
+/// would leave the operator reading the symptom instead of the cause.
 fn first_failure(earlier: ExitCode, later: ExitCode) -> ExitCode {
     if earlier == ExitCode::Success {
         later
@@ -1277,18 +859,11 @@ fn first_failure(earlier: ExitCode, later: ExitCode) -> ExitCode {
     }
 }
 
-/// One line for what a load did to one app, or `None` when it did nothing.
+/// One line for what a load did to one app, or `None` when it did nothing
 ///
-/// A pending field always travels with the verb that promotes it. A list of
-/// names an operator cannot act on is a report nobody can use, and this is
-/// the one place the remedy is known.
-///
-/// The pending clause is a gerund, `waiting on`, rather than a finite verb.
-/// `join(", ")` produces a subject that is singular or plural depending on
-/// what the load parked, and `wait` (what this printed until 2026-09-03) read
-/// as a grammatical error on the common single-field case: `cwd wait for the
-/// next spawn`. A count conditional would agree correctly and would mean two
-/// spellings of one sentence; a gerund agrees with either subject and is one.
+/// A pending field always travels with the verb that promotes it. The
+/// clause is a gerund, `waiting on`, which agrees with the singular and
+/// plural subjects `join(", ")` can produce.
 fn applied_line(sheep: &SheepApplied) -> Option<String> {
     let name = &sheep.name;
     let mut parts = Vec::new();
@@ -1311,30 +886,22 @@ fn applied_line(sheep: &SheepApplied) -> Option<String> {
 }
 
 /// `shep.toml`'s `[interpreters]` entry for `script`'s own extension, if it
-/// has one and the map names it.
+/// has one and the map names it
 ///
-/// `Path::extension` already answers "no extension" the way this needs to:
-/// a dotfile with nothing before its one dot (`.bashrc`) has none, so a
-/// `[interpreters]` entry keyed `""` (nobody would write one, but nothing
-/// stops them) can never match here either.
+/// `Path::extension` reads a dotfile like `.bashrc` as extensionless, so an
+/// entry keyed `""` can never match here.
 fn mapped_interpreter(script: &str, interpreters: &BTreeMap<String, String>) -> Option<String> {
     let extension = Path::new(script).extension()?.to_str()?;
     interpreters.get(extension).cloned()
 }
 
 /// Folds `shep.toml`'s `[interpreters]` mapping and `--interpreter` onto
-/// `apps`, in the precedence the maintainer fixed for task 47: shep.toml, then a
-/// Flockfile's own `interpreter` field, then the flag -- last one to touch
-/// an app wins.
+/// `apps`
 ///
-/// The Flockfile layer needs no code of its own here: [`resolve_target`]
-/// already left an app's `interpreter` at whatever its source said, `None`
-/// for anything that named none, so only filling `None` slots from
-/// `interpreters` is what makes an app's own explicit value (including the
-/// literal `"none"`, which is `Some("none")`, not `None`) outrank the map.
-/// `flag`, when given, then overwrites every app unconditionally -- the top
-/// layer, matching `--cwd`/`--fold` immediately above this function's own
-/// call site.
+/// Precedence: `shep.toml`, then a Flockfile's own `interpreter` field,
+/// then the flag. Filling only `None` slots from `interpreters` is what
+/// makes an app's own value outrank the map, the literal `"none"` included.
+/// `flag` then overwrites every app.
 fn apply_interpreters(
     apps: &mut [DeclaredApp],
     interpreters: &BTreeMap<String, String>,
@@ -1356,13 +923,10 @@ fn apply_interpreters(
     }
 }
 
-/// The `--reset=<mode>` the operator typed, `None` when they typed nothing.
+/// The `--reset=<mode>` the operator typed, `None` when they typed nothing
 ///
-/// Named so the two arms that REFUSE a reset can quote back the flag AND the
-/// mode the operator actually wrote, rather than a bare `--reset` that does
-/// not by itself parse: an operator who typed `--reset=file` should see
-/// `--reset=file` in the refusal, not a flag spelling that would now be a
-/// usage error on its own.
+/// Carries the mode so the two arms that refuse a reset quote back what was
+/// written. A bare `--reset` is a usage error on its own.
 fn reset_flag(args: &StartArgs) -> Option<String> {
     args.reset.map(|mode| {
         let name = mode
@@ -1378,13 +942,11 @@ fn reset_depth(args: &StartArgs) -> ResetDepth {
     args.reset.map_or(ResetDepth::None, ResetMode::to_depth)
 }
 
-/// Which of the two verbs that read a Flockfile is running.
+/// Which of the two verbs that read a Flockfile is running
 ///
-/// They share everything: the same targets, the same four-tier resolution,
-/// the same merge into an app the flock already has, the same refusals. The
-/// whole difference is whether anything is spawned at the end, and it is one
-/// code path rather than two because a document that registered differently
-/// depending on which verb read it is a document nobody could reason about.
+/// They share targets, resolution, merge and refusals; the difference is
+/// whether anything is spawned at the end. One code path, so a document
+/// cannot register differently depending on which verb read it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Load {
     /// `shep start`: register what the flock does not have, and bring up what
@@ -1416,18 +978,15 @@ pub async fn start(
     load(client, streams, args, discovered, interpreters, Load::Start).await
 }
 
-/// Registers what `args` resolves to and starts none of it.
+/// Registers what `args` resolves to and starts none of it
 ///
-/// The app lands registered and stopped, which is what makes a Flockfile
-/// usable as a template. One shipping `env = { DB_HOST = "", DB_PASSWORD =
-/// "" }` cannot be started before it is configured -- the process comes up
-/// against an empty database URL, crashes, spends its restart budget, and has
-/// to be stopped before anybody can fix it. With this the order is register,
-/// fill in, start.
+/// The app lands registered and stopped, so a template shipping `env = {
+/// DB_HOST = "" }` can be filled in before it spawns. The order is
+/// register, fill in, start.
 ///
-/// An app the flock already has is merged into and left exactly as it is,
-/// running or not. Re-running this after editing a template is the ordinary
-/// thing to do, so it must not be able to stop a service.
+/// An app the flock already has is merged into and left as it is, running
+/// or not, so re-running this after editing a template cannot stop a
+/// service.
 pub async fn add(
     client: &Client,
     streams: &mut Streams<'_>,
@@ -1438,7 +997,7 @@ pub async fn add(
     load(client, streams, args, discovered, interpreters, Load::Add).await
 }
 
-/// The body [`start`] and [`add`] share -- see [`Load`] for what they do not.
+/// The body [`start`] and [`add`] share; see [`Load`] for what they do not
 async fn load(
     client: &Client,
     streams: &mut Streams<'_>,
@@ -1466,12 +1025,8 @@ async fn load(
             mode,
         )
         .await;
-        // Printed whenever the verb did its work, not only when it touched a row.
-        // `shep start koji` against a koji that is already online starts nothing
-        // and succeeds, and the flock is still the answer to what happens next --
-        // before this it printed the notice and no table at all. A verb that
-        // FAILED still leaves stdout empty, which is the discipline `cli_e2e`'s
-        // `assert_json_error` pins crate-wide.
+        // Printed whenever the verb succeeded, not only when it touched a
+        // row. A failing verb leaves stdout empty, crate-wide.
         if code == ExitCode::Success {
             let wrote = render_outcome(client, streams, mode.verb(), FlockRows(started)).await;
             if wrote != ExitCode::Success {
@@ -1481,8 +1036,7 @@ async fn load(
         return code;
     }
     // In turn, not atomically: if the second target fails the first is
-    // already up. The exit code is the first failure, so a partial success
-    // is never reported as a whole one.
+    // already up. The exit code is the first failure.
     let mut failure: Option<ExitCode> = None;
     let mut started = Vec::new();
     for target in &args.targets {
@@ -1501,23 +1055,10 @@ async fn load(
             failure = failure.or(Some(code));
         }
     }
-    // One table for the whole invocation, matching `stop` and `restart`. A
-    // header per target would be the only place in the CLI where asking for
-    // three things prints three tables.
-    // Printed whenever the verb did its work, not only when it touched a row.
-    // `shep start koji` against a koji that is already online starts nothing
-    // and succeeds, and the flock is still the answer to what happens next --
-    // before this it printed the notice and no table at all. A verb that
-    // FAILED still leaves stdout empty, which is the discipline `cli_e2e`'s
-    // `assert_json_error` pins crate-wide.
-    //
-    // Keyed on the outcome ALONE, never on `started` being non-empty. The two
-    // agreed while a failure stopped the run, since nothing could follow one
-    // and add a row: now that every row is attempted, a fold whose second app
-    // fails and whose third comes up fine ends non-empty AND failed, and the
-    // old condition printed a table on the error path. Under `--format json`
-    // that is a data envelope beside an error envelope, which is two answers
-    // to one question and what `cli_e2e`'s `assert_json_error` refuses.
+    // One table for the whole invocation, keyed on the outcome alone and
+    // never on `started` being non-empty: every row is attempted, so a
+    // partly-failed fold ends non-empty, and a table there would sit beside
+    // an error envelope under `--format json`.
     if failure.is_none() {
         let wrote = render_outcome(client, streams, mode.verb(), FlockRows(started)).await;
         if wrote != ExitCode::Success {
@@ -1527,18 +1068,9 @@ async fn load(
     failure.unwrap_or(ExitCode::Success)
 }
 
-/// One target's worth of [`load`].
+/// One target's worth of [`load`]
 ///
-/// Eight parameters, the same growth `lookout::frames::sheep`'s own
-/// `#[allow(clippy::too_many_arguments)]` already accepted for itself:
-/// `client` and `streams` are the RPC/rendering plumbing every verb in this
-/// file threads through; `args`, `target` and `discovered` are the three ways
-/// one invocation names what to load; `interpreters` is task 47's
-/// `shep.toml` mapping, read once by the caller rather than re-reading the
-/// file per target; `started` is the caller's own accumulator; and `mode` is
-/// which of the two verbs is running. None of the eight groups naturally
-/// into a struct without inventing one used nowhere else, the same call that
-/// function's own doc makes.
+/// `interpreters` is read once by the caller rather than per target.
 #[allow(clippy::too_many_arguments)]
 async fn load_one(
     client: &Client,
@@ -1550,30 +1082,18 @@ async fn load_one(
     started: &mut Vec<shep_core::protocol::ProcessInfo>,
     mode: Load,
 ) -> ExitCode {
-    // `args.target` is optional so bare `shep start` can mean "this
-    // directory's Flockfile". The caller does the discovery, because the
-    // no-target-and-no-Flockfile case never reaches here: it brings a
-    // shepherd up and stops.
-    //
     // Everything from here to `resolve_target` is the precedence in
-    // `StartArgs::targets`' own help: a sheep by id or name, then a fold, then
-    // a Flockfile, then a path. Each tier claims the token only if the token
-    // actually resolves there, so a name the flock does not have still reaches
-    // the file of that name.
-    //
-    // `-` and `--flockfile` skip the flock entirely. Both say outright that
-    // the token is a source to read, and neither has ever meant anything else.
+    // `StartArgs::targets`' own help: a sheep by id or name, then a fold,
+    // then a Flockfile, then a path. Each tier claims the token only if it
+    // resolves there. `-` and `--flockfile` skip the flock entirely.
     let mut listing: Option<Vec<ProcessInfo>> = None;
     let mut missed: Option<String> = None;
     if let Some(token) = target
         && token != "-"
         && !args.flockfile
     {
-        // Parsed client-side, exactly as every selector-taking verb does, so a
-        // malformed one is a local usage error rather than a round trip. This
-        // is also what makes `shep start fold:backed` and `shep start all`
-        // work at all: `start` takes the same argument grammar as every
-        // other lifecycle verb, so folds are actionable here too.
+        // Parsed client-side, as every selector-taking verb does, so a
+        // malformed one is a local usage error rather than a round trip.
         let selector = match parse_selector(streams, token) {
             Ok(selector) => selector,
             Err(code) => return code,
@@ -1582,48 +1102,10 @@ async fn load_one(
             let flock = flock_now(client).await;
             let matched = flock_matches(&selector, &flock);
             if !matched.is_empty() {
-                // THE guard the whole apply design rests on, and the reason
-                // this arm returns rather than falling through: a name
-                // target reads no file. Nothing below this line runs, so
-                // whatever Flockfile happens to sit in the operator's
-                // current directory is never opened, let alone applied.
-                //
-                // It is a security boundary rather than a tidiness rule. A
-                // Flockfile arrives from an app's own repository, so what it
-                // says today is what the last commit to that repository
-                // said; a routine `shep start web`, or a CI job restarting a
-                // service, must not apply that.
-                //
-                // The line is naming a SHEEP versus reading a FLOCKFILE, and
-                // it is not naming a file versus not naming one: bare `shep
-                // start` in a directory holding a Flockfile discovers that
-                // file, and a discovered load applies exactly as an explicit
-                // one does (pinned by
-                // `a_discovered_flockfile_applies_to_an_app_the_flock_already_has`).
-                // Three reasons, and the third is the decisive one. A bare
-                // start already READS that file to decide what to run, so
-                // applying it extends no trust the invocation had not
-                // extended already. A bare start is in the file family: it
-                // reads a Flockfile and names no sheep. And `shep start` and
-                // `shep start Flockfile.toml`, run in the same directory
-                // against the same file, must not differ in whether they
-                // apply -- two commands that read the same document and
-                // start the same apps behaving differently on config is a
-                // distinction no operator would predict and none could
-                // remember.
-                //
-                // What survives all of that is this arm: a token that
-                // resolved to a sheep reads nothing. Pinned by
-                // `start_by_name_sends_no_apply_config_even_with_a_flockfile_present`.
-                //
-                // Nothing is even reported here, and that is not an
-                // omission either: a selector supplies no config -- `shep
-                // start fold:backed` names sheep, not a Flockfile -- so
-                // there is nothing that could have been silently ignored.
-                //
-                // A reset flag here would be meaningless rather than a
-                // no-op: this arm reads no file, so there is no template to
-                // reset to. Refusing rather than silently doing nothing.
+                // Returns rather than falling through: a token that resolved
+                // to a sheep reads no file, so `shep start web` cannot apply
+                // whatever Flockfile sits in the operator's directory. A
+                // reset flag is refused: there is no template to reset to.
                 if let Some(flag) = reset_flag(args) {
                     let message = format!(
                         "{flag} needs a Flockfile to reset to; {token} names a sheep, not a file"
@@ -1634,16 +1116,13 @@ async fn load_one(
                     Load::Start => {
                         resume_all(client, streams, Some(token), &matched, started).await
                     }
-                    // Nothing to do and nothing to report as an error: the
-                    // sheep is registered, which is all `add` was asked for.
-                    // Saying so anyway, because a verb that printed a table
-                    // and no word would look like it had done something.
+                    // The sheep is registered, which is all `add` was asked
+                    // for. Said anyway, so a printed table is explained.
                     Load::Add => already_registered(streams, &matched),
                 };
             }
             // Held for the failure path below rather than reported here: the
-            // token may still name a Flockfile or a path, and only if it names
-            // neither does the shape it was written in decide the message.
+            // token may still name a Flockfile or a path.
             missed = selector_miss(token, &selector, &flock);
             listing = Some(flock);
         }
@@ -1672,12 +1151,9 @@ async fn load_one(
     let mut apps =
         match resolve_target_declared(target, args.name.as_deref(), &stdin, args.flockfile) {
             Ok(apps) => apps,
-            // The last tier refused too, so the token named nothing anywhere. A
-            // token written unmistakably as a selector is reported as one -- `shep
-            // start fold:typo` says no sheep is in a fold called typo, rather than
-            // reporting that no file called `fold:typo` is on disk, which is the
-            // answer to a question nobody asked. Exit 3, matching what every other
-            // verb returns for a selector that matched nothing.
+            // The token named nothing anywhere. One written unmistakably as
+            // a selector is reported as one, at exit 3, matching every other
+            // verb's answer for a selector that matched nothing.
             Err(TargetError::Unresolvable { .. }) if missed.is_some() => {
                 let message = missed.unwrap_or_default();
                 return streams.fail(ExitCode::NotFound, &message);
@@ -1685,17 +1161,10 @@ async fn load_one(
             Err(err) => return fail_target(streams, &err),
         };
 
-    // The same refusal the name arm above makes, for the other target that
-    // supplies no template. `resolve_target_declared` hands a bare script
-    // path an EMPTY declared set, so a reset flag on one reached
-    // `apply_declared`, which sends nothing for an app that declared
-    // nothing, and `shep start --reset ./thing` exited 0 having reset
-    // exactly nothing. A meaningless flag is refused rather than obeyed
-    // into a no-op.
-    //
-    // The test is the declared set, not the shape of the token, because
-    // that is the thing the reset acts on: every Flockfile app carries at
-    // least its own `script` key, so a real document never lands here.
+    // The other target that supplies no template: a bare script path gets
+    // an empty declared set, so a reset would exit 0 having reset nothing.
+    // Tested on the declared set, not the token's shape, since that is what
+    // a reset acts on. Every Flockfile app declares at least `script`.
     if let Some(flag) = reset_flag(args)
         && apps.iter().all(|app| app.declared.is_empty())
     {
@@ -1710,32 +1179,22 @@ async fn load_one(
         }
     }
     // After the per-app defaults above, so an explicit flag wins over both
-    // the script form's "where you are" default and a Flockfile's own value.
+    // the script form's default and a Flockfile's own value.
     if let Some(cwd) = &args.cwd {
         for app in &mut apps {
             app.config.cwd = Some(cwd.clone());
         }
     }
     apply_interpreters(&mut apps, interpreters, args.interpreter.as_deref());
-    // The same rule the bare-name lookup above applies, now that the target
-    // has become a set of named apps: a name the flock already has is that
-    // sheep. Without this, `shep start ./thing` against a running `thing`
-    // spawned a SECOND copy of a one-instance app -- `instance_slots`
-    // allocates the lowest free slot, so the two sat side by side as ids 0
-    // and 1 under one name, and the next save persisted `instances_running: 2`
-    // for an app configured for 1.
+    // The bare-name rule again, now the target is a set of named apps: a
+    // name the flock already has is that sheep. Without it `shep start
+    // ./thing` spawns a second copy of a one-instance app.
     let flock = match listing {
         Some(flock) => flock,
         None => flock_now(client).await,
     };
-    // EVERY row the name has, not the first one. A clustered app is several
-    // rows under one name, and taking one of them as the app's stand-in meant
-    // a Flockfile naming a stopped four-instance app started instance 0 and
-    // left the other three down. Worse when instance 0 was the live one: the
-    // "already running" notice fired for the whole app and nothing started at
-    // all. Invisible while respawns went out per name, because a name
-    // selector reached the other three anyway; the moment they go out per
-    // row, the representative is all this arm would act on.
+    // Every row the name has, not the first: respawns go out per row, so one
+    // row standing in for a clustered app leaves the other instances down.
     let mut resumed: Vec<(DeclaredApp, Vec<ProcessInfo>)> = Vec::new();
     let mut fresh = Vec::new();
     for app in apps {
@@ -1750,31 +1209,15 @@ async fn load_one(
             resumed.push((app, rows));
         }
     }
-    // Before the resumes below, not after: an operator who edited the file
-    // and gets a wall of restart output should read what the edit did at the
-    // top of the run rather than under it. It matters more now than it did
-    // when this was only a warning -- a `NeedsRespawn` field parks for the
-    // next spawn, and the resume immediately below is that spawn.
-    // The code is carried rather than returned on the spot. A refused field
-    // must not stop the flock coming back up: the resumes below are what
-    // `start` was asked to do, they are what an operator running this in a
-    // deploy needs to happen, and the refusal is reported the moment it
-    // arrives either way. What it changes is what the verb EXITS with.
-    //
-    // The merge runs under `add` too, and only the resume below it does not.
-    // That is the whole of `shep add Flockfile.toml` against an app the flock
-    // already has: the file's new keys are appended, a field the running
-    // child holds parks for its next spawn, and nothing is replaced. Refusing
-    // instead would break re-running the file after a template edit, and
-    // stopping the app would be a config load that killed a process, which
-    // this design forbids outright.
+    // Before the resumes below, since a `NeedsRespawn` field parks for the
+    // next spawn and that is the resume immediately below. The code is
+    // carried rather than returned: a refused field must not stop the flock
+    // coming back up. The merge runs under `add` too, only the resume does not.
     let declared: Vec<DeclaredApp> = resumed.iter().map(|(app, _)| app.clone()).collect();
     let applied = apply_declared(client, streams, &declared, reset_depth(args), mode).await;
     if !resumed.is_empty() && mode == Load::Start {
-        // `None`, not the operator's token: this arm reached the flock through
-        // a Flockfile or a path, so there is no selector to quote back in the
-        // "already running" notice. `shep restart ./rotom.sh` is not a
-        // command. See `resume_all`'s own doc.
+        // `None`, not the operator's token: this arm reached the flock
+        // through a Flockfile or a path, so there is no selector to quote.
         let existing: Vec<ProcessInfo> = resumed
             .iter()
             .flat_map(|(_, rows)| rows.iter().cloned())
@@ -1791,16 +1234,12 @@ async fn load_one(
 
     let (procs, failure) = request_each(
         client,
-        streams, // One request either way: `Start` and `Add` both carry the apps, so
-        // the "selector" here is a placeholder the body closure ignores.
-        // Reusing the looping helper keeps the collect-then-render shape in
-        // one place.
+        streams, // Both requests carry the apps, so this "selector" is a
+        // placeholder the body closure ignores.
         &[SelectorSpec::All],
-        // `START_DEADLINE` for both, and it is not spare budget on the `Add`
-        // side. Nothing is spawned there, but the actor is single-threaded:
-        // an `Add` that arrives while the daemon is part way through a batch
-        // of cold spawns waits behind them, and the client's ordinary 5s
-        // would abandon a registration that was about to happen.
+        // `START_DEADLINE`: a cold spawn plus a readiness probe routinely
+        // outruns the client's default 5s, and on `Add` a single-threaded
+        // actor behind a batch of cold spawns does too.
         Some(START_DEADLINE),
         |_| match mode {
             Load::Start => Request::Start { apps: apps.clone() },
@@ -1812,30 +1251,10 @@ async fn load_one(
         },
     )
     .await;
-    // The load that establishes what a FRESH app's file declared, and the
-    // whole of the spec's migration clause: "first load of an existing app
-    // establishes its current keys". `Request::Start` and `Request::Add` both
-    // register an app and write nothing to the override store, so without
-    // this the app has an empty established set and the SECOND load of the
-    // same file treats every key as unestablished and overwrites the lot --
-    // the one thing the additive default exists to prevent, arriving on the
-    // load after the one everybody tests.
-    //
-    // `ResetDepth::None` whatever flag the operator passed, because there is
-    // nothing to reset: the app was registered from this very file a moment
-    // ago, so every declared key already holds the file's value and the merge
-    // is a no-op that reports nothing. `--reset-all` would be worse than a
-    // no-op, since it drops the record this call exists to write.
-    //
-    // `Request::Add` needs it for exactly the reason `Request::Start` does,
-    // and needs it more: `add` exists so an operator can fill in the empty
-    // `env` keys a template shipped, and a key that was never established is
-    // one the next load of that same template overwrites.
-    //
-    // Only the apps the daemon really registered. An app whose spawn failed
-    // is not in `procs`, and sending its name here would earn an `is not
-    // registered` refusal and a non-zero exit for an app that already
-    // reported its own failure.
+    // Establishes what a fresh app's file declared: `Start` and `Add` write
+    // nothing to the override store. `ResetDepth::None` whatever flag was
+    // passed, since a reset would drop the record this call writes. Only
+    // apps the daemon registered: a failed spawn is not in `procs`.
     let registered: BTreeSet<&str> = procs.iter().map(|info| info.name.as_str()).collect();
     let established: Vec<DeclaredApp> = fresh
         .into_iter()
@@ -1867,7 +1286,7 @@ pub async fn stop(client: &Client, streams: &mut Streams<'_>, args: &SelectorArg
         },
     )
     .await;
-    // See `start`'s own note: printed whenever the verb did its work.
+    // Printed whenever the verb did its work; see `load`.
     if !procs.is_empty() || failure.is_none() {
         let wrote = render_outcome(client, streams, "stop", FlockRows(procs)).await;
         if wrote != ExitCode::Success {
@@ -1877,12 +1296,10 @@ pub async fn stop(client: &Client, streams: &mut Streams<'_>, args: &SelectorArg
     failure.unwrap_or(ExitCode::Success)
 }
 
-/// Restarts the sheep matching `args.selector`.
+/// Restarts the sheep matching `args.selector`
 ///
-/// `paths` is here for one thing: a restart that names a dog is warned about
-/// BEFORE the request goes out, when the operator can still act on it. See
-/// [`dogs::warn_of_a_dog_a_restart_would_break`] for what it warns about and
-/// why nothing is refused.
+/// `paths` is here so a restart that names a dog is warned about before the
+/// request goes out. See [`dogs::warn_of_a_dog_a_restart_would_break`].
 pub async fn restart(
     client: &Client,
     streams: &mut Streams<'_>,
@@ -1892,15 +1309,10 @@ pub async fn restart(
     restart_within(client, streams, paths, args, dogs::VERSION_BUDGET).await
 }
 
-/// [`restart`], against a caller-chosen budget for the dog probe below.
+/// [`restart`], against a caller-chosen budget for the dog probe below
 ///
-/// Exists for the same reason `dogs::vet_binary_within` does. A test here
-/// asks whether the warning fires, in what order, and what it says. None of
-/// those are questions about how long a probe may take, but at the
-/// production budget they all became one: a busy machine makes the probe
-/// time out, a timed-out probe answers unknown, and unknown is deliberately
-/// silent, so the test fails saying no warning fired. That is a true
-/// statement about the runner and an empty one about shep.
+/// A timed-out probe answers unknown and unknown is silent, so at the
+/// production budget a busy machine turns a test's subject into thin air.
 pub async fn restart_within(
     client: &Client,
     streams: &mut Streams<'_>,
@@ -1912,8 +1324,7 @@ pub async fn restart_within(
         Ok(selectors) => selectors,
         Err(code) => return code,
     };
-    // Before `request_each`, deliberately, and this is the whole ordering
-    // the spec asks for: a warning that arrives after the restart is a
+    // Before `request_each`: a warning that arrives after the restart is a
     // description of a state the operator is already in.
     dogs::warn_of_a_dog_a_restart_would_break(streams, paths, &selectors, probe);
     let (procs, failure) = request_each(
@@ -1928,26 +1339,18 @@ pub async fn restart_within(
         },
     )
     .await;
-    // Named before `procs` is moved into the table below. A failed respawn
-    // reaches here as an ordinary `errored` row inside an `Ok`, because the
-    // daemon's aggregation reply for `Restart` has no per-id error slot
-    // (`shep-daemon/src/supervisor.rs`'s `respawn`, `Err` arm) -- the same
-    // gap that let `shep start <name>` exit 0 in silence.
+    // Named before `procs` is moved into the table below. The `Restart`
+    // reply has no per-id error slot, so a failed respawn reaches here as an
+    // ordinary `errored` row inside an `Ok`.
     let failed: Vec<String> = procs
         .iter()
         .filter(|info| info.status == shep_core::status::ProcStatus::Errored)
         .map(|info| info.name.clone())
         .collect();
 
-    // Stdout stays empty on a failure, exactly as `start`'s own failure path
-    // and every other verb's do -- `cli_e2e`'s `assert_json_error` pins that
-    // discipline crate-wide, and under `--format json` printing a data
-    // envelope AND an error envelope would hand a consumer two answers to
-    // one question. The cost is real and taken deliberately: a `restart all`
-    // where one of ten fails no longer lists the nine that came back, and
-    // the operator reads them from `shep flock`. Consistency across verbs is
-    // worth more here than this verb keeping its table on the one path where
-    // it has bad news to deliver.
+    // Stdout stays empty on a failure, as every verb's failure path does.
+    // The cost is that a `restart all` where one of ten fails lists none of
+    // the nine that came back.
     if (!procs.is_empty() || failure.is_none()) && failed.is_empty() {
         let wrote = render_outcome(client, streams, "restart", FlockRows(procs)).await;
         if wrote != ExitCode::Success {
@@ -1968,15 +1371,11 @@ pub async fn restart_within(
 }
 
 /// Reloads the sheep matching `args.selector`, replacing each instance with
-/// a fresh one so the app has a window in which it can hand over.
+/// a fresh one so the app has a window in which it can hand over
 ///
-/// Sends `Request::Reload` with the client's default deadline, exactly as
-/// `stop`/`restart`/`delete` do, and for a reason particular to this verb: the
-/// daemon answers as soon as the reload is ACCEPTED rather than when the swaps
-/// finish (see `Response::Reloading`), so a longer deadline would buy nothing
-/// — the answer is already back long before the first swap commits. The rows
-/// printed are the flock as it stood at acceptance, and the swaps report
-/// themselves on the bus.
+/// The client's default deadline, as `stop`/`restart`/`delete` use: the
+/// daemon answers when the reload is accepted, not when the swaps finish.
+/// The rows printed are the flock as it stood at acceptance.
 pub async fn reload(client: &Client, streams: &mut Streams<'_>, args: &SelectorArgs) -> ExitCode {
     let selectors = match parse_selectors(streams, &args.selectors) {
         Ok(selectors) => selectors,
@@ -1994,7 +1393,7 @@ pub async fn reload(client: &Client, streams: &mut Streams<'_>, args: &SelectorA
         },
     )
     .await;
-    // See `start`'s own note: printed whenever the verb did its work.
+    // Printed whenever the verb did its work; see `load`.
     if !procs.is_empty() || failure.is_none() {
         let wrote = render_outcome(client, streams, "reload", FlockRows(procs)).await;
         if wrote != ExitCode::Success {
@@ -2022,14 +1421,12 @@ pub async fn delete(client: &Client, streams: &mut Streams<'_>, args: &SelectorA
         },
     )
     .await;
-    // See `start`'s own note: printed whenever the verb did its work. The
-    // aside below is guarded separately -- there is nothing to name when
-    // nothing was deleted.
+    // Printed whenever the verb did its work; see `load`. The aside below is
+    // guarded separately: there is nothing to name when nothing was deleted.
     if !ids.is_empty() || failure.is_none() {
-        // The listing this prints no longer holds what was deleted, so the
-        // ids go to stderr rather than being lost. Named as ids and not as
-        // names because ids are all `Response::Deleted` carries, and inventing
-        // the names would need a second listing taken before the delete.
+        // The listing this prints does not hold what was deleted, so the
+        // ids go to stderr. Ids and not names: ids are all
+        // `Response::Deleted` carries.
         let count = ids.len();
         let listed = ids
             .iter()
@@ -2052,14 +1449,11 @@ pub async fn delete(client: &Client, streams: &mut Streams<'_>, args: &SelectorA
 }
 
 /// Sets `args.name`'s instance count (the stocking rate), and renders the
-/// instances that remain.
+/// instances that remain
 ///
-/// No `parse_selector` call, unlike every other verb in this module: `stock`
-/// takes a name. See [`StockArgs`]'s own doc for why.
-///
-/// Sends `Request::Scale` with `START_DEADLINE`, not the client's default: a
-/// stock-up spawns processes, which is the same work `start` already asks
-/// for the longer budget to cover.
+/// No `parse_selector` call, unlike every other verb here: `stock` takes a
+/// name. `START_DEADLINE` rather than the client's default, since a stock-up
+/// spawns processes.
 pub async fn stock(client: &Client, streams: &mut Streams<'_>, args: &StockArgs) -> ExitCode {
     request_and_render(
         client,
@@ -2089,10 +1483,6 @@ mod tests {
     };
     use shep_core::protocol::RpcErrorCode;
 
-    /// Bare `shep start` with a Flockfile discovered by the caller must
-    /// start that file. The no-target-and-no-Flockfile case never reaches
-    /// here -- it brings a shepherd up and stops -- so the remaining hole
-    /// this guards is a `start` that ignored the discovery and refused.
     #[tokio::test]
     async fn a_discovered_flockfile_is_started_when_no_target_was_given() {
         let dir = tempfile::tempdir().unwrap();
@@ -2143,18 +1533,6 @@ mod tests {
         }
     }
 
-    /// The CLI answers `exists` from its own cwd and the daemon spawns from
-    /// a different one, so a relative script has to be absolutised before it
-    /// crosses. The maintainer hit this from `~`: `shep start ./GitHub/zeus/...` where
-    /// the file plainly existed, refused with `No such file or directory`
-    /// A Flockfile is a file you commit, so an app that names no `cwd` runs
-    /// where the Flockfile lives -- not where the daemon happened to be
-    /// started, which is invisible from the command line and effectively
-    /// arbitrary.
-    ///
-    /// Before this, the same committed file worked on the machine where the
-    /// shepherd was started in the right directory and failed on the next
-    /// one with `No such file or directory`, naming neither cause.
     #[test]
     fn a_flockfile_app_without_a_cwd_runs_where_the_flockfile_lives() {
         let dir = tempfile::tempdir().unwrap();
@@ -2168,9 +1546,8 @@ mod tests {
         let apps = resolve_target(flockfile.to_str().unwrap(), None, &[], false)
             .expect("the Flockfile parses");
 
-        // The same shape the app is given: canonical, and on Windows without
-        // the verbatim prefix, which the daemon would otherwise echo back in
-        // `shep describe`.
+        // Canonical and without the verbatim prefix, the shape the app is
+        // given.
         let canonical = std::fs::canonicalize(dir.path()).unwrap();
         let expected = shep_core::paths::strip_verbatim_prefix(&canonical).into_owned();
         assert_eq!(
@@ -2180,9 +1557,6 @@ mod tests {
         );
     }
 
-    /// Only a blank is filled. An app that states its own `cwd` keeps it,
-    /// because the operator said something and shep is not entitled to
-    /// overrule it.
     #[test]
     fn a_flockfile_app_that_sets_its_own_cwd_keeps_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -2199,7 +1573,6 @@ mod tests {
         assert_eq!(apps[0].cwd.as_deref(), Some("/srv/elsewhere"));
     }
 
-    /// because the shepherd's cwd was a checkout elsewhere.
     #[test]
     fn a_relative_script_is_resolved_against_the_callers_cwd() {
         let dir = tempfile::tempdir().unwrap();
@@ -2208,8 +1581,8 @@ mod tests {
         let script = nested.join("thing");
         std::fs::write(&script, b"#!/bin/sh\n").unwrap();
 
-        // Resolved from the tempdir, the way the CLI resolves from wherever
-        // the operator is standing.
+        // From the tempdir, the way the CLI resolves from where the
+        // operator stands.
         let previous = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
         let apps = resolve_target("./bin/thing", None, &[], false);
@@ -2230,12 +1603,7 @@ mod tests {
         assert_eq!(apps[0].name, "thing", "the name still comes from the stem");
     }
 
-    /// The first `Start` on the wire, skipping the flock lookup every `start`
-    /// now issues first.
-    ///
-    /// `start` consults the flock before treating a target as a path, because
-    /// a name the flock already has is that sheep rather than a new one. That
-    /// puts one `ListFlock` ahead of the request these tests are about.
+    /// The first envelope that is not a `ListFlock`.
     async fn next_start(
         envelopes: &mut tokio::sync::mpsc::Receiver<shep_core::protocol::Envelope>,
     ) -> shep_core::protocol::Envelope {
@@ -2262,20 +1630,12 @@ mod tests {
         }
     }
 
-    /// Covers `resolve_target`'s pure `-` arm only — `stdin` here is bytes
-    /// already read, handed straight in. The real `std::io::stdin()` read
-    /// inside `start` (this file's `if args.target == "-"` block) has no
-    /// injection seam and is a documented gap, not tested: swapping the
-    /// process's real fd 0 to feed it would race whatever other test
-    /// `cargo test`'s multi-threaded runner happens to run concurrently,
-    /// and reading the harness's own actual stdin blocks or EOFs depending
-    /// on how the suite was invoked — neither is a real assertion, and
-    /// inventing one that passes either way is worse than admitting the
-    /// gap.
+    /// Covers `resolve_target`'s pure `-` arm. The real `std::io::stdin()`
+    /// read inside `start` has no injection seam and is untested.
     #[test]
     fn a_dash_target_reads_a_flockfile_from_stdin_as_json() {
-        // `app`, not `apps` — the wire key is renamed and unknown keys are a
-        // hard error (flockfile.rs:23-32).
+        // `app`, not `apps`: the wire key is renamed and unknown keys are a
+        // hard error.
         let apps = resolve_target(
             "-",
             None,
@@ -2316,10 +1676,6 @@ mod tests {
         assert_eq!(apps[0].name, "api");
     }
 
-    /// fails if `.js` is ever routed to the node bridge without the flag —
-    /// the regression that would break `shep start server.js` for every
-    /// user who has ever typed it. Deliberately a sibling of
-    /// `any_other_existing_path_becomes_one_minimal_app_named_for_its_stem`.
     #[test]
     fn a_js_file_without_the_flag_is_still_a_script() {
         let dir = tempfile::tempdir().unwrap();
@@ -2331,7 +1687,6 @@ mod tests {
         assert_eq!(apps[0].script, path.to_str().unwrap());
     }
 
-    /// fails if `--flockfile` changes how a recognised extension is read.
     #[test]
     fn the_flag_does_not_change_a_toml_flockfile() {
         let dir = tempfile::tempdir().unwrap();
@@ -2342,9 +1697,8 @@ mod tests {
         assert_eq!(with, without);
     }
 
-    /// fails if an unreadable extension under the flag falls through to the
-    /// script arm instead of refusing — which would silently start the
-    /// operator's config file as a program.
+    /// Falling through to the script arm would start the operator's config
+    /// file as a program.
     #[test]
     fn the_flag_refuses_an_extension_it_cannot_read() {
         let dir = tempfile::tempdir().unwrap();
@@ -2355,16 +1709,11 @@ mod tests {
         assert_eq!(target_exit_code(&err), ExitCode::Usage);
     }
 
-    /// Returns `true` when node is on PATH. The `.js` cases below are the
-    /// only tests in the workspace that need a second runtime, and a machine
-    /// without node must not fail the suite.
+    /// Returns `true` when node is on PATH, so a machine without node does
+    /// not fail the suite
     ///
-    /// The `eprintln!` is not the guard: libtest captures the output of a
-    /// test that PASSES and prints it only on failure, so a skip is
-    /// invisible under a plain `cargo test` — which is exactly the host this
-    /// helper exists for. `SHEP_REQUIRE_NODE=1` is the guard. Set it on any
-    /// machine that has node (the task gate below does) and a broken helper
-    /// is a panic rather than a green run over three tests that never ran.
+    /// `SHEP_REQUIRE_NODE` turns a missing node into a failure. The
+    /// `eprintln!` alone is invisible under a passing test.
     fn node_available() -> bool {
         let ok = std::process::Command::new("node")
             .arg("--version")
@@ -2398,8 +1747,6 @@ mod tests {
         assert_eq!(apps[0].name, "web");
     }
 
-    /// fails if a throwing config is reported as anything but InvalidConfig,
-    /// or if node's own message is dropped on the floor.
     #[test]
     fn a_js_flockfile_that_throws_is_an_invalid_config_quoting_node() {
         if !node_available() {
@@ -2413,16 +1760,9 @@ mod tests {
         assert!(err.to_string().contains("sheep dip empty"), "got: {err}");
     }
 
-    /// fails if a config module that keeps node alive hangs shep, which is
-    /// exactly what one did until this budget existed. `setInterval` leaves a
-    /// handle on node's event loop, so node stays running long after `require`
-    /// returned and `module.exports` was assigned -- the same mechanism as the
-    /// server-at-require-time shape `docs/specs/deferred.md` named, without
-    /// binding a port to get it.
-    ///
-    /// The budget is 200ms rather than [`JS_EVAL_BUDGET`] so the test costs a
-    /// fifth of a second; what it pins is that the bound is enforced and says
-    /// so, not what the shipped bound is.
+    /// `setInterval` keeps node's event loop alive after `module.exports` is
+    /// assigned. 200ms rather than [`JS_EVAL_BUDGET`]: what this pins is that
+    /// the bound is enforced, not what the shipped bound is.
     #[test]
     fn a_js_flockfile_that_keeps_node_alive_is_killed_and_says_why() {
         if !node_available() {
@@ -2448,9 +1788,8 @@ mod tests {
         );
     }
 
-    /// fails if a pm2 ecosystem file is accepted, or if the refusal stops
-    /// naming the key the operator has to change. Decision 2: this feature
-    /// reads a Flockfile-shaped .js, and serde's own message is the answer.
+    /// The refusal has to name the key the operator changes; serde's own
+    /// message is the answer.
     #[test]
     fn a_pm2_ecosystem_shape_is_refused_naming_the_right_key() {
         if !node_available() {
@@ -2470,19 +1809,9 @@ mod tests {
         assert!(msg.contains("app"), "must name what was expected: {msg}");
     }
 
-    /// Drives the VERB, not `resolve_target`, so the assertion covers the
-    /// mapping as well as the resolution — and proves nothing reached the
-    /// wire. A `start` that shipped the unresolved string to the daemon and
-    /// let it fail would return `NotFound` after a round trip and fail both
-    /// assertions.
-    /// `shep start zeus-auth` on a sheep the flock already has must act on
-    /// that sheep, not look for a file called `zeus-auth`. A name is unique
-    /// across a flock, so a target naming one can never have meant "add
-    /// another" -- there is no room for a second.
-    ///
-    /// Armed through `fake_client_on` rather than the envelope-capturing
-    /// fixture, because the flock has to ANSWER for the lookup to find
-    /// anything, and only this one lets a test arm the reply.
+    /// Armed through `fake_client_on`: the flock has to answer for the
+    /// lookup to find anything, and only that fixture lets a test arm the
+    /// reply.
     #[tokio::test]
     async fn a_target_naming_a_stopped_sheep_is_acted_on_not_resolved_as_a_path() {
         use shep_client::testing::fake_client_on;
@@ -2514,9 +1843,7 @@ mod tests {
             .await
         };
 
-        // The path arms would have refused: there is no file called
-        // `zeus-auth` here. Anything other than a usage error means the
-        // lookup found the sheep and acted on it instead.
+        // The path arms would have refused: no file by that name exists here.
         assert_ne!(
             code,
             ExitCode::Usage,
@@ -2530,12 +1857,7 @@ mod tests {
     }
 
     /// The flock a `render_outcome` test hands the fake: two sheep the verb
-    /// did not touch, one it did, and a dog.
-    ///
-    /// The names are chosen so the narrow payload and the full listing cannot
-    /// be confused for one another: a test that asserted "the output mentions
-    /// koji" would pass on the one-row table this change replaces, so every
-    /// assertion below is on the exact SET of rows.
+    /// did not touch, one it did, and a dog
     fn a_flock_with_a_dog() -> Vec<shep_core::protocol::ProcessInfo> {
         use shep_core::protocol::{DogSource, ProcessInfo};
         use shep_core::status::ProcStatus;
@@ -2551,17 +1873,8 @@ mod tests {
         ]
     }
 
-    /// fails if a lifecycle verb prints only the rows it touched.
-    ///
-    /// `shep start koji` printed a one-row table containing koji. The question
-    /// after starting one app is "what does the flock look like now", which a
-    /// one-row table cannot answer.
-    ///
-    /// The narrow payload handed in is koji ALONE, and the armed listing has
-    /// four entries, so the two are distinguishable by row count as well as by
-    /// content -- a build that kept rendering the narrow payload prints one
-    /// row and fails on the first assertion rather than passing on a
-    /// coincidence of names.
+    /// The narrow payload is koji alone and the armed listing has four
+    /// entries, so the two differ by row count as well as by content.
     #[tokio::test]
     async fn a_lifecycle_verb_renders_the_whole_flock_as_a_table() {
         use shep_client::testing::fake_client_on;
@@ -2588,10 +1901,9 @@ mod tests {
 
         assert_eq!(code, ExitCode::Success);
         let printed = String::from_utf8(out).unwrap();
-        // Split at the caption rather than filtering the whole output: the two
-        // tables have different columns, so a NAME read from the wrong one is
-        // a different field. This is also what proves the dog is in the SECOND
-        // table and not merely somewhere on the page.
+        // Split at the caption rather than filtered: the two tables have
+        // different columns, so a name read from the wrong one is a
+        // different field.
         let (sheep, dogs) = printed
             .split_once("\nDogs\n")
             .unwrap_or_else(|| panic!("the dogs table needs its own caption: {printed}"));
@@ -2606,8 +1918,7 @@ mod tests {
             "every sheep, not only the one that was stopped, and no dog among \
              them: {printed}"
         );
-        // Column 1, not 0: the dogs table leads with ID now, exactly as the
-        // sheep table does.
+        // Column 1, not 0: the dogs table leads with ID.
         let dog_names: Vec<&str> = dogs
             .lines()
             .filter_map(|line| line.split_whitespace().nth(1))
@@ -2624,18 +1935,9 @@ mod tests {
         );
     }
 
-    /// fails if `--format json` is widened to the whole flock, or if it pays
-    /// for a listing it does not render.
-    ///
-    /// The machine surface answers a different question from the human one. A
-    /// script that runs `shep stop koji --format json` asked about koji and
-    /// reads `data[0]` to learn what it stopped; handing it four rows, three
-    /// of which it never asked about, breaks it silently.
-    ///
-    /// `list_flock_count` is the second half and is not decoration: it is what
-    /// proves the JSON path SKIPS the listing rather than fetching one and
-    /// discarding it. Without it a build that always asked and then chose what
-    /// to print would pass.
+    /// A script reads `data[0]` to learn what it stopped, so four rows break
+    /// it silently. `list_flock_count` proves the JSON path fetches no
+    /// listing rather than fetching one and discarding it.
     #[tokio::test]
     async fn the_json_surface_keeps_the_rows_the_verb_touched() {
         use shep_client::testing::fake_client_on;
@@ -2680,13 +1982,10 @@ mod tests {
         );
     }
 
-    /// A flock in which every tier of `start`'s precedence has something to
-    /// find, and each tier's answer is distinguishable from the others'.
-    ///
-    /// `golbat` and `koji` are in the fold `backed`; `rotom` is not in any
-    /// fold; `log-rotate` is a dog. The name `backed` is a fold and NOT a
-    /// sheep, which is the whole point: a build that only ever matched names
-    /// finds nothing for it.
+    /// A flock in which every tier of `start`'s precedence finds something
+    /// different: `golbat` and `koji` are in the fold `backed`, `rotom` is in
+    /// no fold, `log-rotate` is a dog, and `backed` is a fold and not a
+    /// sheep.
     fn a_foldable_flock() -> Vec<shep_core::protocol::ProcessInfo> {
         use shep_core::protocol::{DogSource, ProcessInfo};
         use shep_core::status::ProcStatus;
@@ -2704,8 +2003,7 @@ mod tests {
         ]
     }
 
-    /// The names `flock_matches` picks, so a case below reads as the rule it
-    /// is about rather than as a fold of `ProcessInfo` fields.
+    /// The names `flock_matches` picks for `target`.
     fn matched_names(target: &str) -> Vec<String> {
         let selector = ProcessSelector::parse(target).expect("the fixture uses valid selectors");
         flock_matches(&selector, &a_foldable_flock())
@@ -2715,13 +2013,7 @@ mod tests {
     }
 
     /// The precedence `StartArgs::targets`' own help states, one case per
-    /// tier, driven through the function that decides it.
-    ///
-    /// `shep stop fold:backed` already worked and `shep start fold:backed`
-    /// refused with "backed is not `-`, a recognised Flockfile, or an existing
-    /// path", because `start` took a different argument grammar from every
-    /// other lifecycle verb. Folds were actionable everywhere except the verb
-    /// that creates things.
+    /// tier.
     #[test]
     fn a_start_target_walks_the_precedence() {
         assert_eq!(
@@ -2746,11 +2038,9 @@ mod tests {
         );
     }
 
-    /// fails if a name that is BOTH a sheep and a fold resolves to the fold.
-    ///
-    /// The order is name before fold, and this is the only fixture that can
-    /// tell the two apart: `a_start_target_walks_the_precedence`'s `backed` is
-    /// a fold and not a sheep, so it would pass under either order.
+    /// The only fixture that can tell the two apart:
+    /// `a_start_target_walks_the_precedence`'s `backed` is a fold and not a
+    /// sheep, so it would pass under either order.
     #[test]
     fn a_sheep_outranks_a_fold_of_the_same_name() {
         use shep_core::protocol::ProcessInfo;
@@ -2770,14 +2060,8 @@ mod tests {
         assert_eq!(names, vec!["backed"], "the sheep, not the fold it names");
     }
 
-    /// fails if a wildcard sweeps up a dog.
-    ///
-    /// The same rule `ProcessSelector::is_exact` states for the daemon's own
-    /// matching: a dog is a process an operator installed, not a member of the
-    /// flock `all` means, so `shep start all` must pass it by while
-    /// `shep start log-rotate` still reaches it. The fold fallback counts as a
-    /// wildcard even though the token was a bare name, because the operator
-    /// named a group.
+    /// A dog is a process an operator installed, not a member of the flock
+    /// `all` means.
     #[test]
     fn a_wildcard_passes_a_dog_by_and_an_exact_name_reaches_it() {
         assert_eq!(
@@ -2792,14 +2076,9 @@ mod tests {
         );
     }
 
-    /// fails if `name:slot` is treated as a wildcard and so passes a dog by.
-    ///
-    /// `ProcessSelector::is_exact` counts `Instance` as exact, and this
-    /// function used to enumerate `Name` and `Id` and send everything else
-    /// through the dog-filtering tier. `shep start metrics:0` therefore
-    /// filtered the dog out, fell through every later tier, and reported that
-    /// no instance 0 of `metrics` was registered about a process that was.
-    /// `shep start metrics` reached it the whole time.
+    /// `ProcessSelector::is_exact` counts `Instance` as exact. Enumerating
+    /// `Name` and `Id` instead would send `metrics:0` through the
+    /// dog-filtering tier.
     #[test]
     fn an_instance_selector_reaches_a_dog() {
         use shep_core::protocol::{DogSource, ProcessInfo};
@@ -2823,19 +2102,9 @@ mod tests {
         assert_eq!(ids, vec![0], "the named slot, dog or not");
     }
 
-    /// fails if a token carrying a path separator is tried as a sheep or a
-    /// fold.
-    ///
-    /// This is the escape hatch, and it has to be a rule rather than a
-    /// coincidence: somebody whose fold shares a name with a file in the
-    /// current directory needs a way to say which they meant, and the
-    /// precedence alone gives them none. A sheep name may never contain a path
-    /// separator (`shep_core::config::normalize`), so `./backed` is always the
-    /// file.
-    ///
-    /// `/web/` is in the same case for the opposite reason: it is full of
-    /// slashes and is a regex, not a name, so the rule is on the PARSED form
-    /// rather than on the raw token.
+    /// The escape hatch for a fold that shares a name with a file in the
+    /// current directory. `/web/` is full of slashes and is a regex, so the
+    /// rule is on the parsed form rather than on the raw token.
     #[test]
     fn a_token_with_a_path_separator_is_never_a_name() {
         let path = ProcessSelector::parse("./backed").unwrap();
@@ -2852,14 +2121,8 @@ mod tests {
         );
     }
 
-    /// fails if `shep start fold:typo` reports that no FILE called `fold:typo`
-    /// is on disk.
-    ///
-    /// That was the error the maintainer actually hit, and it sent her looking for a file
-    /// she had never asked about. A token written unmistakably as a selector
-    /// is reported as one; a bare name or id carries no marker and may equally
-    /// have been meant as a filename, so it keeps the message that names every
-    /// tier.
+    /// A bare name or id carries no marker and may have meant a filename, so
+    /// it keeps the message that names every tier.
     #[test]
     fn a_selector_that_matched_nothing_is_reported_as_a_selector() {
         let miss = |target: &str, flock: &[shep_core::protocol::ProcessInfo]| {
@@ -2887,20 +2150,9 @@ mod tests {
         assert_eq!(miss("11", &empty), None, "and so may a bare id");
     }
 
-    /// fails if a name repeated NON-ADJACENTLY produces two respawns.
-    ///
-    /// `unique_names` compared each name against the previous one only, which
-    /// drops a duplicate solely when the two sit next to each other. That is
-    /// true of a name-sorted listing and NOT true of `start_one`'s Flockfile
-    /// and path arm, which builds its set from the resolved apps in the file's
-    /// own order. Two instances of one app listed either side of a third then
-    /// produced a second `Request::Restart` and restarted that app twice in
-    /// one invocation.
-    ///
-    /// The fixture is `web`, `api`, `web` precisely because a sorted one
-    /// cannot exhibit it: sorted, the two `web` rows are adjacent and the old
-    /// code was already correct. First-seen order is asserted too, since the
-    /// notice this feeds reads as a list.
+    /// The fixture is `web`, `api`, `web`: sorted, the two `web` rows would
+    /// be adjacent and comparing against the previous name alone would pass.
+    /// First-seen order is asserted too, since the notice reads as a list.
     #[test]
     fn unique_names_drops_a_duplicate_that_is_not_adjacent() {
         use shep_core::status::ProcStatus;
@@ -2918,16 +2170,8 @@ mod tests {
         );
     }
 
-    /// fails if `shep start all` calls a flock empty while it holds dogs.
-    ///
-    /// `flock_matches` passes a dog by for every wildcard, so `all` matching
-    /// nothing means there are no SHEEP. Reading that as an empty flock made
-    /// `shep start all` print "the flock is empty" on a machine where
-    /// `shep flock` was printing dog rows at the same moment, which is a
-    /// contradiction an operator has to reconcile on their own.
-    ///
-    /// Both halves in one case, because a build that always says "no sheep"
-    /// and a build that always says "empty" each pass one of them.
+    /// Both halves in one case: a build that always says "no sheep" and one
+    /// that always says "empty" each pass half of it.
     #[test]
     fn an_all_that_matched_nothing_counts_sheep_and_not_dogs() {
         use shep_core::protocol::{DogSource, ProcessInfo};
@@ -2956,14 +2200,8 @@ mod tests {
         );
     }
 
-    /// fails if `shep start fold:typo` exits anything but 3, or if it reaches
-    /// the daemon with a `Start`.
-    ///
-    /// Driven through the VERB rather than through `selector_miss`, because
-    /// the mapping from "matched nothing" to an exit code lives in `start_one`
-    /// and a unit test of the message alone cannot see it. Exit 3 is what
-    /// `shep stop fold:typo` already returns, which is the consistency this
-    /// whole change is about.
+    /// Driven through the verb rather than `selector_miss`: the mapping from
+    /// "matched nothing" to an exit code lives in `load_one`.
     #[tokio::test]
     async fn a_start_on_an_empty_fold_exits_not_found_without_a_start_request() {
         use shep_client::testing::fake_client_on;
@@ -3005,9 +2243,8 @@ mod tests {
         assert!(out.is_empty(), "stdout stays empty on a failure");
     }
 
-    /// A sheep that is already up is reported, never restarted. Someone who
-    /// typed `start` did not ask for their live service to be replaced, and
-    /// `restart` is right there.
+    /// Someone who typed `start` did not ask for their live service to be
+    /// replaced.
     #[tokio::test]
     async fn a_target_naming_a_running_sheep_leaves_it_alone() {
         use shep_client::testing::fake_client_on;
@@ -3048,11 +2285,10 @@ mod tests {
         );
     }
 
-    /// Three instances of one clustered app, stopped unless named in
-    /// `online`, the shape both respawn
-    /// bugs needed and the shape `a_foldable_flock` cannot show: every sheep
-    /// in it has a name of its own, so a selector naming a name and a
-    /// selector naming a row pick the same set there.
+    /// Three instances of one clustered app, stopped unless named in `online`
+    ///
+    /// The shape `a_foldable_flock` cannot show: there a name selector and a
+    /// row selector pick the same set.
     fn a_clustered_flock(online: &[u32]) -> Vec<ProcessInfo> {
         use shep_core::status::ProcStatus;
         (0..3)
@@ -3067,10 +2303,10 @@ mod tests {
             .collect()
     }
 
-    /// A fake that answers a `start` invocation end to end: the listing it
-    /// begins with, the respawns it decides on, the drift check, and the
-    /// second listing it renders from. `failing` names the ids to answer as
-    /// `errored`, which is how a spawn failure reaches this verb.
+    /// A fake that answers a `start` invocation end to end
+    ///
+    /// `failing` names the ids to answer as `errored`, which is how a spawn
+    /// failure reaches this verb.
     fn a_daemon_for(
         flock: Vec<ProcessInfo>,
         failing: &'static [u32],
@@ -3078,13 +2314,9 @@ mod tests {
         use shep_core::status::ProcStatus;
         move |request| match request {
             Request::ListFlock => Response::Flock(flock.clone()),
-            // One entry per app named, which is what `Response::Applied`
-            // promises and what the daemon really does: an app missing from
-            // that answer is indistinguishable from an app the daemon
-            // dropped. Every entry is a no-op, since these fixtures are
-            // about respawn selectors rather than about config -- but a
-            // fake allowed to send a reply the daemon cannot is a fake that
-            // can hide a real defect.
+            // One entry per app named, as `Response::Applied` promises.
+            // Every entry is a no-op: these fixtures are about respawn
+            // selectors.
             Request::ApplyConfig { apps, .. } => Response::Applied(
                 apps.iter()
                     .map(|app| {
@@ -3094,9 +2326,9 @@ mod tests {
             ),
             Request::Restart { selector } => {
                 let SelectorSpec::Id(id) = selector else {
-                    // Never reached by a correct build, and asserted on
-                    // directly below -- answered rather than panicked so the
-                    // assertion that names the bug is the one that fails.
+                    // Never reached by a correct build. Answered rather than
+                    // panicked, so the assertion naming the bug is the one
+                    // that fails.
                     return Response::Restarted(Vec::new());
                 };
                 let status = if failing.contains(id) {
@@ -3151,15 +2383,8 @@ mod tests {
         )
     }
 
-    /// fails if `shep start 0` respawns anything but id 0.
-    ///
-    /// The maintainer's own flock: ten instances of `zam`, all stopped, and
-    /// `shep start 0` brought all ten back. `resume_all` collapsed the rows
-    /// it matched to their distinct NAMES before sending, and a name selector
-    /// reaches every instance the name has. `Id` is the only selector form
-    /// that can name a subset of one name's rows, so it was the only form the
-    /// collapse could widen -- and it is exactly the form an operator reaches
-    /// for to name one instance of a clustered app.
+    /// Collapsing matched rows to distinct names would widen the request:
+    /// `Id` is the only selector form that names a subset of one name's rows.
     #[tokio::test]
     async fn a_start_by_id_respawns_that_row_and_no_other() {
         use shep_client::testing::fake_client_answering;
@@ -3179,18 +2404,9 @@ mod tests {
         );
     }
 
-    /// fails if a Flockfile load does not apply itself to an app the flock
-    /// already has.
-    ///
-    /// The defect: an operator edits the file, re-runs `shep start`, and the
-    /// app keeps running the old config. `Request::Start` on a name the
-    /// flock already has adds instances rather than reconciling, so the edit
-    /// was not applied -- and, before `Request::ConfigDrift`, not reported
-    /// either.
-    ///
-    /// Asserts on the DECLARED key set as well as the name, because the set
-    /// is what a merge keys on: a build that sent the config with an empty
-    /// set would put the same envelope on the wire and apply nothing.
+    /// Asserts on the declared key set as well as the name, because that is
+    /// what a merge keys on: an empty set puts the same envelope on the wire
+    /// and applies nothing.
     #[tokio::test]
     async fn a_flockfile_load_applies_its_declared_keys_to_an_app_the_flock_has() {
         use shep_client::testing::fake_client_answering;
@@ -3231,9 +2447,7 @@ mod tests {
         );
     }
 
-    /// fails if `--reset=<mode>` does not reach the wire as the depth it
-    /// names. `reset_depth` is the only place that mapping happens, and
-    /// nothing else in this file would notice if it collapsed to `None`.
+    /// `reset_depth` is the only place that mapping happens.
     #[tokio::test]
     async fn reset_modes_choose_the_apply_config_depth_on_the_wire() {
         use shep_client::testing::fake_client_answering;
@@ -3274,9 +2488,7 @@ mod tests {
         assert_eq!(sent_depth(Some(ResetMode::All)).await, ResetDepth::All);
     }
 
-    /// fails if a reset flag is accepted when the target is a NAME. There is
-    /// no file to reset to, so the flag is meaningless and silently doing
-    /// nothing would be worse than refusing.
+    /// There is no file to reset to, so the flag is meaningless.
     #[tokio::test]
     async fn a_reset_flag_on_a_name_target_is_refused() {
         use shep_client::testing::fake_client_answering;
@@ -3299,9 +2511,8 @@ mod tests {
         );
     }
 
-    /// fails if a reset flag is accepted when the target is a bare script
-    /// path. The command line is not a template, so there is no file to
-    /// reset to and the flag would otherwise exit 0 having reset nothing.
+    /// The command line is not a template, so the flag would otherwise exit
+    /// 0 having reset nothing.
     #[tokio::test]
     async fn a_reset_flag_on_a_bare_script_target_is_refused() {
         use shep_client::testing::fake_client_answering;
@@ -3330,13 +2541,9 @@ mod tests {
         );
     }
 
-    /// fails if `shep start ./thing` applies config to a running `thing`.
-    ///
-    /// A bare script path is not a template. The command line supplied every
-    /// value in it, including a `cwd` of wherever the operator happened to be
-    /// standing, and applying that to a sheep the flock already has would
-    /// change a running app's directory because somebody restarted it from a
-    /// different terminal.
+    /// The command line supplied every value, including a `cwd` of wherever
+    /// the operator stood, so applying it would move a running app's
+    /// directory.
     #[tokio::test]
     async fn a_bare_script_target_applies_nothing() {
         use shep_client::testing::fake_client_answering;
@@ -3357,9 +2564,7 @@ mod tests {
         );
     }
 
-    /// fails if a pending field reaches an operator without the verb that
-    /// promotes it. A list of names nobody can act on is a report nobody can
-    /// use, and this is the one place the remedy is known.
+    /// A list of names nobody can act on is a report nobody can use.
     #[tokio::test]
     async fn a_load_names_the_verb_that_promotes_what_is_pending() {
         use shep_client::testing::fake_client_answering;
@@ -3398,21 +2603,8 @@ mod tests {
         );
     }
 
-    /// fails if a load that refused an app exits zero.
-    ///
-    /// The warning this replaced was advisory, so exiting zero was right for
-    /// it. A refusal is not advisory: it means some of the configuration the
-    /// operator declared did not land, and `shep start F.toml && deploy`
-    /// exiting zero on that tells CI to carry on. That is the silent-edit
-    /// failure this verb exists to fix, arriving through the report instead
-    /// of through the merge. `shep stock`'s partial scale-up is the same
-    /// shape and has returned non-zero since it shipped.
-    ///
-    /// Both apps are in one reply on purpose. A run where everything
-    /// refused could be made to pass by any rule that failed a load
-    /// wholesale; this asks the harder question, that one refusal among
-    /// successes still fails the verb, and that the app that DID apply is
-    /// still reported rather than swallowed by the failure.
+    /// Both apps are in one reply: one refusal among successes still fails
+    /// the verb, and the app that did apply is still reported.
     #[tokio::test]
     async fn a_load_that_refused_an_app_exits_non_zero_and_still_reports_the_rest() {
         use shep_client::testing::fake_client_answering;
@@ -3463,16 +2655,9 @@ mod tests {
         );
     }
 
-    /// fails if a load that failed for a reason other than a refusal exits
-    /// zero, or exits with the refusal's configuration code.
-    ///
-    /// Two claims in one case, and the second is why it is not folded into
-    /// the one above. A load whose answer this client cannot read means the
-    /// whole file went nowhere, which is worse than one refused app, so it
-    /// cannot be the path that still exits zero. And it is a daemon-side
-    /// fault rather than a bad file, so it takes the code its own class
-    /// already has -- `request_and_render` calls the identical case
-    /// `Internal` -- instead of being flattened into the refusal code.
+    /// A load whose answer this client cannot read means the whole file went
+    /// nowhere, and a daemon-side fault takes its own class's code rather
+    /// than the refusal's.
     #[tokio::test]
     async fn a_load_that_failed_for_another_reason_exits_with_its_own_class() {
         use shep_client::testing::fake_client_answering;
@@ -3486,9 +2671,8 @@ mod tests {
         .unwrap();
         let path = shep_client::testing::control_address(dir.path());
         let flock = a_clustered_flock(&[0, 1, 2]);
-        // `Pong` to an `ApplyConfig`: a daemon answering a verb with another
-        // verb's reply. `Response` is `#[non_exhaustive]`, so this is also
-        // the shape a daemon NEWER than this client produces.
+        // `Pong` to an `ApplyConfig`. `Response` is `#[non_exhaustive]`, so
+        // this is also the shape a newer daemon produces.
         let (client, _envelopes) = fake_client_answering(&path, move |request| match request {
             Request::ListFlock => Response::Flock(flock.clone()),
             _ => Response::Pong,
@@ -3508,9 +2692,6 @@ mod tests {
         );
     }
 
-    /// fails if an app a load did nothing to prints a line anyway. A deploy
-    /// re-runs the same unchanged file, and eleven no-op lines every time
-    /// would train an operator to stop reading the ones that matter.
     #[test]
     fn a_load_that_did_nothing_to_an_app_says_nothing_about_it() {
         let quiet = SheepApplied::new("zam", Vec::new(), Vec::new(), None);
@@ -3541,23 +2722,10 @@ mod tests {
         sent
     }
 
-    /// fails if the second deserialize `resolve_target` now runs can refuse
-    /// a document the first one accepted, in any of the four formats.
-    ///
-    /// `resolve_target` used to run `Flockfile::parse` and stop. It now goes
-    /// through `Flockfile::parse_declared`, which runs the same validating
-    /// parse and then deserializes the SAME source a second time into a
-    /// `serde_json::Value` to recover which keys the document literally
-    /// wrote. The signature did not change, so `shep runtime` and `shep dev`
-    /// gained that second pass without their call sites moving, and nothing
-    /// pinned that the two passes agree.
-    ///
-    /// They cannot disagree for JSON and JSON5, whose backends deserialize
-    /// into `Value` by construction, and should not for TOML and YAML --
-    /// but "should not" is an argument, and this is the test. One case per
-    /// format, each carrying a nested table (the probe) and a list, which
-    /// are the two shapes a generic value pass is most likely to handle
-    /// differently from a typed one.
+    /// `Flockfile::parse_declared` deserializes the source a second time
+    /// into a `serde_json::Value`. One case per format, each carrying a
+    /// nested table and a list, the two shapes a generic pass is most likely
+    /// to handle differently from a typed one.
     #[test]
     fn every_format_survives_the_second_deserialize_resolve_target_now_runs() {
         let dir = tempfile::tempdir().unwrap();
@@ -3587,8 +2755,7 @@ mod tests {
             std::fs::write(&path, source).unwrap();
             let target = path.to_str().unwrap();
 
-            // The validating pass alone, which is all `resolve_target` ran
-            // before this change: the baseline the second pass must not
+            // The validating pass alone, the baseline the second must not
             // narrow.
             let format = FlockFormat::from_path(&path).expect("a recognised extension");
             let first = Flockfile::parse(source, format).expect("the validating pass accepts it");
@@ -3614,22 +2781,9 @@ mod tests {
         }
     }
 
-    /// fails if bare `shep start` in a directory holding a Flockfile does
-    /// not apply that file to an app the flock already runs.
-    ///
-    /// The line this pins is naming a SHEEP versus reading a FLOCKFILE, and
-    /// NOT naming a file versus not naming one. Discovery counts as naming
-    /// it: a bare start already reads that file to decide what to run, so
-    /// applying it extends no trust the invocation had not extended already,
-    /// and `shep start` and `shep start Flockfile.toml` run in the same
-    /// directory against the same file must not differ in whether they
-    /// apply. Two commands that read the same document and start the same
-    /// apps behaving differently on config is a distinction no operator
-    /// would predict and none could remember.
-    ///
-    /// The route had nothing on it. Every other case here hands `start` a
-    /// target; this is the only one that reaches the apply through
-    /// `discovered`, which is the substitution at the top of `start_one`.
+    /// A bare start already reads the file to decide what to run, so it
+    /// extends no trust the invocation had not extended already. The only
+    /// case here that reaches the apply through `discovered`.
     #[tokio::test]
     async fn a_discovered_flockfile_applies_to_an_app_the_flock_already_has() {
         use shep_client::testing::fake_client_answering;
@@ -3681,21 +2835,10 @@ mod tests {
         );
     }
 
-    /// fails if `shep start <name>` reads a Flockfile.
-    ///
-    /// This is the security boundary the whole apply design rests on, and it
-    /// is a boundary rather than a preference: a Flockfile arrives from an
-    /// app's own repository, so whatever it says today is whatever the last
-    /// commit to that repository said. A routine `shep start web` and a CI
-    /// job that restarts a service must not apply it. A load is something
-    /// the operator asked for by naming a FILE, never a side effect of
-    /// starting a sheep by name.
-    ///
-    /// The Flockfile here declares the same app under a different script, so
-    /// a build that read it would have something to apply and would send it.
-    /// It is handed in as the DISCOVERED file, which is the closest a name
-    /// target ever comes to a document: an operator standing in the app's
-    /// own repository, typing the sheep's name.
+    /// A Flockfile arrives from an app's own repository, so a load is
+    /// something the operator asked for by naming a file. The Flockfile here
+    /// declares the same app under a different script, so a build that read
+    /// it would have something to send.
     #[tokio::test]
     async fn start_by_name_sends_no_apply_config_even_with_a_flockfile_present() {
         use shep_client::testing::fake_client_answering;
@@ -3708,8 +2851,8 @@ mod tests {
         )
         .unwrap();
         let path = shep_client::testing::control_address(dir.path());
-        // Every instance ONLINE, so the resume has nothing to respawn and
-        // the only requests this invocation can produce are the listings.
+        // Every instance online, so the only requests this invocation can
+        // produce are the listings.
         let (client, mut envelopes) =
             fake_client_answering(&path, a_daemon_for(a_clustered_flock(&[0, 1, 2]), &[])).await;
 
@@ -3739,15 +2882,8 @@ mod tests {
         );
     }
 
-    /// fails if `start` respawns a sheep it has just reported as already up.
-    ///
-    /// The same collapse, and the worse half of it: this one needs no `Id`
-    /// selector at all. `resume_all` partitions the rows it matched into live
-    /// and asleep precisely so that a live one is left alone -- and then sent
-    /// a NAME, which walks straight back over the row it had just set aside.
-    /// `shep start all` against a clustered app with one instance up
-    /// restarted that instance, which is the surprise `start` documents
-    /// itself as refusing to be clever about.
+    /// `resume_all` partitions matched rows into live and asleep. Sending a
+    /// name walks back over the row it just set aside, no `Id` needed.
     #[tokio::test]
     async fn a_start_never_respawns_a_row_that_was_already_up() {
         use shep_client::testing::fake_client_answering;
@@ -3769,14 +2905,8 @@ mod tests {
         assert!(said.contains("already"), "the live one is reported: {said}");
     }
 
-    /// fails if the notice for a single live row suggests a command wider
-    /// than the one the operator typed.
-    ///
-    /// `shep start 0` against a live instance answered "`shep restart zam`
-    /// replaces it", which replaces all ten. The suggestion has to be the
-    /// operator's own token whenever there is one; only a path or Flockfile
-    /// target, which is not a selector and cannot be quoted back, falls back
-    /// to the name.
+    /// `shep restart zam` for a `shep start 0` replaces every instance. Only
+    /// a path or Flockfile target falls back to the name.
     #[tokio::test]
     async fn the_already_up_notice_quotes_the_operators_own_token() {
         use shep_client::testing::fake_client_answering;
@@ -3799,14 +2929,6 @@ mod tests {
         );
     }
 
-    /// fails if one row failing to spawn abandons the rows after it.
-    ///
-    /// `request_each` states the discipline for every selector-taking verb --
-    /// attempt them all, report the FIRST failure -- because stopping early
-    /// leaves the operator guessing which of the rest were touched.
-    /// `resume_all` returned on the first failure instead, so one app in a
-    /// fold failing to come up left the fold's remaining apps down without a
-    /// word about them.
     #[tokio::test]
     async fn a_row_that_cannot_spawn_does_not_abandon_the_rows_after_it() {
         use shep_client::testing::fake_client_answering;
@@ -3840,14 +2962,8 @@ mod tests {
         );
     }
 
-    /// fails if a Flockfile naming a clustered app starts only one instance.
-    ///
-    /// This arm matched an app to the flock with a `find`, which takes the
-    /// FIRST row of a name and calls it the app. Harmless while respawns went
-    /// out per name -- the name reached the other instances anyway -- and a
-    /// silent halving the moment they go out per row. Both halves are here:
-    /// three rows respawned, and none of them skipped because the
-    /// representative happened to be the live one.
+    /// Both halves: three rows respawned, and none skipped because the
+    /// representative row happened to be the live one.
     #[tokio::test]
     async fn a_flockfile_naming_a_clustered_app_resumes_every_instance() {
         use shep_client::testing::fake_client_answering;
@@ -3901,16 +3017,9 @@ mod tests {
             .await
         };
         assert_eq!(code, ExitCode::Usage);
-        // NOTHING reaches the daemon. `./does-not-exist` carries a path
-        // separator, and a sheep name may never contain one
-        // (`shep_core::config::normalize`), so the token cannot be a sheep or
-        // a fold and `start` skips the flock lookup rather than asking a
-        // question whose answer it already knows. A target with no separator
-        // does ask -- `a_target_naming_a_stopped_sheep_is_acted_on_not_
-        // resolved_as_a_path` is the case that proves it.
-        //
-        // What must never reach the daemon either way is a `Start` carrying an
-        // app built from an unresolvable target.
+        // Nothing reaches the daemon: `./does-not-exist` carries a path
+        // separator, so `start` skips the flock lookup. A target with no
+        // separator does ask.
         assert!(
             envelopes.try_recv().is_err(),
             "a target that can only be a path costs no round trip, and an \
@@ -3919,32 +3028,19 @@ mod tests {
         assert!(String::from_utf8(err).unwrap().contains("./does-not-exist"));
     }
 
-    /// The client-side parse is the point: every selector-taking verb must
-    /// send a compiled `SelectorSpec` inside its OWN `Request` variant — not
-    /// the raw string, not `SelectorSpec::All`, and not another verb's
-    /// variant. Asserting the whole `sent.body` (not just the selector
-    /// inside it) is what catches a verb sending the wrong request kind:
-    /// the reviewer proved this reachable by mutating both `restart` and
-    /// `delete` to send `Request::Stop { selector }` and getting 9 passed,
-    /// 0 failed — because the previous version of this test only ever
-    /// drove `stop`. Also pins that all four call `request_and_render`
-    /// with `deadline: None` — visible on the wire as `DEFAULT_DEADLINE`,
-    /// since `Client::request_with_deadline` never leaves `deadline_ms`
-    /// unstated — and a verb that stopped doing so passed unnoticed before
-    /// this.
+    /// Every selector-taking verb must send a compiled `SelectorSpec` inside
+    /// its own `Request` variant
     ///
-    /// `reload` belongs in the same list and takes the same default despite
-    /// being the slowest thing this CLI can ask for: the daemon answers it
-    /// as soon as the reload is accepted, so the round trip is a short one
-    /// and a `START_DEADLINE`-sized budget here would be a claim about the
-    /// swaps that the reply never waits for anyway.
+    /// The whole `sent.body` is asserted, so a verb sending the wrong request
+    /// kind is caught. Also pins that all four pass `deadline: None`, visible
+    /// on the wire as `DEFAULT_DEADLINE`.
     #[tokio::test]
     async fn a_selector_reaches_the_wire_in_its_compiled_form() {
         let dir = tempfile::tempdir().unwrap();
         let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
-        // No `shep.toml` in this tempdir, so `restart`'s dog check finds
-        // nothing adopted and spawns nothing -- this test is about the wire.
+        // No `shep.toml` here, so `restart`'s dog check finds nothing
+        // adopted and spawns nothing.
         let paths = ShepPaths::resolve(&|_| None, dir.path());
 
         #[derive(Clone, Copy, Debug)]
@@ -3988,13 +3084,9 @@ mod tests {
                 };
                 let sent = envelopes.recv().await.unwrap();
                 assert_eq!(sent.body, expected_body, "verb={verb:?} input={input}");
-                // `request_and_render` is called with `deadline: None` for
-                // every verb here — `Client::request_with_deadline` never
-                // leaves that unstated on the wire — `request_with_deadline`
-                // fills in `DEFAULT_DEADLINE` — so the wire-level
-                // signal that the call site truly passed `None` (rather
-                // than some other explicit `Some(_)`) is the envelope
-                // carrying exactly that default.
+                // `request_with_deadline` fills in `DEFAULT_DEADLINE`, so
+                // an envelope carrying exactly that is the signal that the
+                // call site passed `None`.
                 assert_eq!(
                     sent.deadline_ms,
                     Some(u64::try_from(DEFAULT_DEADLINE.as_millis()).unwrap()),
@@ -4004,13 +3096,11 @@ mod tests {
         }
     }
 
-    /// Everything G12 row 5 needs to exist: a `$SHEP_HOME`, a dog binary
-    /// answering `--version` with `protocol`, and a `shep.toml` that has
-    /// adopted it under `name`.
+    /// A `$SHEP_HOME`, a dog binary answering `--version` with `protocol`,
+    /// and a `shep.toml` that has adopted it under `name`
     ///
-    /// Written through `ShepToml::adopt_dog`, the same writer `shep adopt`
-    /// uses, so a test dog is recorded exactly the way a real one is rather
-    /// than by a hand-built table that could drift from it.
+    /// Written through `ShepToml::adopt_dog`, so a test dog is recorded the
+    /// way `shep adopt` records a real one.
     fn adopted_dog(dir: &Path, name: &str, answer: &str) -> ShepPaths {
         let paths = ShepPaths::resolve(&|_| None, dir);
         let binary = dir.join(format!("shep-{name}"));
@@ -4028,8 +3118,8 @@ mod tests {
     }
 
     /// `"/[/"` is one of the only three inputs the selector grammar rejects.
-    /// A verb that skipped the client-side parse would send it and exit
-    /// `NotFound` instead.
+    /// A verb skipping the client-side parse would send it and exit
+    /// `NotFound`.
     #[tokio::test]
     async fn a_malformed_selector_exits_usage_without_a_round_trip() {
         let dir = tempfile::tempdir().unwrap();
@@ -4085,21 +3175,10 @@ mod tests {
         assert_eq!(code, ExitCode::NotFound);
     }
 
-    /// Bounded by `timeout` rather than left to run to completion: `start`
-    /// returns early with `ExitCode::Usage` whenever `resolve_target` fails
-    /// — before any request is built — so a regression that reintroduced
-    /// an early return here would otherwise hang this test forever on
-    /// `envelopes.recv()`, reporting a killed CI job rather than a named
-    /// assertion. Also asserts `sent.body`, not only `sent.deadline_ms` —
-    /// a `start` that sent the wrong request with the right deadline must
-    /// not pass.
-    ///
-    /// The fixture itself lives in this test's own tempdir rather than a
-    /// tracked file at the crate root: a tracked fixture's absence is what
-    /// caused the hang above, it depended on Cargo running test binaries
-    /// with CWD == package root, and a `.toml`-named fixture would not
-    /// substitute — that extension routes `resolve_target` into
-    /// `Flockfile::parse`, a different branch entirely.
+    /// Bounded by `timeout`: `start` returns early whenever `resolve_target`
+    /// fails, before any request is built, so a regression would hang on
+    /// `envelopes.recv()`. A `.toml` name would not substitute for the
+    /// fixture, since that extension routes into `Flockfile::parse`.
     #[tokio::test]
     async fn start_asks_for_the_longer_deadline() {
         let dir = tempfile::tempdir().unwrap();
@@ -4130,10 +3209,9 @@ mod tests {
             sent.deadline_ms,
             Some(u64::try_from(START_DEADLINE.as_millis()).unwrap())
         );
-        // `cwd` comes along now: a script started by path runs where the
-        // operator stood, not where the shepherd was spawned. The redacted
-        // `Debug` does not print it, so a mismatch here reads as two
-        // identical-looking values.
+        // `cwd` comes along: a script started by path runs where the
+        // operator stood. The redacted `Debug` does not print it, so a
+        // mismatch reads as two identical-looking values.
         let mut expected = AppConfig::minimal("srv", srv.to_str().unwrap());
         expected.cwd = std::env::current_dir()
             .ok()
@@ -4146,11 +3224,9 @@ mod tests {
         );
     }
 
-    /// `--fold` (the `if let Some(fold) = &args.fold` loop, this file's
-    /// `start`) is spec'd behaviour with, until now, no guard: deleting
-    /// that loop left every other test in this module green (9 passed).
-    /// Assert the fold actually lands on the `AppConfig` that reaches the
-    /// wire, not merely that `start` still exits `Success`.
+    /// The fold has to land on the `AppConfig` that reaches the wire:
+    /// deleting the `if let Some(fold)` loop leaves every other test here
+    /// green.
     #[tokio::test]
     async fn a_fold_flag_lands_on_the_resolved_app() {
         let dir = tempfile::tempdir().unwrap();
@@ -4181,12 +3257,8 @@ mod tests {
         }
     }
 
-    /// [`mapped_interpreter`]'s own extension grammar: matched with the
-    /// dot stripped, absent for a name with no extension, and absent for a
-    /// dotfile whose one dot leads rather than separates -- `Path::extension`
-    /// already reads `.bashrc` as extensionless, so a `[interpreters]` entry
-    /// keyed `""` (nobody would write one, but nothing stops them) still
-    /// cannot fire from here.
+    /// Matched with the dot stripped, absent for a name with no extension,
+    /// and absent for a dotfile whose one dot leads rather than separates.
     #[test]
     fn mapped_interpreter_reads_the_extension_without_its_dot() {
         let mut interpreters = BTreeMap::new();
@@ -4201,11 +3273,8 @@ mod tests {
         assert_eq!(mapped_interpreter("server.py", &interpreters), None);
     }
 
-    /// Task 47's precedence, layer 1: `shep.toml`'s `[interpreters]` mapping
-    /// fills a script's interpreter when nothing else already named one --
-    /// the exact gap that made `shep start server.js` fail with
-    /// `spawn_failed` before this task, the quick start `welcome.rs` and
-    /// `--help` both advertise.
+    /// Layer 1. Without it the quick start `welcome.rs` that `--help`
+    /// advertises fails with `spawn_failed`.
     #[tokio::test]
     async fn a_shep_toml_mapping_fills_an_unset_interpreter() {
         let dir = tempfile::tempdir().unwrap();
@@ -4243,12 +3312,7 @@ mod tests {
         }
     }
 
-    /// Task 47's precedence, layer 2: a Flockfile app's own `interpreter`
-    /// outranks the mapping, since it is the more specific statement about
-    /// this one app. Without this, an operator naming `bun` for one app in
-    /// a Flockfile would find shep.toml's `js -> node` overruling it, which
-    /// is exactly backwards for a mapping that is supposed to be a
-    /// fallback, not a policy.
+    /// Layer 2: the mapping is a fallback, not a policy.
     #[tokio::test]
     async fn a_flockfile_interpreter_outranks_the_shep_toml_mapping() {
         let dir = tempfile::tempdir().unwrap();
@@ -4290,9 +3354,7 @@ mod tests {
         }
     }
 
-    /// Task 47's precedence, layer 3: `--interpreter` outranks both the
-    /// mapping and a Flockfile's own field -- the top layer, for the
-    /// one-off override an operator types on the command line.
+    /// Layer 3, the one-off override typed on the command line.
     #[tokio::test]
     async fn the_interpreter_flag_outranks_a_flockfiles_own_field() {
         let dir = tempfile::tempdir().unwrap();
@@ -4329,9 +3391,6 @@ mod tests {
         }
     }
 
-    /// [`any_restart_failed`]'s own logic, isolated from the wire: `true`
-    /// only when at least one row is `errored`, matching
-    /// [`resume`]'s own doc for why an `Ok` reply can still mean failure.
     #[test]
     fn any_restart_failed_is_true_only_for_an_errored_row() {
         use shep_core::protocol::ProcessInfo;
@@ -4343,10 +3402,8 @@ mod tests {
         assert!(any_restart_failed(&[online, errored]));
     }
 
-    /// fails if the envelope carries anything but the name and the count. `stock`
-    /// is the one verb here that does NOT parse a selector, and a copy-pasted
-    /// `parse_selector` would turn `web` into `SelectorSpec::Name("web")` and send
-    /// a frame the daemon has no arm for.
+    /// `stock` parses no selector, and a copy-pasted `parse_selector` would
+    /// send a `SelectorSpec::Name("web")` frame the daemon has no arm for.
     #[tokio::test]
     async fn the_request_carries_the_app_name_and_the_count() {
         let dir = tempfile::tempdir().unwrap();
@@ -4380,9 +3437,8 @@ mod tests {
         );
     }
 
-    /// fails if an `InvalidConfig` refusal is swallowed or remapped. A count of 0
-    /// is the shape an operator will actually type, and it has to come back as
-    /// exit 4 with the daemon's own sentence, not as a generic failure.
+    /// A count of 0 is the shape an operator will type, and it has to come
+    /// back as exit 4 with the daemon's own sentence.
     #[tokio::test]
     async fn an_invalid_stock_exits_invalid_config_and_prints_the_reason() {
         let dir = tempfile::tempdir().unwrap();
@@ -4419,13 +3475,11 @@ mod tests {
         );
     }
 
-    /// A daemon that registers what it is asked to register: an `Add`
-    /// answers one `Stopped` row per app, and a `Start` one `Online` row.
+    /// A daemon that registers what it is asked to: an `Add` answers one
+    /// `Stopped` row per app, a `Start` one `Online` row
     ///
-    /// A `Start` is ANSWERED rather than refused on purpose. A build that
-    /// sent one from `shep add` should fail on the assertion that names the
-    /// request it sent, not on a transport error that says only that
-    /// something went wrong.
+    /// A `Start` is answered rather than refused, so a build that sent one
+    /// from `shep add` fails on the assertion naming the request.
     fn a_daemon_that_registers(
         flock: Vec<ProcessInfo>,
     ) -> impl Fn(&Request) -> Response + Send + 'static {
@@ -4454,12 +3508,10 @@ mod tests {
         }
     }
 
-    /// Every request body an invocation put on the wire, in order.
+    /// Every request body an invocation put on the wire, in order
     ///
-    /// One drain rather than a helper per request kind, unlike `applies` and
-    /// `respawns` above: a channel can only be emptied once, and every
-    /// assertion below is about what was sent AND what was not, which two
-    /// separate drains could not both see.
+    /// One drain rather than a helper per request kind: a channel can only be
+    /// emptied once.
     fn sent(
         envelopes: &mut tokio::sync::mpsc::UnboundedReceiver<shep_core::protocol::Envelope>,
     ) -> Vec<Request> {
@@ -4491,11 +3543,8 @@ mod tests {
         )
     }
 
-    /// fails if `shep add` spawns the app it just registered.
-    ///
-    /// The whole of the verb, and the assertion that no `Start` was sent is
-    /// the half that matters: `add` and `start` are one code path, so the
-    /// failure this guards is not a missing feature but a mode that leaked.
+    /// `add` and `start` are one code path, so this guards a mode that
+    /// leaked rather than a missing feature.
     #[tokio::test]
     async fn add_registers_a_fresh_app_and_sends_no_start() {
         let dir = tempfile::tempdir().unwrap();
@@ -4527,13 +3576,9 @@ mod tests {
         );
     }
 
-    /// fails if `shep add` leaves a fresh app with no established key set.
-    ///
-    /// The load that follows the registration is not bookkeeping: `add`
-    /// exists so an operator can fill in the empty `env` keys a template
-    /// shipped, and a key nothing established is one the NEXT load of that
-    /// same template overwrites. Without this the pattern the verb was built
-    /// for breaks on the second load rather than the first.
+    /// `add` exists so an operator can fill in the empty `env` keys a
+    /// template shipped, and a key nothing established is one the next load
+    /// overwrites.
     #[tokio::test]
     async fn add_establishes_the_keys_the_template_declared() {
         let dir = tempfile::tempdir().unwrap();
@@ -4565,12 +3610,8 @@ mod tests {
         );
     }
 
-    /// fails if `shep add` restarts an app the flock already has.
-    ///
-    /// Re-running a template after editing it is the ordinary thing to do,
-    /// so the file's new keys have to be merged in -- and the running child
-    /// has to survive it. A config load that killed a process is the one
-    /// outcome this design forbids outright.
+    /// Re-running a template after editing it is ordinary, so the file's new
+    /// keys merge in and the running child survives it.
     #[tokio::test]
     async fn add_merges_into_a_running_app_without_replacing_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -4603,12 +3644,8 @@ mod tests {
         );
     }
 
-    /// fails if `shep add <name>` reads a file or registers anything.
-    ///
-    /// A name target reads no Flockfile -- the security boundary the apply
-    /// design rests on, and `add` sits behind the same one. What is left for
-    /// the verb to do is nothing at all, so the one thing it owes the
-    /// operator is saying so.
+    /// A name target reads no Flockfile, and `add` sits behind that same
+    /// boundary. Nothing is left for the verb to do but say so.
     #[tokio::test]
     async fn add_by_name_registers_nothing_and_says_so() {
         let dir = tempfile::tempdir().unwrap();
@@ -4636,49 +3673,31 @@ mod tests {
         );
     }
 
-    /// Wall-clock tests, skipped by every CI job but the serial `slow` one.
+    /// Wall-clock tests, skipped by every CI job but the serial `slow` one
     ///
-    /// Two kinds live here now. The `restart` cases below ask a dog's binary
-    /// on disk what protocol it speaks, which means a real fork, exec and
-    /// exit inside `commands::dogs`'s one-second budget; a probe that runs
-    /// out of budget answers "unknown", and unknown is deliberately silent,
-    /// so contention turns those tests' subject into thin air rather than
-    /// into a failure with a cause in it. Measured 2026-08-31 on this
-    /// machine: a `/bin/sh` probe takes single-digit milliseconds idle,
-    /// 180-300ms alongside the ordinary suite, and over a second at
-    /// `--test-threads=64`. The product behaviour under that load is right
-    /// -- a busy machine loses the warning and still performs the restart --
-    /// but a test cannot assert it.
-    ///
-    /// The node case needs a real node to START AND EXIT inside the budget,
-    /// which is a claim about how fast the machine is rather than about shep.
-    /// At 200ms it failed on four CI runners at once (arm, macos, musl and
-    /// the coverage job) while passing every local run: node took longer than
-    /// that to come up, so the run hit the deadline still running and shep
-    /// reported the kill it really had performed. The tier exists for exactly
-    /// this, and the budget here is 20s: a stalled read waits out whatever
-    /// is left of it, so the budget IS what the test costs. Raised from 5s
-    /// on 2026-08-31 after four CI failures, and the twenty seconds it now
-    /// spends every run is the price of a red board that means something.
-    /// See `HELD_PIPE_BUDGET` below for both ends of the number.
+    /// The `restart` cases fork and exec a dog's binary inside a budget. A
+    /// probe that runs out of budget answers unknown, and unknown is silent,
+    /// so contention turns their subject into thin air. A `/bin/sh` probe
+    /// takes single-digit milliseconds idle and over a second at
+    /// `--test-threads=64`. The node case needs a real node to start and
+    /// exit inside the budget, which is a claim about the machine.
+    /// The node case climbs a ladder of budgets: the pipe wait spends the
+    /// whole budget, so one number cannot be both cheap and enough. See
+    /// `BUDGETS`.
     mod slow {
-        /// A probe budget no contention can exhaust.
+        /// A probe budget no contention can exhaust
         ///
-        /// These tests ask whether the warning fires, in what order, and
-        /// what it says. At the production budget they were also asking how
-        /// busy the machine was, because a probe that times out answers
-        /// unknown and unknown is silent by design, so a loaded runner made
-        /// them fail reporting no warning. Thirty seconds is not a claim
-        /// about how long a probe should take; it is far enough above this
-        /// suite's contention that timing stops being one of the variables.
+        /// Not a claim about how long a probe should take: far enough above
+        /// this suite's contention that timing stops being a variable.
         const PROBE_BUDGET: Duration = Duration::from_secs(30);
 
         use super::*;
 
-        /// A shepherd that restarts whatever it is asked to and lists an empty
-        /// flock afterwards -- enough for `restart` to run to the end and print
-        /// its receipt, so a test asserting that stderr is EMPTY is asserting
-        /// about the dog check and not about a reply the CLI could not read.
+        /// A shepherd that restarts whatever it is asked to and lists an
+        /// empty flock afterwards
+        ///
+        /// Enough for `restart` to reach the end, so a test asserting an
+        /// empty stderr is asserting about the dog check.
         #[cfg(unix)]
         fn answering_a_restart(request: &Request) -> Response {
             match request {
@@ -4687,8 +3706,8 @@ mod tests {
             }
         }
 
-        /// The answer a dog gives when its binary was built against a protocol
-        /// this shep does not speak -- G12 row 5's binary on disk.
+        /// The answer a dog gives when its binary was built against a
+        /// protocol this shep does not speak
         #[cfg(unix)]
         fn stale_answer() -> String {
             format!(
@@ -4697,36 +3716,12 @@ mod tests {
             )
         }
 
-        /// fails if the warning about a dog whose disk binary cannot talk to
-        /// this shepherd arrives after the restart that acts on it. The whole
-        /// point of row 5 is that the operator can still do something at this
-        /// moment and cannot afterwards, so a warning printed after the request
-        /// is a description of a state they are already in.
-        ///
-        /// The ordering is read off stderr rather than off a clock. The
-        /// shepherd here refuses the restart, so its refusal lands on the same
-        /// stream as the warning, and the two offsets say which ran first --
-        /// the same path-shaped signal `dogs.rs`'s
-        /// `a_name_collision_is_refused_before_vet_binary_ever_runs` uses, for
-        /// the same reason: there is no timing here to race.
-        ///
-        /// Mutation check: moving the `warn_of_a_dog_a_restart_would_break`
-        /// call below `request_each` reddens this on the offsets, with both
-        /// messages still present.
-        // Unix only, and not because the behaviour is. The warning path is
-        // platform-neutral: it reads a config, spawns a probe, compares two
-        // numbers. The FIXTURE is not. `adopted_dog` writes a `#!/bin/sh`
-        // script, which Windows cannot execute, so the probe fails there and
-        // answers unknown.
-        //
-        // That is worse than a failure for three of these. A probe that
-        // answers unknown is deliberately silent, so the three
-        // `restarts_in_silence` tests PASSED on Windows by way of the
-        // fixture never running, which is the definition of a vacuous test.
-        // Only the two that require a warning failed and made the problem
-        // visible. Gating all of them says what is true: this fixture is a
-        // shell script, so these tests are about unix until somebody writes
-        // a portable fake dog.
+        /// The ordering is read off stderr rather than off a clock: the
+        /// shepherd refuses the restart, so its refusal lands on the same
+        /// stream as the warning and the two offsets say which ran first.
+        // Unix only because of the fixture: `adopted_dog` writes a
+        // `#!/bin/sh` script, so on Windows the probe answers unknown and the
+        // three `restarts_in_silence` tests would pass vacuously.
         #[cfg(unix)]
         #[tokio::test]
         async fn a_dog_whose_disk_binary_cannot_connect_is_warned_about_before_the_restart() {
@@ -4764,13 +3759,8 @@ mod tests {
             );
         }
 
-        /// fails if the warning does not carry both numbers and both ways out
-        /// of row 5. G12 gives that row two fixes and picks neither -- the
-        /// operator knows which of the two they meant -- so the message names
-        /// both and tells them what the restart just did.
-        ///
-        /// Mutation check: dropping either clause from the message reddens
-        /// this.
+        /// The operator knows which of the two fixes they meant, so the
+        /// message names both and tells them what the restart just did.
         #[cfg(unix)]
         #[tokio::test]
         async fn the_restart_warning_names_both_numbers_and_both_ways_out() {
@@ -4811,13 +3801,8 @@ mod tests {
             );
         }
 
-        /// fails if an ordinary restart of a healthy dog says anything at all.
-        /// This is the case every restart of every working flock is in, so a
-        /// line here is a line an operator learns to skip, and the one warning
-        /// that matters goes with it.
-        ///
-        /// Mutation check: warning on any answer rather than on a protocol this
-        /// shep does not speak reddens this.
+        /// Every restart of every working flock is in this case, so a line
+        /// here is a line an operator learns to skip.
         #[cfg(unix)]
         #[tokio::test]
         async fn a_dog_whose_disk_binary_is_current_restarts_in_silence() {
@@ -4863,15 +3848,8 @@ mod tests {
             );
         }
 
-        /// fails if a dog that answers nothing is warned about. Every dog that
-        /// existed when the `--version` contract was written is in this state,
-        /// and `docs/dogs.md` promises that not answering is never held against
-        /// one. Unknown is not stale: it is the state `adopt` records, and the
-        /// silence here is what reads it.
-        ///
-        /// Mutation check: treating an unreadable answer as a mismatch -- for
-        /// instance warning whenever the disk protocol is not exactly
-        /// `PROTOCOL_VERSION`, `None` included -- reddens this.
+        /// `docs/dogs.md` promises that not answering is never held against
+        /// a dog. Unknown is not stale: it is the state `adopt` records.
         #[cfg(unix)]
         #[tokio::test]
         async fn a_dog_that_answers_nothing_restarts_in_silence() {
@@ -4917,17 +3895,9 @@ mod tests {
             );
         }
 
-        /// fails if a dog that answers a version but names no protocol is
-        /// warned about. It is the second shape of unknown, and it reaches a
-        /// different line from the dog that answers nothing at all: there IS an
-        /// answer here, it just does not say. `docs/dogs.md` puts both in the
-        /// same place -- "its protocol is simply unknown" -- and a shep that
-        /// guessed a number for the missing line would be warning on its own
-        /// guess.
-        ///
-        /// Mutation check: reading a missing protocol as some sentinel number
-        /// (`answer.protocol.unwrap_or(0)`) reddens this, and leaves the dog
-        /// that answers nothing at all green -- that one never gets this far.
+        /// The second shape of unknown, reaching a different line from the
+        /// dog that answers nothing at all: there is an answer here, it just
+        /// does not say.
         #[cfg(unix)]
         #[tokio::test]
         async fn a_dog_that_names_no_protocol_restarts_in_silence() {
@@ -4969,16 +3939,10 @@ mod tests {
             );
         }
 
-        /// fails if a built-in dog is probed. It cannot be stale on disk: the
-        /// shepherd runs `metrics` and `bark` as `<its own binary> dog <name>`,
-        /// so a built-in dog's binary IS the shepherd's and there is no second
-        /// thing to drift. The config here has a stale adopted dog in it as
-        /// well, so the silence is about this name rather than about an empty
-        /// `adopted_dogs`.
-        ///
-        /// Mutation check: making the lookup fall back to any adopted path when
-        /// the name is not in `adopted_dogs` reddens this, and leaves every
-        /// other test in this group green.
+        /// A built-in dog's binary is the shepherd's own, so there is no
+        /// second thing to drift. The config here has a stale adopted dog in
+        /// it too, so the silence is about this name rather than about an
+        /// empty `adopted_dogs`.
         #[cfg(unix)]
         #[tokio::test]
         async fn a_built_in_dog_is_never_asked_what_its_binary_speaks() {
@@ -5024,11 +3988,24 @@ mod tests {
             );
         }
 
-        /// fails if a module that leaves a process on node's stdout is
-        /// reported as a module shep killed. node itself exits here:
-        /// `detached` plus `unref` takes the child off node's event loop, and
-        /// `stdio: inherit` hands it the pipes shep is reading, so the wait
-        /// ends on its own and only the reads run out of budget.
+        /// A module that exports its config and leaves a detached node
+        /// holding the pipes shep reads. The holder outlives `budget`
+        /// threefold, or the reads would finish and the case pass for the
+        /// wrong reason.
+        fn held_pipe_module(budget: Duration) -> String {
+            format!(
+                "require('child_process')\
+                 .spawn(process.execPath, ['-e', 'setTimeout(()=>{{}},{})'], \
+                 {{ detached: true, stdio: 'inherit' }})\
+                 .unref(); \
+                 module.exports = {{ app: [] }};",
+                (budget * 3).as_millis()
+            )
+        }
+
+        /// node itself exits here: `detached` plus `unref` takes the child
+        /// off node's event loop, and `stdio: inherit` hands it the pipes
+        /// shep is reading, so only the reads run out of budget.
         #[test]
         fn a_js_flockfile_leaving_a_process_on_the_pipe_says_that_instead() {
             if !node_available() {
@@ -5036,47 +4013,41 @@ mod tests {
             }
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("flock.js");
-            std::fs::write(
-                &path,
-                // The pipe-holder is a second node, not `sleep`: node exists
-                // wherever this test runs (it gated on node_available above),
-                // while `sleep` on a Windows runner is Git Bash's, and twice
-                // on CI the parent node sat out the whole 5s budget with it.
-                "require('child_process')\
-                 .spawn(process.execPath, ['-e', 'setTimeout(()=>{},30000)'], \
-                 { detached: true, stdio: 'inherit' })\
-                 .unref(); \
-                 module.exports = { app: [] };",
-            )
-            .unwrap();
 
-            // Twenty seconds, and both ends of that are load-bearing.
-            //
-            // The floor: five seconds was the budget until 2026-08-31 and it
-            // failed on CI four times, twice noted in the comment above and
-            // twice more on `slow (windows-latest)`. The slowest observed
-            // run took 11.41s. This is not a claim about shep, it is a claim
-            // about how long a shared runner takes to start a node process
-            // and notice a held pipe, so it wants headroom rather than
-            // precision.
-            //
-            // The ceiling: the pipe-holder above lives 30 seconds. A budget
-            // at or past that would let the child exit on its own, and the
-            // case would pass for the wrong reason.
-            const HELD_PIPE_BUDGET: Duration = Duration::from_secs(20);
+            // A ladder, not one number: `run_bounded` waits for node and then
+            // spends the rest on the held pipe, so the budget is this case's
+            // runtime. A `Killed` verdict is read as a slow machine and retried
+            // with more room; the last rung falls through.
+            const BUDGETS: [Duration; 3] = [
+                Duration::from_secs(5),
+                Duration::from_secs(20),
+                Duration::from_secs(80),
+            ];
 
-            let err = evaluate_js_flockfile(&path, HELD_PIPE_BUDGET).unwrap_err();
+            for (attempt, budget) in BUDGETS.iter().copied().enumerate() {
+                std::fs::write(&path, held_pipe_module(budget)).unwrap();
+                let err = evaluate_js_flockfile(&path, budget).unwrap_err();
+                let message = err.to_string();
 
-            assert_eq!(target_exit_code(&err), ExitCode::InvalidConfig);
-            let message = err.to_string();
-            assert!(
-                message.contains("left behind still holds the output"),
-                "got: {message}"
-            );
-            assert!(
-                !message.contains("killed"),
-                "node exited on its own, so nothing was killed: {message}"
-            );
+                // node never got as far as exiting, so there was nothing
+                // holding a pipe yet to say anything about. Give it more
+                // room. The last rung falls through instead, so a machine
+                // that cannot do it in 80s fails with the message it earned.
+                if message.contains("still running") && attempt + 1 < BUDGETS.len() {
+                    continue;
+                }
+
+                assert_eq!(target_exit_code(&err), ExitCode::InvalidConfig);
+                assert!(
+                    message.contains("left behind still holds the output"),
+                    "got: {message}"
+                );
+                assert!(
+                    !message.contains("killed"),
+                    "node exited on its own, so nothing was killed: {message}"
+                );
+                return;
+            }
         }
     }
 }

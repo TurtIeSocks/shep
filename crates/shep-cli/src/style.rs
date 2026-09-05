@@ -5,24 +5,15 @@ use std::fmt;
 
 /// How much shep dresses up its output.
 ///
-/// One dial rather than three switches. Colour, boxes and sheep are not
-/// independent tastes in practice: someone who wants the sheep gone usually
-/// wants a calmer table, and someone who wants today's output wants all of
-/// it gone. `NO_COLOR` remains orthogonal because it is a cross-ecosystem
-/// convention about colour alone, not about layout.
+/// One dial, not three switches: colour, boxes and sheep are not independent
+/// tastes in practice. `NO_COLOR` stays orthogonal, being a convention about
+/// colour alone.
 ///
-/// `clap::ValueEnum` so `--style` and this type's own [`Self::parse`] agree
-/// on spelling by construction: clap's derive and `parse` both lowercase the
-/// variant name, so `full`/`plain`/`bare` is the one grammar -- but it is
-/// [`Self::parse`] alone that reads it for both of the two free-form text
-/// sources, `$SHEP_STYLE` (`lib.rs`'s `resolve_style`, through
-/// [`resolve`]) and `shep.toml`'s `[style] level` (`lib.rs`'s
-/// `style_from_config`). The flag goes through clap's own parser instead,
-/// because clap owns argv. `[style] level` used to go through
-/// [`clap::ValueEnum::from_str`] as well -- a second parser for the same
-/// grammar that happened to agree on case but not on whitespace, since
-/// `from_str` does not trim: `SHEP_STYLE=" full "` resolved and
-/// `level = " full "` silently did not. One grammar, one parser, now.
+/// `clap::ValueEnum` so `--style` and [`Self::parse`] agree on spelling by
+/// construction. [`Self::parse`] alone reads the two free-form sources,
+/// `$SHEP_STYLE` and `shep.toml`'s `[style] level`, and trims them; clap's
+/// own parser does not trim, so routing `[style] level` through it once let
+/// `level = " full "` fail silently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum StyleLevel {
     /// Sheep, boxes and colour.
@@ -37,24 +28,16 @@ pub(crate) enum StyleLevel {
 impl StyleLevel {
     /// Whether sheep appear at all.
     ///
-    /// Read by `output::rows::FlockRows`'s own STATUS cell, which draws the
-    /// face at `Full` and nothing but the plain status word otherwise, and
-    /// by the milestone sheep art elsewhere (`commands/query.rs`'s empty
-    /// flock, `commands/muster.rs`'s restored roll) -- both gate on exactly
-    /// this method, alongside `Format::Table`, before ever calling into
-    /// `flourish`.
+    /// Read by the STATUS cell renderer and the milestone sheep art,
+    /// both gated on this alongside `Format::Table`.
     pub(crate) const fn sheep(self) -> bool {
         matches!(self, Self::Full)
     }
 
     /// Whether tables are box-drawn.
     ///
-    /// Read by `output`'s private `table_of` helper, which is how every
-    /// table renderer in the crate picks between
-    /// [`crate::output::render_table`] and `table.rs`'s own `render_boxed`
-    /// -- both `table_of` and `render_boxed` are `output`-internal, so this
-    /// doc names them in prose rather than as intra-doc links a reader
-    /// outside that module could not follow anyway.
+    /// Read by `output`'s `table_of` helper, which picks between
+    /// [`crate::output::render_table`] and the box-drawn renderer.
     pub(crate) const fn boxes(self) -> bool {
         matches!(self, Self::Full | Self::Plain)
     }
@@ -62,9 +45,8 @@ impl StyleLevel {
     /// Whether anything is coloured. `NO_COLOR` can still veto this; it
     /// cannot enable it.
     ///
-    /// Read by [`Presentation::new`], the one place `NO_COLOR` is folded in
-    /// -- this method alone answers what the level asked for, before the
-    /// environment gets a veto.
+    /// Read by [`Presentation::new`], the one place `NO_COLOR` is folded
+    /// in.
     pub(crate) const fn colour(self) -> bool {
         matches!(self, Self::Full | Self::Plain)
     }
@@ -74,11 +56,8 @@ impl StyleLevel {
     ///
     /// The one parser for both free-form text sources of a level:
     /// `$SHEP_STYLE` (via [`resolve`]) and `shep.toml`'s `[style] level`
-    /// (`lib.rs`'s `style_from_config`) both read a level through this
-    /// function and nowhere else, so the two can never silently disagree
-    /// on what counts as valid input the way trimming-vs-not once let them.
-    /// `pub(crate)` rather than private for exactly that reason:
-    /// `style_from_config` lives in `lib.rs`, outside this module.
+    /// both read through this function, so the two cannot disagree on
+    /// what counts as valid input.
     pub(crate) fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "full" => Some(Self::Full),
@@ -99,27 +78,20 @@ impl fmt::Display for StyleLevel {
     }
 }
 
-/// Whether `NO_COLOR` vetoes colour: set and non-empty. An empty `NO_COLOR=`
-/// reads as unset -- the cross-ecosystem convention.
+/// Whether `NO_COLOR` vetoes colour: set and non-empty. An empty
+/// `NO_COLOR=` reads as unset.
 ///
-/// Lives here, not in `lookout::theme::Palette::detect`, so
-/// [`Presentation::new`] and that method call one copy instead of each
-/// restating the rule: `mod lookout` is `#[cfg(unix)]` and this module is
-/// not, so here is the one place both a unix-only binding and an
-/// unconditional one can reach.
+/// Lives here rather than in `lookout::theme::Palette::detect` so both
+/// call one copy: `lookout` is `#[cfg(unix)]` and this module is not.
 pub(crate) fn no_color_set(no_color: Option<&OsStr>) -> bool {
     no_color.is_some_and(|value| !value.is_empty())
 }
 
 /// Whether the terminal supports the 256-colour tier: `$COLORTERM`
 /// containing `truecolor`/`24bit`, or `$TERM` containing `256color`.
-/// Anything else gets the 16-colour fallback -- erring narrow is the
-/// recoverable direction.
+/// Anything else gets the 16-colour fallback.
 ///
-/// Lives here for the same reason [`no_color_set`] does: `output::paint`'s
-/// `anstyle` binding and `lookout::theme`'s `ratatui` binding both need the
-/// same yes/no answer to the same question, and only one of the two modules
-/// that binds it exists off unix.
+/// Lives here for the same reason [`no_color_set`] does.
 pub(crate) fn deep_colour_terminal(term: Option<&OsStr>, colorterm: Option<&OsStr>) -> bool {
     colorterm.is_some_and(|value| {
         let value = value.to_string_lossy();
@@ -130,61 +102,31 @@ pub(crate) fn deep_colour_terminal(term: Option<&OsStr>, colorterm: Option<&OsSt
 /// The level the operator chose, whether colour survived `NO_COLOR`, and
 /// how deep the terminal's own colour support is.
 ///
-/// Two values rather than one because they are two axes: `level` is a
-/// layout dial the operator sets, and `colour` is a cross-ecosystem
-/// convention that vetoes colour without touching layout. `Full` with
-/// colour vetoed still draws boxes and sheep, which is the whole reason
-/// `NO_COLOR` is honoured as its own axis rather than folded into the dial.
-/// `deep_colour` is a third, independent fact about the terminal itself,
-/// and `width` a fourth -- none of the four implies another, so folding
-/// any two together would either lose information or synthesize an answer
-/// nobody gave.
+/// Four independent axes: `level` is a layout dial, `colour` is
+/// `NO_COLOR`'s veto over it, `deep_colour` is a fact about the terminal,
+/// and `width` a fourth. None implies another.
 ///
-/// All four are resolved once, at the seam ([`Presentation::new`], called
-/// from `run_argv`) and never afterward: this is a fact about the operator
-/// and the terminal, not about any one render attempt. Contrast
-/// `table_of`'s (`output/mod.rs`) own STATUS-word retry, which is a
-/// per-attempt decision local to that function and its one caller
-/// (`FlockRows::rows_for`) -- it is threaded as a plain `bool` parameter on
-/// `Render::rows_for` rather than living here, precisely because it is not
-/// a fact resolved once at the seam the way these four are: nothing but
-/// `table_of` ever writes it and nothing but `FlockRows::status_cell` ever
-/// reads it, so it stays function-local rather than leaking onto
-/// crate-wide state that ~100 sites construct. `width` belongs here
-/// because a live `crossterm::terminal::size()` call reads the process's
-/// real controlling terminal, including under `cargo test` when the test
-/// binary was launched from an interactive shell -- only a harness with no
-/// controlling terminal makes such a test pass by accident. Resolving
-/// `width` once here and injecting it everywhere else keeps the function
-/// that renders pure in its inputs and provable at any width a test
-/// chooses.
+/// Resolved once, at [`Presentation::new`], and never per render: `width`
+/// in particular reads the process's real controlling terminal, which a
+/// per-attempt read would make a test's result depend on how it was
+/// launched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Presentation {
     pub(crate) level: StyleLevel,
     pub(crate) colour: bool,
     pub(crate) deep_colour: bool,
     /// The terminal's width in columns, or `80` when there is none to
-    /// measure -- `output::terminal_width`'s own fallback, folded in once
-    /// here instead of read again by every table `table_of` renders in one
-    /// invocation.
+    /// measure.
     pub(crate) width: usize,
 }
 
 impl Presentation {
-    /// `Bare`, no colour, no depth, and an unused `width`: `Bare` never
-    /// reaches `Render::rows_for` at all ([`StyleLevel::boxes`] is false,
-    /// so `table_of` takes the plain `render_table` path instead), and
-    /// `render_table` never reads `width` -- so `80` here is a placeholder,
-    /// not a real fallback, chosen only to match `output::terminal_width`'s
-    /// own so a reader does not have to ask why it differs. The safe
-    /// default for the many test fixtures in this crate that want today's
-    /// plain output and no more.
+    /// `Bare`, no colour, no depth. `width` here is never read: `Bare`
+    /// takes the plain `render_table` path, which ignores it. The
+    /// default for test fixtures that want today's plain output.
     ///
-    /// Every real `Streams` a running `shep` builds carries the
-    /// `Presentation` `lib.rs`'s `run_argv` actually resolved, never this
-    /// constant, so only test fixtures ever name it — a plain (non-test)
-    /// build of this crate has no caller at all. `#[allow(dead_code)]` says
-    /// so explicitly rather than inventing a call site nothing needs yet.
+    /// No non-test caller: `#[allow(dead_code)]` says so rather than
+    /// inventing one.
     #[allow(dead_code)]
     pub(crate) const BARE: Self = Self {
         level: StyleLevel::Bare,
@@ -194,11 +136,9 @@ impl Presentation {
     };
 
     /// Resolves `colour` and `deep_colour` from already-read environment
-    /// values, and carries `width` through unchanged -- terminal-ness and
-    /// terminal width are always parameters here, never a `std::env`/
-    /// `crossterm` call inside the function that renders, the same idiom
-    /// `commands::daemon::ansi_enabled` and `lookout::theme::Palette::detect`
-    /// both follow.
+    /// values, and carries `width` through unchanged: terminal-ness and
+    /// width are always parameters here, never a `std::env`/`crossterm`
+    /// call inside a render function.
     pub(crate) fn new(
         level: StyleLevel,
         no_color: Option<&OsStr>,
@@ -217,9 +157,9 @@ impl Presentation {
 
 /// Which layer decided the level in force.
 ///
-/// Reported by `shep style` because the failure this prevents is an operator
-/// editing `shep.toml` and seeing nothing change, with `$SHEP_STYLE` set in a
-/// shell profile they have forgotten about.
+/// Reported by `shep style`, since an operator editing `shep.toml` and
+/// seeing nothing change usually has `$SHEP_STYLE` set in a forgotten
+/// shell profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StyleSource {
     /// `--style` on this invocation.
@@ -364,10 +304,9 @@ mod tests {
         ));
     }
 
-    /// `Presentation::new` folds `NO_COLOR` into `colour` and never lets it
-    /// switch colour ON for a level that did not ask for it in the first
-    /// place -- `Bare`'s own `colour()` is already `false`, so no env value
-    /// can override that.
+    /// `Presentation::new` folds `NO_COLOR` into `colour`, and never lets
+    /// it switch colour on for a level that did not ask for it: `Bare`'s
+    /// own `colour()` is already `false`.
     #[test]
     fn presentation_new_folds_no_color_into_the_levels_own_answer() {
         let full_untouched = Presentation::new(StyleLevel::Full, None, None, None, 80);
@@ -390,11 +329,9 @@ mod tests {
         );
     }
 
-    /// `deep_colour` follows the terminal, independent of `colour` --
-    /// `table_of` never reaches `output::paint::style_for` unless `colour`
-    /// is also true, so a `Presentation` with `deep_colour` set and
-    /// `colour` false is a harmless, never-read combination rather than an
-    /// invalid one.
+    /// `deep_colour` follows the terminal, independent of `colour`: a
+    /// `Presentation` with `deep_colour` set and `colour` false is a
+    /// harmless, never-read combination rather than an invalid one.
     #[test]
     fn presentation_new_resolves_deep_colour_from_the_terminal() {
         let deep = Presentation::new(

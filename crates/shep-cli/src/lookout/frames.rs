@@ -1,36 +1,13 @@
-//! `Buffer` -> text, and `Buffer` -> ANSI, plus the scene list both the
-//! pinned snapshots and the gallery writer are built from.
+//! Renders a `Buffer` to plain text or ANSI, and holds the scene list the
+//! pinned snapshots and the gallery share.
 //!
-//! **Why this exists at all.** `TestBackend` renders a frame into a plain
-//! text buffer with no terminal involved, which is what makes a TUI testable
-//! headlessly. It is also, for exactly the same reason, what lets a reviewer
-//! SEE the dashboard without running it — so this module's output is a
-//! deliverable (`docs/lookout/frames.txt`, `docs/lookout/frames.ansi`) and
-//! not only test scaffolding. That is the whole point of this module: the maintainer
-//! decides what a layout looks like from these frames, not from a spec
-//! sentence.
+//! `docs/lookout/frames.txt` and `docs/lookout/frames.ansi` are generated
+//! from this module's output, doubling as a rendered layout reference.
 //!
-//! **Why not `TestBackend`'s own `Display`.** Two reasons, both practical:
-//! its exact framing is an upstream presentation detail that can change
-//! between ratatui releases, and it carries no colour, while one of the two
-//! renderers here has to.
-//!
-//! **Why one scene list.** The gallery and the snapshot tests both read
-//! [`Scene::ALL`], so the gallery cannot silently drift from what the suite
-//! checks: a layout change reddens the snapshots in the ordinary run, and
-//! regenerating the gallery is one command.
-//!
-//! **`#[cfg(test)]` at the `mod` declaration in `super::mod`, not a plain
-//! `pub mod`.** The package (`shep`) has a `[lib]` target,
-//! but that does not exempt this module from `dead_code`: `mod lookout` in
-//! `lib.rs` is private, and `lib.rs`'s own doc comment states the crate's
-//! whole public API as three entry points — `main`, `main_runtime`,
-//! `main_dev` — with every other item private. A `pub mod frames` nested
-//! inside a private module is unreachable from outside this crate regardless
-//! of the keyword, so nothing here is called outside this module's own
-//! tests, and a plain `pub mod` fails the task gate on `dead_code`. Gating
-//! the whole module means these items simply do not exist in a non-test
-//! build, and cost nothing when they run under `cargo test`.
+//! Gated at the `mod` declaration with `#[cfg(test)]` rather than
+//! `pub mod`: `lib.rs` exposes only three entry points, so an ordinary
+//! `pub mod` here is unreachable from outside the crate and fails
+//! `dead_code`.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -62,14 +39,12 @@ use crate::style::{StyleLevel, StyleSource};
 /// One rendered buffer as plain text: one line per row, trailing spaces
 /// kept, no escapes.
 ///
-/// Trailing spaces are kept on purpose. A frame is a fixed-size grid, and
-/// trimming makes a right-aligned cell — the flock count in the title, the
-/// control state in the status bar — look as though it moved.
+/// Trailing spaces stay because a frame is a fixed-size grid: trimming
+/// would make a right-aligned cell look like it moved.
 ///
 /// Cells are read by their rendered symbol, not by byte length, so a
-/// multi-byte cell (an ellipsis, a multi-byte name) round-trips exactly as
-/// it was drawn. Indexed with `Buffer[(x, y)]` rather than the deprecated
-/// `Buffer::get`, per ratatui-core 0.1.2.
+/// multi-byte cell round-trips exactly as drawn. Indexed with
+/// `Buffer[(x, y)]`, not the deprecated `Buffer::get`.
 #[must_use]
 pub fn render_text(buffer: &Buffer) -> String {
     let area = buffer.area;
@@ -85,9 +60,8 @@ pub fn render_text(buffer: &Buffer) -> String {
 
 /// The same buffer with SGR escapes, for reading through `less -R`.
 ///
-/// Every line ends with a reset before its newline. A frame that set a
-/// colour and never reset it would bleed into whatever came next — which,
-/// in a file, is the rest of the file.
+/// Every line ends with a reset before its newline, so an unreset colour
+/// does not bleed into the rest of the file.
 #[must_use]
 pub fn render_ansi(buffer: &Buffer) -> String {
     let area = buffer.area;
@@ -112,12 +86,9 @@ pub fn render_ansi(buffer: &Buffer) -> String {
 
 /// The SGR sequence for one cell's foreground.
 ///
-/// Foreground only, because a foreground is the only thing this palette
-/// sets anywhere on screen — no pane uses bold, reversed, or any other
-/// modifier; the selected row is shown by a marker character, not a style.
-/// `no_scene_uses_a_modifier_the_ansi_renderer_would_drop` is the standing
-/// check. A future pane that introduces one renders unstyled here rather
-/// than as a wrong style, and this function grows a case for it then.
+/// Foreground only: no pane uses bold, reverse, or any other modifier, since
+/// the selected row is a marker character rather than a style.
+/// `no_scene_uses_a_modifier_the_ansi_renderer_would_drop` pins it.
 fn sgr(fg: Color) -> String {
     let mut out = String::new();
     match fg {
@@ -290,11 +261,10 @@ impl Scene {
     }
 
     /// One sentence saying what this frame is for, printed above it in the
-    /// gallery so the maintainer does not have to hold thirty-two of them in her head.
+    /// gallery.
     ///
-    /// Every clause here is pinned by an assertion in
-    /// `every_scene_shows_the_thing_it_is_named_for` — a caption may not say
-    /// a thing the frame is not asserted to show.
+    /// `every_scene_shows_the_thing_it_is_named_for` pins each clause: a
+    /// caption may not claim what the frame is not asserted to show.
     #[must_use]
     pub const fn caption(self) -> &'static str {
         match self {
@@ -422,14 +392,9 @@ impl Scene {
     pub const fn size(self) -> (u16, u16) {
         match self {
             Self::Empty => (100, 28),
-            // 51, not 46 and not 49. `columns_for` runs on `width - GUTTER`
-            // (Task 2: the selection marker's two-column gutter, phase plan
-            // design decision 6), so the table only sees `width - 2` — a
-            // scene asked for the raw `NO_MEM` threshold (49) would land two
-            // columns short of it and drop into the `41` tier, which has
-            // already dropped CPU, contradicting this scene's own caption.
-            // 51 - GUTTER == 49, the `NO_MEM` tier: four columns gone, CPU
-            // and UPTIME still there.
+            // 51: `columns_for` runs on `width - GUTTER` (the two-column
+            // selection marker), so 51 - GUTTER = 49, the `NO_MEM` tier:
+            // four columns gone, CPU and UPTIME still there.
             Self::Narrow => (51, 14),
             Self::TooNarrow => (28, 8),
             Self::FilterEditing | Self::FilterActive | Self::FilterNoMatch => (100, 14),
@@ -441,17 +406,12 @@ impl Scene {
             | Self::ActionRefused
             | Self::ActionAccepted
             | Self::ActionRefusedOffline => (100, 14),
-            // 180: the `log_level` confirm's own sentence -- naming both
-            // `SHEP_LOG_LEVEL` and `--log-level` plus "enter confirms, any
-            // other key cancels" -- runs to 170 columns, past every other
-            // scene's width. A narrower frame would truncate the very flag
-            // this scene exists to show.
+            // 180: the log_level confirm's sentence runs to 170 columns,
+            // past every other scene's width. Narrower would truncate the
+            // flag it shows.
             Self::SettingsConfirm => (180, 30),
-            // 45: `SCALAR_TIERS`'s middle tier, and `DOG_TIERS`'s. Wide
-            // enough that both tables still draw a real row, narrow enough
-            // that both have given a column up -- which is the one thing
-            // this frame is here to show, and the axis every other settings
-            // frame (120 and 180) misses.
+            // 45: the middle tier of both `SCALAR_TIERS` and `DOG_TIERS`,
+            // so both tables have dropped one column without losing a row.
             Self::SettingsNarrow => (45, 24),
             // 14 rows: twelve of body, against a screen that wants
             // eighteen lines. Short enough that the cursor cannot be
@@ -468,10 +428,8 @@ impl Scene {
 
 /// Builds one scene and returns its label with the buffer it drew into.
 ///
-/// Ten minutes of dashboard age: long enough that a frozen frame whose
-/// clock had kept running would be obvious in the gallery at a glance, and
-/// it is what both the pinned snapshots and `docs/lookout/frames.txt`
-/// render at.
+/// Renders at ten minutes of dashboard age, the same age the pinned
+/// snapshots and `docs/lookout/frames.txt` use.
 #[must_use]
 pub fn scene(which: Scene) -> (&'static str, Buffer) {
     (which.label(), scene_with(which, Duration::from_secs(600)))
@@ -479,16 +437,12 @@ pub fn scene(which: Scene) -> (&'static str, Buffer) {
 
 /// Parks the gallery's cursor on the sheep with id `id`.
 ///
-/// `SelectDown` moves one VISIBLE row, and the table reads by name, so the
-/// number of presses a given sheep needs is a fact about the fixture's names
-/// rather than about its ids. Walking until the id matches keeps a scene
-/// describing the sheep its assertions name, whatever the ordering rule is.
+/// Walks by name since `SelectDown` moves one visible row and the table
+/// reads by name, not id.
 ///
 /// # Panics
 ///
-/// If `id` is not in the flock, or is hidden by a filter. Gallery scaffolding:
-/// a scene that silently described a different sheep than the one its own
-/// assertions name is the failure this exists to make loud.
+/// If `id` is not in the flock, or is hidden by a filter.
 #[track_caller]
 fn select_id(app: &mut App, id: u32) {
     select_row(app, &RowKey::Sheep(id));
@@ -498,8 +452,8 @@ fn select_id(app: &mut App, id: u32) {
 ///
 /// # Panics
 ///
-/// If `name` has no group header -- which is the case for every app with
-/// one instance, or with an instance that reports no slot.
+/// If `name` has no group header: an app with one instance, or an
+/// instance that reports no slot.
 #[track_caller]
 fn select_group(app: &mut App, name: &str) {
     select_row(app, &RowKey::Group(name.to_string()));
@@ -507,16 +461,12 @@ fn select_group(app: &mut App, name: &str) {
 
 /// Walks the cursor down until it lands on `key`.
 ///
-/// The budget is [`App::visible_rows`]'s own length, NOT `flock_len`: a
-/// grouped app draws a header on top of its own slots, so a flock of six
-/// sheep can be seven or more visible rows and a sheep-counted budget runs
-/// out before reaching the last of them.
+/// Budgeted by [`App::visible_rows`]'s length, not the flock count: a
+/// grouped app's header adds a visible row beyond its own slots.
 ///
 /// # Panics
 ///
-/// If `key` is not a visible row. Gallery scaffolding: a scene that
-/// silently described a different row than the one its own assertions name
-/// is the failure this exists to make loud.
+/// If `key` is not a visible row.
 #[track_caller]
 fn select_row(app: &mut App, key: &RowKey) {
     for _ in 0..=app.visible_rows().len() {
@@ -530,18 +480,14 @@ fn select_row(app: &mut App, key: &RowKey) {
 
 /// One scene, `age` after its opening snapshot.
 ///
-/// The parameter exists for one test:
-/// `the_frozen_frame_does_not_move_however_long_the_link_stays_gone` renders
-/// the frozen scene at two ages and asserts the two frames are identical,
-/// which is the only shape in which "the clock stopped" is a falsifiable
-/// claim about a whole frame.
+/// Deterministic: a forced palette, an explicit `Instant` advanced by exact
+/// `Duration`s, and a literal frozen timestamp, so the gallery never
+/// depends on this machine's clock or environment.
 ///
-/// Deterministic by construction: the palette is forced to the 256-colour
-/// set regardless of this machine's `TERM`, the clock is an explicit
-/// `Instant` advanced by exact `Duration`s, and the frozen timestamp is a
-/// literal. A scene that read the environment or the wall clock would
-/// produce a different gallery on every machine and a snapshot that could
-/// never be pinned.
+/// `age` exists for
+/// `the_frozen_frame_does_not_move_however_long_the_link_stays_gone`,
+/// which renders the frozen scene at two ages and checks for identical
+/// frames.
 #[must_use]
 fn scene_with(which: Scene, age: Duration) -> Buffer {
     use std::ffi::OsStr;
@@ -559,8 +505,7 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
         Scene::Grouped => vec![
             instance(0, "web", 0, 0, 3.4, 182 << 20, 4_512_000),
             // The youngest of the three, and the one carrying restarts: the
-            // group row's uptime is a MINIMUM and its restarts are a SUM, so
-            // three identical instances would render the same either way.
+            // group row's uptime is a minimum and its restarts are a sum.
             instance(1, "web", 1, 2, 2.9, 178 << 20, 300_000),
             instance(2, "web", 2, 1, 3.1, 180 << 20, 9_000_000),
             sheep(
@@ -627,11 +572,9 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
                 None,
             ),
         ],
-        // Two dog processes only -- the dashboard flock is invisible behind
-        // the settings screen this scene draws, so what matters is what
-        // `dog_rows`'s own join sees: `otel` up and healthy, `bark` up but
-        // never handshook. `ledger` (armed enabled in the snapshot below)
-        // has no row here at all, which is what "enabled and absent" means.
+        // Two dog processes: `otel` up and healthy, `bark` up but never
+        // handshook. `ledger` has no row here, which is what "enabled and
+        // absent" means in the settings snapshot below.
         Scene::SettingsDogs | Scene::SettingsNarrow | Scene::SettingsShort => vec![
             dog_sheep(90, "otel", None),
             dog_sheep(91, "bark", Some(false)),
@@ -707,25 +650,10 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
         now: t0 + Duration::from_secs(7),
     });
 
-    // Onto `api`, id 2, in both flocks. A fresh snapshot selects the first
-    // VISIBLE row, so without this every "sheep 2  api" and "bleats  api"
-    // assertion below is asserting about whichever sheep the table happens to
-    // draw first, and failing for a reason that has nothing to do with the
-    // pane.
-    //
-    // Walked by id rather than by a fixed number of `j`s. The table reads by
-    // name, so which row `api` occupies depends on what the other five
-    // sheep are called, not on its id.
-    //
-    // The four excluded scenes have either no flock (`Empty`) or no pane
-    // below the table to describe (`Narrow`, `TooNarrow`, `TableOnly`), so
-    // moving the cursor in them would change a snapshot for no reason.
-    // `Grouped` is excluded for a fifth reason: its cursor belongs on the
-    // group header, which is the whole scene, and it goes there below.
-    // The three settings scenes drawing the dog-drift flock are excluded
-    // for a sixth: that flock has no id 2 at all -- the dashboard behind them is invisible
-    // once the settings screen draws over the whole body, so there is
-    // nothing for a cursor there to do.
+    // Selects `api` (id 2) so the panes below describe a fixed sheep,
+    // walked by id since the table sorts by name. Skipped where there is
+    // no flock, no pane below the table, or the cursor belongs elsewhere
+    // (`Grouped`, and the three settings scenes with no id 2).
     if !matches!(
         which,
         Scene::Empty
@@ -771,13 +699,10 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
         _ => {}
     }
 
-    // Every live scene gets a host sample, including the FROZEN one — a
-    // strip with no host sample at all would render "host  not read yet"
-    // whether or not the freeze guard existed, so this baseline sample is
-    // what gives that guard something to protect. The regression coverage
-    // itself is the SECOND, age-varying sample sent after `Msg::Frozen`
-    // below, in the `Scene::Frozen` arm: this one only establishes what a
-    // live dashboard would have shown first.
+    // Every live scene gets a host sample, frozen included: without a
+    // baseline sample the strip would read "not read yet" regardless of
+    // the freeze guard. `Scene::Frozen` below sends a second, older
+    // sample that exercises the guard itself.
     if which == Scene::HostUnknown {
         app.update(Msg::Host { sample: None });
     } else {
@@ -796,13 +721,8 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
         tail: feed_for(which),
     });
 
-    // `Scene::Frozen` gets a reading too, applied here — while the link is
-    // still `Live` — because `on_lambs` refuses once it is `Lost`, the same
-    // guard `Msg::Bleats` carries. It is not there to support a test: the
-    // property that a reading does not age once frozen is pinned in
-    // `detail.rs`'s own unit test, where the two ages differ by construction
-    // rather than by elapsed time. This frame is a picture, and pictures are
-    // what the maintainer reads.
+    // Applied while the link is still `Live`: `on_lambs` refuses once it
+    // is `Lost`, the same guard `Msg::Bleats` carries.
     if matches!(which, Scene::Lambs | Scene::Frozen) {
         app.update(Msg::Replied {
             sent: Sent::Lambs { id: 2 },
@@ -819,12 +739,8 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
         });
     }
 
-    // `LambsUnknown`'s own reading: `cron` (id 4) has no pid, so the
-    // shepherd's walk never ran. The plan's own code block for this step
-    // never applied a reply for this scene, which leaves `lambs_for(4)`
-    // `None` and renders "not read yet" rather than the caption's own
-    // "this sheep is not running" sentence the assertions below pin — a gap
-    // reported alongside this task rather than silently worked around.
+    // `cron` (id 4) has no pid, so the shepherd's walk never ran and
+    // `lambs_for(4)` stays `None`.
     if which == Scene::LambsUnknown {
         app.update(Msg::Replied {
             sent: Sent::Lambs { id: 4 },
@@ -836,11 +752,8 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
         });
     }
 
-    // The `Msg::Host` above and the two `SelectDown`s are applied BEFORE
-    // `Msg::Frozen` below, because the reducer refuses both after — which is
-    // the property, and which the two-age comparison in
-    // `the_frozen_frame_does_not_move_however_long_the_link_stays_gone` then
-    // pins.
+    // `Msg::Host` and the `SelectDown`s run before `Msg::Frozen`: the
+    // reducer refuses both once frozen.
     match which {
         Scene::Retrying => {
             app.update(Msg::Retrying { attempt: 3 });
@@ -849,17 +762,10 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
             app.update(Msg::Frozen {
                 at_local: "2026-08-14 14:32:07".to_string(),
             });
-            // The frame-level regression test for the `Msg::Host` freeze
-            // guard: a sample sent AFTER `Msg::Frozen`, with a load average
-            // that varies with `age` so it cannot coincide with the
-            // baseline sample above by accident. With the guard in place
-            // this is refused and changes nothing, so the ten-minute and
-            // sixteen-hour renders in
+            // Sent after `Msg::Frozen`, with a load average that varies
+            // with `age`: the guard's refusal keeps
             // `the_frozen_frame_does_not_move_however_long_the_link_stays_gone`
-            // stay byte-identical, as they already do. Remove the guard
-            // and this is what makes that test catch it: the two ages
-            // would then paint two different load averages onto a banner
-            // that claims neither should move.
+            // byte-identical across ages.
             app.update(Msg::Host {
                 sample: Some(HostSample {
                     load: (2.31 + age.as_secs_f64(), 4.10, 3.88),
@@ -876,29 +782,18 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
         _ => {}
     }
 
-    // The last tick, `age` after the opening snapshot. For every live scene
-    // this is what advances the UPTIME column; for the frozen one it must
-    // change nothing at all, because the reducer stopped accepting `now`
-    // when the link was lost. That asymmetry is the whole of design
-    // decision 8, and rendering the same scene at two ages is how it
-    // becomes testable.
+    // The last tick, `age` after the opening snapshot: advances the
+    // uptime column on a live scene, and does nothing on the frozen one,
+    // since the reducer stops accepting `now` once the link is lost.
     app.update(Msg::Tick { now: t0 + age });
 
-    // The five action scenes, applied AFTER the last tick rather than
-    // alongside `Retrying`/`Frozen`/`Refused` above. `scene()` renders at
-    // `age` = 600 seconds, and `CONFIRM_EXPIRY` is 10: an armed confirm built
-    // before that tick would already have expired by the time this function
-    // draws it, which is exactly the defect `Confirm`'s own frame exists to
-    // show the ABSENCE of. A `Sent` action never expires (only `Stage::Armed`
-    // does), so `Acting`, `ActionAccepted` and `ActionRefused` would have been
-    // safe either side of the tick; `Confirm` is the one that is not, so all
-    // five sit here together rather than splitting the rule across two
-    // places.
+    // Applied after the last tick: `scene()` renders at `age` = 600s past
+    // `CONFIRM_EXPIRY` (10s), so an armed confirm built before the tick
+    // would already show expired.
     match which {
         Scene::ActionRefusedOffline => {
-            // The link has to stop being live BEFORE the key is pressed, or
-            // `arm` would accept it — the order is the whole state this
-            // scene shows.
+            // The link must stop being live before the key is pressed, or
+            // `arm` would accept it.
             app.update(Msg::Retrying { attempt: 3 });
             app.update(Msg::Key(KeyPress::Action(ActionVerb::Restart)));
         }
@@ -941,18 +836,14 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
         _ => {}
     }
 
-    // The five settings scenes, applied last for the same reason the five
-    // action scenes above are: `SettingsConfirm` arms a candidate, and
-    // `Settings::pending` expires on the same `CONFIRM_EXPIRY` the
-    // dashboard's own action confirm does, so arming it before the tick at
-    // `age` (600s in `scene()`) would already show it expired by the time
-    // this function draws.
+    // Applied last, for the same reason: `SettingsConfirm` arms a
+    // candidate that expires on the same `CONFIRM_EXPIRY`, so it must be
+    // armed after the tick at `age`.
     match which {
         Scene::SettingsFresh => {
-            // A genuinely fresh document, not a hand-edited snapshot: the
-            // scaffold every first run leaves is `[interpreters]` alone, and
-            // `load_settings` is the same reader `run_ui` calls, so this is
-            // what an operator's very first `s` actually shows.
+            // A fresh document, not a hand-edited snapshot: first run
+            // leaves only `[interpreters]`, and `load_settings` is the
+            // same reader `run_ui` calls.
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("shep.toml");
             ShepToml::edit(&path, ShepToml::write_starter_interpreters).unwrap();
@@ -1029,28 +920,20 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
 
 /// The bleats feed each scene is given, before `Msg::Bleats` carries it in.
 ///
-/// **most scenes** — six ordinary `Stream::Out` lines, `missed_lines: 0`,
-/// `missed_bytes: 0`, so the ordinary header is what the gallery shows.
+/// Most scenes: six ordinary `Stream::Out` lines, no missed lines or
+/// bytes.
 ///
-/// **`FeedGap`** — thirty lines with `missed_lines: 500` and
-/// `missed_bytes: 4_012_000`: the both-kinds case. The header reads
-/// `… 525 earlier lines not shown, and 3.8M before them never read` — 500
-/// the reader dropped, plus 25 the five-row pane has no room for, and
-/// `human_bytes(4_012_000)` is `3.8M`. This is the frame that has to be
-/// legible, because it is the one an operator sees during an incident.
+/// `FeedGap`: thirty lines, `missed_lines: 500`, `missed_bytes:
+/// 4_012_000`, so the header reads both a dropped-lines and a
+/// never-read-bytes count.
 ///
-/// **`FeedMissing`** — no lines, no counts, and a `note` naming the cause,
-/// mirroring [`super::tail::read`]'s own wording for a log file that was
-/// never created.
+/// `FeedMissing`: no lines, no counts, and a `note` mirroring
+/// [`super::tail::read`]'s wording for a log file that was never created.
 fn feed_for(which: Scene) -> Tail {
     match which {
-        // Mirrors what `super::mod`'s `run_ui` would actually send: an empty
-        // flock has no selected row, and `run_ui` never calls `tail::read`
-        // at all in that case — its own header, "bleats  no sheep is
-        // selected", is the pane's complete sentence. A note here would
-        // show stale feed content, or the wrong sentence, under a header
-        // that already says nobody is selected — a real inconsistency this
-        // gallery must not ship.
+        // Mirrors `run_ui`: an empty flock has no selected row, so no
+        // `tail::read` call, just the pane's own "no sheep is selected"
+        // header.
         Scene::Empty => Tail::default(),
         Scene::FeedGap => Tail {
             lines: (0..30)
@@ -1094,14 +977,12 @@ fn feed_for(which: Scene) -> Tail {
     }
 }
 
-/// One row's worth of shepherd reply, spelled out so each scene reads as a
-/// plausible flock rather than as six copies of one sheep.
+/// One row's worth of shepherd reply, spelled out so each scene reads as
+/// a plausible flock rather than six copies of one sheep.
 ///
-/// The two log paths are DERIVED from `name` and `id` rather than taken as
-/// two more parameters — this already carries
-/// `#[allow(clippy::too_many_arguments)]` at eight, and ten would be worse.
-/// Deterministic, and it gives the detail pane something to render and
-/// `no_detail` something to assert the absence of.
+/// The two log paths are derived from `name` and `id` rather than taken
+/// as parameters: this already carries
+/// `#[allow(clippy::too_many_arguments)]` at eight.
 #[allow(clippy::too_many_arguments)]
 fn sheep(
     id: u32,
@@ -1122,14 +1003,9 @@ fn sheep(
         .fold(fold.map(str::to_string))
         .out_file(Some(format!("/home/ada/.shep/logs/{name}-{id}-out.log")))
         .err_file(Some(format!("/home/ada/.shep/logs/{name}-{id}-err.log")))
-        // Derived from `status` rather than taken as a ninth parameter, and
-        // not just to keep the argument count down: a sheep that is not
-        // running always has a reason it stopped, and deriving it means no
-        // scene can accidentally depict an errored sheep with nothing in its
-        // EXIT column. Before this, every pinned frame showed `-` there,
-        // including the errored scene -- so the frames documented none of
-        // what that column is for, and a regression blanking it entirely
-        // would have passed all of them.
+        // Derived from `status`, not a ninth parameter: a sheep that is
+        // not running always has a reason it stopped, so no scene can
+        // depict one with a blank EXIT column.
         .last_exit(match status {
             // Crashed on its own, and a restart is either pending or spent.
             ProcStatus::Errored | ProcStatus::WaitingRestart => Some(ExitInfo {
@@ -1150,12 +1026,9 @@ fn sheep(
 /// One instance of a clustered app: the row a shepherd reports for slot
 /// `slot` of `name`.
 ///
-/// Its own builder call rather than two more parameters on [`sheep`], which
-/// already carries `#[allow(clippy::too_many_arguments)]` at eight. It takes
-/// an explicit `uptime_ms` because [`sheep`] derives that from the id, and a
-/// group row's uptime is the minimum across its members -- a fixture whose
-/// youngest instance was decided by its id number would tie the assertion to
-/// an arithmetic that has nothing to do with grouping.
+/// Takes an explicit `uptime_ms` rather than deriving it from the id like
+/// [`sheep`] does: a group row's uptime is the minimum across its
+/// members, and grouping should not depend on id arithmetic.
 fn instance(
     id: u32,
     name: &str,
@@ -1180,10 +1053,8 @@ fn instance(
 
 /// The row `ActionAccepted`'s reply carries: `api` at id 2, restarted.
 ///
-/// **Pid 48299, not the listing's 48219.** A different pid is what makes
-/// "the reply's own row reached the table" falsifiable — the same pid would
-/// pass whether the reply's row was upserted or silently ignored in favour
-/// of what the last poll already had.
+/// Pid 48299, not the listing's 48219: a matching pid would pass whether
+/// the reply's row was upserted or silently ignored.
 fn restarted_api() -> ProcessInfo {
     sheep(
         2,
@@ -1254,10 +1125,10 @@ fn flock_without_api() -> Vec<ProcessInfo> {
     ]
 }
 
-/// One dog process: `id` and `name` as `dog_rows`'s join key, `handshook`
-/// carrying the same three-state signal a real listing does -- `None` reads
-/// `online`, `Some(false)` reads `silent`, per [`crate::vocabulary::Reported::of`].
-/// [`Scene::SettingsDogs`] is the only scene that calls this.
+/// One dog process: `id` and `name` as `dog_rows`'s join key. `handshook`
+/// carries the three-state signal a real listing does: `None` reads
+/// `online`, `Some(false)` reads `silent`, per
+/// [`crate::vocabulary::Reported::of`].
 fn dog_sheep(id: u32, name: &str, handshook: Option<bool>) -> ProcessInfo {
     ProcessInfo::builder(id, name, ProcStatus::Online)
         .pid(Some(90_000 + id))
@@ -1266,15 +1137,12 @@ fn dog_sheep(id: u32, name: &str, handshook: Option<bool>) -> ProcessInfo {
         .build()
 }
 
-/// Walks the settings screen's cursor onto `field`'s row by real
-/// `SelectDown` keypresses, the same real-path rule
-/// `view::fixtures::app_in_settings_on` follows for its own tests.
+/// Walks the settings screen's cursor onto `field`'s row with real
+/// `SelectDown` keypresses.
 ///
 /// # Panics
 ///
-/// If the settings screen is not open. Gallery scaffolding: a scene that
-/// called this before `Msg::Settings` landed is a defect in the scene, not
-/// in the screen.
+/// If the settings screen is not open.
 #[track_caller]
 fn move_settings_cursor_to(app: &mut App, field: SettingField) {
     let target = app
@@ -1291,9 +1159,9 @@ fn move_settings_cursor_to(app: &mut App, field: SettingField) {
 
 /// A settings snapshot with `log_level`, `socket`, `max_cron_sleep` and
 /// `style_level` declared in `shep.toml`, and `log_json`/`allow_control`
-/// left at their compiled defaults -- the mixed state
-/// [`Scene::SettingsSet`]'s own caption shows, and the fixture
-/// [`Scene::SettingsConfirm`] and [`Scene::SettingsTyping`] both build on.
+/// left at their compiled defaults: the mixed state
+/// [`Scene::SettingsSet`] shows, reused by [`Scene::SettingsConfirm`] and
+/// [`Scene::SettingsTyping`].
 fn settings_snapshot_for_gallery() -> SettingsSnapshot {
     let config = |value: &str| ScalarView {
         value: value.to_string(),
@@ -1310,8 +1178,7 @@ fn settings_snapshot_for_gallery() -> SettingsSnapshot {
         max_cron_sleep: config("30s"),
         allow_control: default("false"),
         style_level: config("full"),
-        // The document declares it, so the file and the resolved value
-        // agree -- see `SettingsSnapshot::style_level_in_file`.
+        // The document declares it, so the file and resolved value agree.
         style_level_in_file: Some("full".to_string()),
         dogs: vec![
             DogView {
@@ -1328,24 +1195,17 @@ fn settings_snapshot_for_gallery() -> SettingsSnapshot {
     }
 }
 
-/// [`settings_snapshot_for_gallery`]'s own scalars, with `dogs` replaced by
-/// the three-way drift [`Scene::SettingsDogs`] shows: `otel` running while
-/// the file disables it, `ledger` enabled and absent from
-/// [`Scene::SettingsDogs`]'s own flock, and `bark` enabled and running --
-/// [`dog_sheep`] gives it `handshook: Some(false)`, so the join reads it
-/// `silent` rather than `online`.
+/// [`settings_snapshot_for_gallery`]'s scalars, with `dogs` replaced by
+/// the three-way drift [`Scene::SettingsDogs`] shows: `otel` running
+/// while the file disables it, `ledger` enabled and absent from the
+/// flock, and `bark` enabled with `handshook: Some(false)`, so the join
+/// reads it `silent`.
 fn settings_snapshot_with_dog_drift() -> SettingsSnapshot {
     SettingsSnapshot {
         dogs: vec![
-            // Both carry a real path, and they have to: `BUILT_IN_DOGS` is
-            // `["metrics", "bark"]`, and `dog_candidates` builds every
-            // other name out of `[daemon] adopted_dogs`, whose values ARE
-            // the paths. So a non-built-in dog with `adopted_path: None`
-            // is a row `load_settings` cannot produce from a document
-            // shep wrote (only a hand-edited non-string value could), and
-            // it rendered
-            // `built-in` for two dogs that are not. The spec's own decision
-            // 9 mockup gives these two paths.
+            // Both carry a real path: a non-built-in dog with
+            // `adopted_path: None` is not a row `load_settings` can
+            // produce from a document shep wrote.
             DogView {
                 name: "otel".to_string(),
                 enabled: false,
@@ -1408,10 +1268,8 @@ screen at 45 columns each get a frame of their own.
 mod tests {
     use super::*;
 
-    /// fails if the plain renderer starts carrying escape bytes, or stops
-    /// producing one line per buffer row. This is the renderer the view's
-    /// own assertions read through, so a change here silently changes what
-    /// nine other tests are asserting on.
+    /// Nine other tests read frames through this renderer: a regression
+    /// here silently changes what they assert.
     #[test]
     fn the_plain_renderer_is_one_line_per_row_and_no_escapes() {
         let text = render_text(&scene(Scene::HealthyWide).1);
@@ -1422,10 +1280,8 @@ mod tests {
         }
     }
 
-    /// fails if the ANSI renderer stops emitting colour, or stops
-    /// resetting. A frame that sets a colour and never resets it bleeds
-    /// into whatever the operator's terminal prints next — which for a file
-    /// read through `less -R` is the rest of the file.
+    /// An unreset colour bleeds into whatever prints next, which for a
+    /// file read through `less -R` is the rest of the file.
     #[test]
     fn the_ansi_renderer_colours_the_errored_row_and_always_resets() {
         let ansi = render_ansi(&scene(Scene::Errored).1);
@@ -1443,20 +1299,12 @@ mod tests {
 
     /// The table row for `name`, or `None` if the table does not draw one.
     ///
-    /// The selection marker (`>`) sits on the row itself, in its own
-    /// one-character gutter column ahead of the id, so a marked row's tokens
-    /// are shifted one place right of an unmarked row's: `nth(1)` is the id,
-    /// not the name. Stripping the marker first keeps both cases on the same
-    /// token index, and the marker never appears anywhere else on a line, so
-    /// `trim_start_matches` cannot eat anything else.
+    /// Strips the leading `>` selection marker first, so a marked and
+    /// unmarked row share the same token index.
     ///
-    /// The `nth(0)` numeric-id guard is load-bearing, not decoration: the
-    /// status bar's own in-flight and outcome lines both open `{verb} {name}
-    /// (id {id})`, so `restart api (id 2): ...` has `"api"` at token index 1
-    /// too. Without the guard this finds the BAR line naming the sheep
-    /// rather than a table row (or, worse, `None` of them) — exactly the
-    /// case `ActionRefused`'s own assertions exercise, where the bar and the
-    /// table disagree about `api` on purpose.
+    /// The numeric-id guard on token 0 is load bearing: the status bar's
+    /// own lines also open `{verb} {name} (id {id})`, so without it this
+    /// could match the bar line instead of a table row.
     #[cfg_attr(windows, allow(dead_code))]
     fn row_for<'a>(frame: &'a str, name: &str) -> Option<&'a str> {
         frame.lines().find(|line| {
@@ -1474,12 +1322,11 @@ mod tests {
             .find(|line| line.trim_start_matches('>').split_whitespace().next() == Some(name))
     }
 
-    /// Whether the MARKED row's name starts with `prefix`. For a name the
-    /// NAME column has truncated, the exact truncated string depends on
-    /// terminal width, so a literal expected value would be wrong at any
-    /// width this test was not written against. `prefix` only needs to fit
-    /// inside the eight-column floor `name_width` never shrinks below to be
-    /// safe here.
+    /// Whether the marked row's name starts with `prefix`.
+    ///
+    /// Handles truncation: the NAME column's truncated string depends on
+    /// terminal width, so `prefix` only needs to fit the eight-column
+    /// floor `name_width` never shrinks below.
     #[cfg_attr(windows, allow(dead_code))]
     fn marked_row_name_starts_with(frame: &str, prefix: &str) -> bool {
         frame.lines().any(|line| {
@@ -1492,40 +1339,21 @@ mod tests {
         })
     }
 
-    /// fails if a scene stops rendering what it is named for. Each
-    /// assertion is the one sentence that scene exists to show the maintainer — if one
-    /// of these stops being true, the frame she is looking at is not the
-    /// frame this plan promised her.
+    /// fails if a scene stops rendering what it is named for.
     ///
-    /// Every clause of every caption in [`Scene::caption`] is pinned by one
-    /// assertion here — the rule this task adds, stated in its own words in
-    /// the plan: "every clause of every caption is one assertion here, or it
-    /// is deleted from the caption."
+    /// Each caption clause in [`Scene::caption`] is pinned by one
+    /// assertion here.
     #[test]
-    /// `cfg(unix)` because one scene's fixture carries a SIGNALLED exit, and
-    /// `output::rows::signal_label` resolves a signal number against the
-    /// running platform's own table on purpose — its doc argues that a
-    /// `ProcessInfo` is always rendered by a binary on the same OS as the
-    /// daemon that produced it, and `shep_core::signals::OperatorSignal`
-    /// deliberately refuses to map numbers to names at all ("a number means
-    /// different signals on different platforms, and shep will not guess").
-    ///
-    /// So Windows renders `15` where unix renders `SIGTERM`, and that is the
-    /// designed behaviour rather than a gap: a Windows `ExitOutcome` never
-    /// carries a signal in the first place (`tokio_runner`'s `wait` sets it
-    /// `None` unconditionally), so this arm is only ever reached by a
-    /// synthetic fixture like this one. The pinned artifacts under
-    /// `docs/lookout/` are unix renderings for the same reason.
-    ///
-    /// Windows lookout coverage is not lost with it: every other pane test
-    /// in this module runs on both platforms, and the dashboard itself was
-    /// exercised against a live Windows flock.
+    /// `cfg(unix)`: one fixture carries a synthetic signalled exit, and
+    /// `signal_label` resolves it against the running platform's table.
+    /// Windows never sets a signal on `ExitOutcome`, so this arm only
+    /// runs against a synthetic fixture like this one; the pinned
+    /// artifacts under `docs/lookout/` are unix renderings for the same
+    /// reason.
     #[cfg(unix)]
     #[allow(clippy::too_many_lines)] // thirty-two captions, each pinned clause by clause
     fn every_scene_shows_the_thing_it_is_named_for() {
-        // "All three panes at 120x30: the host strip under the title, the
-        //  detail pane and the bleats feed under the table. `>` marks the
-        //  selected sheep, and every pane below the table describes it."
+        // HealthyWide: all three panes at 120x30.
         let wide = render_text(&scene(Scene::HealthyWide).1);
         assert!(
             wide.contains("FOLD") && wide.contains("EXIT"),
@@ -1549,13 +1377,8 @@ mod tests {
             "exactly one selection marker"
         );
 
-        // "Three instances of one app under a group header, with the cursor
-        //  parked on the header. The header sums their restarts, CPU and
-        //  memory and takes the SHORTEST of their uptimes, so a group reads
-        //  as time since the app was last disturbed rather than as the age
-        //  of its luckiest instance. The detail pane repeats that rollup and
-        //  says lambs are per-instance; the feed will not guess which
-        //  instance to tail."
+        // Grouped: cursor on the group header, which rolls up restarts,
+        // CPU and memory and takes the shortest uptime.
         let grouped = render_text(&scene(Scene::Grouped).1);
         assert!(
             grouped.contains("web \u{d7}3"),
@@ -1583,10 +1406,8 @@ mod tests {
             .lines()
             .find(|line| line.starts_with("app web "))
             .expect("the detail pane's rollup line");
-        // Every number here is a rollup rather than any one member's: 0+2+1
-        // restarts, 3.4+2.9+3.1 CPU, 182+178+180 MiB. The uptime is the
-        // MINIMUM (300s, plus the 600s this frame is rendered at), which is
-        // why the oldest instance's own 2h 40m must not be what shows.
+        // Summed restarts, CPU and memory; uptime is the minimum (300s
+        // plus the 600s this frame renders at), not the oldest member's.
         assert!(rollup.contains("restarts 3"), "summed restarts: {rollup:?}");
         assert!(rollup.contains("cpu 9.4%"), "summed cpu: {rollup:?}");
         assert!(rollup.contains("mem 540.0M"), "summed memory: {rollup:?}");
@@ -1608,9 +1429,7 @@ mod tests {
             "with no instance's lines under that sentence: {grouped:?}"
         );
 
-        // "No sheep registered. Each of the three panes says why it is empty,
-        //  and the three sentences are different because the three reasons
-        //  are."
+        // Empty: each of the three panes gives its own reason.
         let empty = render_text(&scene(Scene::Empty).1);
         assert!(
             empty.contains("the flock is empty"),
@@ -1626,11 +1445,8 @@ mod tests {
             "and the strip shows no reading, not zero"
         );
 
-        // "51 columns: FOLD, EXIT, RESTARTS, PID and MEM are gone, in that
-        //  order. CPU and UPTIME survive because they explain WHY a RUNNING
-        //  sheep is behaving badly, a question EXIT cannot even ask. The
-        //  host strip fits; the detail pane and the feed do not, at 14
-        //  rows."
+        // Narrow: 51 columns drops FOLD, EXIT, RESTARTS, PID and MEM but
+        // keeps CPU and UPTIME.
         let narrow = render_text(&scene(Scene::Narrow).1);
         assert!(narrow.contains("CPU") && narrow.contains("UPTIME"));
         for gone in ["FOLD", "EXIT", "RESTARTS", "PID", "MEM"] {
@@ -1643,18 +1459,13 @@ mod tests {
             "and neither is the detail pane"
         );
 
-        // "28 columns: below the floor, the pane refuses rather than drawing
-        //  overlapping garbage. Two short lines, so the refusal still fits the
-        //  terminal it is refusing about."
+        // TooNarrow: below the floor, refuses rather than overlapping.
         let too_narrow = render_text(&scene(Scene::TooNarrow).1);
         let mut lines = too_narrow.lines();
         assert_eq!(lines.next().unwrap().trim_end(), "too small");
         assert_eq!(lines.next().unwrap().trim_end(), "need 33x6");
 
-        // "The feed under a burst: 3.8 megabytes were never read and some
-        //  hundreds of lines were read and dropped. The pane counts both, and
-        //  counts them separately, because it knows the second exactly and
-        //  cannot know how many lines are in the first."
+        // FeedGap: dropped lines and never-read bytes, counted separately.
         let gap = render_text(&scene(Scene::FeedGap).1);
         assert!(
             gap.contains("earlier lines not shown"),
@@ -1667,49 +1478,35 @@ mod tests {
             "the gap replaces the header"
         );
 
-        // "The selected sheep has never written a log in this $SHEP_HOME. The
-        //  feed names that cause rather than sitting blank."
+        // FeedMissing: names the cause rather than sitting blank.
         let missing = render_text(&scene(Scene::FeedMissing).1);
         assert!(missing.contains("has not written a log in this $SHEP_HOME"));
 
-        // "20 rows: the detail pane is the first to go, because every number
-        //  on it but the log paths is already in the row above it."
+        // NoDetail: the detail pane is the first to go at 20 rows.
         let no_detail = render_text(&scene(Scene::NoDetail).1);
         assert!(
             no_detail.contains("bleats  api"),
             "the feed stayed, on the selection"
         );
         assert!(no_detail.contains("host  load"), "and so did the strip");
-        // The ABSENCE, pinned to something only the detail pane can emit. The
-        // first draft asserted `!contains("sheep 2  api")`, which passes just
-        // as well when the selection is on sheep 0 and the pane drew
-        // perfectly — a check that cannot fail for the reason it exists. The
-        // log-path prefix is the detail pane's alone: the feed's body lines
-        // are tagged `out  ` too, but they carry log TEXT, not a path.
+        // The log-path prefix is the detail pane's alone: the feed's body
+        // lines are tagged `out  ` too, but carry log text, not a path.
         assert!(
             !no_detail.contains("out  /home/ada/.shep/logs/"),
             "the detail pane went"
         );
 
-        // "12 rows: no optional panes at all. This is 12a's frame, and the
-        //  only thing that changed is the two-column gutter the marker sits in."
+        // TableOnly: 12 rows, no optional panes.
         let table_only = render_text(&scene(Scene::TableOnly).1);
         assert!(!table_only.contains("host  load"));
         assert!(!table_only.contains("bleats  "));
         assert!(table_only.contains("STATUS"), "the table is still there");
 
-        // "33 columns: the narrowest terminal that draws. 26 rows — a couple
-        //  more than the 24-row floor for all three panes being up, so this
-        //  frame has a little breathing room rather than sitting exactly on
-        //  the edge. Everything truncates with an ellipsis; nothing
-        //  overlaps."
+        // Cramped: 33 columns, the narrowest terminal that draws.
         let cramped = render_text(&scene(Scene::Cramped).1);
         assert!(cramped.contains('…'), "something truncated, visibly");
-        // NOT `line.chars().count() == 33` on every row: `render_text` maps
-        // `(0..area.width)` for every row by construction, so that is true of
-        // any frame at any width, including a blank one. What "nothing
-        // overlaps" actually means is that each pane's own marker appears
-        // exactly once, which is a claim about this layout.
+        // Not a row-width check, which `render_text` satisfies trivially:
+        // "nothing overlaps" means each pane's marker appears exactly once.
         for marker in ["host  ", "bleats  ", "out  /home/ada/.shep/logs/"] {
             assert_eq!(
                 cramped
@@ -1725,14 +1522,7 @@ mod tests {
             "and the status bar is still the last row"
         );
 
-        // The four scenes carried over from 12a all changed meaning this
-        // phase — three panes, a marker, a strip, and 20 rows becoming 30 —
-        // so their captions were rewritten and each new clause is pinned here
-        // rather than left as prose nobody checked.
-
-        // "The shepherd stopped answering. Five attempts over about eight
-        //  seconds before this becomes the next frame. Every pane below the
-        //  table keeps describing the selected sheep from the last listing."
+        // Retrying: every pane keeps describing the last listing.
         let retrying = render_text(&scene(Scene::Retrying).1);
         assert!(retrying.contains("reconnecting"));
         assert!(
@@ -1741,9 +1531,7 @@ mod tests {
         );
         assert!(retrying.contains("host  load"), "and so is the strip");
 
-        // "The ladder ran out. Last known values stay, the uptime clock has
-        //  stopped, and so has the host strip — one line ticking over on a
-        //  frozen screen is a contradiction on the same frame."
+        // Frozen: last known values stay, nothing keeps ticking.
         let frozen = render_text(&scene(Scene::Frozen).1);
         assert!(frozen.contains("the shepherd has died"));
         assert!(
@@ -1751,11 +1539,7 @@ mod tests {
             "the strip kept its LAST values rather than blanking"
         );
 
-        // "One errored, one waiting to restart, one stopped, with the
-        //  selection parked on the errored sheep. Each row's own STATUS cell
-        //  is the only coloured cell in that row, and EXIT carries why each
-        //  of the three stopped: a code for the two that crashed, a signal
-        //  name for the one shep stopped itself."
+        // Errored: selection parked on the errored sheep.
         let errored = render_text(&scene(Scene::Errored).1);
         assert!(errored.contains("errored"));
         assert!(
@@ -1767,15 +1551,10 @@ mod tests {
             1,
             "exactly one marker, on that row"
         );
-        // Each row's own STATUS cell is the only coloured cell in that row:
-        // `online`, `errored` and `waiting-restart` each get their own
-        // status colour, and `stopped` happens to share the chrome's muted
-        // grey rather than standing out from it. Only the ANSI rendering
-        // carries colour to check this against.
-        // EXIT carries why each of the three stopped. Asserted on the ROWS
-        // rather than on the whole frame, because `errored.contains("1")`
-        // would pass on any digit anywhere -- a restart count, a pid, a
-        // timestamp -- and pass just as happily if the column were blank.
+        // Only the ANSI rendering carries colour to check STATUS against.
+        //
+        // Asserted per row, not on the whole frame: `errored.contains("1")`
+        // would pass on any digit anywhere, blank column included.
         let row_of = |name: &str| {
             errored
                 .lines()
@@ -1785,8 +1564,7 @@ mod tests {
         };
         for (name, want) in [
             ("api", "1"),
-            // "billing-r": the SMIT column at this frame's width narrows
-            // NAME enough that the truncation lands one syllable earlier.
+            // NAME truncates at this width, landing one syllable earlier.
             ("billing-r", "1"),
             ("cron", "SIGTERM"),
         ] {
@@ -1824,8 +1602,7 @@ mod tests {
             "stopped's STATUS cell shares the chrome's muted grey rather than standing out"
         );
 
-        // "`x` with actions gated off. The refusal is literal, nothing about
-        //  damage gets charming, and the panes below carry on."
+        // Refused: `x` with actions gated off.
         let refused = render_text(&scene(Scene::Refused).1);
         assert!(refused.contains("--allow-control"));
         assert!(
@@ -1833,11 +1610,7 @@ mod tests {
             "a refusal does not blank the screen"
         );
 
-        // "Mid-type at 100x14. The table has already narrowed to the two
-        //  sheep whose names contain the query, the title counts the
-        //  narrowed set and the whole flock, and the status bar carries the
-        //  query, a cursor, and the three keys that mean anything while the
-        //  box is open."
+        // FilterEditing: mid-type, table already narrowed.
         let editing = render_text(&scene(Scene::FilterEditing).1);
         assert_eq!(
             editing
@@ -1857,25 +1630,20 @@ mod tests {
             assert!(editing.contains(named), "the box names {named}");
         }
 
-        // "The same query applied. The box is closed, the table is still
-        //  narrowed, and the bar has changed to name the two keys that now
-        //  touch the filter."
+        // FilterActive: the same query, box closed.
         let active = render_text(&scene(Scene::FilterActive).1);
         assert!(active.contains("filter \"web\""), "the box is closed");
         assert!(!active.contains("enter applies"), "and its keys are gone");
         assert!(active.contains("2 of 6 in the flock"), "still narrowed");
         assert!(active.contains("/ edit") && active.contains("esc clear"));
 
-        // "A query nothing matches. The table names the query rather than
-        //  claiming the flock is empty, and the title keeps the flock's real
-        //  size on screen."
+        // FilterNoMatch: names the query rather than claiming empty.
         let none = render_text(&scene(Scene::FilterNoMatch).1);
         assert!(none.contains("no sheep's name contains \"zzz\""));
         assert!(!none.contains("the flock is empty"));
         assert!(none.contains("0 of 6 in the flock"));
 
-        // "sysinfo reports this platform unsupported. The strip says so and
-        //  keeps the flock's own totals, which lookout can always compute."
+        // HostUnknown: the strip keeps the flock's own totals.
         let unknown = render_text(&scene(Scene::HostUnknown).1);
         assert!(unknown.contains("host  usage is not available on this platform"));
         assert!(
@@ -1883,10 +1651,7 @@ mod tests {
             "the half lookout can compute survives"
         );
 
-        // "The detail pane with a lamb list: how many descendants the
-        //  shepherd's walk found, how old that reading is, and each lamb's
-        //  pid and executable name. The stamp sits before the list so a
-        //  narrow terminal truncates lambs rather than the caveat."
+        // Lambs: the stamp sits before the list.
         let lambs = render_text(&scene(Scene::Lambs).1);
         assert!(lambs.contains("lambs  3 parent-pid descendants, read "));
         assert!(lambs.contains("48220 node"), "each lamb's pid and name");
@@ -1899,10 +1664,7 @@ mod tests {
             "the stamp comes before the list"
         );
 
-        // "The same pane on a stopped sheep. The shepherd had no pid to walk
-        //  from and left the field unset rather than empty, and the line
-        //  says which of the two it is looking at rather than reporting none
-        //  found."
+        // LambsUnknown: no pid to walk from, unset rather than empty.
         let unknown = render_text(&scene(Scene::LambsUnknown).1);
         assert!(unknown.contains("lambs  this sheep is not running, so there is no tree to walk"));
         assert!(
@@ -1911,9 +1673,7 @@ mod tests {
         );
         assert!(unknown.contains("sheep 4  cron"), "on the stopped sheep");
 
-        // "`R` pressed with the gate open. Nothing has been sent: the bar
-        //  asks a question naming the verb and the exact sheep, and `api` is
-        //  still online in the table behind it."
+        // Confirm: `R` pressed, nothing sent yet.
         let confirm = render_text(&scene(Scene::Confirm).1);
         assert!(confirm.contains("restart api (id 2)? enter confirms, any other key cancels"));
         assert!(confirm.contains("control enabled"), "the gate is open");
@@ -1922,9 +1682,7 @@ mod tests {
             "nothing was sent, so api is still online: {confirm:?}"
         );
 
-        // "Enter pressed. The request is out and nothing on the table has
-        //  changed, because nothing the shepherd has said has changed:
-        //  `api` is still online and the cursor has not moved."
+        // Acting: request out, table unchanged.
         let acting = render_text(&scene(Scene::Acting).1);
         assert!(acting.contains("restart api (id 2): sent, waiting for the shepherd"));
         assert!(
@@ -1936,9 +1694,7 @@ mod tests {
             "and the row still says what the shepherd last said"
         );
 
-        // "The shepherd answered. The bar says what it did, in the non-grave
-        //  style a refusal does not get, and the table shows the row the
-        //  reply carried rather than waiting for the next poll."
+        // ActionAccepted: the reply's own row reaches the table at once.
         let accepted = render_text(&scene(Scene::ActionAccepted).1);
         assert!(accepted.contains("restart api (id 2): the shepherd restarted it"));
         assert!(
@@ -1946,10 +1702,7 @@ mod tests {
             "the reply's own row reached the table without waiting for a poll"
         );
 
-        // "The shepherd refused while the request was out, and its own
-        //  sentence is forwarded rather than rewritten. The sheep has left
-        //  the flock in the listing behind it, so the table is one row
-        //  shorter and the cursor has moved to the row below."
+        // ActionRefused: the shepherd's own sentence is forwarded as is.
         let refused = render_text(&scene(Scene::ActionRefused).1);
         assert!(refused.contains("restart api (id 2): selector matched no registered sheep"));
         assert!(
@@ -1966,9 +1719,8 @@ mod tests {
             "and the cursor has moved to the row below: {refused:?}"
         );
 
-        // "An action key pressed while the link is coming back. The refusal
-        //  names the same reconnect attempt the banner above it does, rather
-        //  than the exhausted-ladder sentence."
+        // ActionRefusedOffline: names the same reconnect attempt as the
+        // banner above it, not the exhausted-ladder sentence.
         let offline = render_text(&scene(Scene::ActionRefusedOffline).1);
         assert_eq!(
             offline.matches("reconnecting (attempt 3)").count(),
@@ -1981,18 +1733,14 @@ mod tests {
             "the ladder has not run out yet, so the refusal must not claim it has: {offline:?}"
         );
 
-        // The one frame in the gallery whose left slot is empty while the
-        // gate is open, which makes it the only one that shows the control
-        // hint.
+        // The only frame with the left bar slot empty while the gate is
+        // open, so it is the only one showing the control hint.
         let lambs_bar = render_text(&scene(Scene::Lambs).1);
         for key in ["x stop", "R restart", "L reload"] {
             assert!(lambs_bar.contains(key), "the control hint names {key}");
         }
 
-        // "The settings screen on a fresh $SHEP_HOME: shep.toml holds only
-        //  [interpreters], so every scalar's SOURCE column reads `the
-        //  default` and its VALUE is the compiled fallback. The state most
-        //  operators open this screen in."
+        // SettingsFresh: a bare `shep.toml`, every scalar reads the default.
         let fresh = render_text(&scene(Scene::SettingsFresh).1);
         assert_eq!(
             fresh.matches("the default").count(),
@@ -2004,24 +1752,18 @@ mod tests {
             "a fresh home has declared nothing: {fresh:?}"
         );
 
-        // "The settings screen with some scalars declared. `shep.toml` and
-        //  `the default` sit side by side in the SOURCE column, so what the
-        //  operator wrote and what shep assumes are both visible at once."
+        // SettingsSet: `shep.toml` and the default sit side by side.
         let set = render_text(&scene(Scene::SettingsSet).1);
         assert!(set.contains("shep.toml"), "some scalars are declared");
         assert!(set.contains("the default"), "and some are not: {set:?}");
 
-        // "A [daemon] confirm armed on log_level, naming the variable and
-        //  the flag it cannot see: SHEP_LOG_LEVEL and --log-level, and the
-        //  shep daemon reload the edit needs."
+        // SettingsConfirm: names the env var and flag it cannot see.
         let confirm = render_text(&scene(Scene::SettingsConfirm).1);
         assert!(confirm.contains("shep daemon reload"), "got: {confirm:?}");
         assert!(confirm.contains("SHEP_LOG_LEVEL"), "got: {confirm:?}");
         assert!(confirm.contains("--log-level"), "got: {confirm:?}");
 
-        // "The socket editor open mid-path. The status bar names the field
-        //  being typed, not the dashboard's own filter box, which is what
-        //  it showed here before the fix this frame now pins."
+        // SettingsTyping: names the field being typed, not the filter box.
         let typing = render_text(&scene(Scene::SettingsTyping).1);
         assert!(
             typing.contains("editing socket"),
@@ -2032,9 +1774,7 @@ mod tests {
             "must not read as the dashboard's own filter box: {typing:?}"
         );
 
-        // "The dogs table showing the drift it exists to reveal: otel
-        //  running while disabled in the file, ledger enabled and absent,
-        //  and bark enabled, running, and silent."
+        // SettingsDogs: the drift the table exists to reveal.
         let dogs = render_text(&scene(Scene::SettingsDogs).1);
         assert!(
             dog_row_for(&dogs, "otel")
@@ -2052,11 +1792,7 @@ mod tests {
             "bark: enabled, running, never handshook: {dogs:?}"
         );
 
-        // "The same screen at 45 columns. Both of its tables have dropped a
-        //  column rather than clipping: the scalar rows have lost the apply
-        //  cost and kept SOURCE, and the dogs table has lost SOURCE and
-        //  kept RUNNING. Each keeps whichever half is not said anywhere
-        //  else."
+        // SettingsNarrow: both tables drop a column rather than clip.
         let narrow = render_text(&scene(Scene::SettingsNarrow).1);
         assert!(
             narrow.contains("shep.toml"),
@@ -2099,15 +1835,10 @@ mod tests {
         );
     }
 
-    /// fails if the gallery's cursor walk budgets by SHEEP rather than by
-    /// visible rows.
-    ///
-    /// Two grouped apps, four sheep, six visible rows: the last row sits at
-    /// index 5 and a `0..=flock_len()` budget can only check as far as index
-    /// 4, so the walk runs out and hits its own `panic!` before reaching a
-    /// row that is plainly on screen. One group is not enough to show it --
-    /// a single header lands the budget exactly on the last row -- which is
-    /// why this builds two rather than reusing [`Scene::Grouped`]'s flock.
+    /// Two grouped apps, four sheep, six visible rows: a `0..=flock_len()`
+    /// budget only reaches index 4, short of the last row at index 5. One
+    /// group would not show this, since its header lands the budget
+    /// exactly on the last row.
     #[test]
     fn the_cursor_walk_budgets_by_visible_rows_not_by_sheep() {
         use std::ffi::OsStr;
@@ -2140,10 +1871,8 @@ mod tests {
         assert_eq!(app.selected(), Some(RowKey::Sheep(1)));
     }
 
-    /// fails if a scene is added to [`Scene::ALL`] without a caption, or with
-    /// a caption nobody pinned. The second half cannot be checked by a
-    /// machine — but the first half can, and a scene with no caption is how
-    /// an unpinned one gets in.
+    /// Only checks that every scene has a caption, since whether the
+    /// caption is pinned by an assertion is not machine-checkable.
     #[test]
     fn every_scene_has_a_caption_and_a_distinct_label() {
         let mut labels = std::collections::BTreeSet::new();
@@ -2161,20 +1890,15 @@ mod tests {
                 which.label()
             );
         }
-        // `labels.len() == Scene::ALL.len()` is not asserted: the `insert`
-        // above already guarantees it, so it would be a line that cannot
-        // fail. The literal can — it is what catches a scene added to the
-        // enum and not to `ALL`, or the reverse.
+        // The literal 32 catches a scene added to the enum but not to
+        // `ALL`, or the reverse; `labels.len()` would not, since `insert`
+        // above already guarantees it.
         assert_eq!(Scene::ALL.len(), 32);
     }
 
-    /// fails if a 12b pane introduced a text MODIFIER. `sgr` renders
-    /// foregrounds only — its own doc says a modifier would come out unstyled
-    /// — and this phase deliberately introduced none: the selection marker is
-    /// a character, not a `REVERSED` row, precisely so `NO_COLOR` and a
-    /// 16-colour terminal lose nothing. If this ever reddens, `sgr` needs a
-    /// case before the gallery is regenerated, or the modifier needs
-    /// removing.
+    /// `sgr` renders foregrounds only, so a modifier would come out
+    /// unstyled. The selection marker is a character rather than a
+    /// reversed row for exactly this reason.
     #[test]
     fn no_scene_uses_a_modifier_the_ansi_renderer_would_drop() {
         for which in Scene::ALL {
@@ -2192,18 +1916,10 @@ mod tests {
         }
     }
 
-    /// fails if a frozen frame keeps counting. This is the one thing the
-    /// frozen scene exists to show the maintainer, and it is the property design
-    /// decision 8 is about.
-    ///
-    /// **Rendered twice at two different clock ages and compared**, rather
-    /// than compared against the healthy scene: those two frames differ by
-    /// a banner line, five statuses and a row shift, so an `assert_ne!`
-    /// between them holds whether or not the clock stopped and cannot
-    /// detect the regression its name claims. The live pair at the bottom
-    /// is what keeps the frozen pair honest — without it, a `render_text`
-    /// that emitted no UPTIME column at all would satisfy the first
-    /// assertion perfectly.
+    /// Rendered twice at two different ages and compared to each other,
+    /// not to the healthy scene, since a live-versus-frozen diff would
+    /// pass either way. The live pair at the bottom catches a renderer
+    /// that drops the uptime column entirely.
     #[test]
     fn the_frozen_frame_does_not_move_however_long_the_link_stays_gone() {
         let ten_minutes = render_text(&scene_with(Scene::Frozen, Duration::from_secs(600)));
@@ -2226,28 +1942,15 @@ mod tests {
         );
     }
 
-    /// The frame pins. NOT wire fixtures: re-accepting these after a
-    /// deliberate layout change is correct and expected, which is the
-    /// opposite of IR-35's rule for the protocol snapshots in shep-core.
-    /// Nobody may apply wire discipline to a border glyph.
-    /// `cfg(unix)` because one scene's fixture carries a SIGNALLED exit, and
-    /// `output::rows::signal_label` resolves a signal number against the
-    /// running platform's own table on purpose — its doc argues that a
-    /// `ProcessInfo` is always rendered by a binary on the same OS as the
-    /// daemon that produced it, and `shep_core::signals::OperatorSignal`
-    /// deliberately refuses to map numbers to names at all ("a number means
-    /// different signals on different platforms, and shep will not guess").
+    /// Frame pins, not wire fixtures: re-accepting these after a layout
+    /// change is expected, unlike the rule for shep-core's protocol
+    /// snapshots.
     ///
-    /// So Windows renders `15` where unix renders `SIGTERM`, and that is the
-    /// designed behaviour rather than a gap: a Windows `ExitOutcome` never
-    /// carries a signal in the first place (`tokio_runner`'s `wait` sets it
-    /// `None` unconditionally), so this arm is only ever reached by a
-    /// synthetic fixture like this one. The pinned artifacts under
+    /// `cfg(unix)`: one fixture carries a synthetic signalled exit, and
+    /// `signal_label` resolves it against the running platform's table.
+    /// Windows never sets a signal on `ExitOutcome`, so this only runs
+    /// against a synthetic fixture; the pinned artifacts under
     /// `docs/lookout/` are unix renderings for the same reason.
-    ///
-    /// Windows lookout coverage is not lost with it: every other pane test
-    /// in this module runs on both platforms, and the dashboard itself was
-    /// exercised against a live Windows flock.
     #[cfg(unix)]
     #[test]
     fn frames_are_pinned() {
@@ -2259,23 +1962,18 @@ mod tests {
 
     /// Writes `docs/lookout/frames.txt` and `docs/lookout/frames.ansi`.
     ///
-    /// `#[ignore]` because it writes into the repository, which no ordinary
-    /// test run may do. Run it deliberately:
+    /// `#[ignore]`: writes into the repository, so it only runs on request.
     ///
     /// ```text
     /// cargo test -p shep --lib --all-features -- --ignored write_the_gallery
     /// ```
     ///
-    /// This is the ONE ignored test this phase adds — the `ignored` count
-    /// in the workspace summary goes 3 -> 4, exactly once.
-    ///
-    /// It cannot rot: every frame it writes is `render_text`/`render_ansi`
-    /// over the same `Scene::ALL` the pinned snapshots above read, so a
-    /// layout change reddens the ordinary suite first.
+    /// Cannot rot: it renders the same `Scene::ALL` the pinned snapshots
+    /// read, so a layout change reddens the ordinary suite first.
     #[test]
     #[ignore = "writes into docs/lookout; run it deliberately"]
     fn write_the_gallery() {
-        // Absolute, derived from the manifest — so it lands in the same
+        // Absolute, derived from the manifest, so it lands in the same
         // place whatever directory the run started in.
         let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/lookout"));
         std::fs::create_dir_all(dir).unwrap();

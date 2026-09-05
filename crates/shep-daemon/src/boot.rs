@@ -1,37 +1,15 @@
 //! Daemon boot: layout, pidfile, control-socket bind, and the run/teardown
 //! sequence
 //!
-//! Everything a daemon needs before it can accept its first connection:
-//! creating (and tightening) `$SHEP_HOME`'s directory layout, recording its
-//! own pid, binding the control socket — including recovering from a socket
-//! file a crashed daemon left behind — and, once bound, reporting readiness
-//! on an inherited pipe if the CLI daemonized us (spec §3). This module owns
-//! the 0700 guarantee `crate::server::RpcServer`'s doc names as the boot
-//! path's responsibility: `init_dirs` creates `run/` (and every other
-//! layout directory) `0700` and *tightens* it back down if it already
-//! exists looser, so the guarantee holds whether this is a first boot or a
-//! restart onto a directory some other process touched.
+//! `init_dirs` creates every layout directory `0700` and tightens one that
+//! already exists looser, the guarantee `crate::server::RpcServer`'s doc names
+//! as boot's. [`boot`] assembles bus, supervisor, muster roll and RPC context
+//! into one [`RunningDaemon`]; [`RunningDaemon::run`] serves until a signal or
+//! `KillDaemon`, then tears down in a load-bearing order.
 //!
-//! [`boot`] assembles every piece earlier tasks built (bus, supervisor,
-//! muster roll, RPC context) into one [`RunningDaemon`]; [`RunningDaemon::run`]
-//! serves connections until a signal or `KillDaemon` arrives, then tears
-//! down in a load-bearing order — see its own doc for why.
-//!
-//! **No unsafe in this module.** [`BootOptions::ready_fd`] is
-//! `Option<`[`std::fs::File`]`>`, not a raw descriptor: the CALLER adopts
-//! the inherited readiness pipe (`unsafe fn` `crate::sys::adopt_fd`,
-//! IR-22's sole unsafe surface) before ever constructing a [`BootOptions`],
-//! so [`boot`] only ever receives an already-owned handle and never
-//! constructs one from a bare number itself. Every bind/probe/unlink/
-//! signal-registration step in this module is plain safe std/tokio.
-//!
-//! (`boot` cannot perform that adoption itself: `adopt_fd`'s ordering
-//! precondition is process-wide — "call before THIS PROCESS opens any
-//! descriptor" — and `boot` is `async`, so a tokio runtime with its own live
-//! poller fds already exists by the time `boot` is ever called. Only the
-//! CLI's `main`, as its literal first fd-touching statement, can discharge
-//! that precondition. See `crate::sys::adopt_fd`'s own `# Safety` section
-//! and rationale essay for the full contract.)
+//! [`BootOptions::ready_fd`] arrives as an owned [`std::fs::File`]:
+//! `crate::sys::adopt_fd`'s ordering precondition is process-wide and `boot`
+//! is `async`, so only the CLI's `main` can discharge it.
 
 use core::fmt;
 use core::time::Duration;
@@ -63,9 +41,7 @@ use crate::runner::ProcessRunner;
 use crate::server::RpcServer;
 use crate::snapshot::{self, FlockRegistry, SnapshotError, SnapshotWriter, spawn_snapshot_writer};
 use crate::supervisor::{SupervisorBuilder, SupervisorHandle};
-// Read only by the SIGUSR2 log-reopen handler, which is unix-only — Windows
-// has no user-defined console control event to hang one on. See
-// `install_signals`' Windows arm.
+// unix only: read by the SIGUSR2 log-reopen handler, which Windows has none of.
 #[cfg(unix)]
 use crate::supervisor::SupervisorError;
 
@@ -74,53 +50,24 @@ pub const DIR_MODE: u32 = 0o700;
 
 /// Capacity of each of the two lifecycle-extra report channels.
 ///
-/// Bounded rather than unbounded on purpose: a report producer that outruns
-/// the reporting task should back-pressure (the enforcer's own send is
-/// awaited) rather than grow a queue of restarts nobody has performed yet.
-/// Generous enough that a whole flock breaching on one sampling pass fits.
+/// Bounded, so a report producer that outruns the reporting task
+/// back-pressures instead of queueing restarts nobody has performed. 64 fits
+/// a whole flock breaching on one sampling pass.
 const EXTRAS_REPORT_CAPACITY: usize = 64;
 
-/// Creates `dir` (and any missing parents) at [`DIR_MODE`] directly, via
-/// [`DirBuilderExt::mode`] rather than the std default (`0o777`, narrowed
-/// only by whatever the process umask happens to strip).
+/// Creates `dir` and any missing parents at [`DIR_MODE`] via
+/// [`DirBuilderExt::mode`], closing the TOCTOU a `create_dir_all` plus a
+/// separate `chmod` leaves open: the umask-derived mode in between is wide
+/// enough to race a symlink onto the socket path underneath.
 ///
-/// This is the fix for a real TOCTOU: `create_dir_all` followed by a
-/// separate `chmod` leaves a window where a *freshly created* directory
-/// sits at its umask-derived mode — empirically `0o755` under the common
-/// `umask 022`, and world-*writable* under `umask 0` (a misconfigured
-/// systemd unit), which opens a pre-bind symlink race on the socket path
-/// underneath it. Requesting `0o700` at creation has no group/other bits
-/// for any ordinary umask to strip, so there is nothing left to narrow
-/// after the fact — the directory is never wider than `DIR_MODE`, not even
-/// for the instant between `mkdir` and a later `chmod`.
-///
-/// Does not touch a directory that already exists (the umask given to
-/// `mkdir` only governs directories this call actually creates) — that
-/// case is [`init_dirs`]'s `set_permissions` pass, not this function's job.
+/// Does not touch a directory that already exists; that is [`init_dirs`]'s
+/// `set_permissions` pass.
 #[cfg(windows)]
 fn create_dir_at_dir_mode(dir: &Path) -> std::io::Result<()> {
-    // No mode to set. `DIR_MODE` is a POSIX permission word and Windows
-    // access control is an ACL, not a scalar, so there is nothing here to
-    // translate it into: a directory created this way inherits its parent's
-    // ACL, which under a normal user profile means the user and the local
-    // Administrators group.
-    //
-    // **This is a real difference in posture and is recorded rather than
-    // papered over.** On unix the `0700` on `$SHEP_HOME` is the PRIMARY
-    // access control — `server.rs`'s security writeup says so outright, and
-    // the same-uid peer check is explicitly the second layer behind it. On
-    // Windows the primary control moved to the control pipe's own ACL
-    // instead (see `shep_core::transport`), which is what actually refuses a
-    // foreign local user, and it does so before any byte reaches shep. What
-    // this directory does NOT do is hide `flock.json` — which holds an app's
-    // `env` verbatim so a muster restore can reproduce it — from another
-    // account that already has read access to the profile it lives under.
-    //
-    // Closing that would mean building an explicit DACL with
-    // `PROTECTED_DACL_SECURITY_INFORMATION` so it does not inherit, which is
-    // raw FFI in a crate whose only sanctioned unsafe lives in `sys.rs`. It
-    // is deliberately not smuggled in here, and it is named in the operator
-    // docs rather than left for someone to discover.
+    // No mode to set: `DIR_MODE` is a POSIX word, Windows access control is an
+    // inherited ACL. The control pipe's ACL guards the socket instead, so
+    // `flock.json`'s `env` stays readable to another account with access to
+    // the profile; the operator docs name that gap.
     std::fs::DirBuilder::new().recursive(true).create(dir)
 }
 
@@ -134,26 +81,18 @@ fn create_dir_at_dir_mode(dir: &Path) -> std::io::Result<()> {
 
 /// Creates `$SHEP_HOME` and its subdirectories, tightening loose modes
 ///
-/// Runs on every boot, not just the first: a restart onto a layout that
-/// already exists still forces every directory back to `DIR_MODE`, so a
-/// looser mode left by an external touch (or an older shep version) never
-/// survives a restart. A directory this call actually creates lands at
-/// `DIR_MODE` immediately (via the private `create_dir_at_dir_mode`
-/// helper); the `set_permissions` call below is what tightens one that was
-/// already there.
+/// Idempotent: a restart onto an existing layout forces every directory back
+/// to [`DIR_MODE`].
 ///
 /// # Errors
-/// - [`BootError::Io`] — a directory could not be created or chmod'ed.
+/// - [`BootError::Io`] if a directory could not be created or chmod'ed.
 pub(crate) fn init_dirs(paths: &ShepPaths) -> Result<(), BootError> {
     for dir in [&paths.home, &paths.logs, &paths.pids, &paths.run] {
         create_dir_at_dir_mode(dir).map_err(|source| BootError::Io {
             path: dir.clone(),
             source,
         })?;
-        // Re-tightening an already-existing directory, which is the half
-        // `create_dir_at_dir_mode` cannot do. Unix only, for the reason that
-        // function's Windows arm gives: there is no scalar mode to force a
-        // directory back to.
+        // Unix only: Windows has no scalar mode to force a directory back to.
         #[cfg(unix)]
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(DIR_MODE)).map_err(
             |source| BootError::Io {
@@ -166,39 +105,19 @@ pub(crate) fn init_dirs(paths: &ShepPaths) -> Result<(), BootError> {
 }
 
 /// The daemon's own pidfile: `$SHEP_HOME/pids/shepd.pid`
-///
-/// Public only for `tests/daemon_e2e.rs`, which reads the file back to check
-/// what a booted daemon wrote there. `shep-cli` derives the same path from
-/// `ShepPaths` itself rather than calling this.
 #[must_use]
 pub fn pidfile(paths: &ShepPaths) -> PathBuf {
     paths.pids.join("shepd.pid")
 }
 
-/// Writes the pidfile atomically (temp file in `pids/`, `fsync`, then
-/// `rename`), matching [`crate::snapshot::write_atomic`]'s convention for
-/// every other file this daemon writes. [`crate::snapshot::write_atomic`]
-/// itself isn't reusable here — it's typed to serialize a
-/// [`crate::snapshot::FlockSnapshot`] as JSON, not a bare pid — so this
-/// inlines the same temp+rename shape rather than writing straight to the
-/// final path with `std::fs::write` and risking a reader observing a
-/// truncated file mid-write.
+/// Writes the pidfile atomically: temp file in `pids/`, `fsync`, `rename`.
 ///
-/// [`boot`] itself does NOT call this: it records its own pid through the
-/// crate-private `PidfileLock::record` instead, writing in place into the
-/// SAME open, locked file descriptor it already holds — a rename here
-/// would swap in an unlocked inode and undo that lock's whole point (see
-/// `PidfileLock`'s own doc, next to its definition in this file).
-///
-/// Test-only, and deliberately so. Its only remaining use is seeding a
-/// fixture pidfile without contending for the boot-time lock. Exported, it
-/// would be a footgun: a rename over the locked path by any outside caller
-/// silently disarms `PidfileLock` for the rest of that daemon's life. The
-/// Phase 3 CLI has no need for it either — it learns the daemon's pid from
-/// the handshake's `HelloAck`, not from this file.
+/// Fixture seeding only. [`boot`] records its pid through
+/// `PidfileLock::record` instead: a rename over the locked path swaps in an
+/// unlocked inode and disarms the lock for the daemon's life.
 ///
 /// # Errors
-/// - [`BootError::Io`] — the pidfile could not be written.
+/// - [`BootError::Io`] if the pidfile could not be written.
 #[cfg(test)]
 #[cfg_attr(windows, allow(dead_code))]
 fn write_pidfile(paths: &ShepPaths, pid: u32) -> Result<(), BootError> {
@@ -230,13 +149,11 @@ fn write_pidfile(paths: &ShepPaths, pid: u32) -> Result<(), BootError> {
 /// Reads the recorded daemon pid, if any
 ///
 /// A missing pidfile reads as `None`, as does one whose contents are not a
-/// valid pid (the daemon's own writes never produce that, so it only
-/// happens to a file something else corrupted) — the pid is a best-effort
-/// hint attached to [`BootError::AlreadyRunning`], not itself the source of
-/// truth for whether a daemon is live.
+/// valid pid. A best-effort hint for [`BootError::AlreadyRunning`], never
+/// proof that a daemon is live; the lock is that.
 ///
 /// # Errors
-/// - [`BootError::Io`] — the pidfile exists but could not be read.
+/// - [`BootError::Io`] if the pidfile exists but could not be read.
 pub(crate) fn read_pidfile(paths: &ShepPaths) -> Result<Option<u32>, BootError> {
     let path = pidfile(paths);
     match std::fs::read_to_string(&path) {
@@ -247,103 +164,35 @@ pub(crate) fn read_pidfile(paths: &ShepPaths) -> Result<Option<u32>, BootError> 
 }
 
 /// This daemon's exclusive claim on `$SHEP_HOME`: an `flock(2)` held on the
-/// pidfile for as long as this process is alive.
+/// pidfile from before [`bind_socket`] to the end of [`RunningDaemon::run`].
 ///
-/// Exists to close a real race in [`bind_socket`]'s stale-socket recovery
-/// (spec §6): two daemons racing to boot the same `$SHEP_HOME` can both hit
-/// `EADDRINUSE` on a crashed predecessor's leftover socket file, both probe
-/// it, both observe `ConnectionRefused` (correctly — the file IS stale),
-/// and both proceed into the `remove_file` + rebind arm — B's `remove_file`
-/// can then delete A's freshly-bound listener out from under it, and BOTH
-/// end up with a live [`UnixListener`] on the same path, each unaware of
-/// the other. That is two live daemons on one `$SHEP_HOME`, exactly the
-/// case [`BootError::AlreadyRunning`] exists to prevent, defeated exactly
-/// when the recovery path is what makes it matter.
+/// Serializes [`bind_socket`]'s stale-socket recovery: unserialized, two
+/// daemons both see `ConnectionRefused` on a crashed predecessor's leftover
+/// and the loser's `remove_file` deletes the winner's fresh listener. A crash
+/// needs no cleanup: the kernel releases the lock with the last descriptor on
+/// the open file description.
 ///
-/// `flock` closes it because the kernel serializes concurrent lockers
-/// itself: [`Self::acquire`] uses `LOCK_EX | LOCK_NB`, so of any number of
-/// processes racing to boot the same `$SHEP_HOME`, at most one ever holds
-/// this lock at a time, and every other one fails IMMEDIATELY with
-/// [`BootError::AlreadyRunning`] rather than proceeding into
-/// [`bind_socket`]'s probe/recover logic at all — there is no window left
-/// for two processes to be inside that logic concurrently, because only
-/// the lock's single holder can be in there. [`boot`] acquires this BEFORE
-/// calling [`bind_socket`] and keeps it for [`RunningDaemon`]'s whole
-/// lifetime (dropped only at the end of [`RunningDaemon::run`]) — see this
-/// type's own `acquire`/`record` docs for exactly what that does and does
-/// not still leave [`bind_socket`]'s own probe responsible for.
-///
-/// A crashed daemon's lock needs no separate cleanup: `flock`'s locks are
-/// owned by the OPEN FILE DESCRIPTION, which the kernel releases the
-/// instant every fd referencing it closes — including on process death by
-/// any signal, `SIGKILL` included, with no unlock call required. That is
-/// exactly the property a pidfile-based "am I the only one" check needs
-/// and a filesystem-existence check (`pidfile` alone) cannot give: a stale
-/// pidfile from a crash still exists, but a stale LOCK on it does not.
-/// # Windows
-///
-/// Every property above survives, by a different mechanism and on a
-/// different file. The lock is an exclusive `share_mode(0)` open — the same
-/// primitive [`shep_core::kv`] and [`shep_core::barks`] use — held on a
-/// SIBLING `shepd.pid.lock` rather than on the pidfile itself.
-///
-/// The sibling is not incidental. `share_mode(0)` denies *every* other
-/// handle, including a read-only one, so locking the pidfile directly would
-/// make it unreadable — and reading it is exactly what the losing daemon
-/// does to name the winner in its [`BootError::AlreadyRunning`]. Unix has no
-/// such problem because `flock` is advisory and does not block an ordinary
-/// `open`. Splitting the lock token from the data file restores the unix
-/// behaviour: the loser is refused, and can still read who won.
-///
-/// The load-bearing crash property holds too, for the same underlying
-/// reason. A `flock` lock is owned by the open file description and the
-/// kernel drops it when the last descriptor closes, process death included;
-/// a Windows share-mode reservation is owned by the HANDLE and the kernel
-/// drops it when the last handle closes, process death included. Neither
-/// needs an unlock call, and neither leaves a stale lock behind after a
-/// `SIGKILL` or a `TerminateProcess`. A stale pidfile still exists on both
-/// platforms; a stale lock does not.
-///
-/// One genuine difference: `LockExclusiveNonblock` fails with `EWOULDBLOCK`
-/// and a contended `share_mode(0)` open fails with
-/// `ERROR_SHARING_VIOLATION`. Both are immediate — this is the one lock in
-/// the workspace that must NOT wait, unlike the kv and bark rings, whose
-/// Windows arms retry precisely because their unix arms block.
-///
-/// # The adopted arm
-///
-/// A successor does not take this lock: it inherits the descriptor that
-/// already holds it. See [`UnixLock`] for why it must not take it again.
+/// Windows locks a sibling `shepd.pid.lock`, since `share_mode(0)` would deny
+/// the read-only open the loser needs to name the winner. A successor inherits
+/// the descriptor already holding the lock; see [`UnixLock`].
 #[derive(Debug)]
 struct PidfileLock {
     #[cfg(unix)]
     flock: UnixLock,
-    /// The sibling lock file, held open with every share flag cleared.
-    /// Named with a leading underscore because it is held, never read —
-    /// [`PidfileLock::record`] writes the pidfile itself.
+    /// The sibling lock file, held open with every share flag cleared. Held,
+    /// never read: [`PidfileLock::record`] writes the pidfile itself.
     #[cfg(windows)]
     _handle: std::fs::File,
 }
 
-/// How this process came to hold the pidfile's `flock`, which is the one
-/// thing the two ways of starting a shepherd differ on.
+/// How this process came to hold the pidfile's `flock`.
 ///
-/// # Why an adopted descriptor is never re-locked
-///
-/// A `flock` lock belongs to the open file DESCRIPTION, not to the process
-/// and not to the path, so it crosses an `execve` still held: a successor
-/// inherits the descriptor and the lock on it in one act, before it runs a
-/// line of its own code. Taking the lock again would mean releasing it
-/// first, since `nix` offers no constructor for an already-locked file that
-/// does not lock it, and that window is exactly long enough for a second
-/// daemon to claim this `$SHEP_HOME` while the only process supervising its
-/// flock is mid-boot. So the adopted arm holds the file and does nothing
-/// else with it.
-///
-/// The release rules stay identical either way. The kernel drops the lock
-/// when the last descriptor on the description closes, process death
-/// included, so a successor that crashes leaves the home claimable exactly
-/// as a predecessor that crashed did.
+/// An adopted descriptor is never re-locked: `nix` has no constructor for an
+/// already-locked file that leaves it locked, and the release-then-relock
+/// window is long enough for a second daemon to claim this `$SHEP_HOME`. The
+/// lock crosses an `execve` with the descriptor, so there is nothing to redo.
+/// Either arm releases the same way, when the last descriptor on the open file
+/// description closes.
 #[cfg(unix)]
 #[derive(Debug)]
 enum UnixLock {
@@ -355,8 +204,7 @@ enum UnixLock {
 
 #[cfg(unix)]
 impl UnixLock {
-    /// The locked pidfile itself, which [`PidfileLock::record`] writes
-    /// through.
+    /// The locked pidfile, which [`PidfileLock::record`] writes through.
     fn file(&mut self) -> &mut std::fs::File {
         match self {
             Self::Taken(flock) => flock,
@@ -366,8 +214,7 @@ impl UnixLock {
 
     /// The descriptor carrying the lock, for the blob a handover hands on.
     ///
-    /// Borrowed, never owned. Closing this would release the `flock` that is
-    /// the only thing keeping a second daemon out of this `$SHEP_HOME`.
+    /// Borrowed, never owned: closing it releases the `flock`.
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
         use std::os::fd::AsRawFd as _;
         match self {
@@ -379,9 +226,8 @@ impl UnixLock {
 
 /// The sibling file the Windows arm locks: the pidfile with `.lock` appended.
 ///
-/// Never renamed, never read, and left on disk between boots — an inode with
-/// a stable identity whose only job is to be openable exclusively, exactly
-/// as `kv.json.lock` and `barks.jsonl.lock` are.
+/// Never renamed, never read, left on disk between boots, as `kv.json.lock`
+/// and `barks.jsonl.lock` are.
 #[cfg(windows)]
 fn pidfile_lock_path(paths: &ShepPaths) -> PathBuf {
     paths.pids.join("shepd.pid.lock")
@@ -391,23 +237,20 @@ impl PidfileLock {
     /// Opens (creating if necessary) and takes an exclusive, non-blocking
     /// `flock` on `paths`'s pidfile.
     ///
-    /// Deliberately does NOT truncate on open: a losing caller's
-    /// [`BootError::AlreadyRunning`] still wants to read whatever pid a
-    /// previous winner recorded (via [`Self::record`]) for its error's
-    /// hint, and this call cannot yet know which one it will be.
+    /// Does not truncate on open: a loser's [`BootError::AlreadyRunning`]
+    /// reads the pid the winner recorded through [`Self::record`].
     ///
     /// # Errors
-    /// - [`BootError::AlreadyRunning`] — another process already holds this
-    ///   lock (carries the pid recorded in the file, if any — the file
-    ///   itself is left untouched either way).
-    /// - [`BootError::Io`] — the pidfile could not be opened.
+    /// - [`BootError::AlreadyRunning`] if another process holds this lock,
+    ///   carrying the pid recorded in the file if any.
+    /// - [`BootError::Io`] if the pidfile could not be opened.
     #[cfg(unix)]
     fn acquire(paths: &ShepPaths) -> Result<Self, BootError> {
         let path = pidfile(paths);
         let file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
-            .truncate(false) // preserve any pid a previous winner recorded — see this fn's own doc
+            .truncate(false) // preserve any pid a previous winner recorded
             .mode(0o600)
             .open(&path)
             .map_err(|source| BootError::Io {
@@ -432,10 +275,10 @@ impl PidfileLock {
     /// flag cleared, which no second process can then open at all.
     ///
     /// # Errors
-    /// - [`BootError::AlreadyRunning`] — another process already holds this
-    ///   lock (carries the pid the winner recorded in the pidfile, which
-    ///   stays readable precisely because the lock is on a sibling).
-    /// - [`BootError::Io`] — the lock file could not be opened.
+    /// - [`BootError::AlreadyRunning`] if another process holds this lock,
+    ///   carrying the pid the winner recorded in the pidfile, which stays
+    ///   readable because the lock is on a sibling.
+    /// - [`BootError::Io`] if the lock file could not be opened.
     #[cfg(windows)]
     fn acquire(paths: &ShepPaths) -> Result<Self, BootError> {
         use std::os::windows::fs::OpenOptionsExt as _;
@@ -452,10 +295,8 @@ impl PidfileLock {
             .open(&path)
         {
             Ok(handle) => Ok(Self { _handle: handle }),
-            // Immediate, never retried: unlike the kv and bark rings, whose
-            // unix arms block and whose Windows arms therefore poll, this
-            // lock is non-blocking on unix too. A second daemon must be
-            // refused now, not queued behind the first.
+            // Immediate, never retried: a second daemon is refused now rather
+            // than queued behind the first.
             Err(err) if err.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {
                 Err(BootError::AlreadyRunning {
                     pid: read_pidfile(paths)?,
@@ -465,28 +306,18 @@ impl PidfileLock {
         }
     }
 
-    /// Overwrites the locked pidfile's content with `pid`, in place —
-    /// truncate then write at offset 0, never a temp-file-plus-`rename`
-    /// (contrast `write_pidfile`, this module's test-only helper): renaming
-    /// a fresh inode over this path
-    /// would swap in a file nothing has locked, silently ending this
-    /// type's whole reason to exist for as long as the daemon keeps
-    /// running afterward. A `flock` lock lives on the OPEN FILE
-    /// DESCRIPTION, not the path, so it does not follow a rename.
+    /// Overwrites the locked pidfile's content with `pid` in place: truncate,
+    /// then write at offset 0. Never a temp file plus `rename`, which would
+    /// swap in an inode nothing has locked.
     ///
     /// # Errors
-    /// - [`BootError::Io`] — the write failed.
+    /// - [`BootError::Io`] if the write failed.
     #[cfg(windows)]
     fn record(&mut self, paths: &ShepPaths, pid: u32) -> Result<(), BootError> {
         use std::io::Write as _;
 
-        // An ordinary write, because this arm holds its lock on the sibling
-        // `.lock` rather than on this file — so unlike the unix arm there is
-        // no already-locked handle to write through, and nothing is lost by
-        // not having one: holding the lock is itself proof that no second
-        // daemon is writing here. Truncated in place rather than staged and
-        // renamed, for exactly the reason the unix arm gives — a rename would
-        // swap in an inode of its own.
+        // An ordinary write: this arm's lock is on the sibling `.lock`, so
+        // there is no already-locked handle to write through.
         let path = pidfile(paths);
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -508,15 +339,9 @@ impl PidfileLock {
 
     /// Holds a pidfile descriptor this image inherited, already locked.
     ///
-    /// Nothing here locks, unlocks, truncates or writes. `file` crossed an
-    /// `execve` from the predecessor with its `flock` intact, and taking
-    /// ownership of it is the whole job: it keeps the descriptor open for
-    /// the rest of this process's life, which is what keeps the lock held.
-    /// See [`UnixLock`] for why re-acquiring would be a bug rather than
-    /// belt and braces.
-    ///
-    /// The pidfile's contents need no update either. An `execve` keeps the
-    /// pid, so the number the predecessor recorded is this process's own.
+    /// Nothing here locks, unlocks, truncates or writes: `file` crossed an
+    /// `execve` with its `flock` intact, and an `execve` keeps the pid, so the
+    /// number the predecessor recorded is this process's own.
     #[cfg(unix)]
     fn from_locked(file: std::fs::File) -> Self {
         Self {
@@ -526,8 +351,7 @@ impl PidfileLock {
 
     /// The descriptor the lock lives on, for a handover blob to name.
     ///
-    /// See [`UnixLock::as_raw_fd`]: borrowed, and closing it would hand this
-    /// `$SHEP_HOME` to whoever asks next.
+    /// Borrowed: closing it frees this `$SHEP_HOME` for the next claimant.
     #[cfg(unix)]
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
         self.flock.as_raw_fd()
@@ -558,22 +382,14 @@ impl PidfileLock {
     }
 }
 
-/// The apps a successor records in its own registry, which is what the
-/// muster roll on disk is written from.
+/// The apps a successor records in its own registry, which is what the muster
+/// roll on disk is written from.
 ///
-/// Every carried sheep's, and **no dog's**. A dog is registered by
-/// `dogs::spawn_enabled_dogs` at every boot, from `shep.toml`'s own
-/// `enabled_dogs`/`adopted_dogs` lists, and it has never been in the roll:
-/// nothing on the dog path ever touches [`FlockRegistry::record`]. Writing
-/// one in here would put it there for the first time, and the roll outlives
-/// the daemon -- so a later cold boot would restore `metrics` as an
-/// ordinary sheep, with no marker, before `spawn_enabled_dogs` got to it,
-/// and `shep disable metrics` would not be able to take it back out.
-///
-/// The filter belongs here rather than at the `record_config` call because
-/// this is the one place that still holds the blob's own rows: the registry
-/// takes bare [`AppConfig`](shep_core::config::AppConfig)s, which carry no
-/// marker to filter on afterwards.
+/// Every carried sheep's, and no dog's: the roll outlives the daemon, so a dog
+/// in it would come back on a later cold boot as an unmarked sheep, ahead of
+/// `spawn_enabled_dogs`, and `shep disable metrics` could not take it out.
+/// Filtered here because `record_config` takes bare
+/// [`AppConfig`](shep_core::config::AppConfig)s with no marker to filter on.
 #[cfg(unix)]
 fn apps_for_the_roll(
     flock: &[crate::handover::adopt::AdoptedSheep],
@@ -587,42 +403,16 @@ fn apps_for_the_roll(
 
 /// The handover blob this process was handed, if it is a successor.
 ///
-/// A successor is a shep image an outgoing daemon `execve`d in its own
-/// place, handing it a live flock. Its only marker is `SHEP_HANDOVER` in the
-/// environment, naming the blob to adopt; an image started any other way has
-/// no variable, no blob, and boots normally.
+/// A successor is a shep image an outgoing daemon `execve`d in its own place.
+/// Its only marker is `SHEP_HANDOVER`, naming the blob to adopt.
 ///
-/// # Why a refusal is not an error
+/// An unusable blob logs at `error` and boots as if fresh: the predecessor has
+/// already replaced itself, so refusing leaves the operator no shepherd. A
+/// genuinely lost blob is self-limiting, since a real successor also inherited
+/// the locked pidfile descriptor and the fresh boot stops at
+/// [`BootError::AlreadyRunning`] before restoring anything.
 ///
-/// By the time this runs the predecessor has already replaced itself, so
-/// there is no image left to fall back to and no stop arm to take. That
-/// leaves exactly two outcomes for a blob that cannot be used, and this
-/// function chooses the second:
-///
-/// 1. refuse to boot at all, which leaves the operator no shepherd and a
-///    flock nothing is watching;
-/// 2. say so at `error` level and continue as an ordinary boot, which is
-///    correct for the case this actually happens in.
-///
-/// The case it actually happens in is a STALE VARIABLE: something inherited
-/// `SHEP_HANDOVER` from a process that has long since finished its handover,
-/// and the blob it names was unlinked at the time. There is no live flock
-/// behind it, and a fresh boot is exactly right.
-///
-/// A genuinely lost blob is the other case, and it is self-limiting rather
-/// than dangerous. A real successor inherited the pidfile descriptor too,
-/// with its `flock` still held, so the fresh boot this returns to cannot
-/// take that lock and stops at [`BootError::AlreadyRunning`] before it
-/// restores a thing. The one way a fresh boot proceeds is the one way it
-/// should: no pidfile descriptor was inherited, so this was never a real
-/// handover.
-///
-/// Silence is the outcome neither case may have, which is why every refusal
-/// logs at `error` with the blob's path and what was wrong with it.
-///
-/// Unix only, as the whole handover is: Windows has no `execve`, so
-/// `Arm::for_daemon` never chooses a handover there and no image can be a
-/// successor.
+/// Unix only: Windows has no `execve`, so no image can be a successor.
 #[cfg(unix)]
 #[must_use]
 pub(crate) fn successor_handover() -> Option<Successor> {
@@ -634,21 +424,15 @@ pub(crate) fn successor_handover() -> Option<Successor> {
 /// Rebuild everything a successor was handed: the lock, the listener, and
 /// every sheep's plumbing.
 ///
-/// The blob is removed once its descriptors are adopted, and only then. One
-/// left behind after a refusal is evidence an operator can read; one left
-/// after a success is a picture of a handover that has already happened, and
-/// the next boot would adopt it again.
+/// The blob is removed once its descriptors are adopted, and only then: one
+/// left after a refusal is evidence, one left after a success would be adopted
+/// again by the next boot. No partial success, since the predecessor has
+/// already `execve`d itself away.
 ///
 /// # Errors
 ///
-/// - [`BootError::Adopt`]: a descriptor the blob names is not open in this
+/// - [`BootError::Adopt`] if a descriptor the blob names is not open in this
 ///   process, or is not the kind of object it was named as.
-///
-/// There is no partial success and no fallback here. By the time this runs
-/// the predecessor has already `execve`d itself away, so there is no image
-/// left to hand the flock back to: a successor that cannot rehydrate refuses
-/// to boot rather than serving a flock it only half holds, and the operator's
-/// own `shep daemon reload` starts one in its place.
 #[cfg(unix)]
 fn rehydrate(carried: Successor, paths: &ShepPaths) -> Result<Rehydrated, BootError> {
     let Successor { path, blob } = carried;
@@ -667,10 +451,7 @@ fn rehydrate(carried: Successor, paths: &ShepPaths) -> Result<Rehydrated, BootEr
 
 /// A handover blob, and where it was read from.
 ///
-/// The path is kept because the successor unlinks the blob once it has
-/// adopted what it describes, and only then: a blob left behind after a
-/// refusal is evidence, while one left behind after a success would be
-/// adopted again by the next boot.
+/// The path is kept so [`rehydrate`] can unlink the blob after adopting it.
 #[cfg(unix)]
 #[derive(Debug)]
 pub(crate) struct Successor {
@@ -682,9 +463,8 @@ pub(crate) struct Successor {
 
 /// [`successor_handover`], against a caller-named path.
 ///
-/// Split out so a test can drive every refusal without touching the
-/// environment, which is process-global and, since edition 2024, unsafe to
-/// write.
+/// Split out so a test can drive every refusal without writing the
+/// environment, which is process-global and `unsafe` in edition 2024.
 #[cfg(unix)]
 fn successor_handover_at(path: &Path) -> Option<crate::handover::Handover> {
     match crate::handover::Handover::read(path) {
@@ -701,48 +481,29 @@ fn successor_handover_at(path: &Path) -> Option<crate::handover::Handover> {
     }
 }
 
-/// What, if anything, owns this home's pidfile lock.
+/// What, if anything, owns this home's pidfile lock
 ///
-/// Proof of life is the pidfile LOCK, never the pidfile's contents. A live
-/// daemon holds that lock for its whole run and the kernel drops it on
-/// process death, `SIGKILL` included, so a failure to acquire it is the only
-/// evidence that cannot be faked by a stale file whose pid has since been
-/// reused.
-///
-/// Answers a question; never claims the home. A lock this acquires is
-/// released before the call returns.
-///
-/// Both platform arms of `PidfileLock` are reachable through this, and it
-/// needs no `cfg` of its own: unix contends on the pidfile's `flock` and
-/// Windows on a sibling `.lock` file's share mode, and both report a
-/// contended lock as [`BootError::AlreadyRunning`].
+/// Proof of life is the lock, not the pidfile's contents: a stale file with a
+/// reused pid can fake those, and the kernel drops the lock on process death,
+/// `SIGKILL` included. Any lock this takes is released before it returns.
 ///
 /// # Errors
-/// - [`BootError::Io`] — the pidfile could not be opened, created or read.
-///   A contended lock is NOT an error here; it is [`Shepherd::Running`] or
+/// - [`BootError::Io`] if the pidfile could not be opened, created or read.
+///   A contended lock is not an error; it is [`Shepherd::Running`] or
 ///   [`Shepherd::Booting`].
 pub fn daemon_liveness(paths: &ShepPaths) -> Result<Shepherd, BootError> {
     match PidfileLock::acquire(paths) {
-        // We took it, so nobody else holds it. Released by this `drop`
-        // rather than at the end of the scope, so that the window in which
-        // a question-asker holds a claim on someone else's home is as
-        // short as the type allows.
+        // Dropped here rather than at the end of the scope: a question-asker
+        // holds someone else's home for as short a window as the type allows.
         Ok(lock) => {
             drop(lock);
             Ok(Shepherd::Absent)
         }
         Err(BootError::AlreadyRunning { pid: Some(pid) }) => Ok(Shepherd::Running(pid)),
         Err(BootError::AlreadyRunning { pid: None }) => Ok(Shepherd::Booting),
-        // A home whose layout was never created cannot be holding a lock, so
-        // this is an absence and not a failure. `init_dirs` makes `pids/` on
-        // every boot, so its absence means no daemon has ever run here, which
-        // is precisely what `Absent` says. Reported as an error instead, a
-        // `shep kill` against a fresh `$SHEP_HOME` exits `Failure` rather than
-        // `DaemonUnreachable`, which is a worse answer to a correct question.
-        //
-        // Narrow on purpose. Only `NotFound`, and only for a path under
-        // `pids/`. A permissions error or a corrupt lock file is a real
-        // failure and must still say so.
+        // `init_dirs` makes `pids/` on every boot, so a missing one means no
+        // daemon has ever run here: an absence, not a failure. Narrow to
+        // `NotFound` under `pids/`; a permissions error is a real failure.
         Err(BootError::Io {
             ref path,
             ref source,
@@ -755,34 +516,25 @@ pub fn daemon_liveness(paths: &ShepPaths) -> Result<Shepherd, BootError> {
 
 /// What [`daemon_liveness`] found holding a home's pidfile lock.
 ///
-/// Three states, not two, because "nothing is running" and "something is
-/// starting up" call for opposite actions and an `Option<u32>` cannot tell
-/// them apart. Both would read as `None`: [`boot`] takes the lock at
-/// `PidfileLock::acquire` and records its pid a few statements later, and
-/// binding the socket happens in between, stale-socket recovery included.
-/// A caller that read that window as an absence would refuse with the wrong
-/// reason, or start a second daemon that then dies unable to take the lock.
+/// Three states, not two: [`boot`] takes the lock and records its pid a few
+/// statements later, with the socket bind in between, and a caller that read
+/// that window as an absence would start a second daemon that then dies unable
+/// to take the lock.
 ///
-/// Deliberately NOT `#[non_exhaustive]`, unlike [`BootError`]. The set is
-/// closed by the mechanism rather than by today's implementation: the lock
-/// is either free or held, and a holder either has written its pid or has
-/// not. There is no fourth thing for a future boot step to add, and callers
-/// get exhaustiveness checking on a decision where a missed arm means
-/// signalling the wrong process.
+/// Not `#[non_exhaustive]`, unlike [`BootError`]: the lock is free or held,
+/// and a holder has written its pid or has not, so there is no fourth state to
+/// add.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shepherd {
     /// Nothing holds this home's pidfile lock.
     ///
-    /// A stale pidfile naming a long-dead pid still reads as this, which is
-    /// the whole point of asking the lock rather than the file.
+    /// A stale pidfile naming a long-dead pid reads as this.
     Absent,
     /// A shepherd holds the lock and recorded this pid.
     Running(u32),
     /// A shepherd holds the lock but has not recorded a pid yet.
     ///
-    /// It is alive and owns the home, so it must not be treated as absent,
-    /// but there is no pid to signal. A caller should report that a
-    /// shepherd is starting rather than guess at either.
+    /// It owns the home, so it is not absent, but there is no pid to signal.
     Booting,
 }
 
@@ -795,12 +547,10 @@ pub(crate) fn socket_path(paths: &ShepPaths, override_path: Option<&Path>) -> Pa
     }
 }
 
-/// Warns (does not refuse) when `socket`'s directory is reachable by anyone
-/// but its owner. The default layout's `run/` is always `0700` by the time
-/// [`bind_socket`] runs (via [`init_dirs`]); this only fires for a
-/// `[daemon].socket` override the operator pointed somewhere looser, which
-/// forfeits the 0700 guarantee the security model otherwise rests on. That
-/// is the operator's call to make, not this function's to block.
+/// Warns, and does not refuse, when `socket`'s directory is reachable by
+/// anyone but its owner. [`init_dirs`] leaves the default layout's `run/` at
+/// `0700`, so this fires only for a `[daemon].socket` override pointed
+/// somewhere looser.
 #[cfg(unix)]
 fn warn_if_socket_dir_is_loose(socket: &Path) {
     let Some(parent) = socket.parent() else {
@@ -821,34 +571,20 @@ fn warn_if_socket_dir_is_loose(socket: &Path) {
 /// Binds the control socket, recovering from a crashed daemon's leftovers
 ///
 /// # Errors
-/// - [`BootError::AlreadyRunning`] — a live daemon answered on the socket.
-/// - [`BootError::Io`] — bind, probe, or unlink failed.
-// `needless_return` fires on the Windows arm's explicit `return`, which is
-// load-bearing: the `cfg(unix)` block after it is the rest of the function,
-// and the two cannot be an if/else over `cfg!` because the unix arm names
-// types (`nix`'s errno, `std::os::unix::net`) that do not exist to name on
-// Windows at all.
+/// - [`BootError::AlreadyRunning`] if a live daemon answered on the socket.
+/// - [`BootError::Io`] if bind, probe, or unlink failed.
+// The Windows arm's `return` is load-bearing: the `cfg(unix)` block after it
+// is the rest of the function, and the unix arm names types Windows lacks.
 #[allow(clippy::needless_return)]
 pub(crate) fn bind_socket(paths: &ShepPaths, socket: &Path) -> Result<Listener, BootError> {
-    // Windows takes an entirely different route through this function, and
-    // the reason is worth stating: almost everything below exists to cope
-    // with a socket being a FILE. A named pipe is not one. It has no
-    // `sun_path` length limit, no containing directory whose mode could be
-    // loose, and — decisively — nothing left on disk when its owner dies, so
-    // there is no stale artefact to probe for and no recovery to perform.
-    //
-    // The mutual exclusion the whole probe-and-recover dance is protecting
-    // is instead enforced by the OS: `Listener::bind` passes
-    // `first_pipe_instance`, so a second daemon on the same `$SHEP_HOME` is
-    // refused by the kernel at create time rather than after a race this
-    // code would have to adjudicate. `PidfileLock` still runs ahead of this
-    // on both platforms and is still the primary guard; this is a second,
-    // independent one that unix simply cannot have.
+    // A named pipe is not a file: no `sun_path` limit, no containing directory
+    // mode, and nothing left on disk to probe when its owner dies. The kernel
+    // enforces the exclusion instead, through `Listener::bind`'s
+    // `first_pipe_instance`.
     #[cfg(windows)]
     {
-        /// `ERROR_ACCESS_DENIED` — what `first_pipe_instance` reports when
-        /// the pipe name already has an owner. The one error that means
-        /// "another daemon", rather than a genuine I/O failure.
+        /// What `first_pipe_instance` reports when the pipe name already has
+        /// an owner: another daemon rather than a genuine I/O failure.
         const ERROR_ACCESS_DENIED: i32 = 5;
 
         return match Listener::bind(socket) {
@@ -867,9 +603,9 @@ pub(crate) fn bind_socket(paths: &ShepPaths, socket: &Path) -> Result<Listener, 
 
     #[cfg(unix)]
     {
-        // Ahead of the bind, because the kernel's own refusal names neither the
-        // limit nor `$SHEP_HOME`. `sun_path` is 104 bytes on macOS and 108 on
-        // Linux, and it holds a NUL terminator, so the usable length is one less.
+        // Ahead of the bind, because the kernel's refusal names neither the
+        // limit nor `$SHEP_HOME`. `sun_path` holds a NUL terminator, so the
+        // usable length is one less.
         const SUN_PATH_CAPACITY: usize = if cfg!(target_os = "linux") { 108 } else { 104 };
         let len = socket.as_os_str().as_encoded_bytes().len();
         if len >= SUN_PATH_CAPACITY {
@@ -883,21 +619,10 @@ pub(crate) fn bind_socket(paths: &ShepPaths, socket: &Path) -> Result<Listener, 
         match Listener::bind(socket) {
             Ok(listener) => Ok(listener),
             Err(err) if err.kind() == ErrorKind::AddrInUse => {
-                // EADDRINUSE only says the path exists. Probe it: a live daemon's
-                // listener accepts at the kernel level even mid-accept, while a
-                // file left behind by a crash (or a reboot) refuses. This is the
-                // load-bearing step for the reboot-resurrect scenario (§13.4).
-                //
-                // Only one direction of that is proof, and the asymmetry is
-                // deliberate. A socket answers for as long as ANY descriptor for
-                // it stays open, and `fork` copies every descriptor a process
-                // holds: a child a dying daemon forked and has not yet exec'd
-                // goes on answering on its behalf until close-on-exec clears the
-                // copy. So a refusal proves staleness, while an answer is only
-                // grounds to refuse this boot — never evidence that a healthy
-                // peer is there. Refusing a boot that could have proceeded costs
-                // an operator one retry; binding over a socket a daemon is still
-                // serving on costs two daemons one flock.
+                // EADDRINUSE only says the path exists. Only a refusal is
+                // proof of absence: a dying daemon's forked child keeps the
+                // socket answering until its close-on-exec clears, so an
+                // answer refuses this boot rather than proving a live peer.
                 match std::os::unix::net::UnixStream::connect(socket) {
                     Ok(_) => Err(BootError::AlreadyRunning {
                         pid: read_pidfile(paths)?,
@@ -933,25 +658,16 @@ pub(crate) fn bind_socket(paths: &ShepPaths, socket: &Path) -> Result<Listener, 
 
 /// Environment variable naming the inherited readiness descriptor.
 ///
-/// Set by the CLI on the child it re-execs detached (spec §3); read back and
-/// adopted (`unsafe fn` `crate::sys::adopt_fd`) by that same CLI, not by
-/// anything in this crate — shep-daemon never parses this variable or sees
-/// a raw fd number itself, only the already-adopted [`std::fs::File`] that
-/// lands in [`BootOptions::ready_fd`].
-///
-/// Public with no caller yet, for the same reason `crate::sys::adopt_fd`
-/// is: both halves of this handshake belong to `shep-cli` and neither is
-/// written. Crate-private it has no use at all, and "unused constant" is a
-/// worse description of it than this paragraph.
+/// Set by the CLI on the child it re-execs detached, and adopted by that same
+/// CLI through `crate::sys::adopt_fd`. shep-daemon never parses it or sees a
+/// raw fd, only the adopted [`std::fs::File`] in [`BootOptions::ready_fd`].
 pub const READY_FD_ENV: &str = "SHEP_READY_FD";
 
 /// What the daemonizing parent reads off the readiness pipe.
 ///
-/// Crate-private even though the paragraph above is not, because `write_ready`
-/// does use this type — so narrowing it costs nothing today. What would
-/// reopen it is the CLI-side reader deciding to deserialize into this exact
-/// struct rather than its own; until that exists, the wire format below is
-/// the contract, not the Rust type.
+/// Crate-private, unlike [`READY_FD_ENV`]: the CLI-side reader deserializes
+/// into a struct of its own, so the wire format is the contract rather than
+/// this type.
 // wire format: shep-cli parses this line; changing it is a breaking change
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DaemonReady {
@@ -961,24 +677,16 @@ pub(crate) struct DaemonReady {
     pub(crate) version: String,
 }
 
-/// Writes one newline-terminated JSON readiness line to `pipe` and closes
-/// it — dropping `pipe` at the end of this call is the parent's own EOF
-/// signal that there is nothing more to read.
-///
-/// Takes an already-adopted [`std::fs::File`], never a raw fd: adoption
-/// (`unsafe fn` `crate::sys::adopt_fd`) is a fd-inheritance concern
-/// (`sys.rs`'s rationale essay) with a process-wide ordering precondition
-/// that only the CLI's `main` can discharge — this function never touches a
-/// bare descriptor, only the safe `File` handed to it.
+/// Writes one newline-terminated JSON readiness line to `pipe` and closes it.
+/// Dropping `pipe` here is the parent's EOF.
 ///
 /// # Errors
-/// - [`BootError::ReadyWrite`] — the write failed (carries the OS error).
+/// - [`BootError::ReadyWrite`] if the write failed, carrying the OS error.
 fn write_ready(mut pipe: std::fs::File, ready: &DaemonReady) -> Result<(), BootError> {
     use std::io::Write;
 
-    // DaemonReady is a plain {u32, String} pair: serde_json::to_string only
-    // fails on things neither field can ever be (non-string map keys, NaN
-    // floats), so this can't error in practice.
+    // `DaemonReady` is a plain {u32, String} pair, and `to_string` fails only
+    // on non-string map keys and NaN floats.
     let mut line = serde_json::to_string(ready).expect("DaemonReady always serializes");
     line.push('\n');
     pipe.write_all(line.as_bytes())
@@ -991,57 +699,35 @@ fn write_ready(mut pipe: std::fs::File, ready: &DaemonReady) -> Result<(), BootE
 pub struct BootOptions {
     /// Overrides the layout's default control-socket path.
     pub socket: Option<PathBuf>,
-    /// The inherited readiness pipe, if the CLI daemonized us (see
-    /// [`READY_FD_ENV`]) — already adopted into an owned
-    /// [`std::fs::File`] by the CALLER before this struct is ever
-    /// constructed.
+    /// The inherited readiness pipe (see [`READY_FD_ENV`]), adopted into an
+    /// owned [`std::fs::File`] by the caller.
     ///
-    /// Adoption (`unsafe fn` `crate::sys::adopt_fd`) is deliberately not
-    /// this crate's job: its ordering precondition ("call this before the
-    /// process opens any descriptor of its own") is process-wide, and
-    /// [`boot`] — already running inside a tokio runtime with its own live
-    /// poller fds by the time it is called — cannot discharge that on its
-    /// own caller's behalf. The intended caller is the CLI's `main`, as its
-    /// literal first fd-touching statement, before a tokio runtime even
-    /// exists (Phase 3). Because this field already carries a safe owned
-    /// handle, [`boot`] never constructs a `File` from a raw number and
-    /// this crate's unsafe stays confined to `sys.rs` (IR-22).
+    /// Adoption is the caller's job: `crate::sys::adopt_fd`'s precondition,
+    /// "call before the process opens any descriptor of its own", is
+    /// process-wide, and [`boot`] already runs inside a tokio runtime with
+    /// poller fds of its own.
     pub ready_fd: Option<std::fs::File>,
-    /// Restore the muster roll if one exists (spec §9's `shep muster`).
+    /// Restore the muster roll if one exists.
     pub restore: bool,
     /// Longest a cron worker parks before re-reading the wall clock, from
-    /// `[daemon] max_cron_sleep`. Unset means the default (`cron`'s
-    /// crate-private `DEFAULT_MAX_CRON_SLEEP`, applied by [`boot`] and
-    /// nowhere else) — the same `Option` shape [`Self::socket`] uses, so
-    /// nothing between `shep.toml` and here invents a value.
+    /// `[daemon] max_cron_sleep`. Unset means `DEFAULT_MAX_CRON_SLEEP`,
+    /// which [`boot`] applies and nothing else does.
     pub max_cron_sleep: Option<Duration>,
-    /// Where to report readiness once the muster restore has finished, for
-    /// an init system supervising this process directly. `None` — the
-    /// ordinary case — reports nothing.
+    /// Where to report readiness once the muster restore has finished, for an
+    /// init system supervising this process directly. `None` reports nothing.
     ///
-    /// The resolved address rather than a bool, and not read from the
-    /// environment inside this crate: `std::env::set_var` is `unsafe` in
-    /// edition 2024 and this crate is `#![deny(unsafe_code)]`, so a boot
-    /// test could not establish an ambient `$NOTIFY_SOCKET` to observe the
-    /// ordering against. The CLI reads the variable
-    /// (`crate::notify::NOTIFY_SOCKET_ENV`) once, where it already reads
-    /// every other `SHEP_*` override.
+    /// The resolved address rather than a bool: `std::env::set_var` is
+    /// `unsafe` in edition 2024 and this crate is `#![deny(unsafe_code)]`, so
+    /// a boot test could not establish an ambient `$NOTIFY_SOCKET`.
     ///
-    /// Distinct from [`Self::ready_fd`], which the two share nothing with
-    /// but a name: that one answers a *parent shep process* that daemonized
-    /// this one and is waiting to exit, and it is written the moment the
-    /// socket binds so a slow muster cannot make that parent think the boot
-    /// failed. This one answers an init system that is supervising this
-    /// process itself, and is written last, so the unit goes green only
-    /// once the flock is actually back. Both may be set, but in practice
-    /// never are: whichever one is supervising, the other is not.
+    /// Distinct from [`Self::ready_fd`], which answers a parent shep process
+    /// the moment the socket binds. This one is written last, so a unit goes
+    /// green only once the flock is back.
     pub notify_socket: Option<OsString>,
     /// Dogs to start once the flock is back, in the order given.
     ///
     /// Assembled by the caller from `[daemon] enabled_dogs` and
-    /// `[daemon] adopted_dogs`, so shep-daemon never reads `shep.toml`
-    /// itself — the same division [`Self::socket`] and
-    /// [`Self::max_cron_sleep`] already follow.
+    /// `[daemon] adopted_dogs`, so shep-daemon never reads `shep.toml` itself.
     pub dogs: Vec<DogSpec>,
     /// Every dog name this shepherd may hold a section for, running or
     /// not: the built-in dogs plus every name `[daemon] adopted_dogs`
@@ -1060,114 +746,49 @@ pub struct BootOptions {
     /// the running set refuses exactly that dog.
     pub known_dogs: Vec<String>,
     /// Wipe the in-memory flock registry before [`RunningDaemon::run`]'s
-    /// teardown writes the final muster roll, so that roll always describes
-    /// an empty flock — regardless of whether the session ended through an
-    /// explicit `Stop`/`Delete`/`KillDaemon` sequence or by a signal caught
-    /// inside `run` itself, which no caller-level request can precede.
+    /// teardown writes the final muster roll, so that roll describes an empty
+    /// flock however the session ended.
     ///
-    /// `false` for every real `runtime`/`daemon` boot: the roll surviving
-    /// with the flock's true running state is what lets `shep muster`
-    /// restore it after a reboot. `true` only for `shep dev`'s isolated
-    /// session, where nothing here should ever be worth mustering — see
-    /// `crate::snapshot::FlockRegistry::clear`'s own doc for the shutdown
-    /// gap this closes.
+    /// `true` only for `shep dev`'s isolated session; a real boot needs the
+    /// roll to carry the flock's running state for `shep muster`.
     pub delete_flock_on_shutdown: bool,
     /// Let SIGHUP replace this process's image with a successor holding the
     /// same flock, rather than stopping gracefully.
     ///
-    /// `true` for every boot the `shep` binary performs, which is what makes
-    /// `shep daemon reload` a handover rather than a stop-and-start.
-    ///
-    /// **Defaults to `false`, and the default is the safe direction rather
-    /// than the polite one.** A handover `execve`s the file this process was
-    /// launched from, so it is only ever correct where that file IS the shep
-    /// binary. A test harness, or any program embedding this crate, is
-    /// launched from something else entirely, and a SIGHUP there would
-    /// replace the whole program with a fresh copy of itself, which is not a
-    /// subtle failure but a process that re-runs from the top forever.
-    /// A caller that opts in is asserting it is the shepherd binary.
-    ///
-    /// The graceful stop is what a boot that has not opted in does with
-    /// SIGHUP, which is also what a handover that cannot proceed falls back
-    /// to. Unix only in effect: Windows has no `execve` and every arm of the
-    /// reload there is a stop-and-start (spec H5).
+    /// A handover `execve`s the file this process was launched from, so a
+    /// caller that opts in is asserting it is the shep binary; a test harness
+    /// would re-run itself from the top forever. Defaults to `false`, and a
+    /// boot that has not opted in answers SIGHUP with the graceful stop, as
+    /// does a handover that cannot proceed. Unix only in effect.
     pub handover: bool,
 }
 
-/// Brings the daemon up: signal handlers, layout, roll restore, bus,
-/// supervisor, socket, readiness report.
+/// Brings the daemon up: layout, lock, socket, restore, dogs, readiness
 ///
-/// Step order here is deliberate and load-bearing, not incidental:
-/// 1. install signal handlers — before the socket exists, so there is no
-///    window where the socket is already live but an ordinary `kill -USR2`
-///    (SIGUSR2's default disposition is to terminate) would still kill the
-///    daemon instead of rotating logs;
-/// 2. layout, then the crate-private `PidfileLock::acquire` — this is the
-///    FIRST thing that can fail with [`BootError::AlreadyRunning`], before
-///    `bind_socket` ever runs, and it is what makes that call race-free
-///    against another process booting the same `$SHEP_HOME` concurrently
-///    (see `PidfileLock`'s own doc, next to its definition in this file) —
-///    then socket bind (with stale-socket recovery, spec §6), then
-///    `PidfileLock::record` into the now-held-for-this-process's-whole-life
-///    lock;
-/// 3. report readiness, now that the socket is actually bound (spec §3) —
-///    not once the whole flock is restored, so a slow muster can't make the
-///    parent think boot failed. `options.ready_fd`, if set, already names
-///    an owned [`std::fs::File`] the CALLER adopted before ever
-///    constructing [`BootOptions`] (see that field's own doc) — this step
-///    is a plain write, no fd adoption happens inside `boot` itself;
-/// 4. bus, supervisor, muster restore, [`BootOptions::dogs`], snapshot
-///    writer, `RpcContext` — and the point where step 1's SIGUSR2 listener
-///    is handed the supervisor it reopens through, this being the first
-///    moment one exists. See `install_signals`'s own doc, next to its
-///    definition in this file, for why that seam is a channel rather than
-///    an argument, and why the gap between the two steps drops no signal.
-///    The dogs come up strictly between the restore and the snapshot
-///    writer, and both halves of that placement are load-bearing: after
-///    the restore, because a metrics dog that started first would answer
-///    for an empty flock for the whole restore window, and a bark dog
-///    would raise a `process.start` alert for every sheep the roll brings
-///    back; before step 5's readiness report, because `Type=notify` going
-///    green is meant to mean the whole daemon — flock and dogs alike — is
-///    up, the same reasoning that put the restore itself inside that
-///    promise;
-/// 5. report readiness to an init system supervising this process directly
-///    ([`BootOptions::notify_socket`], `crate::notify`) — last of all,
-///    which is the opposite of step 3 and deliberately so: that one answers
-///    a parent shep waiting to exit, this one decides when a unit goes
-///    green, and a unit that goes green at exec time describes a flock that
-///    is not up yet.
+/// The order is load-bearing: handlers before the socket (SIGUSR2 otherwise
+/// terminates), the pidfile lock before the bind it makes race-free,
+/// `ready_fd` on the bind not the restore, dogs after the restore so a metrics
+/// dog does not answer for an empty flock, [`BootOptions::notify_socket`] last.
 ///
 /// # Errors
-/// - [`BootError::Io`] — a boot filesystem step failed, or the OS refused
-///   to register a signal handler.
-/// - [`BootError::AlreadyRunning`] — another daemon already holds the
-///   pidfile lock, or (belt-and-suspenders, for a peer not participating in
-///   that lock) answered on the socket.
-/// - [`BootError::ReadyWrite`] — the readiness line could not be written to
-///   `options.ready_fd`.
-/// - [`BootError::Snapshot`] — `options.restore` was set, a roll exists, but
-///   it could not be read or parsed.
+/// - [`BootError::Io`] if a boot filesystem or signal-handler step failed.
+/// - [`BootError::AlreadyRunning`] if another daemon holds the lock or answered.
+/// - [`BootError::ReadyWrite`] if the readiness line could not be written.
+/// - [`BootError::Snapshot`] if a roll exists and could not be read or parsed.
 pub async fn boot<R: ProcessRunner>(
     runner: R,
     paths: ShepPaths,
     mut options: BootOptions,
 ) -> Result<RunningDaemon, BootError> {
-    // Before anything else, because it reads the current directory and
-    // that is only the startup directory until something moves it. A
-    // handover execs this path rather than `current_exe()`; see
-    // `handover::exec_target` for why those differ exactly when an
-    // operator has upgraded. `#[cfg(unix)]` because the whole handover
-    // module is: Windows has no `execve` and takes the stop arm.
+    // Before anything else: it reads the current directory, which is the
+    // startup directory only until something moves it.
     #[cfg(unix)]
     crate::handover::record_launch_path();
 
-    // Copied out up front, purely a `bool`, so nothing later in this fn has
-    // to remember to read it off `options` before that struct is consumed.
     let delete_flock_on_shutdown = options.delete_flock_on_shutdown;
 
-    // 1. Install signal handlers before the socket (or anything else
-    //    observable) exists — see this fn's own doc.
+    // 1. Signal handlers, before the socket or anything else observable
+    //    exists.
     let (shutdown, shutdown_rx) = watch::channel(false);
     let shutdown = Arc::new(shutdown);
     #[cfg(unix)]
@@ -1176,18 +797,14 @@ pub async fn boot<R: ProcessRunner>(
     #[cfg(windows)]
     let (signals, connect_supervisor) = install_signals(Arc::clone(&shutdown), paths.clone())?;
 
-    // 2. Layout, then claim exclusive ownership of $SHEP_HOME BEFORE
-    //    touching the socket at all — see `PidfileLock`'s own doc for why
-    //    this is what actually closes the concurrent-boot race a bare
-    //    probe-then-recover sequence can't. Held across the whole
-    //    bind-and-recover sequence, and for the rest of this daemon's life
-    //    (kept in `RunningDaemon`, dropped only at the end of `run`).
+    // 2. Layout, then claim $SHEP_HOME before touching the socket: that is
+    //    what closes the concurrent-boot race a bare probe-then-recover
+    //    sequence cannot. Held for the rest of this daemon's life.
     init_dirs(&paths)?;
     let socket = socket_path(&paths, options.socket.as_deref());
     // A successor takes neither the lock nor the address: it inherited both,
-    // still held, in the same act that made it this process. Rebinding would
-    // race the predecessor's own socket file and lose whatever connection a
-    // client had already made, and re-locking would mean releasing first.
+    // still held. Rebinding would race the predecessor's own socket file, and
+    // re-locking would mean releasing first.
     #[cfg(unix)]
     let (mut pidfile_lock, listener, inherited) = match successor_handover() {
         Some(carried) => {
@@ -1206,13 +823,9 @@ pub async fn boot<R: ProcessRunner>(
     let pid = std::process::id();
     pidfile_lock.record(&paths, pid)?;
 
-    // 3. Report readiness now that the socket is bound. `options.ready_fd`
-    //    is already an owned File adopted by the caller — see this fn's
-    //    own doc and `BootOptions::ready_fd`'s doc — so this is nothing
-    //    more than a write. TAKEN out of `options` rather than moved out of
-    //    it: a partial move leaves the struct unborrowable, and step 4 hands
-    //    it whole to `max_cron_sleep` — see that fn's own doc for why the
-    //    field is not picked out here.
+    // 3. Readiness, now that the socket is bound. Taken rather than moved out:
+    //    a partial move leaves `options` unborrowable, and step 4 hands it
+    //    whole to `max_cron_sleep`.
     if let Some(pipe) = options.ready_fd.take() {
         let ready = DaemonReady {
             pid,
@@ -1223,11 +836,8 @@ pub async fn boot<R: ProcessRunner>(
 
     // 4. Bus, supervisor, muster restore, snapshot writer, context.
     let events = new_bus();
-    // Spawned the moment the bus exists, ahead of the supervisor that will
-    // ever emit anything onto it: this is a subscriber like the snapshot
-    // writer, not a branch inside the engine (see `spawn_dog_watch`'s own
-    // doc), and giving it a receiver early means it can never miss an
-    // `Errored` a dog reaches during boot's own restore step.
+    // Subscribed before the supervisor that emits onto the bus, so it cannot
+    // miss an `Errored` a dog reaches during the restore step.
     let dog_watch = spawn_dog_watch(events.subscribe(), events.clone(), paths.barks.clone());
     let (breach_tx, breach_rx) = mpsc::channel(EXTRAS_REPORT_CAPACITY);
     let (live_tx, live_rx) = mpsc::channel(EXTRAS_REPORT_CAPACITY);
@@ -1238,24 +848,18 @@ pub async fn boot<R: ProcessRunner>(
         },
         max_cron_sleep(&options),
     );
-    // Taken before `extras` is moved into the builder. One `StatsState`, two
-    // owners, for the reason `Extras::enforcer` is shared the same way: the
-    // extras decide which sheep is watched and record the periodic CPU
-    // baseline, the RPC layer reads a live sample against it, and a second
-    // state would leave one of the two reading an empty watch set.
+    // One `StatsState`, two owners: the extras record the periodic CPU
+    // baseline and the RPC layer reads a live sample against it, so a second
+    // state would leave one of them on an empty watch set.
     let stats = Arc::clone(&extras.stats);
     let builder = SupervisorBuilder::new(runner, paths.clone(), events.clone()).extras(extras);
     // A successor installs the flock it inherited rather than spawning one:
-    // every sheep keeps the pid, the id, the epoch and the history it had a
-    // moment ago, and nothing here signals, spawns or reopens anything. From
-    // each sheep's own side the shepherd was never away.
+    // every sheep keeps its pid, id, epoch and history, and nothing here
+    // signals, spawns or reopens.
     #[cfg(unix)]
     let mut carried_apps = Vec::new();
-    // Read before the match consumes `inherited`, and deliberately not
-    // derived from `carried_apps` afterwards: a successor that inherited an
-    // EMPTY flock is still a successor, and the two are only the same
-    // question when the predecessor had at least one sheep. See the restore
-    // guard below for what the difference costs.
+    // Not derived from `carried_apps` below: a successor that inherited an
+    // empty flock is still a successor.
     #[cfg(unix)]
     let inherited_flock = inherited.is_some();
     #[cfg(unix)]
@@ -1272,37 +876,19 @@ pub async fn boot<R: ProcessRunner>(
     };
     #[cfg(windows)]
     let supervisor = builder.spawn();
-    // Ordered, not stylistic: the reporter needs the handle the builder
-    // returns, and the actor must never own a receiver a subsystem feeds.
-    //
-    // Its `JoinHandle` is discarded, which DETACHES the task rather than
-    // stopping it — and that closes a cycle worth naming, because nothing
-    // here breaks it. The reporter holds a `SupervisorHandle`, so the actor's
-    // mailbox can never reach zero senders while the reporter lives; the
-    // reporter itself only ends once BOTH report senders have dropped, and the
-    // enforcer holding one of them lives as long as the actor's registry does.
-    // What actually ends both is `RunningDaemon::run`'s explicit
-    // `SupervisorHandle::shutdown` (teardown step 4), which stops the actor by
-    // command instead of by sender count and drops the registry with it. That
-    // call is load-bearing for this reason as well as for the kill ladder it
-    // is named after; a future teardown that relied on senders going away
-    // would hang here instead.
+    // The detached reporter and the actor hold each other alive: the reporter
+    // holds a `SupervisorHandle`, and its own report senders live as long as
+    // the actor's registry. Only `SupervisorHandle::shutdown` (teardown step
+    // 4) ends either, so a teardown waiting on sender counts would hang.
     spawn_extras_reporter(breach_rx, live_rx, supervisor.clone());
 
-    // The other half of step 1's SIGUSR2 listener, which has been parked on
-    // this since before the socket existed, waiting for the handle it reopens
-    // through — see `install_signals`'s own doc for why the wait is what the
-    // step order forces and why it drops no signal. An `Err` would mean that
-    // listener is already gone, which cannot happen while `signals` — moved
-    // into the `RunningDaemon` below, and the only thing that aborts it — is
-    // still alive.
+    // The other half of step 1's SIGUSR2 listener, parked on this since before
+    // the socket existed.
     let _ = connect_supervisor.send(supervisor.clone());
 
-    // The other half of step 1's SIGHUP task, parked on this since before
-    // the socket existed. It carries the two descriptors a handover blob has
-    // to name, which only this function knows: an fd number means nothing
-    // outside the process that owns it, and the supervisor has never seen
-    // either of them.
+    // The other half of step 1's SIGHUP task. It carries the two descriptors a
+    // handover blob has to name, which only this function knows: an fd number
+    // means nothing outside the owning process.
     #[cfg(unix)]
     let _ = connect_handover.send(options.handover.then(|| HandoverSeam {
         supervisor: supervisor.clone(),
@@ -1315,20 +901,10 @@ pub async fn boot<R: ProcessRunner>(
 
     let registry = FlockRegistry::new();
 
-    // A successor rebuilds the registry from the blob rather than from the
-    // roll, and skips the restore entirely. Both halves matter. The registry
-    // is what the snapshot writer builds the muster roll from, so a
-    // successor that left it empty would overwrite a good roll with an empty
-    // one within seconds of taking over. And a restore would START whatever
-    // the roll records as running, which for a flock that never stopped
-    // means a second copy of every sheep that happens to be down.
-    //
-    // An EMPTY inherited flock is the case that makes `inherited_flock` a
-    // fact about the boot rather than a count of the sheep. `shep daemon
-    // reload` against an idle shepherd carries nothing, and a handover skips
-    // the predecessor's teardown, so the roll on disk is whatever the last
-    // periodic write left. Deriving the flag from `carried_apps` would run
-    // the restore there and start sheep that had just been deleted.
+    // A successor rebuilds the registry from the blob and skips the restore.
+    // An empty registry would overwrite a good roll within seconds, and a
+    // restore would give a flock that never stopped a second copy of every
+    // sheep the roll records as running.
     #[cfg(unix)]
     for app in &carried_apps {
         registry.record_config(app);
@@ -1340,39 +916,21 @@ pub async fn boot<R: ProcessRunner>(
         restore_flock(&paths, &registry, &supervisor).await?;
     }
 
-    // After the restore, before step 5's readiness report — see this fn's
-    // own doc, step 4, for why both halves of that placement are
-    // load-bearing. Never fails the boot: a dog that cannot be spawned is a
-    // monitoring gap, not an outage, and `spawn_enabled_dogs` warns and
-    // carries on rather than propagating anything here.
+    // Never fails the boot: a dog that cannot be spawned is a monitoring gap
+    // rather than an outage, so `spawn_enabled_dogs` warns and carries on.
     crate::dogs::spawn_enabled_dogs(&options.dogs, &paths, &supervisor, &events).await;
 
-    // Built here rather than inside the `RpcContext` below because the watch
-    // on the next line shares it. Still empty, and still deliberately not
-    // carried across a handover: a successor has refused nobody yet, and a
-    // dog it can talk to is not stale by any definition it could apply.
+    // Starts empty and is not carried across a handover: a successor has
+    // refused nobody.
     let dog_refusals = crate::dogs::DogRefusals::new();
-    // Built beside the refusals and for the same reason: the watch on the
-    // next line reads it, and the connection layer writes it. Not carried
-    // across a handover either — a successor has been connected to by
-    // nobody, and a pid it has never seen is one it must not claim has
-    // never called.
-    //
-    // That last clause was a wish rather than a description until
-    // `PEER_CONTACT_WARMUP` existed. An empty map answered `Contact::None`
-    // for every pid, which routes to `Silence::Unreachable` and prints the
-    // reinstall verdict, so for its first seconds a successor told every dog
-    // carried across the reload that the binary on disk could not reach shep.
-    // The warm-up is what makes starting empty safe: until this map has been
-    // listening long enough for an absence to mean something, it answers
-    // `Contact::Unknown` and the ladder names both candidates instead.
+    // Also not carried, so a successor must not claim a pid it has never seen
+    // never called. `PEER_CONTACT_WARMUP` is what makes starting empty safe:
+    // until the map has listened long enough for an absence to mean
+    // something it answers `Contact::Unknown` rather than `Contact::None`.
     let peer_contacts = crate::dogs::PeerContacts::new();
-    // Spawned at every boot, INCLUDING a successor's after an `execve` --
-    // that is why it is anchored here and not to a dog's own spawn (see
-    // `spawn_silent_dog_watch`'s doc). It restarts a dog that has been
-    // running without ever answering this shepherd, which costs a merely
-    // slow dog one restart it did not need; the tradeoff is argued at
-    // `record_silent_dog`.
+    // Spawned at every boot, a successor's included, rather than anchored to a
+    // dog's own spawn. It restarts a dog that has been running without ever
+    // answering this shepherd; the tradeoff is argued at `record_silent_dog`.
     let silent_dog_watch = crate::dogs::spawn_silent_dog_watch(
         supervisor.clone(),
         dog_refusals.clone(),
@@ -1403,23 +961,9 @@ pub async fn boot<R: ProcessRunner>(
         stats,
     };
 
-    // 5. The flock is back and the plane is assembled, so this daemon is
-    //    now what a unit ordered `After=` it expects to find. A failure is
-    //    a `warn!` and the boot continues: the daemon is fully functional
-    //    and only systemd's knowledge of it is wrong, which systemd's own
-    //    `TimeoutStartSec` reports honestly — killing a working daemon over
-    //    an undeliverable datagram would be the worse outcome.
-    //
-    //    Unix only, because `$NOTIFY_SOCKET` is systemd's protocol over a
-    //    unix datagram socket and there is nothing on Windows for it to
-    //    address. The field stays on `BootOptions` on both platforms rather
-    //    than being gated out of the struct: `shep-cli` reads the variable
-    //    in one place for every target, and a config type whose SHAPE
-    //    changes per platform makes every caller carry the gate instead of
-    //    one call site doing so. A Windows daemon simply never has anything
-    //    to report readiness to — the equivalent, once a real Windows
-    //    service exists, is `SetServiceStatus`, which is Tier B work and
-    //    deliberately not faked here.
+    // 5. A failure is a `warn!` and the boot continues: only systemd's view
+    //    is wrong. Unix only, since `$NOTIFY_SOCKET` is a unix datagram
+    //    socket; the field stays on `BootOptions` for both platforms.
     #[cfg(unix)]
     if let Some(target) = options.notify_socket.as_deref()
         && let Err(err) = crate::notify::notify(target)
@@ -1438,23 +982,11 @@ pub async fn boot<R: ProcessRunner>(
         silent_dog_watch,
         paths,
         socket,
-        // Held from here into `RunningDaemon` — `watch::Sender::send` is a
-        // silent no-op whenever the receiver count is zero (confirmed
-        // against tokio's own source), and `ctx.shutdown()` is callable the
-        // instant a caller has `Self::context`, racing ahead of `run` ever
-        // being polled. See `RunningDaemon::shutdown_rx`'s own doc.
+        // `watch::Sender::send` is a silent no-op at zero receivers, and
+        // `ctx.shutdown()` is callable the instant a caller has
+        // `Self::context`, ahead of `run` ever being polled.
         shutdown_rx,
-        // Held from here into `RunningDaemon` too, and through the whole of
-        // `run` — its `Drop` aborts every signal-listener task on every
-        // exit from this point on, including an early `?` return from a
-        // later step in THIS function. See `SignalTasks`'s own doc.
         signals,
-        // Held from here into `RunningDaemon` and through the whole of
-        // `run`: this is what keeps `$SHEP_HOME` exclusively claimed for
-        // this daemon's entire life, not just its boot — dropping it (at
-        // the end of `run`, or on an early `?`-return from a LATER step in
-        // THIS function) is the only thing that releases the `flock`. See
-        // `PidfileLock`'s own doc.
         pidfile_lock,
         delete_flock_on_shutdown,
     })
@@ -1463,19 +995,10 @@ pub async fn boot<R: ProcessRunner>(
 /// The cron sleep bound this boot runs with: [`BootOptions::max_cron_sleep`],
 /// or [`DEFAULT_MAX_CRON_SLEEP`] when `shep.toml` named none.
 ///
-/// A named function rather than an `unwrap_or` inline in [`boot`] only so the
-/// application has a seam a test can stand on. It is still the ONE place that
-/// constant is applied, and a second application anywhere else is how two
-/// supposedly identical constants drift apart: `shep-core` carries the floor
-/// and never the default, the daemon carries the default and never the floor.
-///
-/// It reads the whole [`BootOptions`] rather than the one field because the
-/// field is what [`boot`] would otherwise have to pick out, and picking the
-/// wrong one there is a mistake no test in this crate could catch: the only
-/// behavioural trace `max_cron_sleep` leaves is how often a cron worker wakes,
-/// and a wakeup is observable only through the [`Clock`](crate::cron::Clock)
-/// seam that [`Extras::real`] fixes to the system clock. Reading the struct
-/// here leaves nothing at the call site to get wrong.
+/// The one place that constant is applied: `shep-core` carries the floor and
+/// never the default, the daemon carries the default and never the floor.
+/// Named, and reading the whole [`BootOptions`], so a test has a seam to stand
+/// on; the only behavioural trace is how often a cron worker wakes.
 fn max_cron_sleep(options: &BootOptions) -> Duration {
     options.max_cron_sleep.unwrap_or(DEFAULT_MAX_CRON_SLEEP)
 }
@@ -1483,15 +1006,8 @@ fn max_cron_sleep(options: &BootOptions) -> Duration {
 /// Reads the muster roll (if one exists) and starts every app it restores.
 ///
 /// One line over [`snapshot::muster`], which holds the whole restore rule and
-/// its rationale — a missing roll, a corrupt one, a rejected entry, an app
-/// the flock already has. The `Muster` request an operator sends runs that
-/// same function, so the restore that happens unattended after a reboot is
-/// the one an operator exercises by hand.
-///
-/// What boot supplies that the operator's call does not is an empty flock:
-/// nothing here can already be running, so every restorable app is started
-/// and the names come back describing exactly what boot just did. It discards
-/// them because there is no one at this end of a boot to report them to.
+/// also serves an operator's `Muster` request. The names it returns are
+/// discarded: nobody is waiting on them here.
 async fn restore_flock(
     paths: &ShepPaths,
     registry: &FlockRegistry,
@@ -1508,99 +1024,50 @@ pub struct RunningDaemon {
     ctx: RpcContext,
     listener: Listener,
     writer: SnapshotWriter,
-    // Parks on a broadcast receiver until this handle aborts it (see
-    // `spawn_dog_watch`'s own doc for why holding the handle, not sender
-    // count, is what makes that deterministic). Stopped in `run`'s teardown
-    // step 1 alongside `writer`: both are bus subscribers with no further
-    // reason to run once serving ends.
+    // Held rather than detached: `run`'s teardown step 1 aborts both, so
+    // nothing rewrites the roll or asks for a dog's restart once serving ends.
     dog_watch: JoinHandle<()>,
-    // Parks on a timer rather than on the bus, and is stopped the same way
-    // and at the same moment: nothing may ask for a dog's restart once
-    // serving has ended. See `spawn_silent_dog_watch`'s own doc for why the
-    // task is anchored to boot at all.
     silent_dog_watch: JoinHandle<()>,
     paths: ShepPaths,
     socket: PathBuf,
-    // Held from `boot` onward, not created fresh in `run`: `watch::Sender::send`
-    // is a silent no-op (`Err`, value left unchanged — confirmed against
-    // tokio's own source) whenever the receiver count is zero. `ctx.shutdown()`
-    // is callable the moment `boot` returns [`Self::context`], which can race
-    // ahead of `run` ever being polled; without a receiver alive for that
-    // whole window, an early `ctx.shutdown()` is silently lost and `run` hangs
-    // forever waiting on a signal that already fired. (Caught by
-    // `boot_restores_a_saved_flock_and_tears_down_in_order`, which calls
-    // `ctx.shutdown()` immediately after `tokio::spawn(daemon.run())` with no
-    // guaranteed ordering between the two.)
+    // Held from `boot`, not resubscribed in `run`: `watch::Sender::send` is a
+    // silent no-op at zero receivers, and `ctx.shutdown()` is callable the
+    // moment `boot` returns, so a gap here loses that signal forever.
     shutdown_rx: watch::Receiver<bool>,
-    // Installed by `boot` (not `run` — see `boot`'s own doc for why: SIGUSR2
-    // must be handled before the socket exists), kept alive through `run`'s
-    // whole serving lifetime, and dropped only once teardown finishes —
-    // `SignalTasks`'s own `Drop` is what actually stops these tasks.
+    // Kept alive through `run`'s whole serving lifetime; `SignalTasks`'s
+    // `Drop` is what stops these tasks.
     signals: SignalTasks,
-    // Acquired by `boot` before the socket was ever bound, kept alive
-    // through `run`'s whole serving lifetime, and dropped only once
-    // teardown finishes — releasing this `flock` is what lets a NEXT
-    // daemon's own `PidfileLock::acquire` succeed. See that type's own doc.
+    // Dropping this `flock` is what lets the next daemon's own
+    // `PidfileLock::acquire` succeed.
     pidfile_lock: PidfileLock,
-    // Copied from `BootOptions::delete_flock_on_shutdown` at boot time; see
-    // that field's own doc. Consulted only in `run`'s teardown step 2.
     delete_flock_on_shutdown: bool,
 }
 
 impl RunningDaemon {
     /// Handles for driving this daemon from outside its run loop.
-    ///
-    /// Public only for `tests/daemon_e2e.rs`, which needs to shut a booted
-    /// daemon down and force a roll write without a socket round-trip. The
-    /// CLI boots and calls [`Self::run`]; it never reaches inside.
     #[must_use]
     pub fn context(&self) -> RpcContext {
         self.ctx.clone()
     }
 
     /// The control socket this daemon is bound to.
-    ///
-    /// Public only for the crate-root doc example, which connects a raw
-    /// client to it; the CLI already knows the path it asked to bind.
     #[must_use]
     pub fn socket(&self) -> &Path {
         &self.socket
     }
 
-    /// Serves until a signal or `KillDaemon`, then tears down in order.
+    /// Serves until a signal or `KillDaemon`, then tears down in order
     ///
-    /// TEARDOWN ORDER IS LOAD-BEARING:
-    /// 1. stop the snapshot writer, and the dog watch alongside it — nothing
-    ///    may rewrite the roll from here on, and no bus subscriber has a
-    ///    reason left to watch once serving ends;
-    /// 2. write the final muster roll — records the flock AS IT WAS, still
-    ///    running, unless [`BootOptions::delete_flock_on_shutdown`] asked
-    ///    for the registry to be wiped first, in which case it records
-    ///    nothing;
-    /// 3. broadcast [`BusEvent::DaemonShutdown`] — subscribers learn before their sockets close;
-    /// 4. [`SupervisorHandle::shutdown`] — the kill ladder on every online sheep;
-    /// 5. unlink the socket, remove the pidfile (best-effort on both: a
-    ///    failure removing one must not skip attempting the other).
-    ///
-    /// Steps 1-2 before 4 are the whole point: run them the other way round
-    /// and the roll records a flock of stopped sheep, and `shep muster`
-    /// after a reboot restores nothing — silently breaking spec §13.4, the
-    /// flagship migration scenario. Step 1 specifically must precede step 4
-    /// (not just step 2): the writer would otherwise still be alive to
-    /// observe the kill ladder's own `Exit`/`Stop` events and overwrite the
-    /// roll step 2 just wrote.
-    ///
-    /// Every one of these steps runs unconditionally once this fn starts —
-    /// `boot` succeeding is what commits the daemon to owning the flock,
-    /// the roll, the socket, and the pidfile, so nothing short of a panic
-    /// may return from here without having attempted every step above.
-    /// `install_signals`'s registration runs inside `boot`, before any of
-    /// the state this teardown depends on is even created — a failure there
-    /// can `?`-exit without skipping teardown of state that doesn't exist
-    /// yet. See `boot`'s own doc.
+    /// Every teardown step runs unconditionally: stop the snapshot writer and
+    /// both dog watches, write the final muster roll, broadcast
+    /// [`BusEvent::DaemonShutdown`] before subscribers' sockets close, run
+    /// [`SupervisorHandle::shutdown`]'s kill ladder, then unlink the socket and
+    /// the pidfile best-effort. The roll goes before the ladder, and the writer
+    /// is stopped before the roll, or the ladder's `Exit`/`Stop` events leave a
+    /// roll of stopped sheep for `shep muster` to restore nothing from.
     ///
     /// # Errors
-    /// - [`BootError::Io`] — a teardown filesystem step failed.
+    /// - [`BootError::Io`] if a teardown filesystem step failed.
     pub async fn run(self) -> Result<(), BootError> {
         let RunningDaemon {
             ctx,
@@ -1611,48 +1078,30 @@ impl RunningDaemon {
             paths,
             socket,
             shutdown_rx,
-            // Kept alive (not `_`) until this fn returns: `signals` must
-            // outlive the whole serving lifetime below, and only its `Drop`
-            // (at the end of this scope) stops its tasks. The underscore
-            // prefix suppresses the "unused" warning for a binding that
-            // exists purely for its drop side effect.
+            // Bound, not dropped with `_`: both must outlive the serving
+            // lifetime below, and only their `Drop` at the end of this scope
+            // stops the signal tasks and releases the home.
             signals: _signals,
-            // Same reasoning as `signals` above: this `flock` must stay
-            // held for the whole serving lifetime below, released only by
-            // its `Drop` at the end of this scope — that release is what
-            // lets a future daemon's own boot succeed.
             pidfile_lock: _pidfile_lock,
             delete_flock_on_shutdown,
         } = self;
 
-        // `shutdown_rx` is the receiver `boot` has kept alive since the
-        // watch channel was created (see the field's own doc) — reused
-        // here rather than a fresh `ctx.shutdown.subscribe()` precisely so
-        // there is never a window with zero receivers between `boot`
-        // returning and this line running.
+        // The receiver `boot` kept alive, reused rather than a fresh
+        // `ctx.shutdown.subscribe()`: no window with zero receivers between
+        // `boot` returning and this line running.
         RpcServer::new(listener, ctx.clone())
             .serve(shutdown_rx)
             .await;
 
-        // 1. Stop the snapshot writer FIRST — see this fn's doc. Both dog
-        //    watches stop alongside it: one is a bus subscriber with nothing
-        //    left to watch for once serving ends, and the other is a timer
-        //    that must not ask for a dog's restart while the flock is being
-        //    torn down.
+        // 1. Nothing may rewrite the roll or ask for a dog's restart from here
+        //    on.
         writer.stop().await;
         dog_watch.abort();
         silent_dog_watch.abort();
 
-        // 2. Write the final roll while every sheep is still online — UNLESS
-        //    this boot asked for nothing to survive here at all
-        //    (`delete_flock_on_shutdown`, `shep dev`'s own case): then the
-        //    registry is wiped first, so this write already agrees with
-        //    step 4's kill ladder that nothing here should come back. This
-        //    runs regardless of how serving just ended — a signal caught
-        //    inside `install_signals` ends things exactly the same way a
-        //    `KillDaemon` request does, and no caller-level `Stop`/`Delete`
-        //    pair can run ahead of that path (see
-        //    `crate::snapshot::FlockRegistry::clear`'s own doc).
+        // 2. The final roll, written while every sheep is still online, unless
+        //    `delete_flock_on_shutdown` (`shep dev`'s case) wiped the registry
+        //    first. Runs however serving ended, a caught signal included.
         if delete_flock_on_shutdown {
             ctx.registry.clear();
         }
@@ -1666,22 +1115,10 @@ impl RunningDaemon {
         // 4. Kill ladder on every online sheep.
         ctx.supervisor.shutdown().await;
 
-        // 5. Unlink what boot created — both attempted regardless, the
-        // first failure (if any) wins so a socket-unlink error can't hide
-        // a pidfile that was never even attempted.
-        //
-        // The SOCKET half is unix-only, and skipping it on Windows is not an
-        // omission: there is no file there to remove. The control address is
-        // a named pipe, which stops existing when this process's last handle
-        // closes — the listener is dropped moments from here — so teardown
-        // has nothing to do that the kernel is not already doing.
-        //
-        // Attempting it anyway is not harmlessly redundant, which is how
-        // this was found: `remove_file` on a `\.\pipe\...` name fails with
-        // `ERROR_INVALID_PARAMETER`, so every Windows daemon shutdown
-        // returned `Err` from `run()` — invisible through `shep kill`, which
-        // does not read that value, and caught by `daemon_e2e`'s fixture,
-        // which unwraps it.
+        // 5. Both are attempted regardless and the first failure wins, so a
+        // socket-unlink error cannot hide a pidfile nothing tried to remove.
+        // Unix only: `remove_file` on a `\.\pipe\...` name fails with
+        // `ERROR_INVALID_PARAMETER` and would fail every Windows shutdown.
         #[cfg(unix)]
         let unlink_socket = unlink_if_present(&socket);
         #[cfg(windows)]
@@ -1694,8 +1131,8 @@ impl RunningDaemon {
     }
 }
 
-/// Removes `path`, treating "already gone" as success rather than an error —
-/// teardown's job is to make sure it's gone, not to prove it was there.
+/// Removes `path`, treating "already gone" as success: teardown's job is to
+/// make sure it is gone, not to prove it was there.
 fn unlink_if_present(path: &Path) -> Result<(), BootError> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -1707,15 +1144,10 @@ fn unlink_if_present(path: &Path) -> Result<(), BootError> {
     }
 }
 
-/// Live signal-listener tasks [`install_signals`] spawned, held so they are
-/// properly stopped — not merely detached, see this type's own [`Drop`] impl
-/// — on every exit from [`boot`] or [`RunningDaemon::run`] that follows a
-/// successful `install_signals` call. That includes an early `?`-return from
-/// a LATER step inside `boot` itself (a failed `bind_socket` after signals
-/// were already installed, say): dropping the partially-built value in that
-/// path must not leak a task per boot attempt, which is exactly what
-/// happened before this type existed (a bare counter returned by value, with
-/// the actual `JoinHandle`s discarded at the spawn site).
+/// Live signal-listener tasks [`install_signals`] spawned, held so its
+/// [`Drop`] stops them rather than detaching them. Covers an early `?`-return
+/// from a later step inside [`boot`], which must not leak a task per boot
+/// attempt.
 #[derive(Debug)]
 struct SignalTasks {
     tasks: Vec<JoinHandle<()>>,
@@ -1723,70 +1155,25 @@ struct SignalTasks {
 
 impl Drop for SignalTasks {
     fn drop(&mut self) {
-        // `JoinHandle::drop` alone DETACHES a task rather than stopping it
-        // (the same footgun `server.rs`'s `converse` doc calls out for the
-        // bus forwarder) — every task this struct owns is explicitly
-        // aborted here, which is the whole reason this type exists instead
-        // of a bare `Vec<JoinHandle<()>>`.
+        // `JoinHandle::drop` detaches rather than stopping.
         for task in &self.tasks {
             task.abort();
         }
     }
 }
 
-/// Installs SIGTERM/SIGINT/SIGQUIT (graceful shutdown, first signal starts
-/// it — see below for what a repeat does) and SIGUSR2 (`shep reopen`'s
-/// out-of-band form, spec §9).
+/// Installs SIGTERM/SIGINT/SIGQUIT (graceful shutdown) and SIGUSR2 (reopen)
 ///
-/// SIGUSR2's DEFAULT disposition is to terminate the process, so installing
-/// this handler is load-bearing on its own: without it, an operator's
-/// `kill -USR2` — or a logrotate `postrotate` stanza — kills the daemon
-/// instead of rotating logs. A signal carries no selector, so it can only
-/// mean [`ProcessSelector::All`], and that is exactly what it asks the
-/// supervisor for: every sheep's log pump swaps both of its file handles,
-/// the same work `shep reopen all` does. There is no reply channel either,
-/// so the outcome is logged rather than reported to anyone.
-///
-/// # The supervisor arrives after the handler does
-///
-/// Returned alongside the tasks: the sender that hands the SIGUSR2 listener
-/// the [`SupervisorHandle`] it reopens through. This function runs at
-/// [`boot`]'s step 1, deliberately before the socket — or anything else —
-/// exists, and the supervisor is not built until step 4, so no handle can be
-/// passed in here. The listener parks on the matching receiver instead, and
-/// `boot` connects the two once it has a handle to give.
-///
-/// That wait costs no delivery. The `signal()` call below is what replaces
-/// SIGUSR2's disposition, and it has already done so by the time this
-/// function returns; tokio coalesces every notification arriving before the
-/// first `poll` into one item that the first `recv()` then yields. A SIGUSR2
-/// raced into the window between step 1 and step 4 is therefore served late,
-/// never dropped. A `boot` that FAILS before step 4 drops the sender instead
-/// and the listener ends — with the libc disposition still replaced, which
-/// is the half that matters for a process on its way out.
-///
-/// **Each listener stays armed for the rest of the process's life
-/// (Decision 3, 2026-08-08).** A signal handler, once installed, is
-/// installed for good — `tokio` never uninstalls the underlying libc
-/// disposition just because the [`tokio::signal::unix::Signal`] stream
-/// polling it happens to stop. A loop that awaited only one signal and
-/// returned would leave a real gap: a SECOND SIGTERM arriving during a slow
-/// [`RunningDaemon::run`] teardown (the kill ladder waiting out
-/// `kill_timeout` on a stuck sheep, say) would have nowhere left to go — not
-/// re-delivered to the now-finished task, and not killing the process
-/// either, since installing ANY handler for a signal already replaced its
-/// default terminate disposition. The daemon would sit there, unresponsive
-/// to a second graceful request, with `SIGKILL` as the only remaining way
-/// out. Looping keeps every listener polling for as long as the process
-/// runs, so no delivery is ever silently dropped; a repeat is logged (see
-/// the loop below) but does not otherwise change teardown, which is
-/// already unconditional and already running (see
-/// [`RunningDaemon::run`]'s own doc) — this crate does not invent an
-/// escalation policy beyond "stay armed and observable" that nothing in
-/// the spec or plan asks for.
+/// SIGUSR2's default disposition is to terminate, so this handler is what
+/// keeps a logrotate `postrotate` stanza from killing the daemon; carrying no
+/// selector, it reopens [`ProcessSelector::All`]. The returned sender hands
+/// that listener its [`SupervisorHandle`], absent until [`boot`]'s step 4;
+/// tokio coalesces anything raised in that window into the first `recv()`.
+/// Each listener then loops for life, or a second SIGTERM during a slow
+/// teardown would have nowhere to go and no default disposition left.
 ///
 /// # Errors
-/// - [`BootError::Io`] — the OS refused to register a signal handler.
+/// - [`BootError::Io`] if the OS refused to register a signal handler.
 #[cfg(windows)]
 fn install_signals(
     shutdown: Arc<watch::Sender<bool>>,
@@ -1798,10 +1185,8 @@ fn install_signals(
         tasks: Vec::with_capacity(4),
     };
 
-    // A macro rather than the unix arm loop because each console control
-    // event is its OWN tokio type (`CtrlC`, `CtrlBreak`, `CtrlClose`,
-    // `CtrlShutdown`) with its own `recv`, where unix has one `Signal` type
-    // parameterised by a `SignalKind` value. There is nothing to iterate.
+    // A macro rather than the unix arm's loop: each console control event is
+    // its own tokio type with its own `recv`, so there is nothing to iterate.
     macro_rules! listen {
         ($ctor:path, $name:literal) => {{
             let mut stream = $ctor().map_err(|source| BootError::Io {
@@ -1810,9 +1195,8 @@ fn install_signals(
             })?;
             let shutdown = Arc::clone(&shutdown);
             signals.tasks.push(tokio::spawn(async move {
-                // Looped for the same reason the unix arm loops — see this
-                // function unix twin doc: a single await leaves a second
-                // event during a slow teardown with nowhere to go.
+                // Looped: a single await leaves a second event during a
+                // slow teardown with nowhere to go.
                 let mut already_shutting_down = false;
                 while stream.recv().await.is_some() {
                     if already_shutting_down {
@@ -1830,40 +1214,19 @@ fn install_signals(
         }};
     }
 
-    // CTRL_C and CTRL_BREAK are the console interrupts an operator sends by
-    // hand. CTRL_CLOSE (the console window closing), CTRL_SHUTDOWN (the
-    // machine going down) and their siblings are what a graceful reboot
-    // delivers, and handling them is what keeps a reboot from looking like a
-    // crash to every sheep in the flock.
-    //
-    // **CTRL_CLOSE and CTRL_SHUTDOWN carry a hard OS deadline**, and it is
-    // shorter than the daemon own teardown can promise: Windows terminates
-    // the process about five seconds after the handler returns, regardless
-    // of what shep is still doing. A flock whose apps take longer than that
-    // to stop gracefully will lose the tail of its kill ladder to the OS.
-    // There is no way to extend it from inside the process, and it is the
-    // reason a production Windows deployment wants a real service (which
-    // negotiates its own longer timeout with the SCM) rather than a console
-    // daemon. Recorded here because it is invisible otherwise, and because
-    // it is the sharpest edge in the Windows tier.
+    // CTRL_CLOSE and CTRL_SHUTDOWN carry a hard OS deadline shorter than any
+    // teardown shep can promise: Windows terminates the process about five
+    // seconds after the handler returns, so a flock slower than that loses the
+    // tail of its kill ladder. Only an SCM service can negotiate longer.
     listen!(windows::ctrl_c, "CTRL_C");
     listen!(windows::ctrl_break, "CTRL_BREAK");
     listen!(windows::ctrl_close, "CTRL_CLOSE");
     listen!(windows::ctrl_shutdown, "CTRL_SHUTDOWN");
 
-    // No SIGUSR2 counterpart, and no Windows mechanism to build one from:
-    // there is no user-defined console control event, and no way to deliver
-    // an arbitrary one to another process. So the signal-driven log reopen
-    // has no trigger on this platform.
-    //
-    // It costs less than it appears to. That signal exists for an external
-    // rotator that has just renamed the log files underneath a running
-    // daemon, and the shape of rotation itself differs here — see
-    // `tokio_runner`'s `open_append`, whose Windows arm opens with
-    // `FILE_SHARE_DELETE` precisely so a rotator can rename an open file at
-    // all. The receiver is created and returned so the caller wiring is one
-    // shape on both platforms; dropping the receiving end simply makes
-    // `boot`'s own `let _ = connect_supervisor.send(..)` a no-op.
+    // No SIGUSR2 counterpart: Windows has no user-defined console control
+    // event, so the signal-driven log reopen has no trigger. Rotation works
+    // anyway through `tokio_runner`'s `open_append`. The channel is created
+    // and dropped so the caller wiring is one shape on both platforms.
     let (connect_supervisor, _supervisor_rx) = oneshot::channel::<SupervisorHandle>();
     Ok((signals, connect_supervisor))
 }
@@ -1882,31 +1245,22 @@ fn install_signals(
         SignalKind::interrupt(),
         SignalKind::quit(),
     ] {
-        // An early return here drops `signals`, whose own `Drop` aborts
-        // every task already pushed — registering the 2nd or 3rd kind
-        // failing must not leak the 1st's already-spawned listener.
+        // An early return drops `signals`, whose `Drop` aborts every task
+        // already pushed.
         let mut stream = signal(kind).map_err(|source| BootError::Io {
             path: paths.home.clone(),
             source,
         })?;
         let shutdown = Arc::clone(&shutdown);
         signals.tasks.push(tokio::spawn(async move {
-            // Looped, not `stream.recv().await` once — see this fn's own
-            // doc for why a single await left a real gap. `recv` returning
-            // `None` would mean the stream itself closed (never observed
-            // in practice — the same reasoning the SIGUSR2 loop below
-            // already relies on), at which point this task has nothing
-            // left to listen for and ending it is correct.
+            // `None` means the stream itself closed, leaving this task
+            // nothing to listen for.
             let mut already_shutting_down = false;
             while stream.recv().await.is_some() {
                 if already_shutting_down {
-                    // Not escalated further on purpose: the brief asks
-                    // only that a repeat signal during teardown be
-                    // observable, not that it change teardown's own
-                    // behavior (already unconditional, see
-                    // `RunningDaemon::run`'s doc) — an operator who needs
-                    // the daemon gone RIGHT NOW still has `SIGKILL`, which
-                    // no handler installed here can intercept.
+                    // Observable, but teardown is already unconditional and
+                    // already running. `SIGKILL` is the only faster exit,
+                    // and no handler here can intercept it.
                     tracing::warn!(
                         ?kind,
                         "received a repeat shutdown signal while teardown is already \
@@ -1921,19 +1275,10 @@ fn install_signals(
         }));
     }
 
-    // SIGHUP is the handover trigger, and it is a signal rather than a
-    // request for the reason spec H3 gives: the case that most needs a
-    // reload is the one where the daemon refuses the client at the
-    // handshake, and a remedy delivered over the channel it is meant to
-    // repair is not a remedy. It has its own task rather than riding in the
-    // loop above, because the two dispositions are different: the shutdown
-    // signals stop this daemon, and this one replaces it.
-    //
-    // The graceful stop stays as the arm taken when a handover cannot
-    // proceed. SIGHUP's kernel default is an unhandled terminate that would
-    // drop the flock's pipes rather than walk the ladder, so a stray or
-    // mistaken one, or one whose handover is refused, must still end the way
-    // every other shutdown signal does.
+    // SIGHUP is the handover trigger, a signal rather than a request because
+    // the case that most needs a reload is a daemon refusing the client at the
+    // handshake. Its own task, since it replaces this daemon where the loop
+    // above stops it; a refused handover falls back to the graceful stop.
     let mut hup = signal(SignalKind::hangup()).map_err(|source| BootError::Io {
         path: paths.home.clone(),
         source,
@@ -1941,31 +1286,17 @@ fn install_signals(
     let (connect_handover, handover_rx) = oneshot::channel::<Option<HandoverSeam>>();
     let hup_shutdown = Arc::clone(&shutdown);
     signals.tasks.push(tokio::spawn(async move {
-        // Parked until `boot` reaches step 4, exactly as the SIGUSR2 task
-        // below is, and for the same reason: the descriptors and the
-        // supervisor a handover needs do not exist when signals are
-        // installed. A signal that arrives before then is buffered by the
-        // stream, which was registered above.
-        //
-        // `None` is a boot that did not arm the handover
-        // ([`BootOptions::handover`]), and an `Err` is a boot that never got
-        // that far. Both mean this task has no image to hand anything to,
-        // and both still have to answer SIGHUP: its kernel default is an
-        // unhandled terminate, so a task that simply returned here would
-        // leave a stray signal killing the daemon outright and dropping
-        // every sheep's pipes.
+        // Parked until `boot` reaches step 4: the descriptors and supervisor a
+        // handover needs do not exist yet, and the stream registered above
+        // buffers anything raised meanwhile. `None` (not armed) and `Err`
+        // (boot never got that far) still answer SIGHUP, whose default kills.
         let seam = handover_rx.await.ok().flatten();
-        // `if`, not `while`: this task handles at most one SIGHUP, unlike
-        // the shutdown listeners above, which stay armed for the process's
-        // life. On the success arm there is no image left to loop in, and on
-        // every other arm this daemon is now stopping, and a second SIGHUP
-        // during that teardown would find the same graceful stop already
-        // underway.
+        // `if`, not `while`: at most one SIGHUP. On the success arm there is
+        // no image left to loop in, and every other arm is now stopping.
         if hup.recv().await.is_some() {
             let refusal = match &seam {
                 Some(seam) => match hand_over_now(seam).await {
-                    // No successor statement on the success arm, because
-                    // there is no successor image running this code.
+                    // No successor image runs this code.
                     Ok(never) => match never {},
                     Err(refusal) => refusal,
                 },
@@ -1988,19 +1319,14 @@ fn install_signals(
     })?;
     let (connect_supervisor, supervisor_rx) = oneshot::channel::<SupervisorHandle>();
     signals.tasks.push(tokio::spawn(async move {
-        // Parked until `boot` reaches step 4 — see this fn's own doc for why
-        // the wait loses no signal, and for what an `Err` here means.
-
+        // Parked until `boot` reaches step 4; the wait loses no signal.
         let Ok(supervisor) = supervisor_rx.await else {
             return;
         };
         while usr2.recv().await.is_some() {
-            // A rotator that moved the whole log DIRECTORY needs it back at
-            // `DIR_MODE`, and the pump this reaches is what puts it there —
-            // its own open asks `mkdir` for the mode (see `open_append`).
-            // Recreating it here as well would be a second owner of the same
-            // guarantee, differing from the pump's for any sheep logging
-            // outside the layout.
+            // A rotator that moved the whole log directory gets it back at
+            // `DIR_MODE` from the pump's own open (see `open_append`).
+            // Recreating it here would be a second owner of that guarantee.
             match supervisor.reopen(ProcessSelector::All).await {
                 Ok(reopened) => tracing::info!(
                     reopened = reopened.len(),
@@ -2011,8 +1337,8 @@ fn install_signals(
                 Err(SupervisorError::NotFound) => {
                     tracing::info!("SIGUSR2: no sheep to reopen");
                 }
-                // A signal carries no reply channel, so this log is the whole
-                // report — nobody is waiting to be told.
+                // A signal carries no reply channel, so this log is the
+                // whole report.
                 Err(err) => tracing::warn!(%err, "SIGUSR2: log reopen failed"),
             }
         }
@@ -2024,10 +1350,8 @@ fn install_signals(
 /// What [`install_signals`] hands back: the live listener tasks, and the two
 /// senders that connect them to state `boot` has not built yet.
 ///
-/// The SIGUSR2 task needs a [`SupervisorHandle`] to reopen through, and the
-/// SIGHUP task needs a whole [`HandoverSeam`] or the `None` that says this
-/// boot did not arm one. Both are parked on their receivers from the moment
-/// the handlers are installed, which is before the socket exists.
+/// The SIGUSR2 task needs a [`SupervisorHandle`], the SIGHUP task a
+/// [`HandoverSeam`] or the `None` saying this boot did not arm one.
 #[cfg(unix)]
 type InstalledSignals = (
     SignalTasks,
@@ -2051,14 +1375,10 @@ type Rehydrated = (
 
 /// Everything the SIGHUP task needs to replace this daemon's image.
 ///
-/// A struct handed over a channel rather than three arguments, because none
-/// of it exists when [`install_signals`] runs: the descriptors are opened
-/// two steps later and the supervisor a step after that.
-///
-/// `Debug` is derived and carries nothing sensitive: two descriptor numbers,
-/// a mailbox and the home's own paths. The blob those descriptors end up in
-/// is a different matter and does carry each sheep's environment; see
-/// [`crate::handover::Handover`]'s own doc for what protects it.
+/// Handed over a channel rather than as arguments, because none of it exists
+/// when [`install_signals`] runs. `Debug` carries nothing sensitive: two
+/// descriptor numbers, a mailbox and the home's paths. The blob they end up in
+/// does carry each sheep's environment; see [`crate::handover::Handover`].
 #[cfg(unix)]
 #[derive(Debug)]
 pub(crate) struct HandoverSeam {
@@ -2072,19 +1392,15 @@ pub(crate) struct HandoverSeam {
 
 /// Replace this process with a successor holding `seam`'s flock.
 ///
-/// The gate runs HERE as well as in the client that asked before signalling,
-/// and both are load-bearing. The client asks so that a refusal reaches the
-/// operator and the flock is stopped-and-started rather than left down (spec
-/// H3a); this one asks because a signal is a signal: anyone can send one,
-/// peer input is untrusted, and the flock can change between the question
-/// and the signal.
+/// The gate runs here as well as in the client that asked before signalling:
+/// anyone can send a signal, and the flock can change between the question and
+/// the signal.
 ///
 /// # Errors
 ///
 /// The sentence to log, when the flock cannot be carried, when the actor is
-/// gone, or when the exec itself failed. Every one of them leaves this
-/// process still itself, with no blob on disk, and the caller falls back to
-/// a graceful stop.
+/// gone, or when the exec failed. Each leaves this process still itself with
+/// no blob on disk, and the caller falls back to a graceful stop.
 #[cfg(unix)]
 async fn hand_over_now(seam: &HandoverSeam) -> Result<core::convert::Infallible, String> {
     let (candidates, blob, parked) = seam
@@ -2096,19 +1412,10 @@ async fn hand_over_now(seam: &HandoverSeam) -> Result<core::convert::Infallible,
         Ok(never) => match never {},
         Err(refusal) => refusal,
     };
-    // Taking the snapshot stopped every pump it reached, and this process
-    // is the one that owes them a resume: there is no successor image to do
-    // it, and nothing else in the daemon ever sends one. The caller falls
-    // back to a graceful stop, which is a stretch of seconds during which
-    // the flock is being told to exit and is writing exactly the lines an
-    // operator will reach for. A refusal that changes nothing else must not
-    // silently cost them.
-    //
-    // Here rather than inside `exec_into`'s own error path, which restores
-    // `FD_CLOEXEC` on the same failure: the gate below refuses BEFORE
-    // anything is exec'd, so a resume that lived with the descriptors would
-    // miss the abort that happens most often. This is where every way out
-    // meets.
+    // Taking the snapshot stopped every pump it reached and nothing else ever
+    // sends a resume, so without this the flock logs nothing through the
+    // graceful stop the caller falls back to. Here rather than in
+    // `exec_into`'s error path: this is where every way out meets.
     parked.resume().await;
     Err(refusal)
 }
@@ -2116,17 +1423,15 @@ async fn hand_over_now(seam: &HandoverSeam) -> Result<core::convert::Infallible,
 /// [`hand_over_now`]'s body, split out so a single resume can cover every
 /// way it refuses.
 ///
-/// Two gates, in this order, and they ask different questions. The first
-/// asks whether this FLOCK is a shape a handover carries. The second asks
-/// whether the BLOB describing it is one a successor could actually adopt,
-/// by running the successor's own adoption here, against duplicates, while
-/// this image still exists to fall back to.
+/// Two gates, in order: whether this flock is a shape a handover carries, then
+/// whether the blob describing it is one a successor could adopt, run against
+/// duplicates while this image still exists to fall back to.
 ///
 /// # Errors
 ///
 /// The flock cannot be carried, a successor could not have adopted the blob,
-/// or the exec itself failed. All three leave this process still itself,
-/// with no blob on disk.
+/// or the exec failed. All three leave this process still itself, with no blob
+/// on disk.
 #[cfg(unix)]
 fn hand_over_carrying(
     candidates: &[crate::handover::OwnedCandidate],
@@ -2140,17 +1445,10 @@ fn hand_over_carrying(
     if let crate::handover::Fitness::Refused(reason) = crate::handover::fitness(&borrowed) {
         return Err(reason.to_string());
     }
-    // The gate with no way back if it is skipped. After the `execve` there
-    // is no image to refuse to: `rehydrate` returns `BootError::Adopt`, this
-    // daemon's replacement exits without ever serving, and the flock runs on
-    // with nothing supervising it — which is what that variant's own message
-    // tells the operator, pointing them at `shep muster`.
-    //
-    // Here rather than inside `handover::hand_over`, which would be harder
-    // for a future caller to bypass. The rehearsal registers objects with
-    // the tokio reactor and so needs a runtime, and `hand_over`'s own exec
-    // self-test runs from a plain `#[test]` with a tempfile standing in for
-    // the listener. This is the production seam and its only caller.
+    // The gate with no way back if it is skipped: past the `execve` there is
+    // no image to refuse to, and the flock runs on unsupervised. Not inside
+    // `handover::hand_over`, because the rehearsal registers objects with the
+    // tokio reactor and that fn's own self-test runs from a plain `#[test]`.
     crate::handover::adopt::dry_run(blob).map_err(|err| {
         format!(
             "a successor could not have adopted this flock, so none was started: {err}. This is \
@@ -2164,38 +1462,27 @@ fn hand_over_carrying(
 
 /// Error type returned from this module's boot steps
 ///
-/// Wraps `io::Error` directly rather than stringifying it (contrast
-/// [`shep_core::protocol::WireError`]) so callers keep the underlying OS
-/// diagnostic via [`core::error::Error::source`]; that costs this enum
-/// `Clone`/`PartialEq`/`Eq` (IR-19's documented exception for variants
-/// wrapping `io::Error`).
+/// Wraps `io::Error` directly rather than stringifying it, so callers keep the
+/// OS diagnostic via [`core::error::Error::source`]; that costs this enum
+/// `Clone`/`PartialEq`/`Eq`.
 ///
-/// `#[non_exhaustive]`: today's four variants cover filesystem setup, socket
-/// claim, roll restore, and readiness reporting, and a future boot step —
-/// socket-activation handoff, or cgroup setup — would add a fifth rather
-/// than overloading [`Self::Io`], whose `path`/`source` shape is specific to
-/// the steps that already exist, and shep-daemon is a published library an
-/// out-of-tree matcher should not break for (IR-20).
+/// `#[non_exhaustive]`: a future boot step adds a variant rather than
+/// overloading [`Self::Io`], whose `path`/`source` shape is specific to the
+/// steps that already exist.
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum BootError {
-    /// A flock this image inherited across a handover could not be
-    /// installed.
+    /// A flock this image inherited across a handover could not be installed.
     ///
-    /// The descriptor a blob named is not open here, is not the kind of
-    /// object it was named as, or the supervisor would not take it. A
-    /// `String` rather than the underlying error, because the two sources
-    /// are different types in different modules and neither is part of this
-    /// crate's public surface; what a caller needs is the sentence naming
-    /// which sheep is now unsupervised.
+    /// A `String` because the two underlying sources are private types in
+    /// different modules; what a caller needs is the sentence naming which
+    /// sheep is now unsupervised.
     Adopt(String),
     /// A filesystem step failed (carries the path and the OS error)
     ///
-    /// Deliberately has no `From<std::io::Error>`, and neither does any
-    /// sibling: `ReadyWrite` wraps the same type, so one would make a bare
-    /// `?` in this module pick a variant rather than report one. A caller
-    /// that cannot name the path it was working on has not finished
-    /// thinking about the error yet.
+    /// No `From<std::io::Error>`, here or on any sibling: `ReadyWrite` wraps
+    /// the same type, so one would make a bare `?` in this module pick a
+    /// variant rather than report one.
     Io {
         /// The path the failing step operated on
         path: PathBuf,
@@ -2213,10 +1500,7 @@ pub enum BootError {
     /// limit, so no bind could ever succeed (carries the path and the limit)
     ///
     /// Checked before the bind rather than translated after it: the kernel's
-    /// own `ENAMETOOLONG` names neither the limit nor the variable
-    /// responsible, and an operator reading it has no way to know that the
-    /// number is 104 here and 108 on Linux, nor that `$SHEP_HOME` is what
-    /// feeds it.
+    /// `ENAMETOOLONG` names neither the limit nor `$SHEP_HOME`.
     SocketPathTooLong {
         /// The socket path that would not fit
         path: PathBuf,
@@ -2228,12 +1512,8 @@ pub enum BootError {
     /// Writing the readiness line to the caller-adopted readiness pipe
     /// failed (carries the OS error)
     ///
-    /// Adoption itself (`unsafe fn` `crate::sys::adopt_fd`) is the
-    /// caller's job, not `boot`'s — see [`BootOptions::ready_fd`]'s own
-    /// doc — so `boot` has no error variant for a failed adoption; by the
-    /// time `options.ready_fd` reaches here it is already a valid, owned
-    /// [`std::fs::File`], and this variant covers only the plain IO write
-    /// to it.
+    /// Only the write. Adoption is the caller's job (see
+    /// [`BootOptions::ready_fd`]), so `boot` has no variant for a failed one.
     ReadyWrite(std::io::Error),
 }
 
@@ -2274,13 +1554,11 @@ impl core::error::Error for BootError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::AlreadyRunning { .. } => None,
-            // No source: nothing failed underneath, the path was refused
-            // before any syscall was attempted.
+            // Refused before any syscall was attempted.
             Self::SocketPathTooLong { .. } => None,
             Self::Snapshot(err) => Some(err),
             Self::ReadyWrite(err) => Some(err),
-            // No source: both underlying types are module-private, so the
-            // sentence is the whole report (see the variant's own doc).
+            // Both underlying types are module-private.
             Self::Adopt(_) => None,
         }
     }
@@ -2294,15 +1572,10 @@ impl From<SnapshotError> for BootError {
 
 /// Boot behaviour that is specific to the Windows tier.
 ///
-/// The big `mod tests` below is `#[cfg(unix)]` because almost every case in
-/// it asserts something that only exists on unix — a `0700` mode read back
-/// off a directory, a `raise(SIGTERM)`, a socket FILE left behind by a crash
-/// and then probed. Those are not skipped here out of convenience; they
-/// assert guarantees the Windows tier deliberately makes differently, and
-/// each difference is argued at its own call site above.
-///
-/// What survives translation is asserted here instead, on the three
-/// properties that must hold on both platforms or the daemon is unsound.
+/// The `mod tests` below is `#[cfg(unix)]` because almost every case in it
+/// asserts something only unix has: a `0700` mode, a `raise(SIGTERM)`, a
+/// socket file left behind by a crash. What survives translation is asserted
+/// here instead.
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
@@ -2314,9 +1587,8 @@ mod windows_tests {
         )
     }
 
-    /// fails if the layout is not created. No mode to assert — see
-    /// `create_dir_at_dir_mode`'s Windows arm — but the directories
-    /// themselves are what every later step writes into.
+    /// No mode to assert on this platform, only that the directories every
+    /// later step writes into exist.
     #[test]
     fn init_dirs_creates_the_whole_layout() {
         let dir = tempfile::tempdir().unwrap();
@@ -2327,14 +1599,9 @@ mod windows_tests {
         }
     }
 
-    /// fails if two daemons can both claim one `$SHEP_HOME`.
-    ///
-    /// The Windows arm holds its lock on a SIBLING `.lock` file rather than
-    /// on the pidfile, so this also pins the property that motivated that
-    /// split: the loser must still be able to READ the pidfile to name the
-    /// winner. A `share_mode(0)` open of the pidfile itself would make
-    /// `read_pidfile` fail with a sharing violation instead, and the
-    /// `AlreadyRunning` error would lose its pid.
+    /// Also pins why the lock lives on a sibling `.lock`: a `share_mode(0)`
+    /// open of the pidfile itself would make `read_pidfile` fail with a
+    /// sharing violation, and `AlreadyRunning` would lose its pid.
     #[test]
     fn a_second_pidfile_lock_is_refused_and_can_still_read_the_winners_pid() {
         let dir = tempfile::tempdir().unwrap();
@@ -2355,12 +1622,8 @@ mod windows_tests {
         );
     }
 
-    /// fails if the lock outlives the process that held it.
-    ///
-    /// The crash property: a Windows share-mode reservation is owned by the
-    /// HANDLE and released by the kernel when the last one closes, exactly
-    /// as `flock`'s is released with the last descriptor. Dropping stands in
-    /// for the process dying, which is what closes the handle either way.
+    /// The crash property: dropping stands in for the process dying, which is
+    /// what closes the handle the share-mode reservation is owned by.
     #[test]
     fn dropping_the_lock_releases_it_for_the_next_daemon() {
         let dir = tempfile::tempdir().unwrap();
@@ -2374,15 +1637,9 @@ mod windows_tests {
             .expect("a released lock must be re-acquirable, or a crash would wedge $SHEP_HOME");
     }
 
-    /// fails if two daemons can both bind one control address.
-    ///
-    /// `first_pipe_instance` is what refuses the second, and this asserts
-    /// the refusal arrives as `AlreadyRunning` rather than as a raw
-    /// `ERROR_ACCESS_DENIED` an operator could not act on.
     /// `#[tokio::test]`, unlike its three siblings: creating a named pipe
-    /// instance registers it with the tokio reactor, so `ServerOptions::create`
-    /// panics outside a runtime context. `boot` always has one; a bare
-    /// `#[test]` here does not.
+    /// instance registers it with the tokio reactor, so
+    /// `ServerOptions::create` panics outside a runtime context.
     #[tokio::test]
     async fn a_second_bind_on_a_live_control_address_reports_already_running() {
         let dir = tempfile::tempdir().unwrap();
@@ -2406,7 +1663,6 @@ mod tests {
     use crate::dogs::DogSpec;
     use crate::fake::{ProcScript, ScriptedRunner};
     use crate::snapshot::{FlockSnapshot, SNAPSHOT_VERSION, SavedApp};
-    // the one crate-root fixture (IR-33)
     use crate::testing::{AnnouncingRunner, SharedRunner, capture_logs, test_paths};
     use shep_core::config::{AppConfig, ProbeConfig, ProbeKind, normalize};
     use shep_core::protocol::{DogSource, ProcessEventKind};
@@ -2419,24 +1675,15 @@ mod tests {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
-    /// fails if adopting the pidfile descriptor ever leaves the lock free.
+    /// `flock` conflicts between separate open file descriptions even inside
+    /// one process, so this process can ask for the lock it holds and be
+    /// refused.
     ///
-    /// The failure it prevents: an arm that re-locked would have to release
-    /// first, and that window is exactly long enough for a second daemon to
-    /// win this home while the only one supervising its flock is mid-boot.
-    ///
-    /// What makes the assertion possible at all is that `flock` conflicts
-    /// between separate open file DESCRIPTIONS even inside one process, so
-    /// this process can ask for the lock it already holds and be refused.
-    ///
-    /// `mem::forget` plus `sys::adopt_handover_fd` stands in for the
-    /// `execve` a successor arrives through, and is as close to it as one
-    /// process can get: forgetting the lock skips the `flock(fd, LOCK_UN)`
-    /// its drop would run, exactly as an exec does, and adopting the number
-    /// back gives the descriptor a single new owner, exactly as the
-    /// successor gives it one. Duplicating it instead would leave a second
-    /// descriptor holding the same lock, and both assertions below would
-    /// then hold whatever the adopted arm did with its own.
+    /// `mem::forget` plus `sys::adopt_handover_fd` stands in for the `execve`:
+    /// forgetting skips the `flock(fd, LOCK_UN)` a drop would run, and
+    /// adopting the number gives the descriptor one new owner. Duplicating
+    /// instead would leave a second descriptor holding the same lock, and both
+    /// assertions would hold whatever the adopted arm did.
     #[test]
     fn the_adopted_pidfile_arm_does_not_release_the_lock() {
         let dir = tempfile::tempdir().unwrap();
@@ -2457,21 +1704,10 @@ mod tests {
             "a contended lock must report AlreadyRunning, got {refusal:?}"
         );
 
-        // And it is a lock rather than a descriptor nobody can ever release:
-        // a successor that exits closes the only handle left, and the kernel
-        // frees the home for the next daemon.
-        //
-        // Retried rather than demanded on the first attempt, for the reason
-        // `stale_socket_leftover` spells out at length a few tests below: a
-        // `fork` copies the whole descriptor table, so any child another test
-        // in this binary spawns concurrently holds a duplicate of this
-        // descriptor until its own `exec` runs — and a duplicate holds the
-        // `flock` with it. That is a lying fixture rather than a lock this
-        // arm failed to release, and it was reproducible the moment a
-        // supervisor test began spawning a real child. The assertion is
-        // unweakened: the home must become claimable, and a lock genuinely
-        // still held fails this loop just as flatly as it failed the single
-        // attempt.
+        // Retried rather than demanded on the first attempt: a `fork` copies
+        // the whole descriptor table, so a child another test in this binary
+        // spawns concurrently holds a duplicate of this descriptor, and its
+        // `flock` with it, until its own `exec` runs.
         drop(adopted);
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let claimed = loop {
@@ -2487,30 +1723,14 @@ mod tests {
         drop(claimed);
     }
 
-    /// Serializes every test in this module that calls `boot()` and expects
-    /// it to succeed — NOT just the ones that go on to call `daemon.run()`
-    /// — against every OTHER such test, because `nix::sys::signal::raise`
-    /// (and the real OS signal delivery it triggers) is NOT scoped to one
-    /// test's own tokio runtime: every `Signal` stream registered anywhere
-    /// in this test BINARY'S process receives it, regardless of which test
-    /// spawned it or which runtime owns it.
+    /// Serializes every test here whose `boot()` call succeeds
     ///
-    /// The rule is "calls `boot()` successfully", not "calls `run()`",
-    /// because `install_signals` moved INTO `boot` (see `boot`'s own doc):
-    /// a test whose `boot()` call succeeds has live signal listeners
-    /// running from that point on, whether or not it ever calls `run()`.
+    /// `raise(SIGTERM)` reaches every `Signal` stream in the test binary,
+    /// whichever runtime registered it, so two overlapping tests can rescue or
+    /// corrupt each other's daemon. A successful `boot()` is the line, not a
+    /// `run()`: `install_signals` runs inside `boot`.
     ///
-    /// Without this lock, two overlapping `boot()`-successful tests can
-    /// rescue or corrupt each other: `raise(SIGTERM)` in one test's signal
-    /// path can reach a second test's own hung daemon on the same delivery,
-    /// masking a real regression in that second test. Every test below that
-    /// calls `boot()` takes this for its own duration so no two such tests
-    /// can ever overlap.
-    ///
-    /// `tokio::sync::Mutex`, not `std::sync::Mutex`: the guard is held
-    /// across this fn's own `.await` points (`boot`, `run`, ...), and
-    /// clippy's `await_holding_lock` correctly denies a blocking guard held
-    /// there — an async-aware mutex has no such restriction.
+    /// `tokio::sync::Mutex`, since the guard is held across `.await`.
     static SIGNAL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
@@ -2527,14 +1747,9 @@ mod tests {
 
     #[test]
     fn a_fresh_dir_lands_at_dir_mode_with_no_separate_chmod() {
-        // TOCTOU regression guard: this calls the raw creation primitive
-        // ALONE, with no follow-up set_permissions in this test, so it can
-        // only pass if DirBuilder's `.mode(DIR_MODE)` really lands the mode
-        // at creation. A regression back to `create_dir_all` (0o777, narrowed
-        // only by whatever the ambient umask strips) would still slip past
-        // init_dirs_creates_the_whole_layout_owner_only above, because that
-        // test only observes the mode after init_dirs' own chmod pass has
-        // already run — it can't see the window this test targets.
+        // No `set_permissions` here, so this passes only if `DirBuilder`'s
+        // `.mode(DIR_MODE)` lands the mode at creation. `init_dirs`' own tests
+        // observe the mode after its chmod pass and cannot see that window.
         let dir = tempfile::tempdir().unwrap();
         let never_existed = dir.path().join("nested").join("run");
         create_dir_at_dir_mode(&never_existed).unwrap();
@@ -2584,8 +1799,7 @@ mod tests {
         let paths = test_paths(&dir);
         init_dirs(&paths).unwrap();
         std::fs::write(pidfile(&paths), "999999").unwrap();
-        // The file exists and names a pid. Nothing holds the lock, so this is
-        // NOT a live daemon and must not be reported as one.
+        // The file names a pid; nothing holds the lock, so nothing is live.
         assert_eq!(daemon_liveness(&paths).unwrap(), Shepherd::Absent);
     }
 
@@ -2610,10 +1824,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
         init_dirs(&paths).unwrap();
-        // `boot` takes the lock and records its pid a few statements later,
-        // binding the socket in between. A caller that read this window as
-        // an absence would start a second daemon that then dies unable to
-        // take the lock.
+        // `boot` records its pid a few statements after taking the lock; a
+        // caller reading that window as an absence starts a second daemon.
         let held = PidfileLock::acquire(&paths).unwrap();
         assert_eq!(daemon_liveness(&paths).unwrap(), Shepherd::Booting);
         drop(held);
@@ -2629,10 +1841,8 @@ mod tests {
         assert_eq!(socket_path(&paths, Some(&custom)), custom);
     }
 
-    /// The kernel's own refusal is `ENAMETOOLONG` and names neither the
-    /// limit nor the variable that produced it. An operator whose
-    /// `$SHEP_HOME` is a few directories too deep has no way to guess that
-    /// the number is 104 here and 108 on Linux.
+    /// The kernel's `ENAMETOOLONG` names neither the limit nor `$SHEP_HOME`,
+    /// and the limit is 104 here, 108 on Linux.
     #[tokio::test]
     async fn an_over_length_socket_path_names_the_limit_and_the_variable() {
         let dir = tempfile::tempdir().unwrap();
@@ -2675,49 +1885,24 @@ mod tests {
         drop(listener);
     }
 
-    /// Fabricates exactly what a crashed daemon leaves behind: a socket file
-    /// at `socket` that nothing is listening on. Neither std nor tokio
-    /// unlinks a `UnixListener`'s path on drop, so binding and dropping is
-    /// the right shape — but it is NOT, on its own, enough to guarantee the
-    /// second half of that sentence inside this test binary.
-    ///
-    /// macOS has no atomic `SOCK_CLOEXEC` (the descriptor is marked
-    /// close-on-exec a moment AFTER `socket(2)` returns), and a `fork` copies
-    /// the whole descriptor table, so any child another test spawns
-    /// concurrently — the exec probes, the runner tests — can end up holding
-    /// a duplicate of the listener below. For as long as that duplicate lives
-    /// (until the child's `exec` or exit; measured at up to ~25ms) the socket
-    /// object is NOT destroyed, `connect` to the path SUCCEEDS, and any
-    /// prober is looking at a live socket. That is not a daemon bug — it is a
-    /// lying fixture: it can make
-    /// [`two_concurrent_boots_on_a_stale_socket_exactly_one_wins`] fail as
-    /// `[AlreadyRunning, AlreadyRunning]`, both racers refused — the flock's
-    /// loser refused correctly, and the flock's WINNER then found this
-    /// leftover answering and refused too, exactly as `bind_socket` should.
-    ///
-    /// So establish the precondition instead of assuming it: don't return
-    /// until the path actually refuses a connection. That verdict is stable
-    /// once it lands — a refused socket is a destroyed socket, and only a
-    /// fresh `bind` can make the path answer again, which nothing but the
-    /// code under test does.
-    ///
-    /// Real sleeps, in a module whose default is a paused clock (IR-33): a
-    /// descriptor's lifetime in ANOTHER process is not on any clock tokio can
-    /// advance, and every caller of this helper is already a real-time test
-    /// for the same reason (real socket IO).
+    /// Fabricates what a crashed daemon leaves behind: a socket file at
+    /// `socket` that nothing is listening on. Bind-then-drop is the shape,
+    /// since neither std nor tokio unlinks the path, but macOS marks the
+    /// descriptor close-on-exec just after `socket(2)` returns, so a child
+    /// another test forks in that window holds a duplicate and the path keeps
+    /// answering. So this waits until the path refuses a connection; only a
+    /// fresh bind can undo that. Real sleeps, not the module's paused clock:
+    /// another process's descriptor is on no clock tokio can advance.
     ///
     /// # Panics
     /// If the leftover never goes stale, or the probe fails for any reason
     /// other than nobody listening.
     #[track_caller]
     fn stale_socket_leftover(socket: &Path) {
-        // Two nested loops for two different holders. The inner one waits out
-        // the common case, a child that copied the descriptor mid-spawn and
-        // drops it on `exec`. The outer one re-fabricates for the rarer one,
-        // a child that forked inside the socket(2)-to-close-on-exec window
-        // and therefore keeps the descriptor for its whole life: unlinking
-        // detaches that socket from this path for good, and the next bind
-        // starts clean.
+        // Two loops for two holders: the inner waits out a child that copied
+        // the descriptor mid-spawn and drops it on `exec`; the outer
+        // re-fabricates for one that forked inside the close-on-exec window
+        // and keeps it for life, since unlinking detaches that socket for good.
         for _ in 0..20 {
             let _ = std::fs::remove_file(socket);
             drop(std::os::unix::net::UnixListener::bind(socket).unwrap());
@@ -2761,22 +1946,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
         init_dirs(&paths).unwrap();
-        // `tokio::net::UnixListener` by its full path: this module no longer
-        // imports it, because production code reaches the transport through
-        // `shep_core::transport::Listener` on both platforms now. This case
-        // is `cfg(unix)` and deliberately binds the RAW unix type, so that
-        // what it proves is "a real socket someone else is listening on is
-        // reported as AlreadyRunning" rather than anything about shep's own
-        // wrapper.
+        // The raw unix type, not `shep_core::transport::Listener`: what this
+        // proves is that a real socket someone else listens on reads as
+        // `AlreadyRunning`, not anything about shep's own wrapper.
         let live = tokio::net::UnixListener::bind(&paths.socket).unwrap();
         write_pidfile(&paths, 4242).unwrap();
         assert!(matches!(
             bind_socket(&paths, &paths.socket),
             Err(BootError::AlreadyRunning { pid: Some(4242) })
         ));
-        // The refused bind must be a pure probe: the live daemon's socket
-        // file is untouched (not unlinked) and still answers, proving
-        // bind_socket never reached the remove_file/rebind arm here.
+        // A pure probe: the live daemon's socket file is untouched and still
+        // answers, so `bind_socket` never reached the remove_file/rebind arm.
         assert!(
             paths.socket.exists(),
             "a live daemon's socket must never be unlinked"
@@ -2787,11 +1967,11 @@ mod tests {
     }
 
     /// What one racer thread observed in
-    /// [`two_concurrent_boots_on_a_stale_socket_exactly_one_wins`] — kept
-    /// deliberately small and `'static` so it can cross the thread boundary
-    /// without carrying a `RunningDaemon` (and the tokio resources inside
-    /// it) out of the runtime that created it. See that test's own doc for
-    /// why.
+    /// [`two_concurrent_boots_on_a_stale_socket_exactly_one_wins`]
+    ///
+    /// Small and `'static` so it crosses the thread boundary without carrying
+    /// a `RunningDaemon`, and the tokio resources in it, out of the runtime
+    /// that created it.
     #[derive(Debug)]
     enum RaceOutcome {
         Won { socket_still_accepts: bool },
@@ -2801,55 +1981,24 @@ mod tests {
 
     #[test]
     fn two_concurrent_boots_on_a_stale_socket_exactly_one_wins() {
-        // Pins Decision 2 (2026-08-08), closing double-bind race #3: two
-        // daemons racing to boot the same $SHEP_HOME could both hit
-        // `bind_socket`'s EADDRINUSE -> probe -> remove_file -> rebind arm
-        // over a CRASHED predecessor's leftover socket file, both observe
-        // `ConnectionRefused` (correctly — nobody's listening), and both
-        // proceed into the recovery arm — loser's `remove_file` can delete
-        // winner's freshly-bound listener out from under it, leaving BOTH
-        // convinced they hold the sole live daemon. See `PidfileLock`'s own
-        // doc for the full mechanism and why `flock` closes it.
-        //
-        // NOT `#[tokio::test]`, and each racer gets its OWN
-        // `new_current_thread` runtime on its OWN `std::thread`: `boot`'s
-        // own synchronous prefix (signals, dirs, the pidfile lock, socket
-        // bind) never actually awaits a not-yet-ready future, so two
-        // `boot()` calls driven as plain tokio TASKS on one runtime would
-        // never really interleave — the executor would run the first one's
-        // entire synchronous body to completion in a single poll before the
-        // second ever got scheduled, proving nothing about real contention.
-        // Real OS threads, synchronized to start together via a `Barrier`,
-        // give the two racers genuine kernel-level concurrency over the
-        // same `open`/`flock`/`bind`/`connect`/`remove_file` calls — the
-        // actual shape of the bug this test pins.
-        //
-        // Looped: a race this timing-dependent isn't guaranteed to land on
-        // the exact bad interleaving every single attempt (the fd-reuse
-        // double-close that `sys.rs`'s
-        // `a_closed_descriptor_is_refused_instead_of_adopted` now pins
-        // structurally took 25 saturated workspace runs to show itself even
-        // once) — running many trials inside one test call, and failing on
-        // the first bad one, is what makes the revert-and-confirm-it-fails
-        // check below actually reliable rather than a coin flip.
-        //
-        // Locked per SIGNAL_TEST_LOCK's rule for every trial that has a
-        // winner: `blocking_lock` because this outer fn is plain sync, not
-        // `#[tokio::test]`, so there is no surrounding runtime to `.await`
-        // on when acquiring it.
+        // Two daemons racing on a crashed predecessor's leftover both see
+        // `ConnectionRefused` and enter `bind_socket`'s recovery arm, where the
+        // loser's `remove_file` can delete the winner's fresh listener.
+        // Looped: the bad interleaving does not land on every attempt.
         for _ in 0..25 {
+            // `blocking_lock` per SIGNAL_TEST_LOCK's rule: this fn is sync.
             let _guard = SIGNAL_TEST_LOCK.blocking_lock();
             let dir = tempfile::tempdir().unwrap();
             let paths = test_paths(&dir);
             init_dirs(&paths).unwrap();
-            // The crashed predecessor's leftover, and it must really be
-            // leftover before the racers start: a socket another test's
-            // mid-spawn child is briefly keeping alive would make the flock's
-            // WINNER refuse too, for a reason that has nothing to do with the
-            // race under test. See `stale_socket_leftover`'s own doc — that
-            // exact false failure is why it exists.
+            // Must really be leftover before the racers start: a socket kept
+            // briefly alive by another test's child would make the winner
+            // refuse too, for a reason unrelated to this race.
             stale_socket_leftover(&paths.socket);
 
+            // Real OS threads on a barrier, not tokio tasks: `boot`'s
+            // synchronous prefix never awaits, so two tasks on one runtime
+            // would run one body to completion before the other was scheduled.
             let barrier = Arc::new(std::sync::Barrier::new(2));
             let handles: Vec<_> = (0..2)
                 .map(|_| {
@@ -2866,11 +2015,9 @@ mod tests {
                                 .await
                             {
                                 Ok(daemon) => {
-                                    // Checked (and `daemon` dropped) INSIDE
-                                    // this racer's own runtime — see
-                                    // `RaceOutcome`'s own doc for why
-                                    // nothing tokio-shaped crosses the
-                                    // thread boundary.
+                                    // Checked inside this racer's own
+                                    // runtime: nothing tokio-shaped crosses
+                                    // the thread boundary.
                                     let reachable =
                                         std::os::unix::net::UnixStream::connect(daemon.socket())
                                             .is_ok();
@@ -2931,13 +2078,8 @@ mod tests {
     #[test]
     fn readiness_reports_pid_and_version_then_closes_the_pipe() {
         use std::io::Read;
-        // Safe end-to-end, unlike the pre-Decision-1 version of this test:
-        // `std::io::pipe` (stable 1.87, below this workspace's 1.88 floor)
-        // hands back an owned `PipeWriter`, which converts into `File`
-        // through the standard `OwnedFd` bridge — no `unsafe`, because this
-        // test created the pipe itself and knows exactly what it is. There
-        // is nothing left in this module for `sys::adopt_fd` to be called
-        // on; see this file's own module doc.
+        // No `unsafe`: `std::io::pipe` hands back an owned `PipeWriter`, which
+        // converts into `File` through the standard `OwnedFd` bridge.
         let (mut reader, writer) = std::io::pipe().unwrap();
         let pipe = std::fs::File::from(std::os::fd::OwnedFd::from(writer));
         let ready = DaemonReady {
@@ -2953,20 +2095,10 @@ mod tests {
 
     #[tokio::test]
     async fn boot_writes_readiness_to_the_callers_pipe_after_the_socket_is_bound() {
-        // Real time: binds a real socket. Locked per SIGNAL_TEST_LOCK's rule
-        // — any test whose `boot()` call succeeds has live signal listeners
-        // from that point on.
-        //
-        // `BootOptions::ready_fd` is `Option<std::fs::File>`, so there is no
-        // safe way to hand this test a `File` naming a bad descriptor — the
-        // type itself is the proof the fd was valid at construction time.
-        // BadFd refusal is tested one layer down instead: see
-        // `sys::tests::a_fd_this_process_never_owned_is_refused`, which
-        // calls `sys::adopt_fd` directly. This test covers the happy path
-        // instead — no other test drives a `Some` `ready_fd` through `boot`
-        // at all — a caller-adopted pipe really does receive the readiness
-        // line, and only after the socket is genuinely bound (spec §3),
-        // exactly as `boot`'s own doc claims.
+        // Real time: binds a real socket. Locked per SIGNAL_TEST_LOCK's rule.
+        // The only test driving a `Some` `ready_fd` through `boot`. A bad
+        // descriptor cannot reach `BootOptions::ready_fd`, whose type is
+        // `Option<std::fs::File>`, so `sys::tests` covers that refusal.
         use std::io::Read;
         let _guard = SIGNAL_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
@@ -2990,9 +2122,8 @@ mod tests {
             "boot must bind the socket before it returns"
         );
 
-        // `write_ready` closes its `File` at the end of `boot`'s own call
-        // to it, so this read observes EOF (the readiness line, then
-        // nothing) without blocking on a live writer.
+        // `write_ready` closes its `File`, so this read sees the line and then
+        // EOF rather than blocking on a live writer.
         let mut line = String::new();
         reader.read_to_string(&mut line).unwrap();
         let ready: DaemonReady = serde_json::from_str(line.trim_end()).unwrap();
@@ -3004,24 +2135,15 @@ mod tests {
 
     #[tokio::test]
     async fn boot_restores_a_saved_flock_and_tears_down_in_order() {
-        // Real time: binds a real socket. Locked against
-        // `sigterm_triggers_the_same_graceful_shutdown` — see
-        // SIGNAL_TEST_LOCK's own doc.
+        // Real time: binds a real socket. Locked per SIGNAL_TEST_LOCK's rule.
         let _guard = SIGNAL_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
         init_dirs(&paths).unwrap();
-        // instances_running is a deliberately WRONG sentinel (99, not the 1
-        // instance actually restored below): restore reads `app.instances`
-        // to decide how many to start, never this historical count, so it
-        // has no effect on the boot itself. Its only job is to make the
-        // final-roll assertion below load-bearing: if teardown's roll write
-        // is ever skipped (e.g. because a reordering runs it after the
-        // supervisor has already stopped, when `snapshot_now` silently
-        // no-ops rather than querying a dead engine), this stale 99 survives
-        // untouched and the assertion catches it. A seeded `1` would have
-        // matched the correct post-teardown value by coincidence and let a
-        // skipped write pass unnoticed.
+        // A wrong `instances_running` on purpose: restore reads
+        // `app.instances`, not this count, so 99 changes nothing about the
+        // boot and survives untouched if teardown's roll write is skipped. A
+        // seeded 1 would have matched the right value by coincidence.
         let roll = FlockSnapshot {
             version: SNAPSHOT_VERSION,
             saved_at_ms: 0,
@@ -3068,18 +2190,11 @@ mod tests {
         assert_eq!(read_pidfile(&paths).unwrap(), None);
     }
 
-    /// fails if `delete_flock_on_shutdown` leaves anything in the final
-    /// roll. What this pins is the SHARED shutdown watch: `ctx.shutdown()`
-    /// flips the same watch `run`'s `install_signals` handler flips on a
-    /// caught `SIGTERM`, WITHOUT going through any caller-level
-    /// `Stop`/`Delete` request first, which is precisely the gap a CLI-side
-    /// `tidy_up` flag alone cannot close. It does not raise a real `SIGTERM`
-    /// and proves nothing about the signal-listener wiring itself — only
-    /// about the shutdown path both routes share. If `delete_flock_on_shutdown`
-    /// is ever ignored — or is threaded through as `false` by mistake — this
-    /// app survives into the roll exactly as
-    /// `boot_restores_a_saved_flock_and_tears_down_in_order` above expects
-    /// for the ordinary (non-`dev`) case, and this assertion catches it.
+    /// Pins the shared shutdown watch: `ctx.shutdown()` flips the same watch
+    /// `install_signals` flips on a caught SIGTERM, with no caller-level
+    /// `Stop`/`Delete` first, which is the gap a CLI-side `tidy_up` flag
+    /// cannot close. It raises no real signal, so it says nothing about the
+    /// listener wiring.
     #[tokio::test]
     async fn delete_flock_on_shutdown_clears_the_roll_even_on_a_signalled_exit() {
         let _guard = SIGNAL_TEST_LOCK.lock().await;
@@ -3106,8 +2221,7 @@ mod tests {
 
         let run = tokio::spawn(daemon.run());
         // The signal path, not a caller-level `Stop`/`Delete` pair: `run`'s
-        // own `install_signals` handler flips this same watch on a real
-        // `SIGTERM`, and never runs anything this test hasn't run either.
+        // `install_signals` handler flips this same watch on a real `SIGTERM`.
         ctx.shutdown();
         tokio::time::timeout(Duration::from_secs(5), run)
             .await
@@ -3123,14 +2237,10 @@ mod tests {
         );
     }
 
-    /// fails if the dogs come up before the muster restore, or not at all.
-    /// The order half is the point: a metrics dog that starts first answers
-    /// for an empty flock for the whole restore window, and a bark dog
-    /// raises a start alert for every sheep the roll brought back. The
-    /// assertion reads the ORDER the scripted runner was asked to spawn in
-    /// — [`ScriptedRunner`] hands out pids as `FIRST_SCRIPTED_PID + index`,
-    /// so a lower pid is an earlier spawn — which is the only place the
-    /// sequence is observable.
+    /// A metrics dog that starts first answers for an empty flock for the
+    /// whole restore window, and a bark dog alerts on every restored sheep.
+    /// [`ScriptedRunner`] hands out pids as `FIRST_SCRIPTED_PID + index`, so
+    /// the spawn order is observable only as a pid order.
     #[tokio::test]
     async fn boot_restores_the_flock_before_it_lets_the_dogs_out() {
         let _guard = SIGNAL_TEST_LOCK.lock().await;
@@ -3194,17 +2304,12 @@ mod tests {
         drop(daemon); // no run() needed; SignalTasks::drop stops the listeners
     }
 
-    /// fails if a dog that will not start takes the boot down with it. The
-    /// dog is given no script to spawn against — `ScriptedRunner` answers
-    /// `SpawnFailed("script exhausted")` for the first unscripted spawn — so
-    /// the flock must still come up, and the daemon must still serve.
+    /// The dog gets no script, so `ScriptedRunner` answers
+    /// `SpawnFailed("script exhausted")` on its spawn and the flock must still
+    /// come up.
     ///
-    /// NOT `#[tokio::test]`: `capture_logs` needs a synchronous closure to
-    /// scope its subscriber to (see its own doc), so this drives `boot`
-    /// through a `block_on` of its own inside that closure instead —
-    /// `two_concurrent_boots_on_a_stale_socket_exactly_one_wins`, above,
-    /// establishes the same `new_current_thread` pattern for the same
-    /// reason.
+    /// `#[test]` with a `block_on` of its own, not `#[tokio::test]`:
+    /// `capture_logs` scopes its subscriber to a synchronous closure.
     #[test]
     fn a_dog_that_will_not_start_does_not_fail_the_boot() {
         let _guard = SIGNAL_TEST_LOCK.blocking_lock();
@@ -3261,19 +2366,13 @@ mod tests {
         drop(daemon); // no run() needed; SignalTasks::drop stops the listeners
     }
 
-    /// fails if this boot path answers a name collision the way
-    /// `Request::EnableDog`'s own handler refuses to. `start_dog` is
-    /// idempotent by NAME: enabling a dog under a name a sheep already
-    /// holds comes back `Ok` over the SHEEP, not a started dog, and the RPC
-    /// arm inspects that reply for the missing `dog` marker so it can
-    /// refuse rather than report a success that never happened. Task 6
-    /// flagged this exact gap on the boot path when it built the guard into
-    /// the RPC arm alone — this pins that `spawn_enabled_dogs` closes it
-    /// too, rather than logging the sheep's own info as though a dog had
-    /// started.
+    /// `start_dog` is idempotent by name: enabling a dog under a name a sheep
+    /// already holds comes back `Ok` over the sheep, not a started dog. The
+    /// RPC arm inspects that reply for the missing `dog` marker, and this pins
+    /// that `spawn_enabled_dogs` does the same.
     ///
-    /// `#[test]` + `capture_logs`, not `#[tokio::test]`, for the same
-    /// reason as `a_dog_that_will_not_start_does_not_fail_the_boot` above.
+    /// `#[test]` plus `capture_logs` for the reason
+    /// `a_dog_that_will_not_start_does_not_fail_the_boot` gives.
     #[test]
     fn a_dog_enabled_under_a_sheeps_name_does_not_start_and_does_not_fail_the_boot() {
         let _guard = SIGNAL_TEST_LOCK.blocking_lock();
@@ -3339,22 +2438,14 @@ mod tests {
         drop(daemon); // no run() needed; SignalTasks::drop stops the listeners
     }
 
-    /// fails if the notification is sent before the muster restore finishes.
-    /// That ordering is the entire reason `Type=notify` was chosen over
-    /// `Type=simple`: a unit that goes green at exec time reports a flock
-    /// that is not up yet, and a restore that hangs reads as a healthy
-    /// service supervising nothing.
+    /// The ordering `Type=notify` was chosen for: a unit that goes green at
+    /// exec time reports a flock that is not up yet, and a hung restore reads
+    /// as a healthy service supervising nothing.
     ///
-    /// **How it tells the two orders apart**, since a test that only checks
-    /// the notification arrived would prove nothing about when: the restore
-    /// announces its own spawn on the SAME socket, so what is asserted is
-    /// the queue order of two datagrams rather than the presence of one.
-    /// Reading only `READY=1` after `boot` returns would pass on a notify
-    /// moved to the very top of `boot`, because the kernel keeps that
-    /// datagram queued however early it was sent — confirmed by moving the
-    /// send above step 4 and watching this case fail on the first `recv`.
-    /// The flock is asserted afterwards too, so a `SPAWNED` from something
-    /// other than a completed restore could not carry the case.
+    /// The restore announces its own spawn on the same socket, so what is
+    /// asserted is the queue order of two datagrams. Reading only `READY=1`
+    /// after `boot` returns would pass on a notify moved to the top of `boot`,
+    /// since the kernel keeps that datagram queued however early it was sent.
     #[tokio::test]
     async fn readiness_is_reported_only_once_the_roll_is_restored() {
         // Real time: binds a real socket, so this obeys SIGNAL_TEST_LOCK's
@@ -3386,16 +2477,9 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
 
-        // Both events land on the SAME socket, so the assertion is on their
-        // ORDER rather than on their presence. This is the whole design of
-        // the case: reading only READY=1 after `boot` returns would pass on
-        // a notify moved to the TOP of `boot`, because the datagram is
-        // queued by the kernel and is still there whenever the test looks.
-        // A marker sent from inside the restore's own spawn is the only
-        // thing that distinguishes the two orders. AF_UNIX SOCK_DGRAM
-        // enqueues synchronously, and these two sends are strictly
-        // sequential in program order, so the queue order is the program
-        // order.
+        // The marker sent from inside the restore's own spawn. AF_UNIX
+        // SOCK_DGRAM enqueues synchronously and the two sends are sequential,
+        // so the queue order is the program order.
         let runner = AnnouncingRunner::new(
             ScriptedRunner::new(vec![ProcScript::never_exits()]),
             &notify_path,
@@ -3434,14 +2518,10 @@ mod tests {
         daemon.run().await.unwrap();
     }
 
-    /// fails if an undeliverable readiness datagram takes the daemon down
-    /// with it. Nothing is bound at the address, so the send errors — and
-    /// the boot must still succeed, because what failed is the init
-    /// system's *knowledge* of a daemon that is otherwise fully up. Systemd
-    /// reports that honestly through its own `TimeoutStartSec`; killing a
-    /// working supervisor over one datagram would be the worse outcome, and
-    /// on a `?` here a reboot would leave the flock down instead of merely
-    /// unannounced.
+    /// Nothing is bound at the address, so the send errors and the boot must
+    /// still succeed: what failed is the init system's knowledge of a daemon
+    /// that is otherwise up, which systemd reports through its own
+    /// `TimeoutStartSec`.
     #[tokio::test]
     async fn a_readiness_datagram_that_cannot_be_delivered_does_not_fail_the_boot() {
         let _guard = SIGNAL_TEST_LOCK.lock().await;
@@ -3470,12 +2550,9 @@ mod tests {
 
     #[tokio::test]
     async fn sigterm_triggers_the_same_graceful_shutdown() {
-        // Real time + a real signal. Safe to raise here only because the
-        // handler is installed first: SIGTERM's default action would kill
-        // the test binary. tokio never uninstalls it, which is harmless.
-        // Locked against `boot_restores_a_saved_flock_and_tears_down_in_order`
-        // — see SIGNAL_TEST_LOCK's own doc: this raise() is process-wide and
-        // would otherwise be observed by that test's daemon too.
+        // Real time and a real signal, safe to raise only because the handler
+        // is installed first: SIGTERM's default action would kill the test
+        // binary. The raise is process-wide, hence SIGNAL_TEST_LOCK.
         let _guard = SIGNAL_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
@@ -3487,10 +2564,8 @@ mod tests {
         )
         .await
         .unwrap();
-        // No sleep needed here (there was one; see git history): signal
-        // handlers are installed inside `boot`, which this call already
-        // `.await`ed to completion, so they are provably live the moment
-        // `boot` returns — well before `run()`'s own task is ever polled.
+        // No sleep: the handlers are installed inside `boot`, which this call
+        // already awaited, so they are live before `run()` is ever polled.
         let run = tokio::spawn(daemon.run());
         nix::sys::signal::raise(nix::sys::signal::Signal::SIGTERM).unwrap();
         tokio::time::timeout(Duration::from_secs(5), run)
@@ -3503,28 +2578,16 @@ mod tests {
 
     #[tokio::test]
     async fn sighup_triggers_the_same_graceful_shutdown() {
-        // SIGHUP's default disposition is to terminate the process, and
-        // this handler is what replaces that default. SIGHUP is the
-        // handover trigger now, but a boot that has not opted in
-        // (`BootOptions::handover`, left `false` by the default below) has
-        // no successor to become, and a stray or mistaken SIGHUP must still
-        // walk the same graceful path SIGTERM does rather than drop the
-        // flock's pipes.
-        //
-        // That default is also what keeps this test from replacing the test
-        // binary with a fresh copy of itself, which is what an opted-in boot
-        // would do here: `exec_target` resolves the file this process was
-        // launched from, and in a test that file is the harness. See
-        // `BootOptions::handover`'s own doc.
-        //
-        // Mirrors `sigterm_triggers_the_same_graceful_shutdown` above —
-        // see that test's own comments for why raising a real signal here
-        // is safe only because the handler is installed first, and for
-        // why `SIGNAL_TEST_LOCK` is required.
+        // SIGHUP's default disposition is to terminate, and this handler
+        // replaces it. SIGHUP is the handover trigger, but a boot that has not
+        // set `BootOptions::handover` has no successor to become, and must
+        // still walk SIGTERM's graceful path rather than drop the flock's pipes.
         let _guard = SIGNAL_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
         init_dirs(&paths).unwrap();
+        // `handover` left `false`, or `exec_target` would replace the test
+        // binary with a fresh copy of itself.
         let daemon = boot(
             ScriptedRunner::new(vec![]),
             paths.clone(),
@@ -3542,42 +2605,26 @@ mod tests {
         assert!(!paths.socket.exists());
     }
 
-    /// The daemon-side gate, and why a client asking first is not enough.
+    /// The daemon-side gate: anyone can send a signal, and the flock can
+    /// change between a client's question and the delivery, so the SIGHUP path
+    /// runs [`crate::handover::fitness`] again and refuses on its own.
     ///
-    /// A signal is a signal: anyone can send one, and the flock can change
-    /// between the client's question and the signal. So the SIGHUP path runs
-    /// [`crate::handover::fitness`] again and refuses on its own, which is
-    /// what makes the fallback to a graceful stop reachable at all.
-    ///
-    /// **The descriptors are deliberately invalid.** If the gate ever
-    /// stopped refusing, `hand_over` would go on to clear `FD_CLOEXEC` on
-    /// them, meet `EBADF`, and return, rather than exec'ing this test binary
-    /// into an endless re-run of the whole suite. The assertion on
-    /// the message is what tells the two failures apart.
+    /// The descriptors are invalid on purpose: if the gate stopped refusing,
+    /// `hand_over` would meet `EBADF` and return rather than exec this test
+    /// binary into a re-run of the suite. The assertion on the message is what
+    /// tells the two failures apart.
     #[tokio::test(start_paused = true)]
     async fn a_sighup_over_a_flock_it_cannot_carry_refuses_before_it_execs() {
-        // Real signal listeners, and a PAUSED clock. This case raises
-        // nothing itself, but `SIGNAL_TEST_LOCK`'s rule is "calls `boot()`
-        // successfully", not "calls `raise()`": a successful `boot()`
-        // installs SIGTERM, SIGHUP and SIGUSR2 listeners that run for this
-        // test's whole duration, and a concurrent `raise()` in one of the
-        // shutdown cases reaches them too. This daemon would then shut down
-        // ahead of its own `ctx.shutdown()` while absorbing a delivery the
-        // other test needed, which is the way a real regression there gets
-        // masked. The lock is about the signals; the clock is a separate
-        // question, and pausing it is what stops the refusal this case
-        // needs -- a log pump missing `REPORT_DEADLINE` -- costing the
-        // suite two real seconds. Measured: 2.0s awake, 0.03s paused.
+        // A successful `boot()` installs signal listeners for this test's
+        // whole duration, and a `raise()` elsewhere reaches them, hence the
+        // lock. The paused clock is separate: it keeps the refusal this needs,
+        // a pump missing `REPORT_DEADLINE`, from costing two real seconds.
         let _guard = SIGNAL_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
         init_dirs(&paths).unwrap();
-        // A wedged log pump: the one thing the gate still refuses, and the
-        // only one it ever will. The case is about the gate firing at all
-        // rather than about what fires it, so its fixture has moved every
-        // time a phase carried the feature it was reaching for -- a
-        // shepherd channel in 2b task 5, two instances in task 6, a dog in
-        // phase 3 task 4. There is nothing left for it to move to.
+        // A wedged log pump: the one thing the gate still refuses. The case is
+        // about the gate firing at all, not about what fires it.
         let daemon = boot(
             ScriptedRunner::new(vec![ProcScript::never_exits()])
                 .with_a_pump_that_never_reports(&["wedged"]),
@@ -3615,49 +2662,35 @@ mod tests {
         );
 
         ctx.shutdown();
-        // Bounded, like the sibling above. The lock this case now holds is
-        // held across this await, so a teardown that hung would stop every
-        // other signal test in the module rather than failing this one.
+        // Bounded: the lock is held across this await, so a hung teardown
+        // would stop every other signal test rather than failing this one.
         tokio::time::timeout(Duration::from_secs(5), daemon.run())
             .await
             .unwrap()
             .unwrap();
     }
 
-    /// The second gate: a flock the fitness check passes, described by a
-    /// blob no successor could have adopted, refuses HERE rather than after
-    /// the `execve`.
+    /// The second gate: a flock the fitness check passes, described by a blob
+    /// no successor could have adopted, refuses here rather than after the
+    /// `execve`. Past the exec there is no predecessor to refuse to, so
+    /// `rehydrate` returns [`BootError::Adopt`], the successor exits without
+    /// serving, and the flock runs on unsupervised.
     ///
-    /// This is the failure with no way back. Past the exec there is no
-    /// predecessor to refuse to: `rehydrate` returns `BootError::Adopt`, the
-    /// successor exits without ever serving, and the flock keeps running
-    /// with nothing supervising it. So the rehearsal runs while this image
-    /// still exists, and a refusal takes the stop-and-start arm the operator
-    /// would have had before handovers existed.
-    ///
-    /// **Read the assertion, not just the `expect_err`.** These descriptors
-    /// were already refused before this gate existed, by the `FD_CLOEXEC`
-    /// sweep meeting `EBADF`, so a case that only checked for A refusal
-    /// would pass with the gate deleted. What is new is WHICH refusal: the
-    /// successor's own wording, reached before anything was written or
-    /// cleared. The wording is the whole test.
-    ///
-    /// **The descriptors stay deliberately invalid**, for the reason both
-    /// siblings above give. A blob that got past both gates would exec this
-    /// test binary into a re-run of the entire suite, so no case in this
-    /// module may offer one that could.
+    /// The assertion is on which refusal, not on there being one: the
+    /// `FD_CLOEXEC` sweep meeting `EBADF` refused these descriptors before the
+    /// gate existed. They stay invalid on purpose, since a blob past both
+    /// gates would exec this test binary into a re-run of the suite.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_sighup_over_a_blob_no_successor_could_adopt_refuses_before_it_execs() {
-        // As every sibling: a successful `boot()` installs real signal
-        // listeners for this test's whole duration.
+        // A successful `boot()` installs real signal listeners for this
+        // test's whole duration.
         let _guard = SIGNAL_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
         init_dirs(&paths).unwrap();
-        // No dog and no sheep, so the FIRST gate passes and this case is
-        // about the second one. An empty flock is carryable — see
-        // `handover::fitness`'s own doc.
+        // No dog and no sheep, so the first gate passes: an empty flock is
+        // carryable, and this case is about the second gate.
         let daemon = boot(
             ScriptedRunner::new(Vec::new()),
             paths.clone(),
@@ -3698,26 +2731,21 @@ mod tests {
             .unwrap();
     }
 
-    /// The sharp edge of parking a pump: a handover that reports and then
-    /// refuses has to leave every pump reading again.
+    /// A handover that reports and then refuses has to leave every pump
+    /// reading again.
     ///
-    /// Taking the snapshot stops each pump where it stands, which is what
-    /// makes the report still true at the exec. There is no exec here, and
-    /// nothing else in the daemon ever sends a resume, so a missing one is
-    /// not a slow log or a lost line: it is a flock that logs nothing more,
-    /// through the graceful stop this refusal falls back to and for as long
-    /// as the daemon lives after it, having reported no failure beyond the
-    /// refusal itself.
+    /// Taking the snapshot stops each pump where it stands, and nothing else
+    /// in the daemon ever sends a resume, so a missing one is a flock that
+    /// logs nothing more for the rest of the daemon's life.
     ///
-    /// Two sheep, because the resume has to reach every pump that was
-    /// reported to rather than the one the refusal named.
+    /// Two sheep, since the resume has to reach every pump that was reported
+    /// to rather than the one the refusal named.
     #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn an_abandoned_handover_starts_every_pump_reading_again() {
-        // As the sibling above: a successful `boot()` installs real signal
-        // listeners for this test's whole duration, and the clock is paused
-        // so the missed `REPORT_DEADLINE` this refusal needs costs the
-        // suite nothing to wait out.
+        // A successful `boot()` installs real signal listeners for this test's
+        // whole duration, and the paused clock keeps the missed
+        // `REPORT_DEADLINE` this refusal needs from costing real seconds.
         let _guard = SIGNAL_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
@@ -3726,11 +2754,8 @@ mod tests {
             ScriptedRunner::new(vec![ProcScript::never_exits(); 3])
                 .with_a_pump_that_never_reports(&["wedged"]),
         );
-        // The refusal: a wedged log pump, read AFTER every pump that
-        // answered has already been reported to and parked, which is what
-        // makes the resume owed. It was a dog until phase 3 task 4 carried
-        // one, a shepherd channel until 2b task 5 and two instances until
-        // task 6; what the case needs is any refusal at all.
+        // The refusal: a wedged log pump, read after every pump that answered
+        // has been reported to and parked, which is what makes a resume owed.
         let daemon = boot(
             SharedRunner(Arc::clone(&runner)),
             paths.clone(),
@@ -3775,10 +2800,9 @@ mod tests {
             .map(|name| runner.spawn_index_of(name).expect("started above"))
             .collect();
         let wedged = runner.spawn_index_of("wedged").expect("started above");
-        // Polled rather than read once: a resume carries no acknowledgement
-        // (see `LogCtl::Resume`), so a send that has returned has been
-        // queued rather than served. Bounded, so a pump that is never told
-        // fails here instead of hanging.
+        // Polled: `LogCtl::Resume` carries no acknowledgement, so a send that
+        // returned was queued rather than served. Bounded, so a pump that is
+        // never told fails here instead of hanging.
         let all_resumed = async {
             while answered.iter().any(|sheep| runner.resumes(*sheep) == 0) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3794,9 +2818,8 @@ mod tests {
                 "sheep {sheep} must be resumed once rather than repeatedly"
             );
         }
-        // The plural is what this case adds over its sibling, which has one
-        // answering pump: a resume that reached only the first sheep
-        // reported to would satisfy that one and fail here.
+        // A resume that reached only the first sheep reported to would satisfy
+        // the single-pump sibling and fail here.
         assert_eq!(answered.len(), 2, "two pumps must have answered the report");
         assert_eq!(
             runner.resumes(wedged),
@@ -3811,21 +2834,14 @@ mod tests {
             .unwrap();
     }
 
-    /// The second refusal path, and the one nothing else covers: a snapshot
-    /// abandoned because a pump went quiet still owes a resume to every pump
-    /// that DID answer.
+    /// A snapshot abandoned because a pump went quiet still owes a resume to
+    /// every pump that answered. A missed deadline is a different way into the
+    /// refusal than the sibling's config gate, and it arrives with one pump
+    /// parked and one that never was.
     ///
-    /// Its sibling above proves the resume for a refusal the gate reads off
-    /// a sheep's config. A missed deadline is a different way in, and it
-    /// arrives with one pump already parked and one that never was. Miss it
-    /// and a handover abandoned on a wedged pump leaves the REST of the
-    /// flock parked, which is a silent logging stop for the life of the
-    /// daemon and strictly worse than the stall this deadline exists to end.
-    ///
-    /// No `boot()` and no signal here, unlike its sibling: this is about
-    /// what `hand_over_now` does with a snapshot, and building the
-    /// supervisor directly is what lets the clock be paused, so the deadline
-    /// costs the suite nothing to wait out.
+    /// No `boot()` and no signal: this is about what `hand_over_now` does with
+    /// a snapshot, and building the supervisor directly is what lets the clock
+    /// be paused so the deadline costs nothing to wait out.
     #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn a_handover_abandoned_on_a_wedged_pump_resumes_the_pumps_that_parked() {
@@ -3850,10 +2866,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Deliberately invalid, as its sibling above explains: if the gate
-        // ever stopped refusing, `hand_over` would meet `EBADF` and return
-        // rather than exec this test binary into a re-run of the whole
-        // suite. The assertion on the message is what tells those apart.
+        // Invalid on purpose: if the gate stopped refusing, `hand_over` would
+        // meet `EBADF` and return rather than exec this test binary into a
+        // re-run of the suite.
         let seam = HandoverSeam {
             supervisor: supervisor.clone(),
             fds: crate::handover::DaemonFds {
@@ -3876,11 +2891,9 @@ mod tests {
 
         let answering = runner.spawn_index_of("answering").expect("started above");
         let wedged = runner.spawn_index_of("wedged").expect("started above");
-        // Polled rather than read once: a resume carries no acknowledgement
-        // (see `LogCtl::Resume`), so a send that has returned has been
-        // queued rather than served. Instant under the paused clock, and
-        // bounded so a pump that is never told fails here instead of
-        // hanging.
+        // Polled: `LogCtl::Resume` carries no acknowledgement, so a send that
+        // returned was queued rather than served. Bounded, so a pump that is
+        // never told fails here instead of hanging.
         let delivered = async {
             while runner.resumes(answering) == 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3898,26 +2911,17 @@ mod tests {
 
     #[tokio::test]
     async fn a_repeat_sigterm_is_observed_not_swallowed() {
-        // Pins Decision 3 (2026-08-08): each shutdown-signal listener
-        // `install_signals` spawns stays armed for the rest of the
-        // process's life instead of returning after one `recv()`. Tests
-        // `install_signals` directly rather than the whole `boot()`/`run()`
-        // teardown — the bug and its fix live entirely in this one loop,
-        // and driving a genuinely slow teardown here would only add
-        // unrelated timing noise to what is otherwise a fully
-        // deterministic check.
-        //
-        // Real time + real signals — see SIGNAL_TEST_LOCK's own doc: this
-        // raise() is process-wide.
+        // Each listener `install_signals` spawns stays armed for the process's
+        // life instead of returning after one `recv()`. Drives
+        // `install_signals` directly: the loop is the whole subject. Real time
+        // and real signals, and the raise is process-wide, hence the lock.
         let _guard = SIGNAL_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
         let (shutdown, mut shutdown_rx) = watch::channel(false);
         let shutdown = Arc::new(shutdown);
-        // The SIGUSR2 and SIGHUP halves of the return are dropped unused:
-        // this case drives the shutdown listeners only, and a dropped sender
-        // simply ends the task parked on its receiver (see
-        // `install_signals`'s own doc) without disturbing the three below.
+        // The SIGUSR2 and SIGHUP senders are dropped unused: that ends the
+        // task parked on each receiver without disturbing the three below.
         let (signals, _connect_supervisor, _connect_handover) =
             install_signals(shutdown, paths).unwrap();
 
@@ -3929,31 +2933,17 @@ mod tests {
             .unwrap();
         assert!(*shutdown_rx.borrow());
 
-        // The regression this test pins: on the pre-fix code, the SIGTERM
-        // listener task RETURNED after that one signal (see
-        // `install_signals`'s own doc for the full history) — `is_finished`
-        // would already read `true` here. Looped, it never finishes on its
-        // own; only `SignalTasks::drop`'s `abort()` stops it.
+        // Looped, the listener never finishes on its own; only
+        // `SignalTasks::drop`'s `abort()` stops it.
         assert!(
             !signals.tasks[0].is_finished(),
             "the SIGTERM listener must still be polling after its first signal, not have exited"
         );
 
-        // A second SIGTERM, into the same "already shutting down" state a
-        // real slow teardown would still be in when a repeat arrives (the
-        // watch channel is already `true`, exactly as `run()` would leave
-        // it while its own teardown steps run). The pre-fix version would
-        // have dropped this on the floor: no live task left to receive it,
-        // and no process kill either, since installing this handler already
-        // replaced SIGTERM's default terminate disposition.
-        // `watch::Sender::send` marks its channel changed on every call
-        // regardless of whether the value differs (confirmed against
-        // tokio's own source, matching the precedent `RunningDaemon::
-        // shutdown_rx`'s own doc already relies on for a different
-        // scenario) — so a SECOND `changed()` resolving here, for a value
-        // that was already `true`, is airtight proof the loop delivered
-        // this signal all the way through to another `shutdown.send()`
-        // call, not a timing coincidence.
+        // A second SIGTERM into the already-shutting-down state a slow
+        // teardown would be in. `watch::Sender::send` marks its channel
+        // changed on every call whether or not the value differs, so a second
+        // `changed()` on a value already `true` proves the loop delivered it.
         nix::sys::signal::raise(nix::sys::signal::Signal::SIGTERM).unwrap();
         tokio::time::timeout(Duration::from_secs(5), shutdown_rx.changed())
             .await
@@ -3967,18 +2957,10 @@ mod tests {
         drop(signals); // aborts the listener tasks (SignalTasks::drop)
     }
 
-    // `boot` is the ONE place `DEFAULT_MAX_CRON_SLEEP` is applied — the CLI
-    // half of the plumbing keeps the knob an `Option` all the way down, and
-    // its own test pins that — so nothing else in this workspace would notice
-    // a different fallback landing here. fails if the default is replaced (a
-    // stray `Duration::from_secs(1)` would have every cron worker in the
-    // daemon waking a minute more often than the constant says), and fails if
-    // the configured value is dropped for one of `max_cron_sleep`'s own
-    // invention.
-    //
-    // Whole `BootOptions` values rather than bare `Option`s, because that is
-    // what `boot` hands over: the field this reads is the field the daemon
-    // runs with, with no projection in between for a call site to get wrong.
+    // `boot` is the one place `DEFAULT_MAX_CRON_SLEEP` is applied: the CLI
+    // keeps the knob an `Option` all the way down, so nothing else here would
+    // notice a different fallback. Whole `BootOptions` values rather than bare
+    // `Option`s, since that is what `boot` reads.
     #[test]
     fn an_unset_max_cron_sleep_falls_back_to_the_daemons_own_default() {
         assert_eq!(
@@ -3996,28 +2978,19 @@ mod tests {
         );
     }
 
-    // fails if `boot` never spawns the extras reporter. Nothing else in this
-    // crate drives that call — every other reporter case constructs one by
-    // hand — so dropping it here would leave a real daemon in which no memory
-    // breach and no liveness failure ever restarts anything, with every unit
-    // test still green.
-    //
-    // The whole production chain is what makes the claim: the actor arms a
-    // liveness loop at the Online transition, the loop reports over the sender
-    // `Extras::real` was built with, the reporter reads it, and
-    // `extra_restart`'s guards let it through. Real time and a real
-    // `OsProber` — a paused clock does not move a real TCP connect.
+    // The only case driving `boot`'s own spawn of the extras reporter, over
+    // the whole production chain: the actor arms the liveness loop at Online,
+    // the loop reports over `Extras::real`'s sender, the reporter reads it,
+    // and `extra_restart` lets it through. Real time, and a real `OsProber`.
     #[tokio::test]
     async fn a_booted_daemon_restarts_a_sheep_whose_liveness_probe_fails() {
-        // Real time: binds a real socket, so it takes the signal lock like
-        // every other successful `boot()` here — see SIGNAL_TEST_LOCK's doc.
+        // Real time: binds a real socket, so it takes SIGNAL_TEST_LOCK.
         let _guard = SIGNAL_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
 
-        // Reserve a port, then release it: nothing ever listens there, so
-        // every probe fails with a connection refusal, with no listener to
-        // race and no port to reserve for real.
+        // Reserve a port, then release it: nothing listens there, so every
+        // probe fails with a connection refusal and there is no race.
         let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = reserved.local_addr().unwrap();
         drop(reserved);
@@ -4076,36 +3049,23 @@ mod tests {
             .unwrap();
     }
 
-    // fails if SIGUSR2 stops meaning `reopen all`: a listener that logs the
-    // signal and reaches no pump, one wired to a narrower selector, or a
-    // `boot` that never hands the listener the supervisor it reopens through
-    // (the step-1/step-4 seam). Nothing else in this workspace drives that
-    // seam — `shep reopen` reaches the same supervisor over the socket
-    // instead, so every RPC-tier reopen test stays green with the signal path
-    // dead.
-    //
-    // Both instances are asserted, not just one: `All` is the whole claim,
-    // and a listener that reopened the first sheep it found would satisfy
-    // half of it.
+    // The only case driving the seam where `boot` hands the SIGUSR2 listener
+    // its supervisor; `shep reopen` reaches the same supervisor over the
+    // socket, so the RPC tier stays green with the signal path dead. Both
+    // instances are asserted, since `ProcessSelector::All` is the claim.
     #[tokio::test]
     async fn sigusr2_reopens_every_sheeps_log_files() {
-        // Real time + a real signal, so it takes the lock like every other
-        // successful `boot()` here — see SIGNAL_TEST_LOCK's own doc: this
-        // raise() is process-wide. Raising SIGUSR2 is safe only because
-        // `boot` below has already returned, having replaced a default
-        // disposition that would otherwise kill the test binary outright.
+        // Real time and a real signal, raised process-wide, hence the lock.
+        // Safe only because `boot` below has already replaced SIGUSR2's
+        // default disposition, which would kill the test binary.
         let _guard = SIGNAL_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
 
-        // TWO scripts for two instances, counted against what a BROKEN
-        // implementation demands rather than a working one: `ScriptedRunner`
-        // answers `SpawnFailed("script exhausted")` once it runs out, which
-        // lands that sheep `Errored` with no log pump at all — a state this
-        // case could not tell apart from the pump nobody asked to reopen.
-        // The `log_ctl_live` assertions below are the other half of that
-        // guard: they say a pump is there to be reached before the signal is
-        // ever raised.
+        // Two scripts for two instances: `ScriptedRunner` answers
+        // `SpawnFailed("script exhausted")` once it runs out, landing that
+        // sheep `Errored` with no pump, which this case could not tell apart
+        // from a pump nobody reopened. `log_ctl_live` below is the other half.
         let runner = Arc::new(ScriptedRunner::new(vec![ProcScript::never_exits(); 2]));
         let daemon = boot(
             SharedRunner(Arc::clone(&runner)),
@@ -4138,10 +3098,9 @@ mod tests {
 
         nix::sys::signal::raise(nix::sys::signal::Signal::SIGUSR2).unwrap();
 
-        // Polled rather than awaited: a signal has no reply channel, so
-        // there is nothing to await on — the counters are the only place the
-        // reopen becomes visible. Bounded, so a listener that never reaches a
-        // pump fails here instead of hanging.
+        // Polled: a signal has no reply channel, so the counters are the only
+        // place a reopen becomes visible. Bounded, so a listener that never
+        // reaches a pump fails here instead of hanging.
         let both_reopened = async {
             while runner.reopens(0) == 0 || runner.reopens(1) == 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -4204,22 +3163,15 @@ mod tests {
         }
     }
 
-    /// fails if a carried dog reaches the muster roll.
+    /// A successor rebuilds its registry from the blob, and the roll on disk
+    /// is written from that registry within seconds. `spawn_enabled_dogs`
+    /// never touches `FlockRegistry`, so a successor that recorded a dog would
+    /// put one in the roll permanently: a later cold boot restores `metrics`
+    /// as an unmarked sheep ahead of `spawn_enabled_dogs`, and `shep disable
+    /// metrics` cannot take it out.
     ///
-    /// A successor rebuilds its registry from the blob rather than from the
-    /// roll, and the registry is what the roll on disk is written from
-    /// within seconds. A dog has never been in it -- `spawn_enabled_dogs`
-    /// registers dogs straight through the supervisor and never touches
-    /// `FlockRegistry` -- so a successor that recorded one would put it
-    /// there for the first time, and permanently: the roll outlives the
-    /// daemon, so a later cold boot would restore `metrics` as an ordinary
-    /// unmarked sheep BEFORE `spawn_enabled_dogs` ran, and `shep disable
-    /// metrics` could not take it back out.
-    ///
-    /// Both rows, because a filter that dropped everything would satisfy
-    /// the negative half on its own -- and an empty registry is the failure
-    /// this whole `record_config` path exists to prevent, since it would
-    /// overwrite a good roll with an empty one.
+    /// Both rows are asserted, since a filter that dropped everything would
+    /// satisfy the negative half and overwrite a good roll with an empty one.
     #[cfg(unix)]
     #[test]
     fn a_carried_dog_does_not_reach_the_muster_roll() {

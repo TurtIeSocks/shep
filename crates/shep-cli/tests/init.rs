@@ -1,18 +1,14 @@
-//! The PID-1 init split, driven as a real process: `commands::reap`'s own
-//! reason to exist — signal forwarding and the relayed exit status — has no
-//! coverage anywhere else in the suite. `cargo test -p shep-cli --lib` only
-//! proves `classify` and `should_split` behave in isolation; neither test
-//! there can fail if the whole forwarding arm were deleted from `run_init`'s
-//! `select!`, which is exactly the regression this file exists to catch.
+//! Drives the PID-1 init split as a real process.
+//! `commands::reap`'s signal forwarding and relayed exit status have no
+//! coverage elsewhere.
 //!
-//! `#![cfg(unix)]` for the same reason `cli_e2e.rs` carries it: an
-//! integration test file is its own compilation unit, so without the guard
-//! `--all-targets` would build it (uselessly, since `commands` itself is
-//! `#[cfg(unix)]`) on the Windows CI leg.
+//! `#![cfg(unix)]`: `commands` itself is unix only. An integration test
+//! file is its own compilation unit. Without the guard, `--all-targets`
+//! would build this on Windows.
 //!
-//! Every case here sets `SHEP_FORCE_INIT=1` — a test harness is never PID 1,
-//! so without it `should_split` never fires and there would be nothing to
-//! signal. See `commands::reap::should_split`'s own doc.
+//! Every case sets `SHEP_FORCE_INIT=1`: a test harness is never PID 1.
+//! Without it, `should_split` never fires. See
+//! `commands::reap::should_split`.
 
 #![cfg(unix)]
 
@@ -27,18 +23,13 @@ use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 use tempfile::TempDir;
 
-/// Bound on every wait in this file: reading the init's own "supervising
-/// pid" line, polling for the flock to come online, and the process's own
-/// exit after a signal. A few seconds, like `CRON_DEADLINE` in
-/// `cli_e2e.rs` — the whole claim under test is that the init answers a
-/// signal promptly rather than riding a grace period, so this is generous
-/// headroom for a loaded CI machine's boot-and-start round trip, not a
-/// second budget being smuggled in.
+/// Bound on every wait in this file: reading the init's pid line, the
+/// flock coming online, and the process's exit after a signal. Generous
+/// headroom for a loaded CI boot, not a protocol timeout.
 const INIT_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Writes an executable script into `dir` and returns its path. The
-/// executable bit is the point: without it every `shep runtime` fails
-/// EACCES for a reason that has nothing to do with the init.
+/// executable bit matters: without it `shep runtime` fails EACCES.
 fn write_script(dir: &TempDir, name: &str, contents: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     let path = dir.path().join(name);
@@ -56,10 +47,9 @@ fn write_flockfile(dir: &TempDir, body: &str) -> PathBuf {
     path
 }
 
-/// A long-lived, single-app Flockfile: a bare `sleep 60`, which dies on the
-/// very first `SIGTERM` (its default disposition) and needs no readiness
-/// handshake — the point is a sheep still running when the signal arrives,
-/// not the shape of its script.
+/// A long-lived, single-app Flockfile: a bare `sleep 60`. It dies on
+/// the first `SIGTERM`, its default disposition, needing no readiness
+/// handshake.
 fn write_held_flockfile(dir: &TempDir) -> PathBuf {
     let script = write_script(dir, "held.sh", "#!/bin/sh\nsleep 60\n");
     write_flockfile(
@@ -71,10 +61,8 @@ fn write_held_flockfile(dir: &TempDir) -> PathBuf {
     )
 }
 
-/// Spawns `shep runtime <flockfile>` with `$SHEP_FORCE_INIT=1`, stdout and
-/// stderr both piped so the caller can read the init's own "supervising
-/// pid" line off stderr without either pipe filling up and blocking the
-/// child.
+/// Spawns `shep runtime <flockfile>` with `$SHEP_FORCE_INIT=1`. Stdout
+/// and stderr are both piped so neither fills and blocks the child.
 fn spawn_forced_runtime(home: &Path, flockfile: &Path) -> Child {
     Command::cargo_bin("shep")
         .expect("locate the built shep binary")
@@ -90,10 +78,9 @@ fn spawn_forced_runtime(home: &Path, flockfile: &Path) -> Child {
         .expect("spawn shep runtime")
 }
 
-/// Reads `source` line by line on a background thread, forwarding each
-/// line onto the returned channel. Backgrounding this — rather than
-/// reading inline — is what lets the caller apply its own bound
-/// ([`recv_pid_line`]) instead of blocking on the pipe forever.
+/// Reads `source` line by line on a background thread, forwarding lines
+/// onto the returned channel. Lets the caller bound the wait
+/// ([`recv_pid_line`]) rather than blocking on the pipe.
 fn spawn_line_reader<R: Read + Send + 'static>(source: R) -> Receiver<String> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -107,10 +94,8 @@ fn spawn_line_reader<R: Read + Send + 'static>(source: R) -> Receiver<String> {
 }
 
 /// Copies `source` to nowhere, on a background thread. `shep runtime`
-/// streams the flock's bleats to its own stdout for as long as it runs; if
-/// nothing drains that pipe it eventually fills and blocks the child,
-/// wedging the whole test. This is that drain for the one stream this file
-/// never needs to read.
+/// streams bleats to its own stdout continuously. An undrained pipe
+/// fills and blocks the child, wedging the test.
 fn discard_in_background<R: Read + Send + 'static>(mut source: R) {
     std::thread::spawn(move || {
         let _ = std::io::copy(&mut source, &mut std::io::sink());
@@ -118,10 +103,8 @@ fn discard_in_background<R: Read + Send + 'static>(mut source: R) {
 }
 
 /// Blocks on `rx` until a line matching `shep runtime: init supervising
-/// pid <N>` arrives, and returns `N`. Panics past `deadline` — this is the
-/// stderr line `commands::reap::run_init` prints right after spawning the
-/// supervisor, so its absence within a generous bound means the process
-/// never got that far.
+/// pid <N>` arrives, and returns `N`. Panics past `deadline`: absence
+/// within a generous bound means the process never got that far.
 fn recv_pid_line(rx: &Receiver<String>, deadline: Duration) -> i32 {
     const PREFIX: &str = "shep runtime: init supervising pid ";
     let start = Instant::now();
@@ -145,10 +128,9 @@ fn recv_pid_line(rx: &Receiver<String>, deadline: Duration) -> i32 {
     }
 }
 
-/// Polls `shep --home <home> flock --format json` until `done` accepts the
-/// one sheep's row, or `deadline` elapses. A fresh `shep` invocation reaches
-/// the same daemon `shep runtime` booted in-process, over the socket it
-/// bound at `home`.
+/// Polls `shep --home <home> flock --format json` until the one sheep's
+/// status is `online`, or `deadline` elapses. Reaches the same daemon
+/// `shep runtime` booted in-process, over the socket bound at `home`.
 fn poll_online_sheep(home: &Path, deadline: Duration) -> serde_json::Value {
     let start = Instant::now();
     loop {
@@ -177,10 +159,9 @@ fn poll_online_sheep(home: &Path, deadline: Duration) -> serde_json::Value {
     }
 }
 
-/// Polls `child.try_wait()` until it exits, or `timeout` elapses — a named
-/// panic instead of relying on the harness's own process timeout, which
-/// would fail the whole binary and name nothing (IR-46's distinction,
-/// applied to a plain thread wait rather than an `await`).
+/// Polls `child.try_wait()` until it exits, or `timeout` elapses. A
+/// named panic here, rather than the harness's own process timeout,
+/// which would fail the whole binary and name nothing.
 fn wait_bounded(child: &mut Child, timeout: Duration) -> std::process::ExitStatus {
     let deadline = Instant::now() + timeout;
     loop {
@@ -196,11 +177,9 @@ fn wait_bounded(child: &mut Child, timeout: Duration) -> std::process::ExitStatu
     }
 }
 
-/// Best-effort cleanup so a panicking assertion never leaves a real daemon
-/// and a real sleeping sheep behind: SIGKILLs the supervisor (if its pid
-/// was ever learned) and then the init itself. On every success path in
-/// this file both are already gone by the time this runs, so `kill`/`wait`
-/// here are no-ops whose errors are ignored.
+/// Best-effort cleanup so a panicking assertion never leaves a real
+/// daemon or sleeping sheep behind: SIGKILLs the supervisor, if known,
+/// then the init.
 struct RuntimeGuard {
     child: Child,
     supervisor_pid: Option<i32>,
@@ -216,15 +195,8 @@ impl Drop for RuntimeGuard {
     }
 }
 
-/// fails if the init ignores `SIGTERM`, or exits with its own status
-/// instead of the supervisor's. `commands::reap::run_init`'s whole reason
-/// to exist is the four forwarded signals — deleting that arm reddens
-/// this and nothing else in the phase (Step 10.7, mutation 3).
-///
-/// Three things are asserted in order: the deadline bounds a clean stop
-/// (an init that does not forward exits when the harness gives up, not
-/// when told to), the exit status is the supervisor's own 0, and the held
-/// sheep did not outlive the process that was supposed to stop it.
+/// Fails if the init ignores `SIGTERM` or exits with its own status
+/// instead of the supervisor's.
 #[test]
 fn a_sigterm_to_the_init_reaches_the_flock_and_the_status_is_the_childs() {
     let dir = tempfile::tempdir().unwrap();
@@ -261,13 +233,8 @@ fn a_sigterm_to_the_init_reaches_the_flock_and_the_status_is_the_childs() {
     );
 }
 
-/// fails if a signalled supervisor does not make the init exit `128 +
-/// signal`. This is the one assertion in the phase that reads the
-/// PROCESS's status rather than `classify`'s return value, and it is what
-/// proves `run_init` steps around the `ExitCode` funnel rather than being
-/// clamped by it — `ExitCode` has no variant for 137 and never will (Step
-/// 10.7, mutation 4: hardcoding the exit status reddens this while every
-/// `classify` unit test still passes).
+/// Reads the process's real exit status rather than `classify`'s return
+/// value: `ExitCode` has no variant for 137.
 #[test]
 fn a_supervisor_killed_by_sigkill_makes_the_init_exit_137() {
     let dir = tempfile::tempdir().unwrap();
@@ -296,23 +263,16 @@ fn a_supervisor_killed_by_sigkill_makes_the_init_exit_137() {
     guard.supervisor_pid = None; // already dead; nothing left for Drop to kill
 }
 
-/// fails if the drain loop leaves a reparented orphan as a zombie — the
-/// container's actual failure mode, a process table that fills up over
-/// days. Linux only: `PR_SET_CHILD_SUBREAPER` makes this test process the
-/// reaper for its own descendants, which is the only way to observe
-/// reparenting without being PID 1 or holding a PID namespace; macOS has
-/// no equivalent.
+/// Fails if the drain loop leaves a reparented orphan as a zombie. The
+/// real failure mode is a process table that fills over days.
 ///
-/// This does not go through the `shep` binary — `lib.rs`'s whole public
-/// surface is three functions (decision 1), so nothing in `commands::reap`
-/// is reachable from an external test crate. What it proves instead is the
-/// mechanism `commands::reap::drain` relies on: that a bounded
-/// `waitpid(-1, WNOHANG)` loop, run by a subreaper, actually reaps a
-/// grandchild the kernel reparented to it, rather than leaving it a
-/// zombie forever.
+/// Linux only: `PR_SET_CHILD_SUBREAPER` makes this process the reaper
+/// for its own descendants; macOS has no equivalent.
 ///
-/// This machine is macOS, so this test did not run here; it is CI's Linux
-/// runner's to execute.
+/// Does not go through the `shep` binary: `lib.rs` exposes only three
+/// functions, none of `commands::reap`. Proves instead the mechanism
+/// `commands::reap::drain` relies on. A bounded `waitpid(-1, WNOHANG)`
+/// loop, run by a subreaper, reaps a reparented grandchild.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_reparented_orphan_is_reaped() {
@@ -320,18 +280,9 @@ fn a_reparented_orphan_is_reaped() {
 
     nix::sys::prctl::set_child_subreaper(true).expect("Linux has supported this since 3.4");
 
-    // A shell that forks a short-lived grandchild, prints its pid via `$!`,
-    // and exits immediately, so the grandchild is reparented to this test
-    // process. The printed pid is what lets the wait below target that ONE
-    // process instead of `-1` ("any child of mine"): every `#[test]` in
-    // this binary runs as a thread in one shared OS process, so a wildcard
-    // wait is not scoped to this test's own subtree — it happily reaps
-    // whatever child of the process happens to have exited, including one
-    // a concurrently-running test spawned and is itself still waiting on.
-    // That is exactly what CI hit: this test's `waitpid(-1, ...)` reaped
-    // `a_supervisor_killed_by_sigkill_makes_the_init_exit_137`'s child out
-    // from under it, which then saw `ECHILD` polling a pid the kernel no
-    // longer had any record of.
+    // Targets this one pid rather than `-1`: every `#[test]` runs as a
+    // thread in one shared process, so a wildcard wait can reap another
+    // test's child.
     let mut shell = std::process::Command::new("/bin/sh")
         .args(["-c", "(sleep 0.2; exit 3) & echo $!"])
         .stdout(Stdio::piped())

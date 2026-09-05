@@ -1,9 +1,9 @@
 //! An HTTP server that waits before it starts listening.
 //!
-//! Watch a `readiness_probe` poll and fail while this sleeps, and watch
-//! `listen_timeout` expire if the daemon's fallback window is shorter than
-//! the wait — the same server as `http_server`, with one extra step before
-//! the bind.
+//! Watch a `readiness_probe` poll and fail while this sleeps. Watch
+//! `listen_timeout` expire if the daemon's fallback window is shorter
+//! than the wait. Same server as `http_server`, with one extra step
+//! before the bind.
 //!
 //! # Usage
 //!

@@ -1,5 +1,5 @@
-// IR-33: one crate-root fixture module; every test module in this crate
-// shares this `test_paths` helper instead of hand-rolling its own.
+// One crate-root fixture module: every test module in this crate shares these
+// helpers instead of hand-rolling its own.
 use core::future::Future;
 use core::pin::Pin;
 use core::time::Duration;
@@ -34,16 +34,9 @@ use crate::runner::{ProcIo, ProcessRunner, RunnerError, SpawnSpec};
 use crate::snapshot::FlockRegistry;
 use crate::supervisor::SupervisorBuilder;
 
-// The daemon's warn-and-continue arms — a watch that could not be armed, a
-// cron pattern that would not parse — leave no trace anywhere but their own
-// `tracing` record. `capture_logs` is what turns that record into something a
-// test can assert on, so "it warns and carries on" stops being a claim in a
-// doc comment and becomes a contract.
-//
-// A hand-rolled `MakeWriter` over one shared buffer (IR-33), not
-// `fmt::layer().with_test_writer()`: the test writer hands the output to
-// libtest's capture, where it is hidden from the terminal AND from the test
-// itself, and reading it back is the entire point here.
+// A hand-rolled `MakeWriter` over one shared buffer, not
+// `fmt::layer().with_test_writer()`: the test writer hands its output to
+// libtest's capture, where the test itself cannot read it back.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LogCapture(Arc<Mutex<Vec<u8>>>);
 
@@ -77,61 +70,28 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
     }
 }
 
-/// A second [`tracing::Dispatch`], kept registered for the life of the
-/// process, so that a callsite's first registration is a union over every
-/// registered dispatcher instead of a read of one thread's default.
+/// A second [`tracing::Dispatch`], kept alive for the life of the process, so
+/// a callsite's cached `Interest` is a union over every registered dispatcher.
 ///
-/// `tracing` caches each callsite's `Interest` process-wide the first time
-/// that line of code is reached, and how that first value is computed depends
-/// on a flag: `Dispatchers::has_just_one` is true whenever exactly one
-/// `Dispatch` is alive, and under it a registration resolves through
-/// `Rebuilder::JustOne` -> `dispatcher::get_default` — the default of whatever
-/// thread happened to register. In a test binary that is routinely a sibling
-/// test's thread, which has no subscriber at all, so the callsite caches
-/// `Interest::never()` for every thread and [`capture_logs`] comes back empty
-/// however right the subscriber inside it is. `extras`'
-/// `a_watch_root_that_will_not_resolve_costs_the_app_its_watch_and_nothing_else`
-/// reaches `arm_watch`'s `warn!` — the very callsite
-/// `a_watch_root_that_will_not_resolve_says_in_the_log_which_app_lost_its_watch`
-/// captures — in this same binary, so the two race for real.
-///
-/// A scoped subscriber does NOT sidestep that: `tracing::subscriber::with_default`
-/// is `dispatcher::with_default(&Dispatch::new(subscriber), f)`, and
-/// `Dispatch::new` already rebuilds the cache. What it cannot do is decide
-/// what a callsite registered on some *other* thread, a moment later, caches
-/// — and neither can an explicit `rebuild_interest_cache()`, which only
-/// narrows that window.
-///
-/// Keeping this dispatcher alive closes it: the flag goes false at the first
-/// [`capture_logs`] and stays false, registrations union over the registered
-/// dispatchers, and this one's `Interest::never()` unioned with a capture's
-/// gives `Interest::sometimes()` — the value that routes every event through a
-/// per-thread `enabled()`, which is the per-thread answer a scoped subscriber
-/// needs.
-///
-/// [`tracing::Dispatch::none`] would not do: it is a `'static` no-op that
-/// never registers itself, so it does not count towards the flag at all.
+/// `tracing` caches each callsite's `Interest` process-wide on first reach.
+/// While `Dispatchers::has_just_one` holds, that value is read off whichever
+/// thread registered first, which in a test binary is routinely a sibling with
+/// no subscriber: the callsite caches `Interest::never()` and [`capture_logs`]
+/// comes back empty. A second live dispatcher makes the union
+/// `Interest::sometimes()`, which routes every event through a per-thread
+/// `enabled()`. [`tracing::Dispatch::none`] will not do: it never registers
+/// itself, so it does not count towards the flag.
 static SECOND_DISPATCH: LazyLock<tracing::Dispatch> =
     LazyLock::new(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
 
 /// Runs `f` with a subscriber scoped to THIS thread, returning everything the
 /// records it wrote rendered to.
 ///
-/// Scoped (`tracing::subscriber::with_default`) rather than global: a global
-/// subscriber can be installed once per process, and this crate's test binary
-/// runs hundreds of tests in one. `f` must therefore be synchronous and stay
-/// on this thread — a record written by a `tokio::spawn`ed task is NOT
-/// captured, because a spawned task carries no thread-local dispatcher.
-///
-/// Forcing [`SECOND_DISPATCH`] before the scope opens is load-bearing rather
-/// than tidiness — its own doc carries why, and what an empty capture looks
-/// like without it. Nothing further is needed to refresh the interest cache:
-/// building the `Dispatch` that `with_default` installs re-registers every
-/// callsite already known, against every dispatcher then alive.
-///
-/// ANSI is off so an assertion matches the text and not the escape codes
-/// around it, and the level is `TRACE` so nothing under test is filtered out
-/// by the harness itself.
+/// Scoped rather than global, since a global subscriber installs once per
+/// process. `f` must be synchronous and stay on this thread: a record written
+/// by a `tokio::spawn`ed task carries no thread-local dispatcher and is not
+/// captured. Forcing [`SECOND_DISPATCH`] first is load-bearing; see its doc.
+/// ANSI is off so assertions match text, and the level is `TRACE`.
 pub(crate) fn capture_logs(f: impl FnOnce()) -> String {
     LazyLock::force(&SECOND_DISPATCH);
     let capture = LogCapture::default();
@@ -145,28 +105,18 @@ pub(crate) fn capture_logs(f: impl FnOnce()) -> String {
 }
 
 /// The one `warn!` [`a_sibling_thread_reaching_a_callsite_first_cannot_empty_the_capture`]
-/// races over, in a helper of its own so that exactly two threads share one
-/// callsite and nothing else in this binary can register it first.
+/// races over, in its own helper so exactly two threads share one callsite.
 fn racing_warn() {
     tracing::warn!("a callsite two threads reach");
 }
 
-/// The race [`SECOND_DISPATCH`] exists for, run deterministically: a sibling
-/// thread with no subscriber registers a callsite *inside* a capture's scope,
-/// after the scope opened and before the captured emit.
+/// fails if [`SECOND_DISPATCH`] stops being forced.
 ///
-/// The two channels are the whole point. Without them this is a sleep-shaped
-/// hope; with them the sibling cannot register before the scope opens (it
-/// waits to be told the scope is open) and the capture cannot emit before the
-/// sibling has registered (it waits to be told registration is done), so the
-/// window is entered every run rather than on a coin toss.
-///
-/// fails if [`SECOND_DISPATCH`] stops being forced — verified by removing that
-/// line, which reddens this case with an empty capture while leaving the rest
-/// of the suite green. Run alone it is deterministic; under the full binary's
-/// parallelism another live capture can make `has_just_one` false anyway and
-/// let a broken build through, which is why the negative control is run with
-/// `--exact`.
+/// The two channels put the sibling's registration inside the capture's scope
+/// on every run: the sibling waits to be told the scope is open, and the
+/// capture waits to be told registration is done. Under the full binary's
+/// parallelism another live capture can make `has_just_one` false anyway, so
+/// the negative control has to be run with `--exact`.
 #[test]
 fn a_sibling_thread_reaching_a_callsite_first_cannot_empty_the_capture() {
     let (scope_open, await_scope) = std::sync::mpsc::channel();
@@ -200,12 +150,8 @@ fn a_sibling_thread_reaching_a_callsite_first_cannot_empty_the_capture() {
     );
 }
 
-// WHY a shallow home: later tasks bind a UDS under `run/`, and `sun_path`
-// caps the socket path at 104 bytes on macOS and 108 on Linux, and macOS
-// temp paths are already long — so the tighter number is the one to build
-// against, and it is the platform this runs on most. Using the tempdir root
-// as $SHEP_HOME (no extra nesting) keeps every test in this crate under that
-// limit.
+// The tempdir root is `$SHEP_HOME` with no extra nesting: `sun_path` caps a
+// socket path at 104 bytes on macOS, and macOS temp paths are already long.
 pub(crate) fn test_paths(dir: &tempfile::TempDir) -> ShepPaths {
     let home = dir.path().to_path_buf();
     ShepPaths::resolve(
@@ -218,8 +164,8 @@ pub(crate) fn test_paths(dir: &tempfile::TempDir) -> ShepPaths {
 /// ownership of it. [`ProcessRunner::spawn`] takes `&self`, so sharing one
 /// costs nothing but this forwarding impl.
 ///
-/// IR-33: the supervisor's own tests and `boot`'s both hand a runner away and
-/// then assert on its counters — one wrapper, not two.
+/// The supervisor's tests and `boot`'s both hand a runner away and then assert
+/// on its counters.
 #[derive(Debug)]
 pub(crate) struct SharedRunner(pub(crate) Arc<ScriptedRunner>);
 
@@ -235,14 +181,10 @@ impl ProcessRunner for SharedRunner {
 /// before delegating, so a test can assert on the ORDER of two events rather
 /// than on the presence of one.
 ///
-/// It exists for `boot`'s readiness-ordering case. Both the announcement and
-/// `boot`'s own `READY=1` land on the same socket, and AF_UNIX `SOCK_DGRAM`
-/// enqueues synchronously, so the queue order a test reads back after `boot`
-/// returns *is* the program order — which reading only `READY=1` could never
-/// establish, because the kernel keeps that datagram queued however early it
-/// was sent.
-///
-/// Unix-only, like the socket it writes to and the `boot` module it serves.
+/// For `boot`'s readiness-ordering case: the announcement and `boot`'s own
+/// `READY=1` land on one socket, and AF_UNIX `SOCK_DGRAM` enqueues
+/// synchronously, so the queue order read back is the program order. Unix
+/// only.
 #[cfg(unix)]
 #[derive(Debug)]
 pub(crate) struct AnnouncingRunner<R> {
@@ -267,10 +209,9 @@ impl<R: ProcessRunner> ProcessRunner for AnnouncingRunner<R> {
 
     /// # Panics
     ///
-    /// If the announcement cannot be sent — the socket the test bound is
-    /// gone, or was never bound. Panicking beats swallowing it: the case
-    /// this runner exists for would otherwise block on a datagram that is
-    /// never coming and report a timeout instead of the real fault.
+    /// If the announcement cannot be sent, because the socket the test bound
+    /// is gone or was never bound. Swallowing it would report a timeout
+    /// instead of the real fault.
     #[track_caller]
     fn spawn(&self, spec: &SpawnSpec) -> Result<(Self::Proc, ProcIo), RunnerError> {
         let socket = std::os::unix::net::UnixDatagram::unbound()
@@ -283,15 +224,12 @@ impl<R: ProcessRunner> ProcessRunner for AnnouncingRunner<R> {
 }
 
 /// A proptest configuration running `local_cases` by default, and whatever
-/// `PROPTEST_CASES` names when the environment sets it (IR-37: "case count
-/// capped in CI via env").
+/// `PROPTEST_CASES` names when the environment sets it.
 ///
 /// `Config::default()` already reads `PROPTEST_CASES`, but a struct-update
-/// literal that then writes `cases:` overwrites whatever it read — which is
-/// how a proptest whose case count is tuned in source quietly stops being
-/// capped from outside. Deferring to the default whenever the variable is set
-/// is what keeps both true: a source-tuned count locally, an environment-set
-/// ceiling in CI.
+/// literal that then writes `cases:` overwrites what it read. Deferring to the
+/// default whenever the variable is set keeps both: a source-tuned count
+/// locally, an environment-set ceiling in CI.
 pub(crate) fn proptest_config(local_cases: u32) -> proptest::test_runner::Config {
     let default = proptest::test_runner::Config::default();
     if std::env::var_os("PROPTEST_CASES").is_some() {
@@ -308,8 +246,8 @@ pub(crate) fn proptest_config(local_cases: u32) -> proptest::test_runner::Config
 /// one byte so the file actually exists on disk. Returns the absolute path
 /// written.
 ///
-/// One-byte writes are deliberate: watch tests care that a create/modify
-/// event fires, never about the file's contents.
+/// One byte, because watch tests care that a create or modify event fires and
+/// never about the contents.
 ///
 /// # Errors
 ///
@@ -323,8 +261,7 @@ pub(crate) fn touch(root: &Path, rel: &str) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
-// IR-33: the dispatch tests and the connection-server's tests need the
-// exact same fixture — one factory, not two.
+// The dispatch tests and the connection server's need the same fixture.
 pub(crate) struct Harness {
     pub(crate) ctx: RpcContext,
     // Kept alive only: dropping the tempdir would remove the paths `ctx`
@@ -347,31 +284,27 @@ pub(crate) struct Harness {
     pub(crate) stats: Arc<StatsState>,
 }
 
-/// Capacity of the harness's two report channels — a test that needs more
-/// than this many unread reports is asserting on something else.
+/// Capacity of the harness's two report channels. A test needing more unread
+/// reports than this is asserting on something else.
 const HARNESS_REPORT_CAPACITY: usize = 16;
 
 /// Builds one supervisor engine (a [`ScriptedRunner`] replaying `scripts`)
 /// plus a fresh [`RpcContext`] wired to it, with neutral lifecycle extras: a
 /// harness nobody configured arms nothing and reports nothing.
 pub(crate) fn harness(scripts: Vec<ProcScript>) -> Harness {
-    // A machine with no visible processes: nothing an app arms against can
-    // ever be found, so nothing breaches. NOT `ScriptedSampler::new(vec![])`,
-    // which is a fixture bug the constructor asserts on — the neutral value
-    // is one reading holding an empty table.
+    // A machine with no visible processes, so nothing breaches. Not
+    // `ScriptedSampler::new(vec![])`, which the constructor asserts on: the
+    // neutral value is one reading holding an empty table.
     harness_sampling(scripts, vec![vec![]])
 }
 
 /// [`harness`], over a process table that really holds the first sheep's
 /// tree.
 ///
-/// The one fixture in this file whose resource readings mean anything: the
-/// pid it describes is the one [`ScriptedRunner`] hands the first spawn, so a
-/// sheep started through this harness joins against a reading rather than
-/// against nothing. Every reading reports the same 4 KiB tree and a CPU
-/// counter that advances 1500 ms between the first two — enough for a caller
-/// to record a baseline off one reading and measure a known percentage
-/// against the next.
+/// The pid it describes is the one [`ScriptedRunner`] hands the first spawn,
+/// so a sheep started through this harness joins against a real reading. Every
+/// reading reports the same 4 KiB tree and a CPU counter that advances 1500 ms
+/// between the first two, enough to baseline off one and measure the next.
 pub(crate) fn harness_with_stats(scripts: Vec<ProcScript>) -> Harness {
     let tree = |cpu_ms| {
         vec![ProcessRss {
@@ -392,12 +325,12 @@ pub(crate) const SCRIPTED_TREE_BYTES: u64 = 4096;
 /// derived from spawn order.
 ///
 /// For a test whose scripted proc has to be the same process as a real
-/// socket's peer — see [`ScriptedRunner::spawning_at`].
+/// socket's peer; see [`ScriptedRunner::spawning_at`].
 pub(crate) fn harness_at_pid(scripts: Vec<ProcScript>, pid: u32) -> Harness {
     harness_sampling_with(ScriptedRunner::new(scripts).spawning_at(pid), vec![vec![]])
 }
 
-/// [`harness`] over a scripted process table — the body both spellings share.
+/// [`harness`] over a scripted process table, the body both spellings share.
 fn harness_sampling(scripts: Vec<ProcScript>, readings: Vec<Vec<ProcessRss>>) -> Harness {
     harness_sampling_with(ScriptedRunner::new(scripts), readings)
 }
@@ -429,11 +362,9 @@ fn harness_sampling_with(runner: ScriptedRunner, readings: Vec<Vec<ProcessRss>>)
 
 /// [`harness`], over a process table that reports process identities.
 ///
-/// The one fixture that can answer a lamb walk. [`harness_sampling`]'s
-/// sampler takes the trait's default `identify` (which returns nothing), so
-/// a `describe` driven through [`harness`] finds no lambs however the walk
-/// is implemented — which would make a dispatch test of `with_lambs`
-/// vacuous.
+/// The one fixture that can answer a lamb walk. [`harness_sampling`]'s sampler
+/// takes the trait's default `identify`, which returns nothing, so a
+/// `describe` through [`harness`] finds no lambs however the walk is written.
 pub(crate) fn harness_identifying(
     scripts: Vec<ProcScript>,
     identities: Vec<ProcessIdentity>,
@@ -473,10 +404,8 @@ pub(crate) fn identity(pid: u32, parent: Option<u32>, name: &str) -> ProcessIden
 /// A [`StatsState`] over a machine with no visible processes.
 ///
 /// The neutral value for a fixture that has to hand [`Extras`] a `stats` but
-/// asserts nothing about resource readings — the same role
-/// [`RecordingEnforcer`] plays for the memory ceiling. Watching still works
-/// against it (the watch map is the fixture's own bookkeeping); every reading
-/// it produces is simply an empty tree.
+/// asserts nothing about resource readings. Watching still works against it,
+/// since the watch map is the fixture's own bookkeeping.
 pub(crate) fn idle_stats() -> Arc<StatsState> {
     Arc::new(StatsState::new(Arc::new(ScriptedSampler::new(vec![
         vec![],
@@ -485,16 +414,12 @@ pub(crate) fn idle_stats() -> Arc<StatsState> {
 
 /// [`harness`], with the caller deciding the extras.
 ///
-/// Takes a builder rather than a finished [`Extras`], and that is load-bearing
-/// rather than cosmetic. The harness has to own both report RECEIVERS — that
-/// is the whole reason it can hold them: no reporter is spawned, so a test
-/// asserts the report itself rather than racing a restart it did not trigger —
-/// and a caller-built `Extras` already carries senders whose receivers the
-/// harness could not recover. Handing the caller the [`ExtrasReports`] the
-/// harness just made keeps one owner for each half. Overwriting `reports`
-/// after the fact is not the alternative it looks like: `PollingEnforcer`
-/// swallows its breach sender at construction, so a harness that did would
-/// send breaches into a channel nobody reads.
+/// Takes a builder rather than a finished [`Extras`], because the harness has
+/// to own both report receivers: no reporter is spawned, so a test asserts the
+/// report itself rather than racing a restart. A caller-built `Extras` already
+/// carries senders whose receivers the harness could not recover, and
+/// overwriting `reports` afterwards does not help, since `PollingEnforcer`
+/// swallows its breach sender at construction.
 pub(crate) fn harness_with_extras(
     scripts: Vec<ProcScript>,
     build_extras: impl FnOnce(ExtrasReports) -> Extras,
@@ -504,9 +429,8 @@ pub(crate) fn harness_with_extras(
 
 /// [`harness`], over a [`ScriptedRunner`] the caller built.
 ///
-/// The one thing a `Vec<ProcScript>` cannot say is anything about the runner
-/// itself — which pid its spawns report, which sheep it refuses. A test that
-/// needs one of those builds the runner and hands it over.
+/// A `Vec<ProcScript>` cannot say anything about the runner itself: which pid
+/// its spawns report, which sheep it refuses.
 pub(crate) fn harness_with_runner(
     runner: ScriptedRunner,
     build_extras: impl FnOnce(ExtrasReports) -> Extras,
@@ -520,9 +444,9 @@ pub(crate) fn harness_with_runner(
         breaches: breach_tx,
         liveness: live_tx,
     });
-    // Taken before `extras` is moved, exactly as `boot` takes it: the RPC
-    // layer and the extras must share ONE state, or a listing would read a
-    // watch set nothing ever wrote to.
+    // Taken before `extras` is moved, as `boot` takes it: the RPC layer and
+    // the extras must share one state, or a listing would read a watch set
+    // nothing ever wrote to.
     let stats = Arc::clone(&extras.stats);
     let supervisor = SupervisorBuilder::new(runner, paths.clone(), events.clone())
         .extras(extras)
@@ -563,12 +487,12 @@ pub(crate) fn harness_with_runner(
 /// `AppConfig::minimal(name, "./srv")` with `mutate` applied, normalized.
 ///
 /// The one place a fixture app is built for the lifecycle-extra tests, so a
-/// case that needs `cron_restart` or `watch` says only that (IR-33).
+/// case that needs `cron_restart` or `watch` says only that.
 ///
 /// # Panics
 ///
-/// Panics if the mutated config does not normalize — a fixture bug at the
-/// call site that wrote it, not a condition under test.
+/// Panics if the mutated config does not normalize, which is a fixture bug at
+/// the call site rather than a condition under test.
 #[track_caller]
 pub(crate) fn app_with(name: &str, mutate: impl FnOnce(&mut AppConfig)) -> ResolvedApp {
     let mut app = AppConfig::minimal(name, "./srv");
@@ -622,11 +546,9 @@ pub(crate) struct ArmCall {
     pub(crate) limit: MemSize,
 }
 
-// WHY a recording fake rather than a `PollingEnforcer` over a scripted
-// sampler: the registry tests assert on the ARGUMENTS an arming was made
-// with — the pid above all, since "arms once and never updates" is the bug
-// that shape exists to catch — and a real enforcer only ever reports the
-// consequence of a reading, never what it was armed with.
+// A recording fake rather than a `PollingEnforcer` over a scripted sampler:
+// the registry tests assert on the arguments an arming was made with, the pid
+// above all, and a real enforcer only reports the consequence of a reading.
 #[derive(Debug, Default)]
 pub(crate) struct RecordingEnforcer {
     arms: Mutex<Vec<ArmCall>>,
@@ -671,12 +593,10 @@ impl LimitEnforcer for RecordingEnforcer {
     }
 }
 
-// WHY a clock derived from tokio's Instant: `start_paused = true` freezes
-// `tokio::time`, but `chrono::Utc::now()` keeps reading the real system clock.
-// A cron test that used the real clock would have to wait real hours. Deriving
-// wall time as `epoch + elapsed-since-construction` means `tokio::time::advance`
-// moves both clocks by the same amount, and a whole day of schedule fits in a
-// test that takes microseconds.
+// `start_paused = true` freezes `tokio::time`, but `chrono::Utc::now()` keeps
+// reading the real system clock. Deriving wall time as `epoch + elapsed` makes
+// `tokio::time::advance` move both by the same amount, so a whole day of
+// schedule fits in a test that takes microseconds.
 pub(crate) struct TestClock {
     epoch: DateTime<Utc>,
     started: tokio::time::Instant,
@@ -707,20 +627,17 @@ impl Clock for TestClock {
     fn now_utc(&self) -> DateTime<Utc> {
         self.reads.fetch_add(1, Ordering::Relaxed);
         // `chrono::Duration::from_std` is fallible over its full range, but a
-        // test clock cannot plausibly run long enough to overflow it; a
-        // panicking fixture would just be a panicking constructor by another
-        // name (IR-21), so this saturates instead.
+        // test clock cannot run long enough to overflow it, so this saturates
+        // rather than panicking.
         let elapsed =
             chrono::Duration::from_std(self.started.elapsed()).unwrap_or(chrono::Duration::MAX);
         self.epoch + elapsed
     }
 }
 
-// WHY a scripted sequence rather than one fixed table: the polling
-// memory-limit enforcer's tests need the process-table reading to change
-// between polls — e.g. a tree that stays under its limit for two ticks and
-// crosses it on the third — and a `sample()` that always returns the same
-// table cannot express that.
+// A scripted sequence rather than one fixed table: the polling memory-limit
+// enforcer's tests need the reading to change between polls, such as a tree
+// that crosses its limit only on the third tick.
 pub(crate) struct ScriptedSampler {
     readings: Vec<Vec<ProcessRss>>,
     calls: AtomicUsize,
@@ -735,12 +652,11 @@ impl ScriptedSampler {
     /// A sampler that replays `readings` in order, one per [`MemorySampler::sample`]
     /// call, repeating the last reading once the script is exhausted.
     ///
-    /// `identify` is left unscripted — see [`Self::identifying`] for a
-    /// sampler that answers it too.
+    /// `identify` is left unscripted; see [`Self::identifying`] for a sampler
+    /// that answers it too.
     pub(crate) fn new(readings: Vec<Vec<ProcessRss>>) -> Self {
-        // A script with nothing to replay is a fixture bug: failing loudly
-        // here, at the call site that misconfigured it, beats an
-        // index-out-of-bounds panic three frames away inside `sample`.
+        // A script with nothing to replay is a fixture bug: failing here beats
+        // an index-out-of-bounds panic three frames away inside `sample`.
         assert!(
             !readings.is_empty(),
             "ScriptedSampler needs at least one reading to replay"
@@ -756,10 +672,8 @@ impl ScriptedSampler {
     /// A sampler that answers `identify` from `tables`, one per call, and
     /// `sample` from an empty machine.
     ///
-    /// A separate constructor rather than a field on [`Self::new`] because
-    /// the two halves are scripted independently and every existing caller
-    /// of `new` wants the DEFAULT `identify` — which is itself the subject
-    /// of one case in `stats.rs`'s test module.
+    /// A separate constructor because the two halves are scripted
+    /// independently and every caller of `new` wants the default `identify`.
     pub(crate) fn identifying(tables: Vec<Vec<ProcessIdentity>>) -> Self {
         assert!(
             !tables.is_empty(),
@@ -798,26 +712,17 @@ impl MemorySampler for ScriptedSampler {
     }
 }
 
-// WHY a scripted sequence rather than one fixed outcome: the liveness loop's
-// tests need pass/fail outcomes to change between polls — e.g. two failures
-// followed by a pass that resets the consecutive-failure counter — and a
-// `probe()` that always returns the same value cannot express that. Unlike
-// `ScriptedSampler`, an empty script is not a fixture bug: `harness` wires
-// one by default and the `Prober` dyn-compatibility test constructs one, so
-// `new(vec![])` has to mean something rather than panic. It means "never
-// fails" — the neutral value for a prober nobody scripted, exactly as an
-// empty `ScriptedSampler` table means "a machine with no visible processes."
+// A scripted sequence rather than one fixed outcome: the liveness loop's tests
+// need pass/fail to change between polls. Unlike `ScriptedSampler`, an empty
+// script is not a fixture bug here; `new(vec![])` means never fails, the
+// neutral value for a prober nobody scripted.
 pub(crate) struct ScriptedProber {
     script: Vec<Result<(), ProbeFailure>>,
     calls: AtomicUsize,
     delay: Duration,
     // The `timeout` argument of the most recent `probe()` call, in
-    // milliseconds. Nothing else in this fake reads it — `probe()` ignores
-    // its own `timeout` parameter exactly like it ignores `target` — but a
-    // caller that wires the wrong value in (e.g. `interval` where `timeout`
-    // belongs) has nothing else in this fixture to fail against, since
-    // every other assertion here is keyed on pass/fail outcomes and call
-    // counts alone.
+    // milliseconds. `probe()` ignores the parameter itself, so recording it is
+    // the only way a caller wiring `interval` where `timeout` belongs fails.
     last_timeout_ms: AtomicU64,
 }
 
@@ -837,13 +742,9 @@ impl ScriptedProber {
     /// Every subsequent `probe()` call sleeps `delay` on the (paused) tokio
     /// clock before returning its scripted outcome.
     ///
-    /// Builder-style rather than a second constructor, so call sites built
-    /// around `new`'s signature — the four threshold cases and the
-    /// dyn-compatibility smoke test — stay untouched. The delay is honoured
-    /// even when it exceeds a `probe()` call's own `timeout` argument,
-    /// because this fake ignores that argument like every other one: the
-    /// point of a case that reaches for `with_delay` is a probe that passes
-    /// (or fails) *slowly*, not one that actually times out.
+    /// The delay is honoured even when it exceeds a `probe()` call's own
+    /// `timeout`, which this fake ignores: a case reaching for `with_delay`
+    /// wants a probe that passes or fails slowly, not one that times out.
     pub(crate) fn with_delay(mut self, delay: Duration) -> Self {
         self.delay = delay;
         self
@@ -868,16 +769,12 @@ impl Prober for ScriptedProber {
         timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<(), ProbeFailure>> + Send + 'a>> {
         Box::pin(async move {
-            // Counted at call start, not at completion: a liveness loop that
-            // has ended (reported and returned) must never issue another
-            // call, and a count that only advanced once `with_delay`'s sleep
-            // finished would make "no further calls after N intervals"
-            // indistinguishable from "one more call currently in flight."
+            // Counted at call start, not completion: a count advancing only
+            // after `with_delay`'s sleep would make "no further calls" and
+            // "one call in flight" indistinguishable.
             let call = self.calls.fetch_add(1, Ordering::Relaxed);
-            // Test timeouts are always small (single-digit seconds), so this
-            // cast cannot truncate in practice — and a wrong recorded value
-            // here only breaks a test's own assertion, never production
-            // behavior.
+            // Test timeouts are single-digit seconds, so this cast cannot
+            // truncate, and a wrong value here only breaks an assertion.
             self.last_timeout_ms
                 .store(timeout.as_millis() as u64, Ordering::Relaxed);
             tokio::time::sleep(self.delay).await;
@@ -892,8 +789,7 @@ impl Prober for ScriptedProber {
 
 /// Builds a `ProbeConfig` with fixture-friendly `interval`/`timeout`
 /// (production defaults: 10s/5s) and `failure_threshold` at its production
-/// default of 3. A call site that needs a different threshold overwrites the
-/// field directly via struct-update syntax.
+/// default of 3.
 pub(crate) fn probe_config(kind: ProbeKind, target: &str) -> ProbeConfig {
     ProbeConfig {
         kind,
@@ -908,12 +804,11 @@ pub(crate) fn probe_config(kind: ProbeKind, target: &str) -> ProbeConfig {
 pub(crate) enum HttpReply {
     /// Writes a minimal `HTTP/1.1 {code} OK\r\n\r\n` status line, then closes.
     Status(u16),
-    /// Writes `raw` verbatim, then closes — for a response that is not a
-    /// well-formed HTTP status line at all.
+    /// Writes `raw` verbatim, then closes, for a response that is not a
+    /// well-formed HTTP status line.
     Raw(String),
-    /// Accepts the connection and then never writes a byte — the only way to
-    /// exercise `OsProber`'s read-side timeout honestly, since a scripted
-    /// reply that writes something (even garbage) always resolves the read.
+    /// Accepts the connection and never writes a byte, the only way to reach
+    /// `OsProber`'s read-side timeout: any reply resolves the read.
     Hang,
 }
 
@@ -956,7 +851,7 @@ impl Drop for LoopbackHttp {
     }
 }
 
-/// Binds a loopback HTTP fake on `127.0.0.1:0` — see [`loopback_http_on`].
+/// Binds a loopback HTTP fake on `127.0.0.1:0`; see [`loopback_http_on`].
 pub(crate) async fn loopback_http(script: Vec<HttpReply>) -> LoopbackHttp {
     loopback_http_on("127.0.0.1:0", script).await
 }
@@ -965,16 +860,12 @@ pub(crate) async fn loopback_http(script: Vec<HttpReply>) -> LoopbackHttp {
 /// accepted connection, in order, recording each request it read.
 ///
 /// Binds before spawning the accept loop and returns the already-bound
-/// address, so a probe dialing the returned `SocketAddr` cannot race the
-/// bind — restructuring this into "spawn a task that binds" reintroduces
-/// that race (a fake torn down, or not yet listening, before the code under
-/// test connects makes the connection fail for the wrong reason).
+/// address, so a probe dialing it cannot race the bind. Restructuring this
+/// into a task that binds brings that race back.
 ///
-/// Every connection is READ before it is replied to, including
-/// [`HttpReply::Hang`]'s. Without that, a prober that ignored the target's
-/// path, dropped the `Host:` header or never wrote a request at all would
-/// pass every test here — the reply does not depend on the request, so only
-/// recording it can tell those apart.
+/// Every connection is read before it is replied to, [`HttpReply::Hang`]
+/// included: the reply does not depend on the request, so recording it is the
+/// only way a prober that dropped the `Host:` header would fail.
 pub(crate) async fn loopback_http_on(bind: &str, script: Vec<HttpReply>) -> LoopbackHttp {
     let listener = TcpListener::bind(bind)
         .await
@@ -984,7 +875,7 @@ pub(crate) async fn loopback_http_on(bind: &str, script: Vec<HttpReply>) -> Loop
     let accept_loop = tokio::spawn(async move {
         for reply in script {
             let Ok((mut stream, _peer)) = listener.accept().await else {
-                return; // listener gone (test dropped it) — nothing left to serve
+                return; // listener gone: nothing left to serve
             };
             if requests_tx
                 .send(read_request_head(&mut stream).await)
@@ -1016,8 +907,8 @@ pub(crate) async fn loopback_http_on(bind: &str, script: Vec<HttpReply>) -> Loop
     }
 }
 
-/// Reads one request head — everything through the blank line that ends the
-/// headers — giving up at EOF, at a read error, or at [`REQUEST_HEAD_CAP`].
+/// Reads one request head, everything through the blank line that ends the
+/// headers, giving up at EOF, a read error, or [`REQUEST_HEAD_CAP`].
 async fn read_request_head(stream: &mut tokio::net::TcpStream) -> String {
     let mut head = Vec::new();
     let mut chunk = [0_u8; 256];

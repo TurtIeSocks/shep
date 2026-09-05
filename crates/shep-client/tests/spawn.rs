@@ -19,21 +19,18 @@ use shep_core::protocol::{RpcError, RpcErrorCode};
 
 /// Reaps the `cat` children the launcher closures spawn.
 ///
-/// `connect_or_spawn_with` owns each `Child` and drops it on the way out —
-/// which closes the pipe and lets `cat` exit — but it never `wait()`s, and it
-/// must not: in production that child IS the daemon, and waiting on it would
-/// hang the CLI forever. Nothing else reaps them either, so without this every
-/// `cat` stays a zombie for the life of the test binary.
+/// `connect_or_spawn_with` drops each `Child`, closing the pipe and
+/// letting `cat` exit, but never `wait()`s. In production that child
+/// is the daemon, and waiting on it would hang the CLI. Without this,
+/// every `cat` stays a zombie for the test binary's life.
 #[derive(Debug, Default)]
 struct Reaper(Arc<Mutex<Vec<i32>>>);
 
 impl Reaper {
-    /// A launcher that spawns a child which outlives the call and then dies on
-    /// its own, with no sleep and no orphan: `cat` blocks reading a piped
-    /// stdin whose write end is owned by the `Child`. When
-    /// `connect_or_spawn_with` drops that `Child`, the pipe closes, `cat` sees
-    /// EOF and exits. Lifetime is tied exactly to the call under test — a
-    /// `sleep 60` would leak past it.
+    /// A launcher whose child outlives the call and then dies on its
+    /// own. `cat` blocks reading a piped stdin. Dropping the `Child`
+    /// closes the pipe, so `cat` sees EOF and exits. Its lifetime
+    /// matches the call exactly, unlike a `sleep 60`.
     fn spawn_long_lived(
         &self,
     ) -> impl FnOnce() -> std::io::Result<std::process::Child> + Send + 'static {
@@ -76,14 +73,12 @@ async fn an_existing_daemon_is_used_without_launching_anything() {
     assert!(matches!(outcome, SpawnOutcome::Connected(_)));
 }
 
-/// THE load-bearing test in this file.
+/// The launcher makes a socket that is bound but never accepted from.
+/// It returns a child that stays alive for the whole call.
 ///
-/// The launcher does what a real cold start does: it makes a socket appear
-/// that is BOUND but never accepted from — a daemon that has reached
-/// `boot.rs:498` and not `boot.rs:707` — and returns a child that STAYS
-/// ALIVE for the whole call. Both halves matter. If the child exited, the
-/// dead-child fast path would short-circuit before any probe ran, and the
-/// bare-`connect()` implementation this test exists to catch would pass.
+/// Both halves matter. If the child exited, the dead-child fast path
+/// would short-circuit before any probe ran. A bare `connect()`
+/// implementation would then pass.
 #[tokio::test]
 async fn a_socket_that_accepts_but_never_handshakes_is_not_mistaken_for_ready() {
     let dir = tempfile::tempdir().unwrap();
@@ -145,10 +140,10 @@ async fn a_child_that_dies_fails_fast_instead_of_waiting_out_the_deadline() {
     );
 }
 
-/// The losing side of a cold-start race. The launcher starts a child
-/// that immediately exits 10 AND brings up a daemon that answers — exactly
-/// what happens when another `shep` process won the `flock(2)`. Treating any
-/// non-zero status as fatal fails this test.
+/// The losing side of a cold-start race. The launcher's child exits
+/// 10 and a daemon comes up answering. That is what happens when
+/// another `shep` process won the `flock(2)`. Treating any non-zero
+/// status as fatal fails this test.
 #[tokio::test]
 async fn a_child_exiting_with_the_already_running_code_keeps_probing() {
     let dir = tempfile::tempdir().unwrap();
@@ -158,20 +153,15 @@ async fn a_child_exiting_with_the_already_running_code_keeps_probing() {
     let outcome = connect_or_spawn_with(
         &path,
         move || {
-            // binds AND accepts; the handle is detached deliberately — the
-            // fake outlives the launcher closure and dies with the runtime.
+            // Binds and accepts; the handle is detached so the fake
+            // outlives the launcher closure, dying with the runtime.
             start_fake_daemon_answering_on(&answer_on);
             let child = std::process::Command::new("sh")
                 .args(["-c", "exit 10"])
                 .spawn()?;
-            // Without this, the loop's first probe can win the race against
-            // `try_wait()` ever observing this child's exit at all — the
-            // fake daemon started above is already answering, so a probe
-            // that lands before the next `try_wait()` succeeds and the test
-            // passes without the exit-10 special case ever running. Verified
-            // by mutation: replacing the `DAEMON_ALREADY_RUNNING` check below
-            // with `if true` (treat any exit as fatal) still left this test
-            // green without the sleep.
+            // Without this, a probe can succeed before `try_wait()` ever
+            // observes the child's exit-10, so the test would pass
+            // without exercising the special case.
             std::thread::sleep(Duration::from_millis(50));
             Ok(child)
         },
@@ -212,12 +202,10 @@ async fn a_protocol_mismatch_propagates_instead_of_spawning_a_second_daemon() {
     ));
 }
 
-/// The same propagate-immediately rule as the test above, but for a mismatch
-/// that only a *loop* probe observes — reachable via the no-launch
-/// `HandshakeTimeout` branch hitting a daemon that is still mid-boot on the
-/// first probe and only answers (with a refusal) on a later one. Folding
-/// this into `last` and looping to the deadline would misdiagnose a
-/// definitively-answered condition as "daemon unreachable".
+/// Same rule as the test above, but only a loop probe observes the
+/// mismatch. The daemon is still mid-boot on the first probe,
+/// answering with a refusal later. Looping to the deadline would
+/// misdiagnose a definitive refusal as "daemon unreachable".
 #[tokio::test]
 async fn a_protocol_mismatch_on_a_loop_probe_propagates_instead_of_looping_to_the_deadline() {
     let dir = tempfile::tempdir().unwrap();
@@ -231,10 +219,10 @@ async fn a_protocol_mismatch_on_a_loop_probe_propagates_instead_of_looping_to_th
         connect_or_spawn_with(
             &path,
             move || {
-                // Nothing is bound yet when this launcher runs — the first
-                // probe already saw `ConnectError::Connect`. Bind the
-                // refusing fake here so it's a *loop* probe, not the first
-                // one, that observes the mismatch.
+                // Nothing is bound yet when this launcher runs: the first
+                // probe already saw `ConnectError::Connect`. Binds the
+                // refusing fake here so a loop probe observes the
+                // mismatch, not the first one.
                 tokio::runtime::Handle::current().block_on(fake_daemon(
                     &answer_on,
                     Err(RpcError {

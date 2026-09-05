@@ -1,11 +1,6 @@
 name: Release PR
 # Maintains the pull request that bumps the version and writes the changelog,
 # then queues it to merge itself.
-#
-# Split from the publish half on 2026-08-27, matching zendriver-rs. One file
-# with two jobs meant one `on:` block serving two triggers that want different
-# things, and the `if:` gymnastics needed to keep them apart were most of what
-# the old file was. Two files, two concurrency groups, one trigger each.
 
 permissions:
   contents: write
@@ -24,62 +19,45 @@ jobs:
   release-plz-pr:
     name: Update release PR
     runs-on: ubuntu-latest
-    # Never react to release-plz's own merge landing on main. The auto-merge
-    # step below uses the PAT, and unlike a GITHUB_TOKEN push that DOES
-    # retrigger this workflow, which closes a cycle: open release PR,
-    # auto-merge, push, open release PR.
-    #
-    # The only thing normally breaking that cycle is release-plz finding
-    # nothing to release on the second pass. zendriver-rs proved that is not
-    # enough: on 2026-08-08 a malformed CHANGELOG.md made `changelog_update`
-    # non-idempotent, so every pass produced a diff, read it as an unreleased
-    # change, and cut another version. 44 empty releases and 26 crates.io
-    # publishes later the workflow had to be disabled by hand.
+    # Skips release-plz's own merge landing on main: the auto-merge step
+    # below pushes with a PAT, which (unlike GITHUB_TOKEN) retriggers this
+    # workflow, so without this guard the merge would open a new release PR
+    # in a cycle.
     #
     # Matches both shapes the merge can take: a squash ("chore: release") and
     # a merge commit ("Merge pull request #N from .../release-plz-...").
     if: >-
       !startsWith(github.event.head_commit.message, 'chore: release') &&
       !contains(github.event.head_commit.message, '/release-plz-')
-    # A ceiling against a hang, not a budget. Successful runs of this job
-    # measured 0.4 to 1.9 minutes on 2026-08-29, so 30 is roughly 15x the
-    # slowest. It matters more here than in most jobs: this one holds a
-    # write-capable token, and GitHub's default is 360 minutes.
+    # A ceiling against a hang, not a budget: runs take well under two
+    # minutes. Matters more here than in most jobs, since this one holds a
+    # write-capable token against GitHub's 360-minute default.
     timeout-minutes: 30
     steps:
-      # Every action in these two files is pinned by commit, unlike test.yml's,
-      # which use moving tags. These jobs hold RELEASE_PLZ_TOKEN and
-      # CARGO_REGISTRY_TOKEN; test.yml's hold neither. A mutable tag in a job
-      # with an upload token is a different risk from one in a job that only
-      # runs tests.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # Every action here is pinned by commit, not by tag: this job holds
+      # RELEASE_PLZ_TOKEN and CARGO_REGISTRY_TOKEN, a bigger risk for a
+      # mutable tag than in a job that only runs tests.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # release-plz reads the commits since the last release tag, so a
           # shallow clone would give it nothing to write a changelog from.
           fetch-depth: 0
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
-          # That token is write-capable, and without this the checkout writes
-          # it into .git/config, where every later step in the job can read it.
-          # release-plz pushes its branch, its commits and its tags over the
-          # GitHub API rather than the git CLI, so nothing here needs it
-          # persisted. The old release-plz.yml set this and said so; it was
-          # lost moving to zendriver-rs's shape, which does not set it.
+          # Write-capable token: without this it lands in .git/config,
+          # readable by every later step. release-plz pushes over the API.
           persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
-          # This action normally reads its toolchain from its own git ref, and
-          # pinning by SHA replaces that ref with a hash it cannot parse. It
-          # fails with "'toolchain' is a required input" rather than defaulting,
-          # so the pin and this line go together.
+          # Pinning by SHA replaces the ref this action reads its default
+          # toolchain from, so it fails without an explicit `toolchain:` here.
           toolchain: stable
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
-      # Pinned by commit, not by tag. This action is handed contents:write and
-      # pull-requests:write, and a tag is mutable, so pinning the tag would
-      # mean trusting whatever it points at later. This is the one place this
-      # file deliberately does not match zendriver-rs, which pins `@v0.5.129`.
+      # Pinned by commit: this action holds contents:write and
+      # pull-requests:write, so a mutable tag means trusting whatever it
+      # later points at.
       - uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
         id: release-plz
         with:
@@ -90,17 +68,10 @@ jobs:
           # the registry to work out which versions are already published.
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-      # Second line of defence, independent of why a release PR appeared. A
-      # release that changes no crate version is by definition a no-op, and it
-      # was the zendriver loop's own tell: 15 consecutive changelog-only
-      # "releases" ran while nothing was watching for exactly that shape.
-      #
-      # Block the MERGE, do not close the PR. The same changelog-only shape is
-      # also produced legitimately, by a hand-edited version: release-plz then
-      # has nothing left to bump and opens a PR carrying only the changelog
-      # entry. shep is in exactly that state today, with main at 0.1.7 and the
-      # newest tag v0.1.6. Leaving such a PR open and red puts a human in
-      # front of the decision instead of guessing which case it is.
+      # Blocks the MERGE rather than closing the PR: a changelog-only release
+      # PR also happens legitimately, when a hand-edited version leaves
+      # release-plz nothing to bump. Left open and red, a human decides
+      # which case it is.
       - name: Refuse to auto-merge a release PR with nothing in it
         id: noop-guard
         if: ${{ steps.release-plz.outputs.prs_created == 'true' }}
@@ -110,10 +81,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          # The version VALUE has to change, not merely appear in a file the
-          # diff happens to touch. release-plz also rewrites intra-workspace
-          # dependency versions inside Cargo.toml, so a path-presence test would
-          # pass a pull request that bumps no package version at all.
+          # Compares the version VALUE, not path presence: release-plz also
+          # rewrites intra-workspace dependency versions in Cargo.toml, so a
+          # diff touching the file does not mean the package version changed.
           manifest_version() {
             gh api "repos/${GITHUB_REPOSITORY}/contents/Cargo.toml?ref=$1" \
               -H 'Accept: application/vnd.github.raw' \
@@ -123,11 +93,9 @@ jobs:
           head_sha="$(gh pr view "$PR_NUMBER" --json headRefOid --jq .headRefOid)"
           base_version="$(manifest_version "$base_sha")" || base_version=""
           head_version="$(manifest_version "$head_sha")" || head_version=""
-          # Fail closed on a fetch error. Without this, ONE failed API call
-          # leaves an empty string, the two versions then differ, and the guard
-          # reads a network blip as "a version was bumped". Both failing is
-          # already safe, since two empty strings compare equal; it is the
-          # asymmetric failure that publishes.
+          # Fails closed on a fetch error: an empty string from one side would
+          # read as a version bump. Both empty is already safe since they'd
+          # compare equal.
           if [ -z "$base_version" ] || [ -z "$head_version" ]; then
             echo "::error::could not read Cargo.toml at $base_sha or at $head_sha, so a version change cannot be confirmed."
             echo "::error::Refusing rather than guessing. Re-run the job."
@@ -141,28 +109,22 @@ jobs:
             exit 1
           fi
 
-          # The other no-op shape, and the one that got through on 2026-08-27.
-          # release-plz bumps the version even when every commit since the last
-          # release was filtered out by release-plz-changelog.toml, which skips
-          # docs, test, ci, chore and style, sparing only a breaking commit and
-          # release-plz's own dependency bump. shep-deploy's release PR #1 was a
-          # lone `ci:` commit and came out as `## [0.1.1]` with nothing under
-          # it: a contentless version header, which is exactly what zendriver's
-          # 44 empty releases looked like. The version test above passes it, and
-          # correctly so: the bump is real. The changelog is what is empty.
+          # The other no-op shape: release-plz can bump the version even when
+          # every commit since the last release was filtered out by
+          # release-plz-changelog.toml, producing a version header with
+          # nothing under it. The version-value guard above passes this
+          # correctly, since the bump is real; this guard catches the empty
+          # changelog instead.
           #
-          # Scoped to the changelogs' own added lines, and to the section the
-          # release adds. `gh pr diff` prints every file in the pull request, so
-          # a bullet added anywhere else would otherwise satisfy a guard whose
-          # whole question is whether the NEW VERSION has content.
+          # Scoped to the new version's own added lines: `gh pr diff` prints
+          # every file in the PR, so a bullet added anywhere else would
+          # otherwise pass a guard whose only question is the new section's
+          # content.
           #
-          # Leading whitespace is tolerated even though the template's `trim =
-          # true` strips it per line, which zendriver-rs's own generated
-          # sections confirm: `crates/zendriver-fetcher/CHANGELOG.md` 0.2.0 has
-          # its bullets at column 1 despite the template indenting them. The
-          # slack is here because this guard fails CLOSED. Drop `trim` from
-          # release-plz-changelog.toml some day and a strict pattern would stop
-          # every release with no signal beyond a red job nobody expects.
+          # Leading whitespace is tolerated in the pattern even though the
+          # template's `trim = true` strips it per line: dropping `trim`
+          # later would otherwise stop every release here with no clear
+          # signal why.
           if ! gh pr diff "$PR_NUMBER" | awk '
                 /^diff --git /                 { in_log = 0 }
                 /^\+\+\+ b\/.*CHANGELOG\.md$/  { in_log = 1; under_new = 0; next }
@@ -177,49 +139,38 @@ jobs:
             exit 1
           fi
 
-          # Handed to the merge step so it can bind to the head this guard
-          # actually read. See that step for why targeting the PR number alone
-          # is not enough.
+          # Handed to the merge step, which binds to this exact head rather
+          # than the PR number alone.
           echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
 
       # Auto-merge so publishing stays hands-off: the merge pushes
       # "chore: release ..." to main, which triggers release-plz-release.yml.
       #
-      # GH_TOKEN is the PAT, not GITHUB_TOKEN. A GITHUB_TOKEN-authored push
-      # would not trigger the release workflow at all (GitHub's anti-recursion
-      # rule), and a GITHUB_TOKEN-authored PR does not start its own checks,
-      # so --auto would queue behind checks that never run.
+      # GH_TOKEN is the PAT: a GITHUB_TOKEN-authored push would not trigger
+      # release-plz-release.yml (GitHub's anti-recursion rule), and a
+      # GITHUB_TOKEN-authored PR would never start its own checks for
+      # `--auto` to wait on.
       #
-      # `gh pr merge --auto` queues the merge behind main's required status
-      # checks, which the `main` ruleset defines. The `|| gh pr merge`
-      # fallback covers the ruleset being absent.
+      # `--auto` queues behind main's required status checks (the `main`
+      # ruleset); the `|| gh pr merge` fallback covers the ruleset being
+      # absent.
       #
-      # Do not read that gate as protection against a runaway loop. zendriver's
-      # incident merged 44 release PRs straight through it, each waiting its
-      # full green CI and getting it, because an empty release genuinely passes
-      # every check. Required checks answer "is this branch broken", never
-      # "should this exist". That question belongs to the job-level `if:` and
-      # the no-op step above.
+      # Required checks answer whether the branch is broken, never whether
+      # the release should exist: an empty release passes every check, so
+      # that question belongs to the job-level `if:` and the no-op guard
+      # above.
       #
-      # Squash rather than zendriver-rs's `--merge`, and this one matters.
-      # release-plz 0.3.160, which the pinned action runs, does not
-      # necessarily release the commit it was handed: when that commit is a
-      # MERGE commit it looks up the associated pull request, takes that PR's
-      # last commit P, runs `git branch --contains P`, and on a hit runs a
-      # literal `git checkout P` before packaging. So the tarball would be
-      # built from the PR head rather than from what landed on main, and
-      # anything that reached main while the release PR sat open would be
-      # absent from it. A squash merge is a new commit with the branch
-      # deleted, so `git branch --contains` finds nothing and release-plz
-      # releases what is checked out. The old release-plz.yml carried a
-      # dedicated step to refuse this case; squashing removes the case.
+      # Squash, not --merge: release-plz can resolve a merge commit to its
+      # PR's last commit via `git branch --contains` and check that out
+      # before packaging, so a merge commit here risks releasing the PR head
+      # instead of what landed on main. Squashing leaves no branch for that
+      # lookup to find.
       #
-      # `--match-head-commit` binds the merge to the commit the guard above
-      # actually inspected. Targeting the pull request number alone leaves a
-      # window: release-plz can push again between the guard and this step, and
-      # `--auto` then sits queued against whatever the head becomes, so the
-      # thing that merges need never have been the thing that was checked.
-      # With the SHA, a moved head refuses instead.
+      # `--match-head-commit` binds the merge to the exact commit the guard
+      # above inspected. The PR number alone leaves a window: release-plz
+      # could push again before `--auto` merges, so the thing merged might
+      # never have been checked. A moved head refuses instead with the SHA
+      # pinned.
       - name: Auto-merge the release PR
         if: ${{ steps.release-plz.outputs.prs_created == 'true' }}
         env:

@@ -1,20 +1,12 @@
 //! `shep serve`'s basic-auth check: a creds file, and a constant-time
 //! comparison of what it holds against what a client presented.
 //!
-//! Pure-ish, not `#[cfg(unix)]` (Phase 15 decision, Task 6's doc comment):
-//! [`satisfies`] and its base64 decoder touch no filesystem and compile on
-//! every target. [`load`]'s permission-mode refusal is the one unix-only
-//! piece, isolated to [`check_mode`] so the rest of the module stays
-//! portable — on a non-unix target `check_mode` is a no-op, because that
-//! platform has no `mode & 0o077` to read.
+//! [`load`]'s permission-mode refusal is the only unix-only piece,
+//! isolated in [`check_mode`] so the rest of the module compiles on every
+//! target.
 //!
-//! # Order (decision 6)
-//!
-//! Auth is checked **before** path resolution, in `serve::worker` (Task 6).
-//! An unauthenticated client that gets the same 401 whether the path it
-//! guessed exists or not learns nothing from the difference; checking after
-//! resolution would let it use 400-vs-404 to map the filesystem before it
-//! ever proves who it is.
+//! Checked before path resolution in `serve::worker`, so a 401 never
+//! distinguishes a guessed path that exists from one that does not.
 
 use core::fmt;
 use std::path::{Path, PathBuf};
@@ -28,30 +20,25 @@ const MAX_HEADER_LEN: usize = 1024;
 
 /// One `user:password` pair, read from a file.
 ///
-/// No `Debug` derive, and not a redacted one either — this type has no
-/// `Debug` at all (IR-41's stronger form). There is no line of output
-/// anywhere in shep where printing a credential is the right answer, so the
-/// way to be sure of that is for the type not to be printable.
+/// No `Debug` derive: nothing in shep ever needs to print a credential.
 pub struct Credentials {
     expected: Vec<u8>,
 }
 
 impl Credentials {
     /// Builds the expected credential from an already-split `user` and
-    /// `password`. Private: the only non-test caller is [`load`], which
-    /// parses a creds file's one line into this pair.
+    /// `password`.
     fn from_pair(user: &str, password: &str) -> Self {
         Self {
             expected: format!("{user}:{password}").into_bytes(),
         }
     }
 
-    /// Whether `header` — the raw `Authorization` value — satisfies these
+    /// Whether `header`, the raw `Authorization` value, satisfies these
     /// credentials.
     ///
-    /// Compares through [`ring::hmac::verify`] rather than a raw byte
-    /// compare — see [`credentials_match`]'s doc comment for why, and for
-    /// the deviation from this phase's original design.
+    /// Compares through [`ring::hmac::verify`], not a raw byte compare:
+    /// see [`credentials_match`].
     #[must_use]
     pub fn satisfies(&self, header: Option<&str>) -> bool {
         let Some(header) = header else {
@@ -70,19 +57,14 @@ impl Credentials {
     }
 }
 
-/// Why [`load`] refused a creds file. Every message names the path and the
-/// problem and **never a byte of the contents** — a parse error that quotes
-/// the offending line is how a password reaches a terminal and a log.
+/// Why [`load`] refused a creds file. Every message names the path and
+/// the problem, never a byte of the contents.
 ///
-/// Module-scoped per IR-18. Deliberately NOT `#[non_exhaustive]`, the IR-20
-/// reasoning `ShepTomlError` already carries: shep-cli is a library with a
-/// three-function public surface (Phase 15 decision 1) and this type is not
-/// part of it — nothing outside this crate can match on it, so there is no
-/// downstream matcher for the attribute to protect.
+/// Not `#[non_exhaustive]`: nothing outside this crate can match on it.
 #[cfg_attr(windows, allow(dead_code))]
 #[derive(Debug)]
 pub enum AuthError {
-    /// Reading `path` failed at the OS level — missing, a directory, or a
+    /// Reading `path` failed at the OS level: missing, a directory, or a
     /// permissions failure the OS itself enforces.
     Io {
         /// The path that failed.
@@ -91,8 +73,7 @@ pub enum AuthError {
         source: std::io::Error,
     },
     /// `path`'s permission bits are readable by the group or the world
-    /// (`mode & 0o077 != 0`). A credential every account on the box can
-    /// read is not a credential. Unix only — see [`check_mode`].
+    /// (`mode & 0o077 != 0`). Unix only, see [`check_mode`].
     Mode {
         /// The path whose mode was refused.
         path: PathBuf,
@@ -100,8 +81,8 @@ pub enum AuthError {
         mode: u32,
     },
     /// `path` has no non-empty line, holds more than one, or its one line
-    /// has no `:`. Deliberately one variant for all three: distinguishing
-    /// them would need quoting the line to explain which rule it broke.
+    /// has no `:`. One variant for all three: distinguishing them would
+    /// need quoting the line to explain which rule it broke.
     Malformed {
         /// The path whose contents did not parse.
         path: PathBuf,
@@ -112,10 +93,9 @@ impl fmt::Display for AuthError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
-            // `mode` is the raw `st_mode` — `S_IFREG` (0o100000) or'd onto
-            // the permission bits — so printing it bare shows an operator
-            // "100644" next to advice ("chmod 600") they cannot connect to
-            // that number. `& 0o7777` keeps only the bits `chmod` accepts.
+            // `mode` is the raw `st_mode`, `S_IFREG` or'd onto the
+            // permission bits. `& 0o7777` keeps only the bits `chmod`
+            // accepts.
             Self::Mode { path, mode } => write!(
                 f,
                 "{}: mode {:03o} is readable by the group or the world; \
@@ -141,13 +121,10 @@ impl core::error::Error for AuthError {
     }
 }
 
-/// Reads `path`'s permission bits and refuses one the group or the world can
-/// read.
+/// Reads `path`'s permission bits and refuses one the group or the world
+/// can read.
 ///
-/// Unix only: Windows has no `mode & 0o077` to read, and this module stays
-/// portable (Task 6's doc comment: `path`, `mime`, `listing` and `auth` all
-/// stay pure) by isolating the one platform-specific piece here rather than
-/// gating the whole file.
+/// Unix only: Windows has no `mode & 0o077` to read.
 #[cfg(unix)]
 fn check_mode(path: &Path) -> Result<(), AuthError> {
     use std::os::unix::fs::PermissionsExt;
@@ -165,8 +142,7 @@ fn check_mode(path: &Path) -> Result<(), AuthError> {
     Ok(())
 }
 
-/// No mode bits to check on a non-unix target. Kept as a same-signature
-/// no-op rather than an `#[cfg]` at each call site, so [`load`] reads
+/// No mode bits to check on a non-unix target: a no-op so [`load`] reads
 /// identically on every target.
 #[cfg(not(unix))]
 fn check_mode(_path: &Path) -> Result<(), AuthError> {
@@ -182,17 +158,9 @@ fn check_mode(_path: &Path) -> Result<(), AuthError> {
 /// - [`AuthError::Mode`] if its mode is group- or world-readable
 ///   (`mode & 0o077 != 0`, unix only).
 ///
-/// **Mode is checked last, after the content already parsed.** Reordering
-/// this earlier is the plausible simplification — "refuse the file before
-/// touching it" reads as the more defensive shape — and it is wrong: a
-/// tempfile created with `std::fs::write` (as every test in this module
-/// does) gets the umask's default mode, typically `0644`, which trips the
-/// mode check before a mode-agnostic test ever reaches the content it means
-/// to exercise. Reading our own process's already-granted OS read access
-/// first leaks nothing — the property this check protects is *other*
-/// accounts' access, not ours — so parsing first and refusing last is both
-/// correct and the only order under which
-/// `no_error_message_quotes_the_file` actually tests what its name says.
+/// Mode is checked last, after the content parses: a freshly written
+/// tempfile carries the umask's default mode, which would trip the mode
+/// check before a mode-agnostic test ever exercises the content.
 pub fn load(path: &Path) -> Result<Credentials, AuthError> {
     let contents = std::fs::read_to_string(path).map_err(|source| AuthError::Io {
         path: path.to_path_buf(),
@@ -213,34 +181,11 @@ pub fn load(path: &Path) -> Result<Credentials, AuthError> {
 
 /// Compares two credentials in constant time.
 ///
-/// **Deviation from this task's written design, recorded here because it is
-/// load-bearing.** The plan's Step 5.2 specified
-/// `ring::constant_time::verify_slices_are_equal(digest(a), digest(b))` —
-/// digest first to normalize both operands to a fixed 32 bytes (so the
-/// comparison itself never short-circuits on length), then a constant-time
-/// compare of the digests. That is exactly what this function still does in
-/// spirit. What changed is *which ring primitive performs the compare*: in
-/// the version this workspace actually resolves (`ring` 0.17.14),
-/// `ring::constant_time` is `pub use deprecated_constant_time as
-/// constant_time` — the whole module is deprecated, and
-/// `verify_slices_are_equal`'s own doc comment reads "Internal function not
-/// intended for external use with no promises regarding side channels."
-/// Using it would need `#[allow(deprecated)]` to pass `clippy -D warnings`,
-/// suppressing a warning that is ring's own maintainers saying they no
-/// longer stand behind this function's timing behavior for a caller outside
-/// the crate — the exact property this design decision exists to buy.
-///
-/// [`ring::hmac::verify`] is the sanctioned replacement: its own doc
-/// comment says plainly "The verification will be done in constant time to
-/// prevent timing attacks," it is not deprecated, and it is still `ring`,
-/// so this stays a zero-new-dependency change. The key carries no secrecy
-/// requirement of its own — `hmac::verify` is being borrowed here for its
-/// constant-time comparison, not for HMAC's authentication property — so a
-/// fixed all-zero key keeps this deterministic rather than pulling in a
-/// process-wide RNG for one comparison. `hmac::sign(key, presented)`
-/// produces a 32-byte tag regardless of `presented`'s length, which is the
-/// same length-normalization the digest step bought in the original design;
-/// `hmac::verify` then does the constant-time compare against `expected`.
+/// Uses [`ring::hmac::verify`] rather than a raw byte compare or
+/// `ring::constant_time`, which is deprecated and disclaims side-channel
+/// safety. The key is fixed and public: `hmac::sign` serves only as a
+/// length-normalizing constant-time compare here, not for HMAC's
+/// authentication property.
 fn credentials_match(presented: &[u8], expected: &[u8]) -> bool {
     let key = hmac::Key::new(hmac::HMAC_SHA256, &[0u8; 32]);
     let tag = hmac::sign(&key, presented);
@@ -291,8 +236,7 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
-    /// Encodes standard base64, the inverse of [`base64_decode`]. Test-only:
-    /// production code only ever decodes an `Authorization` value.
+    /// Encodes standard base64, the inverse of [`base64_decode`].
     fn base64(input: &str) -> String {
         const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let bytes = input.as_bytes();
@@ -333,8 +277,7 @@ mod tests {
         );
     }
 
-    /// fails if a creds file the group or the world can read is accepted. A
-    /// credential every account on the box can read is not a credential.
+    /// fails if a creds file the group or the world can read is accepted.
     #[cfg(unix)]
     #[test]
     fn a_group_readable_creds_file_is_refused() {
@@ -344,10 +287,8 @@ mod tests {
         let path = dir.path().join("creds");
         std::fs::write(&path, "alice:s3cret\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
-        // `.err().unwrap()`, not `.unwrap_err()`: `Result::unwrap_err`
-        // requires `T: Debug` to build its panic message, and `Credentials`
-        // deliberately has none (see its doc comment). `Option::unwrap` has
-        // no such bound.
+        // `.err().unwrap()`: `Result::unwrap_err` needs `T: Debug`, and
+        // `Credentials` has none.
         let err = load(&path).err().unwrap();
         assert!(matches!(err, AuthError::Mode { .. }), "{err:?}");
         // positive control: the same file at 0600 loads.
@@ -356,10 +297,7 @@ mod tests {
     }
 
     /// fails if `AuthError::Mode`'s `Display` prints the raw `st_mode`
-    /// (`S_IFREG | 0o644` = `0o100644`) instead of the permission bits alone
-    /// — the message an operator locked out of `shep serve --auth` reads
-    /// first, and "mode 100644" next to "chmod 600 it" names a number the
-    /// operator cannot connect to the advice.
+    /// instead of the permission bits alone.
     #[test]
     fn a_mode_error_prints_the_permission_bits_not_the_raw_st_mode() {
         let err = AuthError::Mode {

@@ -1,0 +1,53 @@
+# nextest profiles for CI. `cargo test` still works and is still what the
+# task gate in CLAUDE.md runs locally; this file only shapes the CI legs.
+#
+# Why nextest is here at all: `cli_e2e` spawns a real shepherd and real sheep
+# per case, and a contended runner cannot always schedule them promptly. Two
+# such failures on 2026-09-04 turned out to be real defects and were fixed
+# (see docs/decisions.md), but the residual class is genuine and will not go
+# away: the musl leg already caps its thread count for exactly this reason,
+# and its comment records that the triage cost more than the fix, twice.
+#
+# What retries DO NOT excuse. A retry hides a defect as readily as a flake,
+# and both of the 2026-09-04 failures would have been hidden by one: a
+# missing precondition in a test, and the log pump dropping a child's last
+# line 39 times in 64 at the seam. Read a retried failure before shrugging at
+# it. Every CI profile below writes junit, and .github/actions/nextest-report
+# reads it after each leg, so a test that passed only on retry is a warning
+# on the run and a row in the job summary rather than nothing.
+
+[profile.ci]
+# Report every failure in one run. A matrix leg is expensive to re-trigger
+# and one pass should name the whole picture.
+fail-fast = false
+
+# Retries on the integration tier ONLY, which is `kind(test)`: 165 tests as
+# of 2026-09-04, against 2376 `kind(lib)` unit tests that get none. Measured
+# with `cargo nextest list -E 'kind(test)'` rather than assumed, and the two
+# sum to the whole suite. The unit tiers are deterministic, so a retry there
+# would buy nothing and mask a real race.
+[[profile.ci.overrides]]
+filter = 'kind(test)'
+retries = 2
+
+# Written under target/nextest/ci/. The path is relative to that store
+# directory, not to the workspace root.
+[profile.ci.junit]
+path = "junit.xml"
+
+[profile.ci-slow]
+# The `slow` job's tier: real FSEvents, real inotify, real elapsed time, and
+# two thread races. Serial, because the only load should be its own.
+fail-fast = false
+test-threads = 1
+
+# Deliberately NO retries here, unlike `ci` above. This tier exists because
+# these tests assert a duration, a batch or a count that a contended runner
+# cannot hold still, and a quiet serial job is already the answer to that. A
+# retry would instead let a real debouncer regression through, which is the
+# one thing the tier was carved out to protect.
+
+# No retries, but the same report: a `slow` failure is a real one and the
+# artifact is what a person reads when the job is red.
+[profile.ci-slow.junit]
+path = "junit.xml"

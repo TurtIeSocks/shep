@@ -20,22 +20,13 @@
 //! }
 //! ```
 //!
-//! # Why the name and version are arguments
+//! `name` and `version` are arguments rather than `env!` calls in this
+//! crate, since `env!` expands where it is written and would report
+//! `shep-client`'s own version instead of the dog's.
 //!
-//! They are the two facts only the dog knows. `env!` expands where it is
-//! written, so a `CARGO_PKG_VERSION` inside this crate would report
-//! `shep-client`'s version to every dog that called it. Everything else in
-//! the answer, the flag names, the key that carries the protocol number, and
-//! the protocol number itself, comes from shep and is not the dog's to get
-//! wrong.
-//!
-//! # Answering is optional, and that is what the `schema` feature turns off
-//!
-//! A dog that answers nothing is recorded as having no schema and is refused
-//! nothing. Turning `schema` off (it is on by default) therefore is not a
-//! broken state: [`probe`] still answers the version flag, and for the schema
-//! flag it exits without printing, which reads to shep as a dog with no
-//! schema.
+//! Answering is optional: with the `schema` feature off, [`probe`] still
+//! answers the version flag, and the schema flag exits without printing,
+//! which shep reads as a dog with no schema and refuses nothing for.
 
 use std::io::Write as _;
 
@@ -51,11 +42,9 @@ pub use shep_macros::DogConfig;
 /// What a dog's config type tells shep about itself: which of its fields are
 /// credentials, and the schema extension key that says so.
 ///
-/// Do not write this impl by hand. Derive it, and mark each credential field
-/// with `#[shep(secret)]`. The derive exists precisely so that
-/// [`SECRET_KEY`]'s value is never typed by a dog author: a transposed letter
-/// in it compiles, validates, marks nothing, and paints a webhook credential
-/// on screen.
+/// Derive it, and mark each credential field with `#[shep(secret)]`; do not
+/// write this impl by hand, since a mistyped [`SECRET_KEY`] compiles,
+/// validates, marks nothing, and paints a credential on screen.
 pub trait DogConfig {
     /// The schema extension key a marked field carries. Always
     /// [`SECRET_KEY`]; it is an associated const so the derive can name it
@@ -71,12 +60,12 @@ pub trait DogConfig {
 /// A field marked `#[shep(secret)]` that names no property of the config
 /// type's own schema, so the marker had nothing to land on.
 ///
-/// A like-named property of some other type under `$defs` does not count.
-/// That is a different field of a different type, and letting it answer for
-/// this one is how a renamed credential ships unmarked.
+/// A like-named property under `$defs` does not count: it's a different
+/// type's field, and letting it answer for this one is how a renamed
+/// credential ships unmarked.
 ///
 /// `Debug` is derived: the field it names is an identifier from the dog's
-/// own source, never a credential's value (IR-41).
+/// own source, never a credential's value.
 #[cfg(feature = "schema")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretFieldMissing {
@@ -103,22 +92,14 @@ impl core::fmt::Display for SecretFieldMissing {
 impl core::error::Error for SecretFieldMissing {}
 
 /// The JSON Schema a dog answers the schema flag with: what `schemars`
-/// generates for `T`, with every field `T` marked `#[shep(secret)]` carrying
-/// [`SECRET_KEY`]. The marks land on `T`'s own fields: the types `T` merely
-/// mentions answer for themselves, and are asked separately when one of them
-/// is what shep asked about.
-///
-/// [`probe`] calls this. It is public because a dog that renders its own
-/// settings, or a test that wants to see the marks, should not have to spawn
-/// itself to get them.
+/// generates for `T`, with every `#[shep(secret)]` field of `T` carrying
+/// [`SECRET_KEY`]. Public so a dog or test can render the marks without
+/// spawning itself.
 ///
 /// # Errors
 ///
-/// [`SecretFieldMissing`] when a marked name matches no property of `T`'s own
-/// representation. That is a credential which did not get marked, so it is an
-/// error rather than a silent pass. A property of that name under `$defs`
-/// belongs to another type, so it neither carries the mark nor answers for
-/// it.
+/// [`SecretFieldMissing`] when a marked name matches no property of `T`'s
+/// own representation.
 #[cfg(feature = "schema")]
 pub fn config_schema<T: DogConfig + schemars::JsonSchema>()
 -> Result<schemars::Schema, SecretFieldMissing> {
@@ -143,38 +124,17 @@ pub fn config_schema<T: DogConfig + schemars::JsonSchema>()
 const DEFS: &str = "$defs";
 
 /// Writes `key` into every property named in `secrets` that belongs to the
-/// root type's OWN representation, and records which names were reached.
+/// root type's own representation, and records which names were reached.
 ///
-/// The whole node is walked rather than only its `properties`, because a
-/// struct is the one shape that has a top-level `properties` to read. An
-/// internally tagged enum is a `oneOf` of one object per variant, an untagged
-/// one an `anyOf`, and an adjacently tagged one nests each variant's fields
-/// under the content property's own `properties`. Reading the top level alone
-/// would find nothing in all three, mark nothing, and say nothing, which is
-/// the failure this whole contract exists to remove.
+/// Walks the whole node, not just `properties`: a tagged enum's variants
+/// live under `oneOf`/`anyOf`, or nested under a content property, so only
+/// a struct has properties at the top level. Stops at [`DEFS`], so a
+/// like-named property of another type is never marked or counted as found.
+/// A recursive root's `$ref: "#"` is a string, so the walk skips it as a leaf.
 ///
-/// [`DEFS`] is where the walk stops, and that is what keeps the mark on the
-/// type shep asked about. Entering it marks a property because some stranger
-/// one level down shares a name, and records that name as found, which then
-/// answers the missing-name check on behalf of a field that never got marked.
-/// Both halves were live at once: `BarkConfig::sinks` holds webhook
-/// credentials and is marked, `Rule::sinks` lists sink names and is not, and
-/// the second came out marked while a renamed credential could have come out
-/// plain.
-///
-/// Stopping there costs the root nothing. A root enum's variant objects are
-/// emitted inline, and a recursive root points at itself with `$ref: "#"`
-/// rather than through a definition, so no shape this contract accepts keeps
-/// its own fields in `$defs`. A `$ref` needs no skipping of its own: it is a
-/// string, and a string is a leaf.
-///
-/// Two consequences remain, both deliberate. Marking is by NAME within that
-/// representation, so two variants sharing a field name are both marked even
-/// if only one carried the attribute; that over-redacts, which is the safe
-/// direction. And a property whose schema is not an object (a bare `true`,
-/// which is legal JSON Schema and which `schemars` does not emit for a typed
-/// field) is left alone and not recorded as found, so it surfaces as
-/// [`SecretFieldMissing`] rather than as a silent miss.
+/// Marks by name, so two variants sharing a field name are both marked
+/// even if only one carried the attribute. A non-object property schema is
+/// left unmarked, surfacing as [`SecretFieldMissing`] rather than a silent miss.
 #[cfg(feature = "schema")]
 fn mark_secrets_in_object(
     map: &mut serde_json::Map<String, serde_json::Value>,
@@ -221,26 +181,18 @@ fn mark_secrets(
     }
 }
 
-/// Answers shep's probes, and returns when this run is not a probe, so a dog
-/// calls it as the first line of `main` and carries on into normal startup.
+/// Answers shep's probes, and returns when this run is not a probe, so a
+/// dog calls it as the first line of `main`.
 ///
-/// `name` and `version` are the dog's own, ordinarily
-/// `env!("CARGO_PKG_NAME")` and `env!("CARGO_PKG_VERSION")`. Only the version
-/// is read by shep; the name is there because a human runs `--version` too.
+/// `name` and `version` are ordinarily `env!("CARGO_PKG_NAME")` and
+/// `env!("CARGO_PKG_VERSION")`; only the version is read by shep.
 ///
 /// # Exits
 ///
-/// This function ends the process when it answered, with
-/// [`process::exit`](std::process::exit): the run was shep asking a question,
-/// and a dog that answered and then started up would leave a process behind
-/// for shep to kill. Nothing after the call runs in that case, and no
-/// destructor runs either, which is why it belongs on the first line of
-/// `main` before anything has been opened.
-///
-/// The exit status is 0 for an answer given, and 1 for a config type whose
-/// [`SecretFieldMissing`] makes its schema unpublishable. That failure prints
-/// to stderr, so a dog author who runs the flag by hand sees it, and shep
-/// sees an empty answer and records a dog with no schema.
+/// Ends the process with [`process::exit`](std::process::exit) before
+/// `main` opens anything: status 0 for an answer given, 1 when
+/// [`SecretFieldMissing`] makes the schema unpublishable (printed to
+/// stderr first).
 #[cfg(feature = "schema")]
 pub fn probe<T: DogConfig + schemars::JsonSchema>(name: &str, version: &str) {
     match first_argument().as_deref() {
@@ -256,26 +208,18 @@ pub fn probe<T: DogConfig + schemars::JsonSchema>(name: &str, version: &str) {
     }
 }
 
-/// Answers shep's probes, and returns when this run is not a probe, so a dog
-/// calls it as the first line of `main` and carries on into normal startup.
+/// Answers shep's probes, and returns when this run is not a probe, so a
+/// dog calls it as the first line of `main`.
 ///
-/// `name` and `version` are the dog's own, ordinarily
-/// `env!("CARGO_PKG_NAME")` and `env!("CARGO_PKG_VERSION")`. Only the version
-/// is read by shep; the name is there because a human runs `--version` too.
-///
-/// This is the build with the `schema` feature off, so there is no schema to
-/// answer with: the schema flag exits without printing, and shep records a
-/// dog with no schema, which it refuses nothing for. Exiting rather than
-/// falling through is the kinder half of that, since the alternative is a dog
-/// booting itself with an argument it does not understand while shep waits
-/// out a timeout for an answer that is never coming.
+/// `name` and `version` are ordinarily `env!("CARGO_PKG_NAME")` and
+/// `env!("CARGO_PKG_VERSION")`; only the version is read by shep. With the
+/// `schema` feature off, the schema flag exits without printing, so shep
+/// records a dog with no schema instead of waiting out a timeout.
 ///
 /// # Exits
 ///
-/// This function ends the process when it answered, with
-/// [`process::exit`](std::process::exit), status 0. Nothing after the call
-/// runs in that case, and no destructor runs either, which is why it belongs
-/// on the first line of `main` before anything has been opened.
+/// Ends the process with [`process::exit`](std::process::exit), status 0,
+/// before `main` opens anything.
 #[cfg(not(feature = "schema"))]
 pub fn probe<T: DogConfig>(name: &str, version: &str) {
     match first_argument().as_deref() {
@@ -287,21 +231,16 @@ pub fn probe<T: DogConfig>(name: &str, version: &str) {
 
 /// The argument shep spawns a probe with, which is the only one it passes.
 ///
-/// The first argument and not a scan of all of them, because that is the
-/// contract `docs/dogs.md` publishes and a dog's own arguments are its
-/// business. A dog whose real command line happens to start with one of these
-/// flags was being probed as far as this contract is concerned.
+/// Only the first: `docs/dogs.md` publishes that contract, and a dog's
+/// own arguments are its business.
 fn first_argument() -> Option<String> {
     std::env::args().nth(1)
 }
 
-/// Prints an answer and ends the process, which is what makes a probe run
-/// end where a normal run would carry on.
+/// Prints an answer and ends the process.
 ///
-/// The explicit flush is not decoration: [`std::process::exit`] runs no
-/// destructor, so nothing else would push a partial buffer out. Both answers
-/// end in a newline, which Rust's line-buffered stdout would flush anyway,
-/// and neither of those two facts is one to leave the contract resting on.
+/// The explicit flush matters: [`std::process::exit`] runs no destructor,
+/// so nothing else would push a partial buffer out.
 fn answer(text: &str) -> ! {
     let mut stdout = std::io::stdout();
     // A write to a closed stdout is not something a dog can do anything
@@ -314,9 +253,7 @@ fn answer(text: &str) -> ! {
 /// The `--version` answer, whole, ending in a newline.
 ///
 /// Split out from [`probe`] so the format can be tested against
-/// [`shep_core::dogs::parse_version_answer`], which is the code that reads
-/// it. The two used to be a docs snippet and a parser with nothing holding
-/// them together.
+/// [`shep_core::dogs::parse_version_answer`], the code that reads it.
 fn version_answer(name: &str, version: &str) -> String {
     format!(
         "{name} {version}\n{SHEP_PROTOCOL_KEY}: {}\n",
@@ -356,14 +293,8 @@ mod tests {
         assert_eq!(parsed.protocol, Some(crate::PROTOCOL_VERSION));
     }
 
-    /// Everything the `schema` feature gates, gated the same way.
-    ///
-    /// A dog that turns the feature off gets a library with no
-    /// `config_schema` in it, which is the supported opt-out rather than a
-    /// broken build. The tests have to say so too: gated on `test` alone
-    /// they name `schemars`, `serde_json` and `config_schema` in a build
-    /// that has none of them, so the crate's own test target was the one
-    /// place the feature stopped being additive.
+    /// Everything the `schema` feature gates, gated the same way: with the
+    /// feature off there is no `config_schema` to name here either.
     #[cfg(feature = "schema")]
     mod schema {
         use super::*;

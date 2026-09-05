@@ -1,52 +1,52 @@
 #!/bin/sh
 # Rejects a commit subject release-plz cannot read.
 #
-# release-plz walks the INDIVIDUAL commits on a branch, not the merge
-# commit's subject, and `filter_unconventional = true` in
-# release-plz-changelog.toml silently drops anything that does not parse.
-# A dropped commit contributes nothing to the changelog and nothing to the
-# version bump, so a breaking change in one ships inside a compatible
-# version with an empty changelog entry and no error anywhere.
-#
-# That is not hypothetical. shep-core 0.2.1 went to crates.io carrying a
-# changed public signature because the commit that made it was called
-# "Tell a running dog its config changed".
+# release-plz walks individual commits, not the merge subject, and
+# `filter_unconventional = true` (release-plz-changelog.toml) silently drops
+# anything that does not parse: no changelog entry, no version bump, even
+# for a breaking change.
 #
 # Install once per clone: git config core.hooksPath .githooks
 
 msg_file="$1"
 subject=$(sed -n '1p' "$msg_file")
 
-# A merge subject is git's own wording. So are the autosquash markers, and
-# those are legitimate HERE because they are created locally and consumed by
-# `git rebase --autosquash` before the branch is pushed. The CI gate rejects
-# them, since one surviving to a pull request head was never squashed.
+# Merge subjects are git's own wording. Autosquash markers are legitimate
+# here since they're consumed locally by `git rebase --autosquash`; the CI
+# gate still rejects one that reaches a PR head unsquashed.
 #
-# `Revert "..."`, which `git revert` writes for you, is NOT exempt. It parses
-# as nothing and release-plz drops it, so a reverted breaking change would go
-# unrecorded. Retitle it `revert: ...` and see the note below about giving
-# `revert` a parser.
+# `Revert "..."` is not exempt: it parses as nothing, so retitle it
+# `revert: ...` (revert still needs a parser; see below).
+#
+# Matches the literal text git's fmt-merge-msg.c produces, plural forms
+# included for an octopus merge. A hand-written subject with the same text
+# is exempted too; this checks the subject string, not its origin.
+if printf '%s' "$subject" | grep -qE "^Merge (branch|branches|remote-tracking branch|remote-tracking branches|tag|tags|commit|commits) |^Merge pull request #"; then
+    exit 0
+fi
 case "$subject" in
-    "Merge "*|"fixup!"*|"squash!"*|"amend!"*) exit 0 ;;
+    "fixup!"*|"squash!"*|"amend!"*) exit 0 ;;
 esac
 
-# The nine types below are not the conventional-commits list, they are what
-# release-plz-changelog.toml actually handles. Measured with git-cliff 2.14.1
-# against that exact config:
+# git-cliff (release-plz-changelog.toml) gives feat/fix/perf/refactor an
+# entry, a chore's Cargo.toml/Cargo.lock dependency bump an entry under
+# Internal ahead of the generic chore skip, skips docs/test/ci/chore/style
+# unless breaking, and silently drops revert/build: neither matches a parser.
 #
-#   feat fix perf refactor   produce a changelog entry
-#   docs test ci chore style  match `skip = true`, dropped on purpose
-#   revert build              match NO parser, so `filter_commits = true`
-#                             drops them with no entry and no warning
+# `protect_breaking_commits` rescues a `!` only on a subject that parsed:
+# `docs!:` and `chore!:` arrive marked BREAKING, but `revert!:` and
+# `build!:` still vanish, and so does a `!` with no type in front of it:
+# type first, `!` second.
 #
-# `revert` and `build` are the trap. They are real conventional types, they
-# look correct, and they contribute nothing. They are rejected here rather
-# than accepted, because a gate that passes a commit release-plz discards is
-# the bug this file exists to prevent. To use one, give it a parser in
+# `revert` and `build` are real conventional types that contribute nothing:
+# rejected here rather than accepted, since a gate that passes a commit
+# release-plz discards is the bug this file prevents. Give one a parser in
 # release-plz-changelog.toml first, then add it here.
 
-# type(optional scope)optional !: space, then something.
-if printf '%s' "$subject" | grep -qE '^(feat|fix|perf|refactor|docs|test|ci|chore|style)(\([a-z0-9 ._/-]+\))?!?: .+'; then
+# Scope is `[^()]`, not a narrower class: git-conventional permits any
+# character except a newline and parenthesis, so `feat(API): ...` is valid.
+
+if printf '%s' "$subject" | grep -qE '^(feat|fix|perf|refactor|docs|test|ci|chore|style)(\([^()]+\))?!?: .+'; then
     exit 0
 fi
 

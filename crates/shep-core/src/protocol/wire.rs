@@ -26,8 +26,8 @@ pub fn codec() -> LengthDelimitedCodec {
 ///
 /// # Errors
 ///
-/// - [`WireError::Json`] — serialization failed (carries serde's message).
-/// - [`WireError::FrameTooLarge`] — payload exceeds [`MAX_FRAME_BYTES`].
+/// - [`WireError::Json`]: serialization failed (carries serde's message).
+/// - [`WireError::FrameTooLarge`]: payload exceeds [`MAX_FRAME_BYTES`].
 pub fn encode_frame<T: Serialize>(value: &T) -> Result<Bytes, WireError> {
     let vec = serde_json::to_vec(value).map_err(|e| WireError::Json(e.to_string()))?;
     if vec.len() > MAX_FRAME_BYTES {
@@ -40,18 +40,15 @@ pub fn encode_frame<T: Serialize>(value: &T) -> Result<Bytes, WireError> {
 ///
 /// # Errors
 ///
-/// - [`WireError::Json`] — the payload is not valid JSON for `T`.
+/// - [`WireError::Json`]: the payload is not valid JSON for `T`.
 pub fn decode_frame<T: DeserializeOwned>(frame: &[u8]) -> Result<T, WireError> {
     serde_json::from_slice(frame).map_err(|e| WireError::Json(e.to_string()))
 }
 
 /// Error type returned from [`encode_frame`] and [`decode_frame`]
 ///
-/// `#[non_exhaustive]` unconditionally, per IR-20's rule for every wire
-/// enum: the protocol will grow past a JSON payload and a size cap —
-/// checksums, compression, or a second framing format — and this type is on
-/// the peer-facing surface, so an out-of-tree caller must not break the day
-/// it does.
+/// `#[non_exhaustive]`: this type is on the peer-facing surface, and the
+/// protocol will grow past a JSON payload and a size cap eventually.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WireError {
@@ -105,8 +102,6 @@ mod tests {
     #[test]
     fn codec_uses_u32_prefix_and_max_frame() {
         let c = codec();
-        // 16 MiB cap per spec-adjacent sanity: a frame larger than this is a
-        // protocol violation, not a legitimate message.
         assert_eq!(c.max_frame_length(), MAX_FRAME_BYTES);
     }
 

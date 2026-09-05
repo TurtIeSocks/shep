@@ -10,6 +10,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-09-05
+
+
+## [0.2.3] - 2026-09-05
+
+
+## [0.2.2] - 2026-09-04
+
+### Fixed
+
+- A stop no longer discards the child's last line
+- Drain on every exit from the pump loop, not just one
+- Gate fill_pipe on unix, which is where its argument type exists
+- Put FINAL_DRAIN back to 100ms, and name what actually bounds it
+
+
 ## [0.2.1] - 2026-09-04
 
 

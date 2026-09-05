@@ -1,26 +1,15 @@
 //! The host-usage strip: one line, five self-labelled segments.
 //!
-//! Half of it is read from this machine ([`super::super::source::HostSample`])
-//! and half is summed from the flock the dashboard already holds. Every
-//! segment names which half it belongs to, because a strip truncated by a
-//! narrow terminal must never leave a bare `mem 12.4G` beside a bare
+//! Half is read from this machine ([`super::super::source::HostSample`])
+//! and half is summed from [`super::super::app::App::all_rows`], the whole
+//! flock, never the filtered [`super::super::app::App::rows`]: a name
+//! filter must not narrow what this strip claims. Every segment names its
+//! half, so a truncated strip never leaves a bare `mem 12.4G` beside a bare
 //! `mem 706.0M`.
 //!
-//! The flock half sums [`super::super::app::App::all_rows`], the WHOLE
-//! flock, never [`super::super::app::App::rows`], the table's current view.
-//! A strip that named itself `flock cpu`/`flock mem` is a claim about the
-//! machine's total load, and a name filter narrowing the table must not
-//! quietly narrow that claim along with it; the
-//! title bar is where the filtered-vs-total split already lives
-//! (`2 of 6 in the flock`), one row above this one.
-//!
-//! Segments are joined **in the drop order** — `up` last, then the flock's
-//! memory, its CPU, the host's memory, with the load average first — and the
-//! line is fitted with [`super::flock::fit`], the same call every other line
-//! on this screen goes through. Truncating from the right therefore IS the
-//! drop order, with no second mechanism to maintain, and the `…` says so the
-//! way it does on every truncated name in the table above. See the phase
-//! plan's design decision 9 for the machinery that was cut and why.
+//! Segments join in the drop order (`up` last, load average first) and
+//! [`super::flock::fit`] truncates from the right, so truncation is the
+//! drop order with no second mechanism.
 
 use ratatui::text::{Line, Span};
 
@@ -64,21 +53,15 @@ fn segments(app: &App) -> Vec<String> {
             out.push("host  usage is not available on this platform".to_string());
         }
         // Reachable for at most one redraw: `tokio::time::interval`'s first
-        // tick is immediate, so the heartbeat samples before the second frame.
-        // It still gets a sentence and a gallery scene — an untested string is
-        // where this project's claims rot.
+        // tick is immediate, so the heartbeat samples before the second
+        // frame.
         None => out.push("host  not read yet".to_string()),
     }
 
-    // Summed from the WHOLE flock, `all_rows`, not the table's current
-    // `rows`: a filter that narrows what's on screen must not also narrow
-    // what this strip claims about the machine, and `-` here must keep
-    // meaning "no reading", never "the filter matched nothing" — see the
-    // module doc and `App::all_rows`. Never requested on its own: this is
-    // the same `ListFlock` reply the table already has. `-` and not `0.0%`
-    // when nothing reported: `ProcessInfo::cpu_percent`'s own doc is
-    // explicit that `None` is unknown, and rendering unknown as zero claims a
-    // measurement the shepherd never made.
+    // Summed from the whole flock, `all_rows`, not the filtered `rows`, so
+    // `-` here always means no reading, never "the filter matched nothing".
+    // `-`, not `0.0%`: `ProcessInfo::cpu_percent`'s `None` is unknown, and
+    // zero would claim a measurement the shepherd never made.
     let rows = app.all_rows();
     let cpu: Option<f32> = rows
         .iter()
@@ -116,10 +99,8 @@ mod tests {
     use shep_core::protocol::ProcessInfo;
     use shep_core::status::ProcStatus;
 
-    /// fails if a segment stops saying whose number it is. A strip truncated
-    /// by a narrow terminal must never leave a bare `mem 12.4G` beside a bare
-    /// `mem 706.0M` — the two are the host's and the flock's, and an operator
-    /// reading an incident cannot afford to guess which is which.
+    /// A truncated strip must never leave a bare `mem 12.4G` beside a bare
+    /// `mem 706.0M`, one the host's and one the flock's.
     #[test]
     fn every_segment_names_whose_number_it_is() {
         let app = with_host(sample(), flock_of(4, 1));
@@ -129,17 +110,8 @@ mod tests {
         }
     }
 
-    /// fails if the strip stops truncating visibly, or if the load average
-    /// stops being the segment that survives a narrow terminal.
-    ///
-    /// There is no drop loop and no width table. The segments are joined in
-    /// the drop order — least useful last — and `flock::fit` truncates from
-    /// the right, so truncating IS the drop order and this is the whole of the
-    /// fitting behaviour. An earlier draft built a second mechanism for it and
-    /// a test that walked every width from 200 down to 10 recording the order
-    /// things vanished; the maintainer's ruling for this phase is "as plain as the flock
-    /// table", and the ellipsis on every other line of the screen is the
-    /// precedent. Three widths, not a hundred and ninety.
+    /// There is no drop loop and no width table: `flock::fit` truncates from
+    /// the right, so truncating is the drop order.
     #[test]
     fn a_narrow_strip_truncates_visibly_and_keeps_the_load_average() {
         let app = with_host(sample(), flock_of(4, 1));
@@ -169,11 +141,9 @@ mod tests {
         );
     }
 
-    /// fails if an unknown flock reading renders as zero. `ProcessInfo`'s own
-    /// doc is explicit that `None` covers three cases — not running, under one
-    /// sampling window, or a shepherd predating the field — and that a reader
-    /// renders all three as unknown and never as zero. `0.0%` claims a
-    /// measurement the shepherd never made.
+    /// `ProcessInfo`'s `None` covers three cases (not running, under one
+    /// sampling window, or a shepherd predating the field), and a reader
+    /// renders all three as unknown, never as zero.
     #[test]
     fn a_flock_with_no_readings_shows_a_dash_and_not_a_zero() {
         let app = with_host(
@@ -186,9 +156,8 @@ mod tests {
         assert!(!line.contains("0.0%"));
     }
 
-    /// fails if an unsupported platform stops saying so. `None` from the
-    /// sampler is a real case, and a strip that silently dropped its host half
-    /// would look like a strip whose numbers had not arrived yet.
+    /// A silently dropped host half would look identical to numbers that
+    /// have not arrived yet.
     #[test]
     fn an_unread_host_says_which_of_the_two_reasons_it_is() {
         let unsupported = with_host_none(flock_of(4, 1), true);
@@ -204,13 +173,8 @@ mod tests {
         assert!(rendered(&strip_line(&unsupported, 200)).contains("flock cpu"));
     }
 
-    /// fails if the strip's flock totals move when a filter narrows the
-    /// table. The strip is a claim about the whole machine, not about
-    /// whatever the table currently shows: `flock cpu`/`flock mem` must
-    /// never silently sum the FILTERED set while staying labelled `flock`
-    /// — a filter matching nothing would make a running flock's strip
-    /// print `-`, the same cell this dashboard reserves for "no reading
-    /// arrived yet".
+    /// A filter matching nothing would otherwise make a running flock's
+    /// strip print `-`, the same cell reserved for "no reading arrived yet".
     #[test]
     fn the_flock_totals_ignore_the_filter() {
         let mut app = with_host(sample(), flock_of(4, 1));

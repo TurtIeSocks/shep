@@ -105,7 +105,7 @@ reviews:
     - path: "crates/**/*.rs"
       instructions: >-
         This workspace has a written Rust style, docs/idiomatic-rust.md, with
-        46 numbered rules IR-1 through IR-46. Cite the rule number when a
+        47 numbered rules IR-1 through IR-47. Cite the rule number when a
         finding matches one.
 
         Load-bearing rules, in rough order of how often they drift: no

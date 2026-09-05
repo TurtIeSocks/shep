@@ -1,31 +1,15 @@
 //! The muster roll: persisted flock state for restart-survival (`shep muster`)
 //!
-//! `FlockRegistry` tracks each registered sheep's [`AppConfig`] in memory;
-//! `FlockRegistry::roll` turns it plus a live [`ProcessInfo`] listing into
-//! a [`FlockSnapshot`], written to `flock.json` by `write_atomic`. A
-//! `SnapshotWriter` task (`spawn_snapshot_writer`) debounces lifecycle
-//! events off the bus so a whole restart storm produces one write, not one
-//! per event. `restorable` turns a loaded snapshot back into apps a
-//! `muster` should start, re-validating every entry (the file is
-//! human-editable) and collecting failures instead of aborting the whole
-//! muster.
+//! `FlockRegistry::roll` turns the registry's [`AppConfig`]s plus a live
+//! [`ProcessInfo`] listing into a [`FlockSnapshot`], written to `flock.json`
+//! by `write_atomic`. A `SnapshotWriter` task debounces lifecycle events so a
+//! restart storm produces one write. `restorable` re-validates every entry,
+//! since the file is human-editable.
 //!
-//! `muster` reads the roll and starts those apps. It is the daemon's ONE
-//! restore path, reached both from `boot` and from the `Muster` request an
-//! operator sends, so the restore that runs unattended after a reboot is the
-//! same code an operator can drive by hand.
-//!
-//! ## Restore rule
-//!
-//! An app restores iff it was running when the roll was saved
-//! (`instances_running > 0`) AND `autostart` is still true — "was up when we
-//! saved" is the muster contract; `autostart = false` is the user's explicit
-//! opt-out of being brought back automatically.
-//!
-//! An app the flock ALREADY has is then left exactly where it stands, and is
-//! still reported as restored. That half of the rule only ever bites the
-//! operator's call — boot's flock is empty by construction — and `muster`'s
-//! own doc carries the reasoning.
+//! `muster` reads the roll and starts those apps, from `boot` and from the
+//! `Muster` request alike. An app restores iff it was running when the roll was
+//! saved (`instances_running > 0`) and `autostart` is still true; one the flock
+//! already has is left where it stands, still reported as restored.
 
 use core::fmt;
 
@@ -73,8 +57,8 @@ pub struct FlockSnapshot {
 /// One sheep's entry in a [`FlockSnapshot`]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavedApp {
-    /// The config the sheep was started from (Debug redacts `env` — nests
-    /// through [`AppConfig`]'s own redacting `Debug`, IR-41)
+    /// The config the sheep was started from (Debug redacts `env`, through
+    /// [`AppConfig`]'s own redacting `Debug`)
     pub app: AppConfig,
     /// How many instances of this sheep were running when the roll was built
     pub instances_running: u32,
@@ -108,16 +92,13 @@ impl FlockRegistry {
     /// Records one app's config directly, for a successor rebuilding this
     /// registry from a handover blob.
     ///
-    /// [`Self::record`] takes [`ResolvedApp`]s because every other caller
-    /// has just normalized one. A successor has not: it holds the
-    /// [`AppConfig`] the blob carried, which the supervisor re-normalizes on
-    /// its own way to installing the sheep, and normalizing it a second time
-    /// here would be a second place for the two to disagree.
+    /// [`Self::record`] takes [`ResolvedApp`]s because every other caller has
+    /// just normalized one. A successor holds only the [`AppConfig`] the blob
+    /// carried, and the supervisor re-normalizes that on its own way to
+    /// installing the sheep.
     ///
-    /// Load-bearing rather than a convenience. The registry is what the
-    /// muster roll is written from, so a successor that left it empty would
-    /// overwrite a good roll with an empty one within seconds of taking
-    /// over, and a reboot after that would restore nothing.
+    /// The roll is written from this registry, so a successor that left it
+    /// empty would overwrite a good roll within seconds of taking over.
     #[cfg(unix)]
     pub(crate) fn record_config(&self, config: &AppConfig) {
         self.apps
@@ -130,14 +111,10 @@ impl FlockRegistry {
     /// empty flock regardless of what is still live in the supervisor's own
     /// listing.
     ///
-    /// The one caller is [`crate::boot::RunningDaemon::run`]'s teardown,
-    /// and only when that boot asked for it
-    /// (`BootOptions::delete_flock_on_shutdown`) — `shep dev`'s isolated
-    /// session, where nothing should survive for a later `shep muster` to
-    /// restore, even when the session ends by signal rather than through
-    /// the CLI's own `Stop`/`Delete` requests. A production `runtime`/
-    /// `daemon` shutdown never calls this: the roll surviving with the
-    /// flock's true running state is the entire point of muster.
+    /// The one caller is [`crate::boot::RunningDaemon::run`]'s teardown, under
+    /// `BootOptions::delete_flock_on_shutdown`: `shep dev`'s isolated session,
+    /// where nothing should survive for a later `shep muster`. A production
+    /// shutdown never calls it.
     pub(crate) fn clear(&self) {
         self.apps
             .lock()
@@ -177,11 +154,9 @@ impl FlockRegistry {
 
 /// True for the statuses [`FlockRegistry::roll`] counts as "up".
 ///
-/// [`ProcStatus::Stopping`] is deliberately absent: a reload's drainee is
-/// going away and its replacement already holds the same instance slot, so
-/// counting both would report two running instances for one — the muster
-/// roll must see only the replacement, never the entry riding out its own
-/// kill ladder to a terminal status.
+/// [`ProcStatus::Stopping`] is absent: a reload's drainee and its replacement
+/// hold the same instance slot, so counting both would report two running
+/// instances for one.
 fn is_running(status: ProcStatus) -> bool {
     matches!(
         status,
@@ -192,17 +167,12 @@ fn is_running(status: ProcStatus) -> bool {
 /// Error type returned from `write_atomic` and [`read`]
 ///
 /// Wraps `io::Error`/`serde_json::Error` directly rather than stringifying
-/// them (contrast [`WireError`](shep_core::protocol::WireError)) so callers
-/// keep the underlying OS/serde diagnostic via [`core::error::Error::source`];
-/// that costs this enum `Clone`/`PartialEq`/`Eq` (IR-19's documented
-/// exception for variants wrapping `io::Error`).
+/// them, so callers keep the underlying diagnostic through
+/// [`core::error::Error::source`]. That costs the enum
+/// `Clone`/`PartialEq`/`Eq`.
 ///
-/// `#[non_exhaustive]`: today's four variants cover the write-side steps (no
-/// parent, serialize, I/O) and the read-side parse failure, and a future
-/// roll-format change — a version this daemon recognizes but refuses to
-/// restore, rather than merely fails to parse — would need its own variant
-/// distinct from [`Self::Parse`]'s catch-all, and shep-daemon is a published
-/// library an out-of-tree matcher should not break for (IR-20).
+/// `#[non_exhaustive]`: a future roll-format refusal would need its own
+/// variant, distinct from [`Self::Parse`]'s catch-all.
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum SnapshotError {
@@ -254,30 +224,17 @@ impl From<std::io::Error> for SnapshotError {
     }
 }
 
-/// Writes `snapshot` to `path` atomically: a temp file in the same
-/// directory (so `rename(2)` is guaranteed atomic, which it only is within
-/// one filesystem), `fsync`ed, renamed over `path`, and on unix the
-/// directory `fsync`ed in turn so the rename itself survives a power cut.
-/// `shep_core::atomic_file::sync_dir` is a no-op on Windows, where that
-/// last guarantee is only as strong as NTFS makes it.
-///
-/// That last step matters more here than anywhere else this workspace
-/// writes. The roll exists to be read back by the restore that runs
-/// unattended after a reboot, and the graceful write at the end of `boot`
-/// is exactly the one a power cut skips, so what a restore finds is
-/// whatever the debounced `SnapshotWriter` last renamed into place. Making
-/// the contents durable without the rename that publishes them would leave
-/// the flock unrecoverable by the event the file exists to survive.
-///
-/// The temp file is created owner-only (unix mode 0600) and `persist` keeps
-/// that mode across the rename. That mode is not cosmetic: the roll stores
-/// app `env` verbatim so a restore can reproduce it, which is the one place
-/// shep writes secrets to disk (spec §10 redacts them everywhere else).
+/// Writes `snapshot` to `path` atomically: a temp file in the same directory,
+/// since `rename(2)` is atomic only within one filesystem, `fsync`ed, renamed
+/// over `path`, then on unix the directory `fsync`ed so the rename survives a
+/// power cut (a no-op on Windows). The temp file is owner-only (unix mode
+/// 0600) and `persist` keeps that mode: the roll stores app `env` verbatim,
+/// the one place shep writes secrets to disk.
 ///
 /// # Errors
-/// - [`SnapshotError::NoParent`] — the roll path has no directory to write into.
-/// - [`SnapshotError::Encode`] — the roll failed to serialize.
-/// - [`SnapshotError::Io`] — the temp file, fsync, or rename failed.
+/// - [`SnapshotError::NoParent`]: the roll path has no directory to write into.
+/// - [`SnapshotError::Encode`]: the roll failed to serialize.
+/// - [`SnapshotError::Io`]: the temp file, fsync, or rename failed.
 pub(crate) fn write_atomic(path: &Path, snapshot: &FlockSnapshot) -> Result<(), SnapshotError> {
     use std::io::Write;
 
@@ -300,15 +257,13 @@ pub(crate) fn write_atomic(path: &Path, snapshot: &FlockSnapshot) -> Result<(), 
 
 /// Reads and validates a muster roll written by `write_atomic`.
 ///
-/// Public only for `tests/daemon_e2e.rs`, which reads the roll a live daemon
-/// wrote and asserts on its contents; [`FlockSnapshot`], [`SavedApp`] and
-/// [`SnapshotError`] are public because they are what this returns. The
-/// daemon's own restore path calls this from inside `boot`.
+/// Public only for `tests/daemon_e2e.rs`, which asserts on the roll a live
+/// daemon wrote; the daemon's own restore path calls it from inside `boot`.
 ///
 /// # Errors
-/// - [`SnapshotError::Io`] — the roll could not be read.
-/// - [`SnapshotError::Parse`] — invalid JSON, or a schema version this
-///   daemon does not know.
+/// - [`SnapshotError::Io`]: the roll could not be read.
+/// - [`SnapshotError::Parse`]: invalid JSON, or a schema version this daemon
+///   does not know.
 pub fn read(path: &Path) -> Result<FlockSnapshot, SnapshotError> {
     let bytes = std::fs::read(path)?;
     let snapshot: FlockSnapshot =
@@ -323,7 +278,7 @@ pub fn read(path: &Path) -> Result<FlockSnapshot, SnapshotError> {
 }
 
 /// What a `muster` should put back: every member, which of them to start, and
-/// the ones the roll can no longer justify
+/// the ones that failed re-validation
 #[derive(Debug)]
 pub(crate) struct Restorable {
     /// Every entry that still normalizes, in roll order. The flock is a
@@ -333,30 +288,20 @@ pub(crate) struct Restorable {
     /// The subset of [`Self::members`] that was up when the roll was written
     /// and still opts into `autostart`.
     pub(crate) to_start: Vec<ResolvedApp>,
-    /// Sheep name + the reason its saved config no longer normalizes
+    /// Sheep name, and why its saved config failed to normalize
     pub(crate) rejected: Vec<(String, NormalizeError)>,
 }
 
 /// Splits a loaded [`FlockSnapshot`] into members, the subset to start, and
 /// the entries rejected on re-validation.
 ///
-/// **Membership survives everything but `delete`.** A sheep that was stopped
-/// when the roll was written comes back registered and `Stopped`, not gone —
-/// restoring only `instances_running > 0 && autostart` would make `shep
-/// stop` silently destructive across a daemon restart: the sheep would drop
-/// out of the flock entirely, with its config surviving only in the roll
-/// file itself.
+/// Membership survives everything but `delete`: a sheep stopped when the roll
+/// was written comes back registered and `Stopped`. What to START is a
+/// separate question, answered by `instances_running > 0 && autostart`.
 ///
-/// "Was up when we saved" is still the contract for what to START, and
-/// `autostart = false` is still the user's opt-out of coming back
-/// automatically — running and belonging are separate questions.
-/// [`FlockRegistry::roll`] keeps an app in the roll whenever it appears in
-/// the listing, running or not, and records the count separately.
-///
-/// The roll is a file a human can edit, so every surviving entry is run back
-/// through [`normalize()`] exactly like peer input (spec §6's "the daemon
-/// MUST re-normalize" rule) — a bad entry is collected into `rejected`
-/// instead of aborting the whole muster.
+/// The roll is a file a human can edit, so every entry is run back through
+/// [`normalize()`] like peer input, and a bad one is collected into `rejected`
+/// rather than aborting the muster.
 #[must_use]
 pub(crate) fn restorable(snapshot: FlockSnapshot) -> Restorable {
     let mut members = Vec::new();
@@ -386,36 +331,15 @@ pub(crate) fn restorable(snapshot: FlockSnapshot) -> Restorable {
 /// Reads the muster roll and starts every app it restores, returning the
 /// names it restored.
 ///
-/// The daemon's one restore path, and deliberately only one: `boot` runs it
-/// when `--restore` is set, and the `Muster` request runs it for an operator,
-/// so the restore that happens unattended after a reboot is the same code an
-/// operator exercises by hand. The two callers differ in what they do with
-/// the return — boot discards it, the request handler turns it into a listing
-/// — which is why this hands back NAMES rather than a listing: a listing
-/// would tempt the boot path into reporting one nobody reads.
-///
-/// An app the flock already has is left exactly where it stands, and is still
-/// counted as restored. Boot never meets that case, since its flock is empty
-/// by construction; an operator meets it whenever a muster follows a partial
-/// restore, or simply runs twice. Starting such an app again would not be the
-/// no-op it looks like: [`instance_slots`](crate::assemble::instance_slots)
-/// allocates the lowest FREE slot, so a second start of a one-instance app
-/// leaves it running two, and the next roll records the pair. Restarting it
-/// instead would drop live connections over a verb that never claimed to be
-/// `restart`, and refusing the whole muster over it would break the
-/// partial-restore case the verb is most useful for. Leaving it alone is what
-/// makes the verb idempotent, and idempotence is what lets it be run twice,
-/// or from a boot script, without an operator having to think about it. The
-/// unit of that rule is the APP, not the instance count: a muster starts apps
-/// the flock does not have, and never adds instances to one it does.
-///
-/// A missing roll restores nothing and is not an error — a fresh
-/// `$SHEP_HOME` has none, and that is a first boot rather than a fault. A
-/// roll that exists and will not parse IS reported: something corrupted or
-/// hand-edited it, and starting an empty flock instead would hide that.
+/// The daemon's one restore path: `boot` runs it under `--restore`, the
+/// `Muster` request runs it for an operator. An app the flock already has is
+/// left where it stands, still counted as restored, which makes the verb
+/// idempotent; starting it again is not a no-op, since
+/// [`instance_slots`](crate::assemble::instance_slots) takes the lowest free
+/// slot. A missing roll is not an error; an unparseable one is reported.
 ///
 /// # Errors
-/// - [`SnapshotError`] — the roll exists but could not be read or parsed.
+/// - [`SnapshotError`]: the roll exists but could not be read or parsed.
 pub(crate) async fn muster(
     path: &Path,
     registry: &FlockRegistry,
@@ -442,21 +366,14 @@ pub(crate) async fn muster(
         .collect();
 
     // A supervisor that cannot be listed has no flock left to collide with,
-    // and the `start` below announces itself when it fails for that same
-    // reason, so this needs no branch of its own.
+    // and the `start` below announces its own failure.
     let running = supervisor.list_checked().await.unwrap_or_default();
     let known = |app: &ResolvedApp| running.iter().any(|info| info.name == app.config().name);
 
-    // Membership for every surviving entry the `start` below will NOT bring
-    // up: the flock is a list of what belongs, and `delete` is the only thing
-    // that ends belonging. A sheep saved while stopped lands here and nowhere
-    // else, which is the whole point -- it comes back listed and restartable
-    // instead of vanishing.
-    //
-    // The ones being started are excluded deliberately. Registering them at
-    // rest first would leave an idle `instance: 0` entry for `start` to
-    // allocate around, and the sheep would show up twice: once stopped, once
-    // online.
+    // Membership for every entry `start` will not bring up, so a sheep saved
+    // while stopped comes back listed. The ones being started are excluded:
+    // registering them at rest first would leave an idle `instance: 0` entry
+    // for `start` to allocate around, and the sheep would show up twice.
     let starting: Vec<&str> = restorable
         .to_start
         .iter()
@@ -483,24 +400,18 @@ pub(crate) async fn muster(
     if to_start.is_empty() {
         return Ok(restored);
     }
-    // Recorded regardless of whether `start` below fully succeeds, matching
-    // `rpc::run`'s own Start handler: already-registered entries must
-    // persist even when a later spawn in the same batch fails. Only what
-    // this call starts is recorded — an app left where it stands keeps the
-    // config it is actually running under, rather than having the roll's
-    // copy written over it for the next save to persist.
+    // Recorded whether or not `start` fully succeeds: already-registered
+    // entries must persist even when a later spawn in the batch fails. Only
+    // what this call starts, so an app left where it stands keeps the config
+    // it is actually running under.
     registry.record(&to_start);
-    // `start_restored`, not `start`: the difference is whether one saved app
-    // that cannot run keeps the rest of the flock down, and the comment below
-    // has always said it must not. `start` refuses a whole batch over an app
-    // whose script provably is not there, which is right for an operator
-    // typing `shep start` against a Flockfile and wrong here -- this runs at
-    // boot with nobody watching, and a binary missing after a rebuild would
-    // silently cost the machine its entire flock.
+    // `start_restored`, not `start`: `start` refuses a whole batch over an app
+    // whose script provably is not there, which is right for an operator typing
+    // `shep start` and wrong at an unattended boot, where a binary missing after
+    // a rebuild would cost the machine its entire flock.
     if let Err(err) = supervisor.start_restored(to_start).await {
-        // One bad entry does not sink the muster — the same policy
-        // `restorable` already applies at validation time. The sheep that
-        // failed to spawn is already recorded `Errored` by the supervisor.
+        // One bad entry does not sink the muster; the sheep that failed to
+        // spawn is already recorded `Errored` by the supervisor.
         tracing::warn!(%err, "muster roll restore failed to spawn one or more apps");
     }
     Ok(restored)
@@ -516,21 +427,17 @@ fn is_state_change(event: &BusEvent) -> bool {
 #[derive(Debug)]
 pub(crate) struct SnapshotWriter {
     handle: JoinHandle<()>,
-    /// Read only by [`Self::writes`]; see that method for why both carry an
-    /// `allow` rather than an `expect`.
+    /// Read only by [`Self::writes`], which carries the same `allow`.
     #[allow(dead_code, reason = "read by this crate's own tests through `writes`")]
     writes: Arc<AtomicU64>,
 }
 
 impl SnapshotWriter {
-    /// Completed roll writes since boot — the number the metrics dog reports
+    /// Completed roll writes since boot
     ///
-    /// The dog reads that number off the wire, not off this handle, so this
-    /// accessor's only callers today are this module's own tests, and it is
-    /// dead in a non-test build. `allow` rather than `expect` because the
-    /// expectation would go unfulfilled in the test build.
-    // IR-25: trivial atomic load, no branch — inline across codegen units.
-    // Not per-frame hot, so `#[inline]`, never `#[inline(always)]`.
+    /// The metrics dog reads this off the wire, so the only callers are this
+    /// module's tests and it is dead in a non-test build.
+    // A trivial atomic load, not per-frame hot: #[inline], never #[inline(always)].
     #[inline]
     #[must_use]
     #[allow(dead_code, reason = "called by this module's own tests")]
@@ -562,9 +469,9 @@ pub(crate) fn spawn_snapshot_writer(
     SnapshotWriter { handle, writes }
 }
 
-/// The writer's actor loop — cancel-safe by construction: the debounce
-/// deadline is recomputed from the STORED `Option<Instant>` every iteration,
-/// so losing the `select!` race never extends the window.
+/// The writer's actor loop. Cancel-safe: the debounce deadline is recomputed
+/// from the stored `Option<Instant>` every iteration, so losing the `select!`
+/// race never extends the window.
 async fn run_writer(
     path: PathBuf,
     supervisor: SupervisorHandle,
@@ -622,7 +529,7 @@ mod tests {
     use super::*;
     use crate::fake::{ProcScript, ScriptedRunner};
     use crate::supervisor::spawn_supervisor;
-    use crate::testing::test_paths; // the one crate-root fixture (IR-33)
+    use crate::testing::test_paths;
     use shep_core::config::{AppConfig, normalize};
     use shep_core::protocol::{BusEvent, ProcessEventKind, ProcessInfo};
     use shep_core::status::ProcStatus;
@@ -636,15 +543,10 @@ mod tests {
             .build()
     }
 
-    // fails if `is_running` starts counting `ProcStatus::Stopping` — the
-    // status a reload's drainee wears from the moment its replacement is
-    // spawned. Both entries share one instance slot for the length of the
-    // swap, so counting the drainee as well would roll a one-instance app at
-    // two. This is the half of that guarantee that lives here: the
-    // supervisor's
-    // `a_reload_stops_counting_the_drainee_as_running_before_its_replacement_starts`
-    // pins the other half, that the mark lands before the replacement
-    // registers. Neither covers for the other.
+    // fails if `is_running` starts counting `ProcStatus::Stopping`, the status
+    // a reload's drainee wears once its replacement is spawned. Both share one
+    // instance slot for the swap, so counting the drainee would roll a
+    // one-instance app at two.
     #[test]
     fn roll_counts_running_instances_and_prunes_deleted_names() {
         let registry = FlockRegistry::new();
@@ -672,10 +574,7 @@ mod tests {
 
     #[test]
     fn write_atomic_round_trips_with_no_leftovers() {
-        // Portable: snapshot.rs is in the 'compiles everywhere' tier (Global
-        // Constraints' portability split). The 0600 owner-only guarantee is
-        // unix-only and lives in write_atomic_is_owner_only_on_unix below —
-        // Windows has no equivalent permission bit to assert here.
+        // The `0600` half lives in `write_atomic_is_owner_only_on_unix`.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("flock.json");
         let registry = FlockRegistry::new();
@@ -698,9 +597,7 @@ mod tests {
     #[test]
     fn write_atomic_is_owner_only_on_unix() {
         // The roll stores app env verbatim (spec §10): owner-only, always.
-        // This is the ONE unix-gated test in an otherwise-portable file
-        // (Global Constraints' portability split exception) — 0600 is a
-        // unix permission-bit guarantee with no Windows ACL equivalent.
+        // Unix-gated because `0600` has no Windows ACL equivalent.
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("flock.json");
@@ -729,13 +626,8 @@ mod tests {
         assert!(matches!(read(&path), Err(SnapshotError::Parse { .. })));
     }
 
-    /// Membership and running are different questions, and the roll answers
-    /// both. Every entry that still normalizes is a member; only the ones
-    /// that were up and opt into `autostart` are started.
-    ///
-    /// The old rule dropped the other two entirely, which made `shep stop`
-    /// destructive across a daemon restart: the sheep left the flock and its
-    /// config survived only in a file the operator had to `cat` to find.
+    /// Restoring only the running ones would make `shep stop` destructive
+    /// across a daemon restart: the sheep would leave the flock entirely.
     #[test]
     fn restorable_keeps_every_member_and_starts_only_what_was_up() {
         let mut stopped = AppConfig::minimal("stopped", "./s");
@@ -787,9 +679,7 @@ mod tests {
         assert!(restorable.rejected.is_empty());
     }
 
-    /// The bug this contract change exists for, at the unit level: a sheep
-    /// saved while stopped is still a member, so a later `restart` has
-    /// something to find.
+    /// So a later `restart` has something to find.
     #[test]
     fn a_sheep_saved_while_stopped_is_still_a_member() {
         let roll = FlockSnapshot {
@@ -844,7 +734,7 @@ mod tests {
 
     #[test]
     fn debug_does_not_leak_env_values() {
-        // IR-41: the roll carries env; its Debug lands in daemon logs.
+        // The roll carries env, and its Debug lands in daemon logs.
         let mut app = AppConfig::minimal("web", "./srv");
         app.env
             .insert("DATABASE_URL".to_string(), "postgres://secret".to_string());
@@ -862,11 +752,8 @@ mod tests {
     }
 
     /// fails if `muster` starts an app the roll says was down, skips one it
-    /// says was up, or drops either from the flock. All three in one case,
-    /// because a restore rule that inverted would pass any one alone.
-    ///
-    /// Both entries come back as members -- membership ends only at
-    /// `delete` -- and exactly one of them is running.
+    /// says was up, or drops either from the flock. All three in one case: an
+    /// inverted restore rule would pass any one alone.
     #[tokio::test(start_paused = true)]
     async fn muster_restores_both_and_starts_only_the_one_that_was_up() {
         let dir = tempfile::tempdir().unwrap();
@@ -917,30 +804,14 @@ mod tests {
 
     /// fails if a bad entry that is not LAST takes every app after it down.
     ///
-    /// The sibling case below has the broken app last in roll order, which is
-    /// exactly why it did not catch this: `do_start`'s spawn loop returned on
-    /// the first failure regardless of policy, so `BatchPolicy::PerApp`
-    /// bought nothing for anything sorted after the wreck. `a-good` came up,
-    /// `b-bad` failed, and `c-good` was never registered at all -- not
-    /// `Errored`, absent, with no log line.
+    /// `FlockRegistry` is a `BTreeMap`, so the roll is alphabetical and
+    /// `restorable` preserves that order: the `a-`/`b-`/`c-` names here make
+    /// the roll order the production order, with the wreck in the middle.
     ///
-    /// Not a race that might not bite. `FlockRegistry` is a `BTreeMap`, so
-    /// `roll` writes the saved apps alphabetically and `restorable` preserves
-    /// that order, which makes this a certainty whenever the broken name
-    /// sorts before a working one. The names here are `a-`/`b-`/`c-` so the
-    /// roll order below IS the production order.
-    ///
-    /// ONE `muster` call, deliberately. `shep muster`'s CLI path calls twice
-    /// -- an autostart boot restore, then an explicit `Request::Muster` --
-    /// and the second call re-registers what the first lost, which is what
-    /// hid this through three rounds of review. The single unattended
-    /// restore a real `shep startup` unit performs is the only path where it
-    /// matters and the only one with nobody watching, and it is the one this
-    /// exercises.
-    ///
-    /// `failing_to_spawn` is load-bearing: scripts are consumed in spawn
-    /// order, so no arrangement of the script list can make the MIDDLE app
-    /// fail while its neighbours come up.
+    /// One `muster` call: `shep muster`'s CLI path calls twice and the second
+    /// re-registers what the first lost, so only the single unattended restore
+    /// a `shep startup` unit performs can show this. `failing_to_spawn` is
+    /// load-bearing, since scripts are consumed in spawn order.
     #[tokio::test(start_paused = true)]
     async fn a_bad_saved_app_does_not_take_the_apps_after_it_down() {
         let dir = tempfile::tempdir().unwrap();
@@ -998,28 +869,14 @@ mod tests {
     /// fails if ONE saved app that cannot start keeps the rest of the flock
     /// down at the next boot.
     ///
-    /// The restore shares `do_start` with `Request::Start`, so the
-    /// pre-registration check written for an operator typing `shep start`
-    /// against a Flockfile reached this path too. Under it, a machine whose
-    /// saved `gone` had lost its binary to a rebuild came back with NOTHING
-    /// running -- not the twelve apps that were fine -- and did so at boot
-    /// with nobody watching. That is a strictly worse version of the
-    /// half-registered Flockfile the check exists to prevent, which is why
-    /// `muster` calls `start_restored` rather than `start`.
+    /// `muster` calls `start_restored`, not `start`, because `start`'s
+    /// pre-registration check refuses a whole batch over one app whose script
+    /// is gone, which at an unattended boot costs the machine its flock.
     ///
-    /// The comment at that call site has always claimed "one bad entry does
-    /// not sink the muster". This is the case that makes the claim true
-    /// rather than aspirational.
-    ///
-    /// `refusing` is load-bearing and this case cannot fail without it:
-    /// `ScriptedRunner` reads nothing from a spec, so its `preflight`
-    /// answers `Unknown` for everything and the validating pass never
-    /// refuses anything at all.
-    ///
-    /// One script for two apps, so `gone` fails at its spawn as well. Both
-    /// halves matter: it must be REACHED (the regression refused it before
-    /// any spawn) and it must land as a visible `Errored` row rather than
-    /// vanishing.
+    /// `refusing` is load-bearing: `ScriptedRunner`'s `preflight` answers
+    /// `Unknown` for everything, so the validating pass refuses nothing on its
+    /// own. One script for two apps, so `gone` also fails at its spawn and has
+    /// to land as a visible `Errored` row rather than vanishing.
     #[tokio::test(start_paused = true)]
     async fn one_unstartable_saved_app_does_not_keep_the_rest_of_the_flock_down() {
         let dir = tempfile::tempdir().unwrap();
@@ -1068,14 +925,9 @@ mod tests {
     /// fails if `muster` starts an app the flock already has.
     ///
     /// `instance_slots` hands a second `Start` of a one-instance app the next
-    /// FREE slot rather than nothing, so a muster that started every
-    /// restorable app unconditionally would leave a one-instance app running
-    /// two — and the next roll would record the pair. The single script is
-    /// what makes that visible: the flock's own `web` consumes it, so the
-    /// duplicate lands as `Errored` (`ScriptedRunner` answers
-    /// `SpawnFailed("script exhausted")`), and this asserts on the status as
-    /// well as the count so the wrong implementation cannot pass by leaving
-    /// one healthy sheep and one wreck.
+    /// free slot, so an unconditional muster would leave it running two. The
+    /// single script makes that visible: the flock's own `web` consumes it, so
+    /// a duplicate lands as `Errored`.
     #[tokio::test(start_paused = true)]
     async fn muster_leaves_an_app_the_flock_already_has_where_it_stands() {
         let dir = tempfile::tempdir().unwrap();
@@ -1115,8 +967,8 @@ mod tests {
     }
 
     /// fails if a missing roll becomes an error. A fresh `$SHEP_HOME` has
-    /// none, and a daemon that refused to boot over it would be unbootable
-    /// on a clean machine.
+    /// none, and a daemon that refused over it could not boot on a clean
+    /// machine.
     #[tokio::test(start_paused = true)]
     async fn a_missing_roll_restores_nothing_without_failing() {
         let dir = tempfile::tempdir().unwrap();

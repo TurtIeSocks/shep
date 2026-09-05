@@ -1,65 +1,14 @@
-//! `bleats` (alias `logs`): following a sheep's log stream — the only
-//! streaming verb, and the only one whose output does not go through
-//! [`crate::output`]'s envelope (see that module's own doc: a follow has
-//! no end, so there is nothing to wrap).
+//! `bleats` (alias `logs`): following a sheep's log stream. The only
+//! streaming verb, and the only one whose output skips
+//! [`crate::output`]'s envelope: a follow has no end, so there is nothing
+//! to wrap.
 //!
-//! Order matters here in a way it does not for the other verbs: one
-//! `Request::ListFlock` resolves an id -> [`ProcessInfo`] cache *before*
-//! `Request::Subscribe` goes out, never the other way around — subscribing
-//! first would lose every line the daemon pushes while the listing is
-//! still in flight. An id that later shows up on the bus but was not in
-//! that one listing renders as its bare id rather than blocking on a
-//! second `ListFlock` per unknown line.
+//! One `Request::ListFlock` resolves an id -> [`ProcessInfo`] cache before
+//! subscribing, since the daemon's topic filter carries no sheep identity:
+//! selector filtering happens client-side against that cache.
 //!
-//! Selector filtering happens **client-side**, against the id set that one
-//! listing resolved: the daemon's own topic filter globs on the topic
-//! string (`log.out`, `log.err`), which carries no sheep identity at all,
-//! so the daemon has nothing to narrow by selector with — only this
-//! module can.
-//!
-//! `--out`/`--err` choose which of a sheep's two output streams is shown,
-//! not where shep's own text goes: both a followed sheep's stdout and its
-//! stderr are the data the user asked for, so both land on
-//! [`Streams::out`]. [`Streams::err`] carries only shep's own
-//! diagnostics — the lag notice, the shutdown notice — never a line a
-//! sheep itself wrote; interleaving sheep stderr into it would make
-//! `shep bleats > file` silently lose half the output, and `--err` would
-//! produce an empty file.
-//!
-//! `--no-follow` does not touch the bus at all: it takes the same one
-//! `Request::ListFlock` [`resolve_names`] already sends, then prints the
-//! tail of each matched sheep's log file and exits — `tail` to `--follow`'s
-//! `tail -f`. It never subscribes, so there is no stream, no `Lagged`, no
-//! shutdown notice, and no extra round trip. A file's tail is bounded
-//! twice (`--lines` lines, found within the last [`TAIL_WINDOW_BYTES`]
-//! of the file), and files are read one at a time, so peak memory for this
-//! path is one window regardless of flock size.
-//!
-//! **Following prints that same tail first, then subscribes.** A sheep that
-//! already crashed has said everything it is going to say, so a follow that
-//! showed only new lines showed an empty screen while the reason sat in the
-//! file — which is exactly how a boot-looping sheep came to look like it had
-//! logged nothing at all.
-//!
-//! **The ordering limitation is real and is stated, not hidden.** Within one
-//! file, lines print in file order (append order, chronological). Across a
-//! sheep's two files there is no merge: `out_file` prints in full, then
-//! `err_file` starts. The FILES now carry the time shep wrote each line, so
-//! a merge key exists on disk — but [`read_tail`] strips it before anything
-//! here sees a line (a line has to mean the same thing as it does on the
-//! bus), and nothing merges on one. Until something does, guessing an order
-//! from file order would be wrong exactly when a sheep writes to both
-//! streams at once: seeing all of `out` before any of `err` must not be read
-//! as "everything on stdout happened first".
-//! `--out`/`--err` sidestep the seam by reducing a sheep to the one file that
-//! matters. `--follow` has no such limitation: the bus delivers in arrival
-//! order, which is chronological across both streams.
-//!
-//! No-follow can also show a **stopped** sheep's last output, which
-//! `--follow` cannot: the daemon creates both files at spawn and keeps
-//! appending to them for the life of the sheep, so a sheep that has since
-//! stopped still has a file to read, while it has nothing left to publish
-//! to the bus.
+//! `--no-follow` never subscribes: it tails each matched sheep's log files
+//! and exits. `--follow` prints that same tail first, then subscribes.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Seek, SeekFrom};
@@ -77,9 +26,8 @@ use crate::commands::selector::parse_selector;
 use crate::exit::ExitCode;
 use crate::output::{self, Streams, write_outcome};
 
-/// One line of `bleats` output under `--format json` — a stability surface
-/// of its own (Task 12's fixture), deliberately not wrapped in
-/// [`output::OutputEnvelope`]: see this module's own doc for why.
+/// One line of `bleats` output under `--format json`. A stability surface of
+/// its own, not wrapped in [`output::OutputEnvelope`]: a follow has no end.
 #[derive(Debug, Serialize)]
 struct BleatLine<'a> {
     /// [`output::SCHEMA_VERSION`] at the time this line was produced.
@@ -105,8 +53,8 @@ struct BleatLine<'a> {
 ///
 /// # Errors
 /// Renders and returns the exit code for a request that failed to reach
-/// the daemon, or a response this client does not recognise (`Response` is
-/// `#[non_exhaustive]`, Global Constraints).
+/// the daemon, or a response this client does not recognise (`Response`
+/// is `#[non_exhaustive]`).
 async fn resolve_names(
     client: &Client,
     streams: &mut Streams<'_>,
@@ -142,7 +90,7 @@ async fn subscribe(client: &Client, streams: &mut Streams<'_>) -> Result<EventSt
 }
 
 /// Resolves `id` to a name from `cache`, or the bare id if `id` was not in
-/// the one listing `resolve_names` took — an id that shows up on the bus
+/// the one listing `resolve_names` took. An id that shows up on the bus
 /// later than that snapshot is not a reason to block on a second listing.
 fn resolved_name(cache: &HashMap<u32, ProcessInfo>, id: u32) -> String {
     cache
@@ -151,13 +99,12 @@ fn resolved_name(cache: &HashMap<u32, ProcessInfo>, id: u32) -> String {
 }
 
 /// The slot a followed line's sheep occupies, or `None` when `id` was not
-/// in the one listing `resolve_names` took, or when its app has only one
-/// instance registered.
+/// in the one listing `resolve_names` took, or its app has only one
+/// instance.
 ///
-/// A follow always knows which sheep wrote a line -- the daemon emits
-/// [`BusEvent::LogOut`]/[`LogErr`](BusEvent::LogErr) per sheep -- so unlike
-/// the backlog path this labels a line even when several instances share
-/// one log file (module doc, D11).
+/// The daemon emits [`BusEvent::LogOut`]/[`LogErr`](BusEvent::LogErr) per
+/// sheep, so a follow labels a line even when several instances share one
+/// log file, unlike the backlog path.
 fn resolved_instance(cache: &HashMap<u32, ProcessInfo>, id: u32) -> Option<u32> {
     let info = cache.get(&id)?;
     if instance_count(cache, &info.name) > 1 {
@@ -171,10 +118,9 @@ fn resolved_instance(cache: &HashMap<u32, ProcessInfo>, id: u32) -> Option<u32> 
 /// `cache`'s snapshot of that sheep if it has one.
 ///
 /// An id the initial listing never saw has no name or fold to match
-/// against; it is matched with an empty name and no fold, which is enough
-/// for `all` and for `ProcessSelector::Id` (both work without identity)
-/// while a name/regex/fold selector correctly excludes it — there is
-/// nothing to prove it belongs.
+/// against, so it is matched with an empty name and no fold: enough for
+/// `all` and for `ProcessSelector::Id`, while a name, regex or fold
+/// selector excludes it.
 fn selector_allows(selector: &ProcessSelector, cache: &HashMap<u32, ProcessInfo>, id: u32) -> bool {
     match cache.get(&id) {
         Some(info) => selector.matches(&info.name, info.id, info.fold.as_deref(), info.instance),
@@ -182,10 +128,9 @@ fn selector_allows(selector: &ProcessSelector, cache: &HashMap<u32, ProcessInfo>
     }
 }
 
-/// Writes one rendered line to `out`. `stream` is `"out"` or `"err"` — the
+/// Writes one rendered line to `out`. `stream` is `"out"` or `"err"`, the
 /// sheep stream the line came from, not `out`'s own identity: every line
-/// this function is called with lands on [`Streams::out`], per this
-/// module's own doc.
+/// this function is called with lands on [`Streams::out`].
 fn write_line(
     out: &mut dyn io::Write,
     fmt: Format,
@@ -215,33 +160,20 @@ fn write_line(
     }
 }
 
-/// How many rows of `cache` carry `name` -- counted over the WHOLE cache,
-/// never a selector's matched subset, so a selector cannot change how a
-/// line is labelled (`shep bleats web:0` still prints `web:0`, not `web`).
+/// How many rows of `cache` carry `name`, counted over the whole cache and
+/// never a selector's matched subset, so a selector cannot change how a line
+/// is labelled: `shep bleats web:0` still prints `web:0`, not `web`.
 fn instance_count(cache: &HashMap<u32, ProcessInfo>, name: &str) -> usize {
     cache.values().filter(|info| info.name == name).count()
 }
 
-/// Writes one of this module's own notices — not a sheep's line, and not
-/// `parse_selector`'s kind of usage error either — to `streams.err`, through
-/// [`output::emit_notice`] rather than [`output::emit_error`]: a notice's
-/// code (`log_path_unknown`, `dropped`, `daemon_shutdown`, ...) is not part
-/// of [`crate::exit::ExitCode`]'s taxonomy, and a clean run can still emit
-/// one on its way to exit 0 — reusing the error envelope would leave a
-/// `--format json` consumer unable to tell a diagnostic from a failure
-/// (whole-branch review item 4; `cli_e2e.rs`'s `assert_json_error` pins the
-/// opposite rule for real errors: JSON on stderr means the command failed).
-///
-/// A no-op when `quiet` is set: `--quiet`'s own doc
-/// (`cli::GlobalArgs::quiet`, "suppress non-essential output") is exactly
-/// what a notice is — a sheep's own line and a real error both still print
-/// regardless (whole-branch review item 2).
 /// One of `bleats`' own notices, unless `--quiet` asked for silence.
 ///
-/// Kept as a wrapper rather than folded into [`Streams::aside`] because the
-/// `quiet` gate is this verb's, not every verb's: `bleats` is the one command
-/// an operator leaves running, so its own asides are the ones worth being
-/// able to switch off without losing a sheep's output.
+/// Goes out through [`output::emit_notice`], not [`output::emit_error`]:
+/// its code is not part of [`crate::exit::ExitCode`]'s taxonomy, and a
+/// clean run can emit one on its way to exit 0. The `quiet` gate is this
+/// verb's own, not [`Streams::aside`]'s; a sheep's own line and a real
+/// error both still print under it.
 fn write_notice(streams: &mut Streams<'_>, quiet: bool, code: &str, message: &str) {
     if quiet {
         return;
@@ -253,56 +185,27 @@ fn write_notice(streams: &mut Streams<'_>, quiet: bool, code: &str, message: &st
 ///
 /// Binds only when lines average over 5 KiB, so in ordinary use the caller's
 /// line count is the bound that decides. A line count alone cannot bound
-/// memory on its own — one arbitrarily long line with no newline would
-/// defeat it — hence both bounds.
+/// memory: one arbitrarily long line with no newline would defeat it.
 const TAIL_WINDOW_BYTES: u64 = 256 * 1024;
 
-/// The last `limit` lines of one log file, bounded twice over: a
-/// [`TAIL_WINDOW_BYTES`] window from the end of the file, then `limit` once
-/// that window is split into lines.
+/// The last `limit` lines of one log file, bounded twice: a
+/// [`TAIL_WINDOW_BYTES`] window from the end of the file, then `limit`
+/// lines within it. Returns the lines and whether either bound cut them
+/// short.
 ///
-/// Returns the lines and whether EITHER bound was what cut them short — the
-/// caller needs to tell "this is all of it" from "this is not", and
-/// `whistle`'s `tail_bleats` (`crate::whistle::read`) surfaces that to a
-/// model as `BleatTail::truncated`. A model that cannot tell the two apart
-/// concludes a busy app went quiet. The line cap and the byte window are
-/// both real ways to lose the older half of a log — a sheep logging long
-/// structured lines fills [`TAIL_WINDOW_BYTES`] in under `limit` lines — so
-/// a caller that only asked the line cap would report `false` on a tail
-/// that is, in fact, not the whole story.
-///
-/// `limit` is a parameter rather than a constant because the callers each
-/// have their own answer: [`tail_log_files`] passes `--lines`, and `whistle`
-/// passes its own clamped `lines`.
-///
-/// `std::fs`, not `tokio::fs`: shep-cli's tokio does not carry the `fs`
-/// feature, and this is a bounded read on a one-shot command with nothing
-/// else on the runtime.
-///
-/// Each line comes back with the daemon's per-line timestamp stripped
-/// ([`shep_core::logstamp`]), so a line means the same thing here as it does
-/// on the bus — which is what `--follow` reads, and what `--format json`
-/// commits to.
-///
-/// A window boundary can land mid-line. When the seek away from the start
-/// of the file was non-zero, the bytes up to and including the first `\n`
-/// in the window are discarded rather than rendered as a fragment — half a
-/// line shown as a whole one is a lie. The remaining bytes are decoded with
-/// [`String::from_utf8_lossy`]: a log file is whatever the child wrote and
-/// is under no obligation to be UTF-8, and refusing to show a log over one
-/// bad byte is the wrong failure.
+/// `std::fs`, not `tokio::fs`: shep-cli's tokio has no `fs` feature. Each
+/// line loses its daemon-added timestamp ([`shep_core::logstamp`]), so it
+/// reads the same as a line from the bus. A non-zero seek discards bytes
+/// up to the first `\n`, rather than rendering a mid-line fragment.
 ///
 /// # Errors
-/// The file could not be opened, `stat`ed, seeked, or read. Notably
-/// includes [`io::ErrorKind::NotFound`] (the sheep has never run in this
-/// `$SHEP_HOME`) and `EISDIR` (`out_file`/`err_file` named a directory) —
-/// [`tail_log_files`] gives the two different treatment.
+/// The file could not be opened, `stat`ed, seeked, or read.
 pub(crate) fn read_tail(path: &Path, limit: usize) -> io::Result<(Vec<String>, bool)> {
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
     let start = len.saturating_sub(TAIL_WINDOW_BYTES);
     // `start > 0` means the byte window itself left content behind, before
-    // a single line has been counted — the file is bigger than the window.
+    // a single line has been counted: the file is bigger than the window.
     let window_truncated = start > 0;
     if start > 0 {
         file.seek(SeekFrom::Start(start))?;
@@ -321,14 +224,10 @@ pub(crate) fn read_tail(path: &Path, limit: usize) -> io::Result<(Vec<String>, b
     };
 
     let text = String::from_utf8_lossy(window);
-    // The daemon's per-line stamp comes back off here, and this is the one
-    // place it can: a `line` has one meaning across both of this verb's
-    // paths, and the follow path reads the bus, which carries a sheep's own
-    // bytes. Leaving it on would make `--no-follow --format json` report a
-    // sheep as having said something it did not, and make the same line
-    // differ between the two spellings of the same command. The stamp is
-    // still in the file for `tail`, `less` and `grep`, which is what it is
-    // for. (`shep_core::logstamp` argues both halves.)
+    // The daemon's per-line stamp comes off here, so a `line` has one
+    // meaning across both of this verb's paths: the follow path reads the
+    // bus, which carries a sheep's own bytes. The stamp stays in the file
+    // for `tail`, `less` and `grep`.
     let mut lines: Vec<String> = text
         .split('\n')
         .map(|line| shep_core::logstamp::strip(line).to_string())
@@ -346,22 +245,14 @@ pub(crate) fn read_tail(path: &Path, limit: usize) -> io::Result<(Vec<String>, b
 /// order, and returns the exit code that reports how that went.
 ///
 /// Within one sheep, `out_file` (unless `--err`) prints before `err_file`
-/// (unless `--out`) — this module's own doc states the ordering limitation
-/// that follows from it. The matched sheep are sorted before anything is
-/// read -- `cache` is a `HashMap` and its iteration order is arbitrary -- by
-/// name, then instance slot, then id, the one order every operator-facing
-/// listing takes (`shep_core::protocol::sort_flock`). It was id order until
-/// that rule was made the only one.
+/// (unless `--out`), with no merge between them. `cache` is a `HashMap`, so
+/// matched sheep are sorted first, by name, then instance slot, then id.
 ///
-/// A `None` path means the shepherd predates the field (module doc,
-/// [`shep_core::protocol::ProcessInfo::out_file`]) — one `log_path_unknown`
-/// notice per path the flags actually asked for, exit code unaffected. A
-/// missing file ([`io::ErrorKind::NotFound`]) is silent: the daemon creates
-/// both files at spawn, so a missing one means this sheep has never run in
-/// this `$SHEP_HOME`, and a notice per quiet sheep would spam stderr on a
-/// fresh flock. Any other read failure is one `log_unreadable` notice naming
-/// the path and the OS error, and the rest of the flock still prints — only
-/// this last case sets the final [`ExitCode::Failure`].
+/// A `None` path (a shepherd predating
+/// [`shep_core::protocol::ProcessInfo::out_file`]) is a `log_path_unknown`
+/// notice. A missing file is silent, since the daemon creates both at
+/// spawn. Any other read failure is a `log_unreadable` notice and sets
+/// [`ExitCode::Failure`]; the rest of the flock still prints.
 fn tail_log_files(
     streams: &mut Streams<'_>,
     quiet: bool,
@@ -373,14 +264,10 @@ fn tail_log_files(
         .values()
         .filter(|info| selector.matches(&info.name, info.id, info.fold.as_deref(), info.instance))
         .collect();
-    // `(name, instance, id)`, the one order every operator-facing shep
-    // listing takes (`shep_core::protocol::sort_flock`'s own doc). Not
-    // `sort_flock` itself: this is a `Vec<&ProcessInfo>` borrowed out of the
-    // cache, and copying the rows to reach the helper would buy nothing but a
-    // clone per sheep -- but the KEY is the shared one, character for
-    // character. Without the slot, `shep bleats web` read the instances of a
-    // reloaded app out of order, because a reload gives slot 0 a fresh high
-    // id and id alone then sorts that instance last.
+    // `(name, instance, id)`, the key `shep_core::protocol::sort_flock`
+    // takes, though not that helper: these are `&ProcessInfo` borrowed out of
+    // the cache. Without the slot, a reloaded app's instances sort wrong, a
+    // reload giving slot 0 a fresh high id.
     matched.sort_unstable_by(|a, b| {
         (a.name.as_str(), a.instance, a.id).cmp(&(b.name.as_str(), b.instance, b.id))
     });
@@ -389,14 +276,13 @@ fn tail_log_files(
 
     // One file, one read. Several instances can resolve to one path: every
     // `merge_logs` app does, and so does any app that set `out_file`
-    // explicitly. Reading per row printed the file once per instance.
+    // explicitly.
     let mut seen_paths: HashSet<String> = HashSet::new();
     let mut seen_notices: HashSet<String> = HashSet::new();
 
-    // Whether a path is shared between several rows, over the WHOLE cache
-    // rather than the matched subset -- a selector narrowing to one row
-    // must not hide that the underlying file is still shared, since the
-    // file itself has no idea which lines are whose either way.
+    // Whether a path is shared between several rows, over the whole cache
+    // rather than the matched subset: a selector narrowing to one row must
+    // not hide that the file is still shared.
     let mut path_owners: HashMap<(&'static str, String), usize> = HashMap::new();
     for info in cache.values() {
         for (stream_name, path) in [
@@ -436,10 +322,8 @@ fn tail_log_files(
                         continue;
                     }
                     // Only label a backlog line with a slot when this path
-                    // belongs to exactly one row: several instances sharing
-                    // one file (`merge_logs`, or a hand-set `out_file`)
-                    // interleave in it and no line says who wrote it, so
-                    // shep does not guess.
+                    // belongs to exactly one row: instances sharing one file
+                    // interleave in it and no line says who wrote it.
                     let shared = path_owners
                         .get(&(stream_name, path.to_string()))
                         .copied()
@@ -500,11 +384,10 @@ fn tail_log_files(
 /// Handles one [`BusEvent`] already known to be `Ok` (a `Lagged` item is
 /// handled by the caller, not here).
 ///
-/// `BusEvent` is `#[non_exhaustive]`: the `_` arm ignores anything this
-/// client does not recognise, silently — a follow must not die on a bus
-/// event a newer daemon added (Global Constraints). `Dropped` is NOT one of
-/// those unrecognised events — it is a real, named variant this client
-/// understands — so it gets its own arm rather than falling into that `_`.
+/// `BusEvent` is `#[non_exhaustive]`: the `_` arm silently ignores anything
+/// this client does not recognise, since a follow must not die on a bus event
+/// a newer daemon added. `Dropped` is a named variant this client
+/// understands, so it gets its own arm.
 fn handle_event(
     streams: &mut Streams<'_>,
     quiet: bool,
@@ -531,13 +414,10 @@ fn handle_event(
             Ok(())
         }
         BusEvent::Dropped { count } => {
-            // Daemon-side cause, deliberately NOT the `Lagged` arm's
-            // wording below: `Dropped` is the daemon's own outbound queue
-            // overflowing for this subscriber, while `Lagged` is this
-            // client's receiver falling behind reading its socket. The two
-            // failures live on opposite sides of the connection and must
-            // read differently, or a user cannot tell which end to
-            // investigate.
+            // Worded apart from the `Lagged` arm below: `Dropped` is the
+            // daemon's own outbound queue overflowing for this subscriber,
+            // `Lagged` is this client's receiver falling behind reading its
+            // socket. Opposite ends of the connection to investigate.
             write_notice(
                 streams,
                 quiet,
@@ -562,13 +442,11 @@ fn handle_event(
 
 /// Follows the bleats (log output) of the sheep matching `args.selector`.
 ///
-/// `quiet` is `cli::GlobalArgs::quiet` — it silences this module's own
-/// notices (whole-branch review item 2) and nothing else: a sheep's own
-/// line and a real error both still print regardless.
+/// `quiet` is `cli::GlobalArgs::quiet`: it silences this module's own notices
+/// and nothing else. A sheep's own line and a real error both still print.
 ///
-/// Delegates to [`bleats_with_signal`] with a real `SIGINT` as the
-/// interrupt source — see that function's own doc for the shape both
-/// share.
+/// Delegates to [`bleats_with_signal`] with a real `SIGINT` as the interrupt
+/// source.
 pub async fn bleats(
     client: &Client,
     streams: &mut Streams<'_>,
@@ -586,29 +464,17 @@ pub async fn bleats(
 }
 
 /// [`bleats`] with the interrupt injected, so the Ctrl-C branch has a test
-/// that does not need a real `SIGINT` — one would kill the test runner.
+/// that does not need a real `SIGINT`.
 ///
-/// One `Request::ListFlock` always goes out first, building the id -> name
-/// cache both paths share.
+/// One `Request::ListFlock` builds the id -> name cache both paths share.
+/// `--no-follow` stops there and hands off to [`tail_log_files`], issuing
+/// no `Request::Subscribe`. `--follow` subscribes and loops on
+/// `tokio::select!`: a line renders, a `Lagged` item is noted and the
+/// follow continues, the stream ending means the daemon is gone
+/// ([`ExitCode::DaemonUnreachable`]), and `interrupt` firing exits
+/// [`ExitCode::Success`].
 ///
-/// **`--no-follow`** (`args.no_follow`) stops there and hands off to
-/// [`tail_log_files`]: it never issues `Request::Subscribe`, so there is no
-/// stream, no `Lagged`, no `DaemonShutdown`, and nothing for `interrupt` to
-/// race — a bounded file read terminates on its own.
-///
-/// **`--follow`** (the default) subscribes (`log.*`/`daemon.*`) and loops
-/// over one `tokio::select!` with two arms, checked in this priority order
-/// every iteration:
-///
-/// 1. The event stream — a normal line is rendered, a `Lagged` item is
-///    noted to `streams.err` and the follow continues, and the stream
-///    ending (`None`) means the daemon is gone: flush and exit
-///    [`ExitCode::DaemonUnreachable`].
-/// 2. `interrupt` — a user ending a follow deliberately has not failed:
-///    flush and exit [`ExitCode::Success`].
-///
-/// `streams.out` is flushed on every exit path — a follow that ends with
-/// lines still buffered would otherwise lose them silently.
+/// `streams.out` is flushed on every exit path, or buffered lines are lost.
 pub async fn bleats_with_signal(
     client: &Client,
     streams: &mut Streams<'_>,
@@ -621,9 +487,9 @@ pub async fn bleats_with_signal(
         Err(code) => return code,
     };
 
-    // Order matters: the id/name cache is built from ONE listing taken
-    // before subscribing. Subscribing first would lose every line pushed
-    // while the listing is still in flight.
+    // The id/name cache is built from one listing taken before subscribing.
+    // Subscribing first would lose every line pushed while the listing is
+    // still in flight.
     let cache = match resolve_names(client, streams).await {
         Ok(cache) => cache,
         Err(code) => return code,
@@ -633,21 +499,9 @@ pub async fn bleats_with_signal(
         return tail_log_files(streams, quiet, &cache, &selector, args);
     }
 
-    // The backlog first, then the stream. Following alone shows only what
-    // arrives next, so a sheep that already died printed an empty screen
-    // while the reason sat in its log file -- which is how a boot-looping
-    // sheep came to look like it had logged nothing at all.
-    //
-    // Read before subscribing rather than after, so a line written in the
-    // gap between the two is missed rather than printed twice. Neither is
-    // free; a duplicate is the one a reader would notice and mistrust. The
-    // same trade is already made just above, where the id/name cache is
-    // built from a listing taken before the subscription.
-    //
-    // The tail's own exit code is deliberately discarded: an unreadable log
-    // for one sheep must not stop a follow over the whole flock, and a
-    // failed write to stdout will fail again in the loop below, where it is
-    // handled properly.
+    // Backlog before subscribing, so a line in the gap is missed rather
+    // than printed twice. The tail's exit code is discarded: an unreadable
+    // log for one sheep must not stop the follow over the whole flock.
     if args.lines > 0 {
         let _ = tail_log_files(streams, quiet, &cache, &selector, args);
     }
@@ -714,8 +568,7 @@ mod tests {
             .build()
     }
 
-    /// Like [`info`], but with a real instance slot -- `info` never sets
-    /// one, so it cannot express a multi-instance app on its own.
+    /// Like [`info`], but with a real instance slot: `info` never sets one.
     fn info_with_instance(id: u32, name: &str, slot: u32) -> ProcessInfo {
         ProcessInfo::builder(id, name, ProcStatus::Online)
             .pid(Some(1000 + id))
@@ -729,10 +582,8 @@ mod tests {
         BleatsArgs {
             selector: selector.to_string(),
             no_follow,
-            // The tail default is exercised by its own tests below. The
-            // follow tests here predate the backlog and assert on what the
-            // BUS delivers, so they ask for no history and keep testing
-            // exactly what they were written to test.
+            // The follow tests here assert on what the bus delivers, so
+            // this asks for no history.
             lines: crate::cli::DEFAULT_BLEAT_LINES,
             err,
             out,
@@ -766,7 +617,7 @@ mod tests {
         bleats_args(selector, true, false, true)
     }
 
-    /// Writes `content` to `dir/name` and returns the path as a `String` —
+    /// Writes `content` to `dir/name` and returns the path as a `String`,
     /// what a scripted [`ProcessInfo`]'s `out_file`/`err_file` needs.
     fn write_log(dir: &Path, name: &str, content: &str) -> String {
         let path = dir.join(name);
@@ -792,9 +643,8 @@ mod tests {
         };
         assert!(args.no_follow);
 
-        // The flag stores NO value: `--no-follow` is `ArgAction::SetTrue`, so a
-        // following token is not consumed by it and lands on the positional
-        // instead.
+        // `--no-follow` is `ArgAction::SetTrue` and stores no value, so a
+        // following token is not consumed by it and lands on the positional.
         let Commands::Bleats(args) = Cli::try_parse_from(["shep", "bleats", "--no-follow", "true"])
             .unwrap()
             .command
@@ -809,18 +659,15 @@ mod tests {
     }
 
     /// Every `bleats(...)`/`bleats_with_signal(...)` call in this module is
-    /// bounded by this timeout — a broken implementation that hangs (e.g. a
-    /// drain that never terminates, or a follow that never observes an
-    /// interrupt) fails with a named assertion instead of a killed CI job.
+    /// bounded by this timeout, so a hang fails with a named assertion
+    /// instead of a killed CI job.
     const RUN_TIMEOUT: Duration = Duration::from_secs(5);
 
-    /// `daemon.close_after_subscribe()` — not `daemon.close()` — ends the
-    /// connection right after the real `Subscribe` this test's `bleats`
-    /// call issues has been served and anything queued via `push` has been
-    /// flushed. That is what makes this test scheduler-independent: a
-    /// follow that runs to end-of-stream observes everything pushed before
-    /// the close, in order, on any executor — there is no race between "the
-    /// events arrived" and "the loop decided nothing was buffered".
+    /// `daemon.close_after_subscribe()`, not `daemon.close()`: it ends the
+    /// connection only after the real `Subscribe` this test's `bleats` call
+    /// issues has been served and every `push`ed event flushed, so a follow
+    /// running to end-of-stream observes everything in order regardless of
+    /// scheduling.
     #[tokio::test]
     async fn ids_resolve_to_names_from_one_listing_and_unknown_ids_render_bare() {
         let dir = tempfile::tempdir().unwrap();
@@ -923,10 +770,8 @@ mod tests {
         }
     }
 
-    /// The daemon's topic filter globs on `log.out` / `log.err`, which carry
-    /// no identity — so this filtering CANNOT have happened server-side,
-    /// and a test that let the fake daemon pre-filter would prove nothing.
-    /// Same `close_after_subscribe` reasoning as the test above.
+    /// The daemon's topic filter globs on `log.out` / `log.err`, which
+    /// carry no sheep identity, so this filtering must happen client-side.
     #[tokio::test]
     async fn a_selector_filters_client_side_on_the_resolved_id_set() {
         let dir = tempfile::tempdir().unwrap();
@@ -973,16 +818,10 @@ mod tests {
         );
     }
 
-    /// D11's whole asymmetry: unlike the backlog, a follow always knows
-    /// which sheep wrote a line -- the daemon emits `BusEvent::LogOut` per
-    /// sheep -- so it labels a multi-instance app's lines with their slot
-    /// even though `info_with_instance`'s two rows would share a file if
-    /// this went through the backlog path. This test alone only catches a
-    /// `resolved_instance` that drops the label outright; the gate that
-    /// decides WHEN to apply it and the `LogErr` arm's own threading each
-    /// have their own test below
-    /// (`a_single_instance_app_with_a_slot_on_its_row_still_follows_bare`,
-    /// `a_multi_instance_apps_followed_stderr_line_carries_its_slot_too`).
+    /// A follow always knows which sheep wrote a line, the daemon emitting
+    /// `BusEvent::LogOut` per sheep, so it labels a multi-instance app's
+    /// lines with their slot even though the two rows here would share a
+    /// file on the backlog path.
     #[tokio::test]
     async fn a_multi_instance_apps_follow_labels_its_lines_with_the_slot() {
         let dir = tempfile::tempdir().unwrap();
@@ -1034,13 +873,10 @@ mod tests {
         );
     }
 
-    /// Minor fix bundle: a selector narrowed to one instance must not change
-    /// how that instance's line is labelled -- `instance_count` counts over
-    /// the WHOLE cache, never the matched subset, so `web:0` still prints
-    /// `web:0` even though the cache holds a `web:1` this selector excludes.
-    /// This deliberately differs from the flock table's own rollup rule,
-    /// where the count describes the rows actually listed -- a table row
-    /// summarises a listing, a log prefix identifies a process.
+    /// A selector narrowed to one instance must not change how it is
+    /// labelled: `instance_count` counts over the whole cache, so `web:0`
+    /// still prints `web:0` even though the cache holds a `web:1` this
+    /// selector excludes.
     #[tokio::test]
     async fn a_selector_narrowed_to_one_instance_does_not_change_its_label() {
         let dir = tempfile::tempdir().unwrap();
@@ -1082,12 +918,9 @@ mod tests {
         );
     }
 
-    /// Guards the `instance_count(cache, &info.name) > 1` gate in
-    /// `resolved_instance` specifically: `info_with_instance`'s row DOES
-    /// carry `.instance(Some(0))`, so a `resolved_instance` that returned
-    /// `info.instance` unconditionally -- skipping the "more than one
-    /// instance registered" check -- would still print `web:0` here. Only a
-    /// cache with a single row for the app can catch that.
+    /// Guards `resolved_instance`'s "more than one instance registered"
+    /// check: this row carries `.instance(Some(0))`, so returning it
+    /// unconditionally would still print `web:0` here.
     #[tokio::test]
     async fn a_single_instance_app_with_a_slot_on_its_row_still_follows_bare() {
         let dir = tempfile::tempdir().unwrap();
@@ -1176,10 +1009,9 @@ mod tests {
         );
     }
 
-    /// The stream stays open for the whole test — the fake is never closed
-    /// — so the ONLY thing that can end this follow is the injected
-    /// interrupt. A `bleats` that ignored the interrupt arm hangs and the
-    /// timeout fails it.
+    /// The stream stays open for the whole test, so only the injected
+    /// interrupt can end this follow; ignoring it hangs and the timeout
+    /// fails the test.
     #[tokio::test]
     async fn ctrl_c_during_a_follow_exits_success() {
         let dir = tempfile::tempdir().unwrap();
@@ -1221,18 +1053,12 @@ mod tests {
         );
     }
 
-    /// The pair that makes the shutdown branch bite. Both end in
-    /// `DaemonUnreachable` — the daemon went away either way — so the exit
-    /// code alone discriminates nothing. The NOTICE is the behaviour under
-    /// test: a `bleats` that never matches `BusEvent::DaemonShutdown` and
-    /// just maps any end-of-stream to `DaemonUnreachable` passes the first
-    /// assertion of each and fails the stderr assertion of the first.
+    /// Both end in `DaemonUnreachable`, so the exit code alone discriminates
+    /// nothing; the notice text is the behaviour under test.
     ///
-    /// `close_after_subscribe`, not `close()`: this test genuinely needs
-    /// the connection to end mid-follow (there is no interrupt here, and
-    /// `follow_args` never terminates on its own), and `close_after_subscribe`
-    /// ends it deterministically, right after the real `Subscribe` this
-    /// test's `bleats` call issues has been served.
+    /// `close_after_subscribe`, not `close()`: this test needs the
+    /// connection to end mid-follow, deterministically, right after
+    /// `Subscribe` is served.
     #[tokio::test]
     async fn a_daemon_shutdown_mid_follow_is_announced_before_the_stream_ends() {
         let dir = tempfile::tempdir().unwrap();
@@ -1266,8 +1092,6 @@ mod tests {
         );
     }
 
-    /// Same `close_after_subscribe` usage as the test above, and for the
-    /// same reason.
     #[tokio::test]
     async fn a_stream_that_just_ends_reports_no_shutdown_notice() {
         let dir = tempfile::tempdir().unwrap();
@@ -1300,13 +1124,10 @@ mod tests {
         );
     }
 
-    /// Whole-branch review item 2: `--quiet` (`GlobalArgs::quiet`, threaded
-    /// in here as `bleats`' own `quiet` parameter) must actually do
-    /// something, and this module's notices are what it was given meaning
-    /// against. Same shutdown scenario as
-    /// `a_daemon_shutdown_mid_follow_is_announced_before_the_stream_ends`,
-    /// with `quiet: true` instead of `false` — the exit code must not move
-    /// (the daemon really did go away either way), only the notice text.
+    /// Same shutdown scenario as
+    /// [`a_daemon_shutdown_mid_follow_is_announced_before_the_stream_ends`],
+    /// with `quiet: true`: the exit code must not move, only the notice
+    /// text.
     #[tokio::test]
     async fn quiet_suppresses_the_daemon_shutdown_notice_but_not_the_exit_code() {
         let dir = tempfile::tempdir().unwrap();
@@ -1344,11 +1165,9 @@ mod tests {
         );
     }
 
-    /// The other half of `--quiet`'s contract: it narrows notices only.
-    /// `resolved_name`/`write_line` never see `quiet` at all (their call
-    /// sites are unconditional in `handle_event`), so this is a
-    /// belt-and-braces end-to-end check that a sheep's own line still
-    /// reaches `streams.out` under `quiet: true`.
+    /// `resolved_name`/`write_line` never see `quiet` (their call sites are
+    /// unconditional in `handle_event`), so this checks end-to-end that a
+    /// sheep's own line still reaches `streams.out` under `quiet: true`.
     #[tokio::test]
     async fn quiet_does_not_suppress_a_sheeps_own_line() {
         let dir = tempfile::tempdir().unwrap();
@@ -1386,42 +1205,15 @@ mod tests {
         );
     }
 
-    /// Same `close_after_subscribe` reasoning as
-    /// `ids_resolve_to_names_from_one_listing_and_unknown_ids_render_bare` —
-    /// but unlike that test, this one is **not** scheduler-independent, for
-    /// a different reason than the drain arm the amendment retired.
+    /// Depends on the default current-thread runtime: `overrun_by` pushes
+    /// `EVENT_CHANNEL_CAPACITY + n` events in one burst, and only a
+    /// receiver that has not yet been scheduled falls behind enough to see
+    /// a `Lagged`. Under `multi_thread`, real parallelism keeps the
+    /// receiver caught up and no lag is produced.
     ///
-    /// **Verified, current known limitation**: run 10/10 in isolation under
-    /// `#[tokio::test(flavor = "multi_thread")]`, this test fails 10/10 —
-    /// `stderr` comes back empty, meaning `overrun_by`'s forced lag never
-    /// happens. `overrun_by` pushes `EVENT_CHANNEL_CAPACITY + n` events that
-    /// the fake flushes onto the wire in one burst right after `Subscribe`;
-    /// a `Lagged` only appears if this test's own `EventStream` falls behind
-    /// that burst by more than `EVENT_CHANNEL_CAPACITY` before it drains any
-    /// of it. Under the default current-thread runtime that reliably
-    /// happens: the connection actor decodes the whole burst in one
-    /// uninterrupted turn before this test's task gets scheduled again.
-    /// Under `multi_thread`, real parallelism lets this test's receiver keep
-    /// pace with the actor as events arrive, so the backlog never crosses
-    /// `EVENT_CHANNEL_CAPACITY` and no lag is ever produced. The other six
-    /// tests converted alongside this one all pass 10/10 in the same
-    /// isolated check — this is `overrun_by`'s own timing dependency, not a
-    /// symptom of the retired drain arm, and forcing a deterministic lag
-    /// would need a synchronization point `FakeDaemon` does not have today.
-    /// `cfg(unix)` on top of the scheduling dependency this test's own doc
-    /// already describes above. `overrun_by` produces a lag only when the
-    /// connection actor decodes the whole burst in one uninterrupted turn
-    /// before this task is scheduled again — the doc says so, and says that
-    /// a deterministic version would need a synchronization point
-    /// `FakeDaemon` does not have.
-    ///
-    /// A named pipe wakes its reader on a different schedule than a unix
-    /// socket does, so on Windows the receiver keeps pace and the backlog
-    /// never crosses `EVENT_CHANNEL_CAPACITY` — the same way the doc
-    /// records `multi_thread` defeating it. That is this fixture's known
-    /// fragility meeting a second transport, not a lag notice that stopped
-    /// working: `EventStream`'s own `Lagged` handling is covered by
-    /// `shep-client`'s tests, which run on both platforms.
+    /// `cfg(unix)`: a named pipe wakes its reader on a different schedule,
+    /// so on Windows the receiver keeps pace and the lag never triggers,
+    /// the same way `multi_thread` defeats it above.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_lag_notice_reaches_stderr_and_the_follow_continues() {
@@ -1466,20 +1258,13 @@ mod tests {
         );
     }
 
-    /// fails if `BusEvent::Dropped` falls into `handle_event`'s `_ => Ok(())`
-    /// catch-all and vanishes — the daemon's own outbound queue overflowing
-    /// is exactly the "a sheep went quiet" failure mode this module's doc
-    /// warns against swallowing silently.
+    /// Fails if `BusEvent::Dropped` falls into `handle_event`'s `_ =>
+    /// Ok(())` catch-all and vanishes.
     ///
-    /// `Dropped` (the daemon's queue) and `Lagged` (this client's own
-    /// receiver falling behind) are different causes and must read
-    /// differently, so this asserts the daemon-side wording specifically —
-    /// `stderr.contains("dropped")` alone would also pass if the `Lagged`
-    /// arm's wording were reused by mistake, which is exactly the bug this
-    /// test exists to catch.
-    ///
-    /// Same `close_after_subscribe` reasoning as
-    /// `ids_resolve_to_names_from_one_listing_and_unknown_ids_render_bare`.
+    /// `Dropped` (the daemon's queue) and `Lagged` (this client's receiver
+    /// falling behind) must read differently, so this asserts the
+    /// daemon-side wording specifically: a bare `stderr.contains("dropped")`
+    /// would also pass if the `Lagged` arm's wording were reused by mistake.
     #[tokio::test]
     async fn a_dropped_notice_reaches_stderr_worded_for_the_daemon_side_cause() {
         let dir = tempfile::tempdir().unwrap();
@@ -1519,16 +1304,9 @@ mod tests {
         );
     }
 
-    /// Important fix (item 3): every other test in this module uses
-    /// `Format::Table`, so mutating the JSON line shape (renaming a field,
-    /// or rendering table rows under `--format json`) left every test green.
-    /// Global Constraints pins every command's JSON shape; this is that pin
-    /// for `bleats`' own line shape (deferred by the brief to a Task 12
-    /// fixture, pinned independently here since item 2 puts that fixture's
-    /// shape in doubt).
-    ///
-    /// Same `close_after_subscribe` reasoning as
-    /// `ids_resolve_to_names_from_one_listing_and_unknown_ids_render_bare`.
+    /// Every other test in this module uses `Format::Table`, so a JSON
+    /// line shape change (a renamed field, or rendering table rows under
+    /// `--format json`) would leave every other test green.
     #[tokio::test]
     async fn json_format_renders_the_pinned_six_key_line_shape() {
         let dir = tempfile::tempdir().unwrap();
@@ -1578,7 +1356,7 @@ mod tests {
         );
     }
 
-    /// A writer that always fails with `BrokenPipe` — `shep bleats | head`
+    /// A writer that always fails with `BrokenPipe`: `shep bleats | head`
     /// closing the reading end is the normal way this streaming verb ends,
     /// not an error.
     struct BrokenPipeWriter;
@@ -1593,16 +1371,12 @@ mod tests {
         }
     }
 
-    /// Important fix (item 5): `shep bleats | head` is this verb's normal
-    /// case, not an error — `write_outcome` already treats a `BrokenPipe`
-    /// write failure as [`ExitCode::Success`], but nothing in this module
-    /// exercised that path through an actual write failure.
+    /// `write_outcome` already treats a `BrokenPipe` write as
+    /// [`ExitCode::Success`]; this exercises that path through an actual
+    /// write failure.
     ///
-    /// `close_after_subscribe` is scripted here too, for consistency with
-    /// the rest of this module's follow-mode tests, but the exit code stays
-    /// `Success` regardless: the write fails on the very first event, which
-    /// returns from `handle_event`'s write-error branch long before the
-    /// stream could ever reach end-of-stream.
+    /// The write fails on the very first event, well before
+    /// `close_after_subscribe` could end the stream.
     #[tokio::test]
     async fn a_broken_pipe_while_writing_a_line_exits_success() {
         let dir = tempfile::tempdir().unwrap();
@@ -1641,12 +1415,9 @@ mod tests {
         );
     }
 
-    // --- Task 10a: `--no-follow` reads the log files ----------------------
-    //
-    // None of these subscribe: `--no-follow` never issues `Request::Subscribe`
-    // at all, so there is no `daemon.close()`/`close_after_subscribe()` to
-    // script and no scheduler dependence to worry about — a bounded file read
-    // terminates on its own, which is exactly what `RUN_TIMEOUT` guards.
+    // --- `--no-follow` reads the log files ---
+    // None of these subscribe, so there is nothing for `RUN_TIMEOUT` to
+    // guard but a bounded file read.
 
     /// A `--no-follow` still wired to the bus fails the second assertion; one
     /// wired to neither fails the first. This is the test that tells the two
@@ -1694,10 +1465,9 @@ mod tests {
         );
     }
 
-    /// The bug the maintainer hit: a sheep crashes, `shep bleats <name>` is run after
-    /// the fact, and following alone prints an empty screen while the reason
-    /// sits in the log file. The backlog is what makes the reason reachable
-    /// without having to start the sheep again in a second window.
+    /// A sheep that already crashed before `shep bleats <name>` runs: the
+    /// backlog is what makes its last output reachable without starting it
+    /// again in a second window.
     #[tokio::test]
     async fn following_prints_the_existing_log_before_it_follows() {
         let dir = tempfile::tempdir().unwrap();
@@ -1986,12 +1756,9 @@ mod tests {
         );
     }
 
-    /// `truncated` must report `true` when the byte window is what cut the
-    /// tail short, even when the line cap never binds — a sheep logging a
-    /// few long, structured lines can fill `TAIL_WINDOW_BYTES` in far fewer
-    /// than `limit` lines. Before this test, `read_tail` reported `false`
-    /// here, and `whistle`'s `tail_bleats` handed a model exactly that
-    /// wrong answer.
+    /// `truncated` must report `true` when the byte window alone cut the
+    /// tail short: a sheep logging a few long, structured lines can fill
+    /// `TAIL_WINDOW_BYTES` in far fewer than `limit` lines.
     #[test]
     fn read_tail_reports_truncated_on_a_byte_window_cut_alone() {
         let dir = tempfile::tempdir().unwrap();
@@ -2010,8 +1777,8 @@ mod tests {
     }
 
     /// Three ways: `--out` (out lines only), `--err` (err lines only),
-    /// neither (out lines, then err lines — this module's own pin on
-    /// within-sheep ordering).
+    /// neither (out lines, then err lines, this module's own within-sheep
+    /// ordering).
     #[tokio::test]
     async fn out_and_err_select_which_file_is_read() {
         async fn run(args: BleatsArgs) -> String {
@@ -2061,18 +1828,11 @@ mod tests {
         );
     }
 
-    /// fails if the sheep are tailed in the order the cache happens to hold
-    /// them, or in id order.
+    /// Fails if the sheep are tailed in id order rather than name order.
     ///
-    /// The fixture is built so those two answers and the right one are all
-    /// different. `b` holds id 1 and `a` holds id 2, so id order is `b, a`
-    /// while name order is `a, b`; the listing is scripted `b, a` so the
-    /// cache's arbitrary `HashMap` order cannot be what makes the assertion
-    /// pass either.
-    ///
-    /// If id order and name order ever match, the test passes without being
-    /// able to tell the two apart, so the fixture must keep them
-    /// disagreeing.
+    /// `b` holds the lower id but sorts after `a` by name, and the listing
+    /// is scripted in id order, so neither a `HashMap`'s arbitrary order
+    /// nor id order can make the assertion pass by accident.
     #[tokio::test]
     async fn files_are_printed_in_name_order() {
         let dir = tempfile::tempdir().unwrap();
@@ -2114,17 +1874,13 @@ mod tests {
         );
     }
 
-    /// fails if one app's instances are tailed in id order rather than in
-    /// slot order.
+    /// Fails if one app's instances are tailed in id order rather than
+    /// slot order: a reload gives slot 0 a fresh high id, so id order
+    /// alone would read 1, 2, 0.
     ///
-    /// A reload replaces slot 0 with a fresh process at a fresh high id, so
-    /// after one, id order reads the app's instances 1, 2, 0. The listing
-    /// every other surface prints is `(name, instance, id)`, and this one
-    /// claimed to take it while sorting by `(name, id)`.
-    ///
-    /// The fixture puts slot 0 at the HIGHEST id, so id order and slot order
-    /// disagree, and scripts the listing in slot order so the cache's
-    /// arbitrary `HashMap` order cannot be what makes the assertion pass.
+    /// Slot 0 is given the highest id here and the listing is scripted in
+    /// slot order, so neither id order nor a `HashMap`'s arbitrary order
+    /// can make the assertion pass by accident.
     #[tokio::test]
     async fn one_apps_instances_are_printed_in_slot_order() {
         let dir = tempfile::tempdir().unwrap();
@@ -2175,7 +1931,7 @@ mod tests {
     }
 
     /// The daemon creates both files at spawn, so a missing one means this
-    /// sheep has never run in this `$SHEP_HOME` — not a fault worth a
+    /// sheep has never run in this `$SHEP_HOME`, not a fault worth a
     /// notice.
     #[tokio::test]
     async fn a_missing_file_is_silent_and_the_rest_still_print() {

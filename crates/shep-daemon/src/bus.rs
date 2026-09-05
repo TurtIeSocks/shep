@@ -18,13 +18,10 @@ use tokio::task::JoinHandle;
 
 /// Ring capacity of the daemon event bus.
 ///
-/// Every subscriber reads this one ring at its own cursor, so the number is
-/// the per-subscriber backlog: a subscriber more than `BUS_CAPACITY` events
-/// behind loses the OLDEST ones and is told how many (spec §6's
-/// drop-oldest-plus-`Dropped`-notice rule). 1024 events is ~1 MiB at a 1 KiB
-/// log line — enough that a client stalled for a second on a chatty sheep
-/// catches up, small enough to leave the single-digit-MB idle footprint goal
-/// alone (spec §14.11).
+/// Every subscriber reads this ring at its own cursor: falling more than
+/// `BUS_CAPACITY` events behind loses the oldest ones and reports the count.
+/// 1024 events is ~1 MiB at a 1 KiB log line, enough for a client stalled a
+/// second on a chatty sheep to catch up without growing the idle footprint.
 pub const BUS_CAPACITY: usize = 1024;
 
 /// Ceiling on topic patterns per `Subscribe`.
@@ -49,23 +46,14 @@ pub fn new_bus() -> Bus {
 /// The daemon's event channel, plus the one question the channel cannot
 /// answer: whether anything is listening for log lines.
 ///
-/// A `broadcast::Sender`'s `receiver_count` is the wrong question here and
-/// would always answer "yes". Two subscribers exist for the daemon's whole
-/// life and neither reads a log line: [`crate::dogs::spawn_dog_watch`] acts
-/// only on a dog's `Errored`, and the snapshot writer only on a lifecycle
-/// change. A sheep's stdout therefore woke both of them, once per line, to
-/// look at an event and drop it — measured at 39% of the daemon's per-line
-/// CPU on a sheep emitting 7,315 lines/s with nothing attached.
+/// `broadcast::Sender::receiver_count` would always answer yes: two
+/// subscribers exist for the daemon's whole life and neither reads a log
+/// line. This counts only subscribers whose `TopicFilter` actually matches
+/// a log topic, and [`Self::publish_log`] skips the publish while it is zero.
 ///
-/// So the count kept here is of subscribers whose `TopicFilter` actually
-/// matches a log topic, which in practice means a `shep bleats`, a bark dog,
-/// or a `lookout`, and [`Self::publish_log`] skips the whole publish while it
-/// is zero.
+/// # Debug
 ///
-/// # Debug (IR-41)
-///
-/// Derived, unredacted, and carrying nothing to redact: a channel handle and
-/// a counter.
+/// Derived, unredacted: only a channel handle and a counter.
 #[derive(Clone, Debug)]
 pub struct Bus {
     tx: broadcast::Sender<SharedEvent>,
@@ -76,26 +64,13 @@ pub struct Bus {
 impl Bus {
     /// Publishes one log line, unless nothing is subscribed to log topics.
     ///
-    /// # Why dropping it is not a lost event
-    ///
-    /// A `broadcast` receiver begins at the channel's CURRENT tail
-    /// (`tokio::sync::broadcast`'s `new_receiver` reads `tail.pos` into the
-    /// receiver's cursor), so a subscriber has never been shown an event
-    /// published before it attached. An event skipped while the count is zero
-    /// is therefore one no receiver could have read had it been published:
-    /// the ring would have carried it, every existing subscriber would have
-    /// filtered it out, and the next one to attach would have started past
-    /// it.
-    ///
-    /// What the gate does widen, by the time it takes one atomic store to
-    /// become visible to another core, is a window that is already there:
-    /// `Self::subscribe_for` registers a filter's interest BEFORE it takes
-    /// its receiver, so between an operator running `shep bleats` and its
-    /// first line there has always been an interval in which a line goes to
-    /// nobody. Nothing orders a client's `Subscribe` against a sheep's
-    /// stdout, and nothing could.
+    /// Not a lost event: a `broadcast` receiver starts at the channel's
+    /// current tail, so nothing published before a subscriber attached was
+    /// ever visible to it. `Self::subscribe_for` registers interest before
+    /// taking the receiver, so a race window between a `Subscribe` and the
+    /// first line already exists independent of this gate.
     pub fn publish_log(&self, event: BusEvent) {
-        // Relaxed: nothing is published THROUGH this counter, and the only
+        // Relaxed: nothing is published through this counter, and the only
         // consequence of reading a stale zero is the race above.
         if self.log_subscribers.load(Ordering::Relaxed) == 0 {
             return;
@@ -105,11 +80,10 @@ impl Bus {
 
     /// A receiver for one subscription, plus its registered log interest.
     ///
-    /// Registered before the receiver exists, so the receiver can only ever
-    /// miss events from before it was created — see [`Self::publish_log`].
-    /// The guard restores the count when it is dropped, which for a
-    /// forwarder is when its task ends OR is aborted, since aborting a task
-    /// drops the future and everything it captured.
+    /// Registered before the receiver exists, so it can only ever miss
+    /// events from before it was created (see [`Self::publish_log`]). The
+    /// guard restores the count on drop, whether the forwarder's task ends
+    /// or is aborted.
     #[must_use]
     fn subscribe_for(
         &self,
@@ -134,7 +108,7 @@ impl Bus {
 impl Deref for Bus {
     type Target = broadcast::Sender<SharedEvent>;
 
-    // IR-25: a field return, on the path every non-log publish takes.
+    // Trivial field return: worth inlining, it's on every non-log publish.
     #[inline]
     fn deref(&self) -> &broadcast::Sender<SharedEvent> {
         &self.tx
@@ -143,20 +117,14 @@ impl Deref for Bus {
 
 /// Announces one `config.dog.<name>` per dog whose section changed.
 ///
-/// Says THAT it changed and nothing more, per the dog-config design's
-/// decision 8: a dog re-asks with `Request::DogConfig` and decides for
-/// itself whether that means swapping values, rebinding a listener or
-/// asking for its own restart.
+/// Says only that it changed: a dog re-asks with `Request::DogConfig` and
+/// decides for itself whether to swap values, rebind a listener, or
+/// restart. Exactly one event per name, none for an empty list. A dog told
+/// twice re-asks twice, which for one that restarts on a change is two
+/// restarts an operator reads as instability.
 ///
-/// Exactly one event per name, and none at all for an empty list, which is
-/// what every boot after the first passes. A dog told twice re-asks twice,
-/// and for a dog that answers a change by restarting itself that is two
-/// restarts on the column an operator reads as instability.
-///
-/// Not published through [`Bus::publish_log`]'s gate: that gate counts
-/// subscribers wanting LOG topics, and a dog subscribed to its own config
-/// is not one of them. The send is a no-op when nothing is attached, which
-/// is the ordinary case here.
+/// Not gated by [`Bus::publish_log`]: that gate counts subscribers wanting
+/// log topics, and a dog watching its own config is not one.
 pub fn publish_dog_config_changed(bus: &Bus, dogs: &[String]) {
     for dog in dogs {
         let _ = bus.send(BusEvent::DogConfigChanged { dog: dog.clone() }.into());
@@ -196,28 +164,15 @@ pub(crate) fn test_bus(capacity: usize) -> (Bus, broadcast::Receiver<SharedEvent
 
 /// One published [`BusEvent`], plus the wire frame its subscribers share.
 ///
-/// The bus carries this rather than the event itself because both of the
-/// costs it removes are LINEAR IN SUBSCRIBERS. A `broadcast` channel clones
-/// its item once per receiver, which for a `LogOut` is a fresh copy of the
-/// line; and every forwarder used to encode its own frame from that copy,
-/// so the same bytes were built once per attached client. Measured on a
-/// sheep logging 7,315 lines/s: one attached `shep bleats` took the daemon
-/// from 23.99% of a core to 37.50%, +18.6 us per line. Here a clone is a
-/// refcount bump and the frame is built by whichever forwarder asks first.
+/// Both costs this removes are linear in subscriber count: a `broadcast`
+/// clone is a refcount bump instead of copying the event, and the frame is
+/// encoded once, by whichever forwarder asks first, instead of per client.
 ///
-/// The bytes are unchanged — this is how OFTEN [`encode_frame`] runs, never
-/// what it produces.
+/// # Debug
 ///
-/// # Debug (IR-41)
-///
-/// Unredacted, and hand-written rather than derived. Nothing here is a
-/// secret that [`BusEvent`]'s own `Debug` is not already trusted with — the
-/// wrapper adds a cached frame, which is that same event encoded, and a
-/// test-only encode tally. Both are dropped from the output: the frame
-/// because printing a payload twice tells a reader nothing, and the tally
-/// because a `#[cfg(test)]` field in a derived format would make the string
-/// this type prints under `cargo test` a different one from the string it
-/// prints in a release daemon.
+/// Hand-written, so the cached frame and the test-only encode tally stay
+/// out: printing the frame twice tells a reader nothing, and a
+/// `#[cfg(test)]` field would make the debug string differ under `cargo test`.
 #[derive(Clone)]
 pub struct SharedEvent(Arc<Shared>);
 
@@ -230,21 +185,19 @@ impl core::fmt::Debug for SharedEvent {
     }
 }
 
-/// [`SharedEvent`]'s payload — one allocation per published event.
+/// [`SharedEvent`]'s payload: one allocation per published event.
 #[derive(Debug)]
 struct Shared {
     event: BusEvent,
     /// The wire frame, filled by the first forwarder that needs it.
     ///
-    /// `Some(None)` once encoding has been TRIED and failed, so an event
-    /// nothing can encode is reported once rather than once per subscriber.
+    /// `Some(None)` once encoding has been tried and failed, so an
+    /// unencodable event is reported once, not once per subscriber.
     frame: OnceLock<Option<Bytes>>,
     /// How many times [`encode_frame`] has actually run for this event.
     ///
-    /// Test-only. [`OnceLock`] already makes "at most once" a fact about the
-    /// type; what a test cannot otherwise see is that the encode ran AT ALL
-    /// through this path, and that no future edit reintroduces a
-    /// per-subscriber one beside it.
+    /// [`OnceLock`] already guarantees at most once; this checks that it
+    /// ran at all through this path rather than a per-subscriber one.
     #[cfg(test)]
     encodes: AtomicUsize,
 }
@@ -306,8 +259,8 @@ impl SharedEvent {
 impl Deref for SharedEvent {
     type Target = BusEvent;
 
-    // IR-25: a field return through one pointer hop, on the path every
-    // subscriber takes for every event.
+    // Trivial pointer-hop return: on the path every subscriber takes for
+    // every event.
     #[inline]
     fn deref(&self) -> &BusEvent {
         &self.0.event
@@ -347,8 +300,8 @@ impl TopicFilter {
     /// Compiles one subscription's topic patterns into a matcher.
     ///
     /// # Errors
-    /// - [`BusError::TooManyPatterns`] — more than [`MAX_TOPIC_PATTERNS`].
-    /// - [`BusError::BadPattern`] — a pattern the glob compiler rejects.
+    /// - [`BusError::TooManyPatterns`]: more than [`MAX_TOPIC_PATTERNS`].
+    /// - [`BusError::BadPattern`]: a pattern the glob compiler rejects.
     pub fn new(patterns: &[String]) -> Result<Self, BusError> {
         if patterns.len() > MAX_TOPIC_PATTERNS {
             return Err(BusError::TooManyPatterns(patterns.len()));
@@ -379,11 +332,10 @@ impl TopicFilter {
 
     /// True when this filter would match either log topic.
     ///
-    /// Asked once per subscription, never per event, and the answer is what
-    /// [`Bus::publish_log`] gates on. The two topic strings are duplicated
-    /// from [`BusEvent::topic`] because there is no event to ask — a
-    /// publisher decides whether to BUILD one. `wants_logs_agrees_with_the
-    /// _topics_log_events_carry` is what keeps the two in step.
+    /// Asked once per subscription, never per event: the answer is what
+    /// [`Bus::publish_log`] gates on. The two topic strings duplicate
+    /// [`BusEvent::topic`], since there is no event to ask before one is
+    /// published.
     #[must_use]
     pub fn wants_logs(&self) -> bool {
         ["log.out", "log.err"]
@@ -392,9 +344,7 @@ impl TopicFilter {
     }
 
     /// The source patterns this filter was compiled from.
-    // IR-25: trivial field return, no branch — inline across codegen units.
-    // Not per-frame hot like `matches` above (a `GlobSet` call, not a
-    // forwarding one), so `#[inline]`, never `#[inline(always)]`.
+    // `#[inline]`, not `#[inline(always)]`: not per-frame hot like `matches`.
     #[inline]
     #[must_use]
     #[allow(dead_code, reason = "called by this crate's own tests")]
@@ -403,15 +353,11 @@ impl TopicFilter {
     }
 }
 
-/// Error type returned from [`TopicFilter::new`]
+/// Error type returned from [`TopicFilter::new`].
 ///
-/// `#[non_exhaustive]`: today's two variants cover a pattern that will not
-/// compile and a subscribe that asked for too many, and a future
-/// subscribe-time check — a wildcard-depth limit, or a reserved-topic
-/// refusal — would need its own variant rather than stretching
-/// [`Self::BadPattern`] to cover a rule the compiler never rejected, and
-/// shep-daemon is a published library an out-of-tree matcher should not
-/// break for (IR-20).
+/// `#[non_exhaustive]`: a future subscribe-time check (a wildcard-depth
+/// limit, a reserved-topic refusal) would need its own variant rather than
+/// stretching [`Self::BadPattern`], and shep-daemon is a published library.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BusError {
@@ -457,12 +403,9 @@ fn step(received: Result<SharedEvent, RecvError>, filter: &TopicFilter) -> Forwa
     let event = match received {
         Ok(event) if filter.matches(&event) => event,
         Ok(_) => return Forwarded::Skip,
-        // Drop notices BYPASS the filter on purpose: a subscriber to
-        // `process.*` still has to learn it lost events, and `daemon.dropped`
-        // would otherwise be filtered out exactly when it matters most.
-        //
-        // Wrapped like any other event, but the count is this subscriber's
-        // own, so this is the one frame per lag nothing else can share.
+        // Drop notices bypass the filter: a `process.*` subscriber still
+        // must learn it lost events. Wrapped like any event, but the count
+        // is this subscriber's own, so it's the one frame nothing shares.
         Err(RecvError::Lagged(count)) => SharedEvent::new(BusEvent::Dropped { count }),
         Err(RecvError::Closed) => return Forwarded::Stop,
     };
@@ -474,18 +417,14 @@ fn step(received: Result<SharedEvent, RecvError>, filter: &TopicFilter) -> Forwa
 
 /// Spawns the forward task for one subscriber
 ///
-// Back-pressure model (IR-31): a client that stops reading stalls the
-// connection's writer, which fills the write queue, which parks this task on
-// `send`, which stops draining the ring — so the *broadcast channel itself*
-// becomes the bounded per-subscriber queue, drops the oldest events, and
-// reports the exact count as `Lagged(n)`. That is spec §6's requirement
-// implemented by the runtime rather than by a hand-rolled `VecDeque`, and it
-// isolates one slow client from every other connection.
+// A client that stops reading stalls the writer, filling the queue, which
+// parks this task on `send` and stops draining the ring. The broadcast
+// channel itself becomes the bounded per-subscriber queue: it drops the
+// oldest events and reports the count as `Lagged(n)`.
 pub fn spawn_forwarder(bus: &Bus, filter: TopicFilter, out: mpsc::Sender<Bytes>) -> JoinHandle<()> {
     let (mut rx, interest) = bus.subscribe_for(&filter);
-    // Cancel-safety: `recv` and `send` are both cancel-safe and are awaited
-    // sequentially (no select!), so an aborted forwarder can lose at most the
-    // frame in flight — which the subscriber is no longer there to read.
+    // Cancel-safe: `recv` and `send` run sequentially (no select!), so an
+    // aborted forwarder loses at most the frame in flight.
     tokio::spawn(async move {
         // Captured by the future rather than created inside it, so a
         // forwarder aborted before its first poll still releases the count.
@@ -512,10 +451,8 @@ mod tests {
 
     /// How long a test waits for a forwarder to produce a frame.
     ///
-    /// Virtual, not wall clock: every caller runs `start_paused`, so a
-    /// forwarder that never sends leaves the runtime idle, time jumps
-    /// straight here, and the test fails with its own message instead of
-    /// hanging until CI's timeout (IR-33).
+    /// Virtual, not wall clock: every caller runs `start_paused`, so an idle
+    /// runtime jumps straight here instead of hanging until CI's timeout.
     const FORWARD_DEADLINE: core::time::Duration = core::time::Duration::from_secs(1);
 
     /// One frame from a forwarder, or a named failure if none arrives.
@@ -593,7 +530,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn lag_becomes_a_dropped_notice_that_bypasses_the_filter() {
-        // The count is READ from the runtime, never hand-computed: whatever
+        // The count is read from the runtime, never hand-computed: whatever
         // tokio says was missed is exactly what the subscriber is told.
         let (tx, mut rx) = test_bus(4);
         for id in 0..10 {
@@ -634,7 +571,7 @@ mod tests {
         drop(tx);
         handle.await.unwrap();
 
-        // Ordering IS the filtering assertion: the two process frames arrive
+        // Ordering is the filtering assertion: the two process frames arrive
         // back to back, so nothing was emitted for the log line between them.
         let first: BusEvent = decode_frame(&out_rx.recv().await.unwrap()).unwrap();
         let second: BusEvent = decode_frame(&out_rx.recv().await.unwrap()).unwrap();
@@ -660,14 +597,9 @@ mod tests {
 
     /// Fails if every subscriber encodes its own copy of the same event.
     ///
-    /// That cost is linear in attached clients, and it is the measured one:
-    /// a sheep logging 7,315 lines/s cost the daemon 23.99% of a core with
-    /// nobody watching and 37.50% with ONE `shep bleats` attached.
-    ///
-    /// Two assertions, and the second is the one that matters here. Byte
-    /// equality is the wire contract, which a per-subscriber encode would
-    /// also satisfy; SAME-BUFFER identity is what says the encode ran once
-    /// and the rest of the subscribers cloned a refcount.
+    /// Byte equality alone is what a per-subscriber encode would also
+    /// produce; same-buffer identity is what proves the encode ran once
+    /// and every subscriber cloned a refcount.
     #[tokio::test(start_paused = true)]
     async fn every_subscriber_gets_the_same_frame_from_one_encode() {
         let (tx, _keep) = test_bus(16);
@@ -713,11 +645,9 @@ mod tests {
     /// Fails if [`encode_frame`] runs once per subscriber rather than once
     /// per event.
     ///
-    /// A count rather than a clock: the cost is linear in attached clients,
-    /// which is a fact about how many times a function ran and about nothing
-    /// else. Zero before anyone asks is half the claim — a `SharedEvent`
-    /// that eagerly encoded would charge every publisher for subscribers
-    /// that may not exist.
+    /// Zero before anyone asks is half the claim: an eagerly-encoding
+    /// `SharedEvent` would charge every publisher for subscribers that may
+    /// not exist.
     #[tokio::test(start_paused = true)]
     async fn encode_frame_runs_once_per_event_however_many_subscribers() {
         const SUBSCRIBERS: usize = 5;
@@ -761,12 +691,10 @@ mod tests {
     }
 
     /// Fails if [`SharedEvent`]'s `Debug` starts carrying the encoded frame,
-    /// the test-only encode tally, or a redaction nobody asked for (IR-41).
+    /// the test-only encode tally, or an unwanted redaction.
     ///
-    /// An exact string rather than a `contains`: the claim is what a reader
-    /// of a `tracing` line or a panic message SEES, and every part of it —
-    /// the wrapper's name, the two fields, the event printed whole and
-    /// unredacted — is a decision this pins.
+    /// An exact string, not a `contains`: every part of it, the wrapper's
+    /// name, the two fields, the event printed whole, is a decision this pins.
     #[test]
     fn shared_event_debug_prints_the_event_and_whether_it_is_encoded() {
         let event = SharedEvent::new(BusEvent::LogOut {
@@ -827,18 +755,16 @@ mod tests {
 
     /// Fails if a log line is published while nothing wants one.
     ///
-    /// The count is the assertion rather than a clock, because the cost being
-    /// removed is a fact about how often a publish happens. `receiver_count`
-    /// cannot stand in: the daemon always has two subscribers that read every
-    /// event and act on no log line, and it is exactly their per-line wakeup
-    /// that the gate exists to stop.
+    /// `receiver_count` cannot stand in: the daemon always has two
+    /// subscribers that read every event and act on no log line, and their
+    /// per-line wakeup is exactly what the gate exists to stop.
     #[tokio::test(start_paused = true)]
     async fn a_log_line_is_not_published_while_no_filter_wants_one() {
         let (bus, mut plain) = test_bus(16);
         assert_eq!(bus.log_subscribers(), 0);
 
-        // A subscriber that reads everything and asked for nothing — the
-        // shape both of the daemon's own internal subscribers have.
+        // A subscriber that reads everything and asked for nothing: the
+        // shape both daemon-internal subscribers have.
         bus.publish_log(log_out("dropped"));
         assert!(
             plain.try_recv().is_err(),
@@ -882,11 +808,8 @@ mod tests {
         assert!(plain.try_recv().is_err());
     }
 
-    /// fails if a dog's config topic drifts out from under the glob a
-    /// subscriber writes, or under a glob that was never meant to reach it.
-    /// `config.*` is what a dashboard watching every dog's config asks for,
-    /// and a `log.*` subscriber that started receiving these would be
-    /// getting frames it never asked for on the busiest filter shep has.
+    /// `config.*` is what a dashboard watching every dog's config asks for;
+    /// `log.*` must never start matching these frames too.
     #[test]
     fn a_dog_config_event_is_under_the_config_glob_and_no_other() {
         let event = BusEvent::DogConfigChanged {
@@ -896,17 +819,13 @@ mod tests {
         assert!(filter(&["config.dog.bark"]).matches(&event));
         assert!(!filter(&["log.*"]).matches(&event));
         assert!(!filter(&["process.*"]).matches(&event));
-        // The dog next door does not hear it, which is the whole point of
-        // putting the name in the topic rather than in a payload every
-        // subscriber has to filter for itself.
+        // The dog next door does not hear it: the name is in the topic, not
+        // a payload every subscriber would have to filter itself.
         assert!(!filter(&["config.dog.metrics"]).matches(&event));
     }
 
-    /// fails if the announcement stops being one event per dog. A dog that
-    /// heard nothing runs on config that has moved out from under it; a dog
-    /// told twice re-asks twice, and for a dog that answers a change by
-    /// restarting itself that is two restarts on the column an operator
-    /// reads as instability.
+    /// A dog told twice re-asks twice, which for one that restarts on a
+    /// change reads as two restarts in the operator's status column.
     #[tokio::test(start_paused = true)]
     async fn every_moved_dog_is_announced_exactly_once() {
         let (bus, mut events) = test_bus(16);

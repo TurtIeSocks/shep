@@ -2,37 +2,16 @@
 //! real daemon, a real socket, and real spawned sheep, each on a fresh
 //! `$SHEP_HOME` in its own [`tempfile::TempDir`].
 //!
-//! This is the first tier where the whole stack runs as an actual binary
-//! rather than through the unit tiers' fakes — everything the fakes could
-//! not reach (autostart, the cold-start race, real exit codes, real stderr
-//! vs stdout separation, the daemon's own process-group leadership) lives
-//! here.
+//! Two rules every case follows: `.timeout(CMD_TIMEOUT)` before `.output()`,
+//! so a hang fails as a named assertion; and a [`DaemonGuard`] adopting the
+//! `$SHEP_HOME` immediately after the `Output` that might have spawned a
+//! daemon, before any assertion that could panic.
 //!
-//! **Runs on Windows too.** The script writers emit a `.cmd` on Windows
-//! (see `script_header`/`sleep_line`), and the cases that genuinely cannot
-//! port — file modes, symlinks, process-group leadership, signal delivery —
-//! carry their own `#[cfg(unix)]` and say why at the case.
-//!
-//! Cases 14 and 15 are the file's slow ones: a cron occurrence and a
-//! memory-limit breach are both events on *real* wall clock — a minute
-//! boundary and a 15-second sampling tick — with no seam this tier could
-//! pause. Each names its own measured cost; [`CRON_DEADLINE`] carries the
-//! argument for spending it rather than marking them `#[ignore]`.
-//!
-//! Every case's command chain carries `.timeout(CMD_TIMEOUT)` before
-//! `.output()`, so a regression that hangs (case 7's `--no-follow`
-//! following forever being the live hazard) fails as a named assertion
-//! instead of a killed CI job. Every case that can leave a daemon behind
-//! registers its `$SHEP_HOME` with a [`DaemonGuard`] immediately after the
-//! `Output` that might have spawned one, before any assertion that could
-//! panic.
+//! Windows scripts are `.cmd` (see `script_header`); cases that cannot port
+//! carry their own `#[cfg(unix)]`.
 
-// Roughly half of this file's cases are `#[cfg(unix)]` — file modes,
-// symlinks, process-group leadership, signal delivery — and their helpers
-// and constants go with them, so on Windows those items are compiled and
-// unreachable. That is the honest shape of a shared e2e file with a
-// platform-split body, not something to fix by scattering `#[cfg(unix)]`
-// over sixty more items.
+// The `#[cfg(unix)]` cases take their helpers and constants with them, so on
+// Windows those items compile unused.
 #![cfg_attr(windows, allow(dead_code))]
 
 #[cfg(unix)]
@@ -50,42 +29,22 @@ use assert_cmd::Command;
 use assert_cmd::cargo::CommandCargoExt as _;
 use tempfile::TempDir;
 
-/// Bound on every `shep` invocation in this file. `assert_cmd`'s
-/// `.output()` blocks unbounded without it; case 7 (`bleats --no-follow`)
-/// is the live hazard, since its regression mode is following forever.
+/// Bound on every `shep` invocation here; `.output()` blocks unbounded
+/// without it.
 ///
-/// Must outlive [`shep_client::spawn::SPAWN_DEADLINE`], not merely equal it
-/// (whole-branch review item 5): the autostart path
-/// (`shep_client::spawn::probe_until_ready`, `spawn.rs:298`->`:328`) can run
-/// right up to that whole budget before it ever reports
-/// `DaemonUnreachable`, plus this binary's own write-and-exit overhead on
-/// top — roughly 35s end to end. A `CMD_TIMEOUT` merely equal to
-/// `SPAWN_DEADLINE` races `assert_cmd`'s own kill against that report; on a
-/// loaded machine the kill can win, and this harness would then observe a
-/// killed process instead of the exit-5 failure it meant to exercise. The
-/// extra margin below is headroom for that overhead, not a second deadline
-/// — expressed as an offset from `SPAWN_DEADLINE` rather than a bare number
-/// so the relationship stays visible if either budget ever moves.
+/// Must outlive [`shep_client::spawn::SPAWN_DEADLINE`]: the autostart path can
+/// spend that whole budget before reporting `DaemonUnreachable`, and an equal
+/// bound kills the process before it can report exit 5.
 const CMD_TIMEOUT: Duration =
     Duration::from_secs(shep_client::spawn::SPAWN_DEADLINE.as_secs() + 15);
 
 /// Bound on how long [`concurrent_cold_starts_produce_exactly_one_daemon`]
-/// waits for one of its two racers, after which the case FAILS.
+/// waits for one of its racers.
 ///
-/// [`CMD_TIMEOUT`] does not cover this, and the gap is not academic — it is
-/// the one that let a real daemon bug stall the suite for minutes at a time
-/// rather than report anything. `assert_cmd`'s timeout bounds the *process*
-/// wait; the reader threads it joins afterwards are bounded only by EOF on
-/// the child's stdout and stderr, and EOF waits for the last copy of the
-/// write end to close — including a copy held by a daemon that inherited it
-/// (`shep-cli/src/launch.rs`'s `seal_inherited_fds`). A racer that never
-/// comes back has to be given up on from out here, by the only thread that
-/// can still fail the case.
-///
-/// Sized off [`CMD_TIMEOUT`] the way that constant is sized off
-/// `SPAWN_DEADLINE`: strictly longer, so a racer that is merely slow (a
-/// loaded machine, the full autostart budget) still reports its own outcome
-/// and this bound only ever fires on a racer that is genuinely stuck.
+/// [`CMD_TIMEOUT`] bounds the process wait, not the reader threads after it:
+/// those end on EOF, which waits for every copy of the write end, including
+/// one a daemon inherited. Strictly longer than [`CMD_TIMEOUT`], so it fires
+/// only on a stuck racer.
 const RACER_DEADLINE: Duration = Duration::from_secs(CMD_TIMEOUT.as_secs() + 15);
 
 /// How long [`bleats_no_follow_until_written`] keeps retrying.
@@ -94,195 +53,144 @@ const BLEATS_DEADLINE: Duration = Duration::from_secs(10);
 /// Gap between [`bleats_no_follow_until_written`]'s retries.
 const BLEATS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// How long a fixture sheep's script sleeps after writing whatever it
-/// writes. Long enough that none of the cases using it could plausibly
-/// outlast it (each finishes in well under a second of real daemon/sheep
-/// work); short enough that a sheep the [`DaemonGuard`] sweep somehow missed
-/// self-terminates quickly rather than lingering for the rest of a CI job.
+/// How long a fixture sheep's script sleeps after writing whatever it writes.
 ///
-/// The two real-clock cases at the bottom of this file are the exception —
-/// they wait on wall-clock schedules measured in tens of seconds — and use
-/// [`SLOW_SCRIPT_SLEEP_SECS`] instead.
+/// Outlasts every case that uses it, and short enough that a sheep the
+/// [`DaemonGuard`] sweep missed self-terminates. The real-clock cases use
+/// [`SLOW_SCRIPT_SLEEP_SECS`].
 const SCRIPT_SLEEP_SECS: u32 = 60;
 
-/// [`SCRIPT_SLEEP_SECS`] for the two real-clock cases, whose own deadlines
-/// run to [`CRON_DEADLINE`].
+/// [`SCRIPT_SLEEP_SECS`] for the two real-clock cases.
 ///
-/// Sized to outlast the longest of those deadlines by a wide margin, and that
-/// margin is load-bearing rather than slack: it is what lets each of those
-/// cases claim the restart it observed came from the trigger under test. A
-/// script that could reach its own exit inside the observation window would
-/// make "the sheep restarted" equally consistent with a crash loop, and no
-/// assertion on the count could tell the two apart. Every second of it is
-/// also the exposure a sheep the [`DaemonGuard`] sweep missed would linger
-/// for, so it is twice the deadline rather than ten times it.
+/// Twice [`CRON_DEADLINE`], the longest of their deadlines: a script that
+/// could exit inside the observation window would make "the sheep restarted"
+/// equally consistent with a crash loop.
 const SLOW_SCRIPT_SLEEP_SECS: u32 = 300;
 
 /// Basename, under a case's own `$SHEP_HOME`, of the file every fixture
-/// script appends its own pid to. See [`record_pid_line`] for why, and
-/// [`DaemonGuard`] for who reads it.
+/// script appends its own pid to. Written by [`record_pid_line`], read by
+/// [`DaemonGuard`].
 const FIXTURE_PIDS: &str = "fixture.pids";
 
-/// How long [`DaemonGuard::drop`] keeps retrying for a parseable daemon pid
-/// before giving up and saying so.
+/// How long [`DaemonGuard::drop`] keeps retrying for a parseable daemon pid.
 ///
-/// The window it covers is real rather than theoretical:
-/// `PidfileLock::acquire` opens the pidfile with `create(true)` and
-/// `truncate(false)` (`shep-daemon/src/boot.rs`), while `record` writes the
-/// pid into it only once the control socket is bound — so in a fresh
-/// `$SHEP_HOME`, which is every case here, the file exists and is *empty* for
-/// the whole bind. A case that panics inside that window would otherwise hand
-/// this guard an unparseable pidfile and get silence.
+/// `PidfileLock::acquire` creates the pidfile empty and `record` fills it only
+/// once the control socket is bound, so a fresh `$SHEP_HOME` has an empty
+/// pidfile for the whole bind.
 const GUARD_PID_DEADLINE: Duration = Duration::from_secs(3);
 
 /// Gap between [`GUARD_PID_DEADLINE`]'s and [`GUARD_SWEEP_WINDOW`]'s retries.
 const GUARD_PID_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// How long [`sweep_flock`] keeps re-reading a case's recorded sheep pids
-/// before giving up. Covers the gap between a sheep being spawned (which is
-/// when `shep start` reports it `Online`) and its script's first line actually
-/// running, which is when the pid reaches disk. See [`sweep_flock`].
+/// How long [`sweep_flock`] keeps re-reading a case's recorded sheep pids.
+/// Covers the gap between the spawn `shep start` reports as `Online` and the
+/// script's first line, which is when the pid reaches disk.
 const GUARD_SWEEP_WINDOW: Duration = Duration::from_secs(2);
 
-/// How long [`poll_flock`] keeps asking before returning whatever it last
-/// saw.
+/// How long [`poll_flock`] keeps asking before returning what it last saw.
 ///
-/// One deadline for both directions, deliberately: the case that waits for a
-/// watch-triggered restart and the case that waits to be sure a dot-file
-/// caused none must wait the *same* length, or the negative case proves only
-/// that it looked sooner. Sized against the 500ms `DEFAULT_WATCH_DELAY`
-/// debounce plus a spawn and two RPC round trips — roughly an order of
-/// magnitude of headroom on an idle machine, which is what a loaded one
-/// needs.
+/// One deadline for both directions: a case waiting for a restart and a case
+/// proving none came must wait the same length. Sized against the 500ms
+/// `DEFAULT_WATCH_DELAY` debounce plus a spawn and two RPC round trips, with
+/// an order of magnitude of headroom.
 const FLOCK_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Gap between [`poll_flock`]'s attempts.
 const FLOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// How long [`poll_metrics`] keeps retrying a scrape of the metrics dog's
-/// `/metrics` endpoint before giving up.
+/// `RequestError::Closed`: the reply a client loses when the image on the
+/// other end of its request was replaced by a handover. An accepted
+/// connection is `FD_CLOEXEC` and dies at the `execve`; the handover spec's
+/// H2 table rules that the client sees the drop.
+const DROPPED_REPLY: &str = "the connection closed before a reply arrived";
+
+/// `ConnectError::HandshakeClosed`: the same exec, caught between the accept
+/// and the `HelloReply`. A shepherd that is gone prints "could not connect"
+/// instead, so neither is reachable from a dead one.
+const DROPPED_HANDSHAKE: &str = "the daemon closed the connection during the handshake";
+
+/// How long [`poll_metrics`] keeps retrying a `/metrics` scrape.
 ///
-/// Covers the same real gap [`FLOCK_DEADLINE`] does for a sheep, one hop
-/// further out: `shep enable metrics` returns once the `EnableDog` RPC is
-/// accepted, before the daemon has necessarily finished exec'ing `shep dog
-/// metrics`, let alone before that process has bound its listener. Sized
-/// the same as `FLOCK_DEADLINE` — both wait on one freshly spawned process
-/// finishing its own startup, not on anything slower.
+/// `shep enable metrics` returns once the `EnableDog` RPC is accepted, before
+/// the daemon has exec'd `shep dog metrics` or that process has bound.
 const METRICS_SCRAPE_DEADLINE: Duration = FLOCK_DEADLINE;
 
 /// Gap between [`poll_metrics`]'s retries.
 const METRICS_SCRAPE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Bound on a single scrape attempt's own I/O, inside [`poll_metrics`]'s
-/// outer retry loop — a connect that succeeds against a peer that then
-/// never answers (unlikely against this dog, but this is the same belt the
-/// dog's own `READ_TIMEOUT` buckles on the server side) must not be able to
-/// stall the loop past its own deadline.
+/// Bound on a single scrape attempt's own I/O, inside [`poll_metrics`]'s retry
+/// loop: a peer that connects and then never answers must not stall it past
+/// its own deadline.
 const METRICS_SCRAPE_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How long [`poll_http_get`] keeps retrying a `shep serve` worker before
-/// giving up. Same reasoning as [`METRICS_SCRAPE_DEADLINE`]: `shep serve`
-/// returning success means the RPC registering the sheep landed, not that
-/// the worker has bound its listener yet.
+/// How long [`poll_http_get`] keeps retrying a `shep serve` worker. `shep
+/// serve` returning success means the sheep is registered, not that the worker
+/// has bound its listener.
 const SERVE_HTTP_DEADLINE: Duration = FLOCK_DEADLINE;
 
 /// Gap between [`poll_http_get`]'s retries.
 const SERVE_HTTP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Bound on a single `shep serve` request's own I/O, inside
-/// [`poll_http_get`]'s outer retry loop — the same belt
-/// [`METRICS_SCRAPE_READ_TIMEOUT`] buckles for the metrics dog.
+/// [`poll_http_get`]'s retry loop.
 const SERVE_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Bound [`a_served_sheep_stops_on_sigterm_rather_than_riding_the_ladder_to_sigkill`]
-/// asserts `shep stop`'s own wall-clock against.
+/// asserts `shep stop`'s wall clock against.
 ///
-/// Not a race against anything asynchronous: `Command::Stop`'s daemon-side
-/// handler (`shep-daemon/src/supervisor.rs`'s `begin_manual`) defers its
-/// reply until the matched sheep has actually exited, so `shep stop`'s own
-/// elapsed time is a deterministic report of which rung of the kill ladder
-/// answered — never a value this test could observe mid-flight. A worker
-/// that rides the ladder to `SIGKILL` takes AT LEAST `kill_timeout`
-/// (`AppConfig::default`'s 1600ms) by the ladder's own construction
-/// (`shep-daemon/src/kill.rs`); a worker that handles `SIGTERM` the way
-/// `serve::worker::run` is supposed to (copied from the metrics dog's own
-/// handler, Task 6's doc) returns in low tens of milliseconds. This bound
-/// sits well inside that 1600ms floor with wide margin on both sides, so it
-/// distinguishes the two rather than merely hoping load doesn't intervene.
+/// `Command::Stop` defers its reply until the sheep has exited, so elapsed
+/// time reports which rung of the kill ladder answered: `SIGKILL` takes at
+/// least `kill_timeout`, 1600ms; a handled `SIGTERM` takes tens of
+/// milliseconds.
 const SERVE_STOP_DEADLINE: Duration = Duration::from_millis(1000);
 
-/// How long [`a_cron_occurrence_restarts_a_sheep_on_the_real_clock`] waits
-/// for its occurrence.
+/// How long [`a_cron_occurrence_restarts_a_sheep_on_the_real_clock`] waits.
 ///
-/// Five-field cron cannot express anything finer than a minute, so a
-/// `* * * * *` pattern armed at an arbitrary moment is up to a full 60s of
-/// *real* wall clock from its first occurrence — there is no seam to shorten
-/// that, which is the whole point of the case. Two and a half minutes covers
-/// two successive occurrences, so a runner loaded enough to miss the first
-/// one still has a second to answer with.
-///
-/// This is the most expensive constant in the file and it is deliberately not
-/// hidden behind `#[ignore]`: an ignored test closes no gap. Measured over
-/// five runs the case cost 26s to 61s, and the variance is entirely where in
-/// the minute the daemon happened to boot. It runs concurrently with the rest
-/// of this tier, which finishes in about 11s without it, so it *is* this
-/// file's wall clock now — see
-/// [`a_cron_occurrence_restarts_a_sheep_on_the_real_clock`] for the numbers.
+/// A `* * * * *` pattern armed at an arbitrary moment is up to 60s from its
+/// first occurrence. Two and a half minutes covers two, so a loaded runner
+/// that misses the first still has a second. The case costs 26s to 61s.
 const CRON_DEADLINE: Duration = Duration::from_secs(150);
 
 /// How long [`a_real_memory_breach_restarts_a_sheep`] waits for its breach.
 ///
-/// The real enforcer samples every `shep_daemon::limits::MEMORY_POLL_INTERVAL`
-/// (15s) and its ticks are phased off daemon boot rather than off the sheep,
-/// so the worst honest wait is one whole interval after the sheep's resident
-/// set crosses its ceiling, plus a kill ladder and a respawn. Four times that
-/// is headroom for a loaded runner, not a second schedule.
+/// The enforcer samples every `shep_daemon::limits::MEMORY_POLL_INTERVAL`
+/// (15s), phased off daemon boot, so the worst wait is one whole interval plus
+/// a kill ladder and a respawn. Four times that is headroom.
 const BREACH_DEADLINE: Duration = Duration::from_secs(60);
 
 /// How long a string [`write_ballooning_script`] grows, in bytes.
 ///
-/// Measured rather than guessed (macOS, `/bin/sh`): a bare `/bin/sh` sitting
-/// in `sleep` holds about 1.2 MB resident, and growing a 16 MiB string takes
-/// it to about 166 MB, because the doubling loop's intermediate allocations
-/// stay in the shell's heap. The case does not lean on that slack, though —
-/// the string *alone* is twice [`BREACH_LIMIT`], so a thriftier `/bin/sh` on
-/// some other unix that held the string and nothing else would still breach.
+/// Growing a 16 MiB string takes a `/bin/sh` from about 1.2 MB resident to
+/// about 166 MB: the doubling loop's intermediate allocations stay in its
+/// heap. The string alone is twice [`BREACH_LIMIT`].
 const BALLOON_BYTES: u64 = 16 * 1024 * 1024;
 
-/// The `max_memory` the ballooning sheep is given.
-///
-/// Well above any plausible bare-shell resident set (1.2 MB measured, see
-/// [`BALLOON_BYTES`]) and half the string that script grows, so both halves
-/// of the claim — under the ceiling before, over it after — hold with a wide
-/// margin rather than on a coin toss.
+/// The `max_memory` the ballooning sheep is given: above a bare shell's 1.2 MB
+/// resident set and half the string it grows, so it is under the ceiling
+/// before and over it after.
 const BREACH_LIMIT: &str = "8M";
 
 /// The `listen_timeout` [`write_never_ready_flockfile`] gives its sheep.
 ///
-/// Short because the two log-plane cases wait it out twice over, and safe to
-/// be short because nothing races it: the sheep never signals at all, so this
-/// is a delay before a certainty rather than a window some slower machine
-/// could close first. The daemon takes a timed-out `wait_ready` sheep `Online`
-/// anyway, which is what makes the elapse observable through `shep flock`
-/// rather than only through the record under test.
+/// Nothing races it: the sheep never signals, so this is a delay before a
+/// certainty. The daemon takes a timed-out `wait_ready` sheep `Online`, so the
+/// elapse shows in `shep flock` too.
 const NEVER_READY_TIMEOUT: &str = "1s";
 
 /// What [`write_rotating_script`]'s sheep prints before the rotation, and
 /// what must end up in the renamed archive rather than in the recreated log.
 const ROTATE_BEFORE: &str = "before-the-rotation";
 
-/// What the same sheep prints after it, once the reopen has returned. Its
-/// arrival in the recreated file is the whole assertion.
+/// What the same sheep prints after it. Its arrival in the recreated file is
+/// the whole assertion.
 const ROTATE_AFTER: &str = "after-the-rotation";
 
-/// The daemon record the two log-plane cases provoke and then read out of
-/// `$SHEP_HOME/logs/shepd.err.log`.
+/// The daemon record the two log-plane cases read out of
+/// `$SHEP_HOME/logs/shepd.err.log`, written at `WARN` by
+/// `Actor::handle_ready_result`.
 ///
-/// One owner for the string, because the two cases assert opposite things
-/// about the same record — present at the default level, absent above it —
-/// and a pair that drifted apart would keep passing while proving nothing.
-/// It is `shep-daemon`'s `Actor::handle_ready_result` (`supervisor.rs`) that
-/// writes it, at `WARN`.
+/// One owner for the string: the two cases assert opposite things about the
+/// same record, and a drifted pair would keep passing while proving nothing.
 const READINESS_RECORD: &str = "readiness deadline elapsed";
 
 // --- Fixture helpers ---------------------------------------------------
@@ -295,12 +203,9 @@ fn fixture_path(name: &str) -> PathBuf {
         .join(format!("{name}.json"))
 }
 
-/// Loads and parses a committed fixture. Every envelope fixture is compared
-/// as a `serde_json::Value` (structural equality, not byte equality) since
-/// `normalize_process_info`/`normalize_ping` already reduce the real output
-/// to the same shape; only `bleats_no_follow.json` (case 4's second half) is
-/// compared byte-for-byte, directly against `std::fs::read`, not through
-/// this function.
+/// Loads and parses a committed fixture, for the envelope fixtures compared
+/// structurally as a `serde_json::Value`. `bleats_no_follow.json` is compared
+/// byte for byte through `std::fs::read` instead.
 fn load_fixture(name: &str) -> serde_json::Value {
     let path = fixture_path(name);
     let text = std::fs::read_to_string(&path)
@@ -309,20 +214,10 @@ fn load_fixture(name: &str) -> serde_json::Value {
 }
 
 /// Writes a trivial long-running script into `dir` and returns its path.
-/// The executable bit is the point: without `set_mode(0o755)` every
-/// `shep start` fails EACCES and every case that starts a sheep fails
-/// together, for a reason that has nothing to do with the CLI.
 ///
-/// A bare `sleep`, deliberately not `exec sleep`: a bare trailing `sleep`
-/// is a *forked* child of the `/bin/sh` process the daemon actually tracks,
-/// in the shell's own process group — the wrapper-script shape real users
-/// write. `exec`ing into it would hide a daemon bug where the graceful
-/// stop signals only the one recorded pid, killing the shell and orphaning
-/// an untracked `sleep` grandchild: the stop goes to the
-/// whole process group (`shep-daemon/src/tokio_runner.rs`'s `signal_group`),
-/// so keeping the fork means every case in this file
-/// exercises the shape that regressed, over the real CLI, rather than the one
-/// shape the bug could not reach.
+/// The trailing `sleep` is bare, not `exec sleep`: a bare one is a forked
+/// child of the `/bin/sh` the daemon tracks, sharing its process group, which
+/// is what a stop signalling only the recorded pid would orphan.
 fn write_test_script(dir: &TempDir) -> PathBuf {
     write_script(
         dir,
@@ -336,14 +231,12 @@ fn write_test_script(dir: &TempDir) -> PathBuf {
     )
 }
 
-/// Writes a script whose top-level process explicitly backgrounds a
-/// `sleep 300` and `wait`s on it — a real forked lamb for
-/// [`describe_renders_a_real_sheeps_lamb_tree`], distinct from
-/// [`write_test_script`]'s own bare trailing `sleep` (a lamb too, per that
-/// function's own doc, but that fact is incidental there rather than the
-/// point). `wait` keeps the top-level `sh` alive exactly as long as its
-/// forked child, so the daemon's own pid stays the one this test started
-/// and stopping it still reaches the lamb through the shared process group.
+/// Writes a script that backgrounds a `sleep 300` and `wait`s on it, a real
+/// forked lamb for [`describe_renders_a_real_sheeps_lamb_tree`].
+///
+/// `wait` keeps the top-level `sh` alive as long as its child, so the daemon's
+/// pid stays the one this test started and a stop still reaches the lamb
+/// through the shared process group.
 fn write_forking_script(dir: &TempDir) -> PathBuf {
     write_script(
         dir,
@@ -355,24 +248,14 @@ fn write_forking_script(dir: &TempDir) -> PathBuf {
 /// The line every fixture script opens with: this spawn's own pid, appended
 /// to `<home>/`[`FIXTURE_PIDS`].
 ///
-/// `$$` in `/bin/sh` is the pid the daemon tracks and the leader of its own
-/// process group (`shep-daemon/src/tokio_runner.rs` spawns every sheep with
-/// `process_group(0)`), so `-pid` per recorded line reaches that sheep's
-/// lambs too — which is what makes [`DaemonGuard`]'s panic-path sweep able to
-/// reap a whole flock the daemon's own kill ladder never got to drive.
+/// `$$` is the pid the daemon tracks and leads its own process group, so
+/// `-pid` reaches that sheep's lambs and [`DaemonGuard`]'s sweep can reap a
+/// whole flock. Appended, so a restart adds a row; the dead pid is an `ESRCH`
+/// no-op later.
 ///
-/// One line per *spawn*, appended rather than overwritten, so a restart adds
-/// a row instead of replacing one: the dead pid is an `ESRCH` no-op later,
-/// and the live one is the whole point.
-///
-/// The path is `dir`'s own `$SHEP_HOME`, spelled absolutely, because a
-/// script's cwd is the sheep's `cwd` and is not this test's to assume. It is
-/// quoted for the same reason `write_script`'s callers never build a path by
-/// hand — a tempdir path is not guaranteed free of shell metacharacters.
-///
-/// The append goes to a file and never to stdout: case 4 compares
-/// `bleats --no-follow` byte-for-byte against a committed fixture, and one
-/// extra line on the sheep's own stdout would break it.
+/// The path is absolute, since a script's cwd is the sheep's `cwd`, and
+/// quoted, since a tempdir path may carry shell metacharacters. It never goes
+/// to stdout: one extra line breaks the byte-exact `bleats` fixture.
 fn record_pid_line(dir: &TempDir) -> String {
     #[cfg(unix)]
     {
@@ -381,13 +264,8 @@ fn record_pid_line(dir: &TempDir) -> String {
             dir.path().join(FIXTURE_PIDS).display()
         )
     }
-    // Nothing on Windows, and nothing is needed. `cmd.exe` has no `$$`, and
-    // the only consumer of these pids is `sweep_flock`'s panic-path cleanup,
-    // which exists because a unix sheep that outlives its daemon is an
-    // orphan nothing will reap. On Windows every sheep is inside a job
-    // object it cannot leave, so `shep kill` — or the daemon dying — takes
-    // the whole tree with it. The guarantee the pid file is emulating is the
-    // one the OS already makes here.
+    // No `$$` in `cmd.exe`, and none needed: a Windows sheep is in a job object
+    // it cannot leave, so the daemon dying takes the whole tree with it.
     #[cfg(windows)]
     {
         let _ = dir;
@@ -395,16 +273,9 @@ fn record_pid_line(dir: &TempDir) -> String {
     }
 }
 
-/// [`write_test_script`] with [`SLOW_SCRIPT_SLEEP_SECS`]' sleep instead of
-/// [`SCRIPT_SLEEP_SECS`]', for
-/// [`a_cron_occurrence_restarts_a_sheep_on_the_real_clock`].
-///
-/// That case runs one of these twice over — once as the sheep under test and
-/// once as the control beside it — so what it has to be is unremarkable and
-/// very long-lived. See [`SLOW_SCRIPT_SLEEP_SECS`] for why the length is what
-/// makes the control mean anything. The memory case's control is its own
-/// ballooning script rather than this one, for the reason
-/// [`write_ballooning_script`] gives.
+/// [`write_test_script`] with [`SLOW_SCRIPT_SLEEP_SECS`]' sleep, for
+/// [`a_cron_occurrence_restarts_a_sheep_on_the_real_clock`], which runs one as
+/// its subject and one as its control.
 fn write_slow_script(dir: &TempDir) -> PathBuf {
     write_script(
         dir,
@@ -421,39 +292,22 @@ fn write_slow_script(dir: &TempDir) -> PathBuf {
 /// Writes a script that grows its own resident set past [`BALLOON_BYTES`] and
 /// then sleeps for [`SLOW_SCRIPT_SLEEP_SECS`].
 ///
-/// [`a_real_memory_breach_restarts_a_sheep`] runs this as *both* its subject
-/// and its control, where the cron case's two sheep share
-/// [`write_slow_script`]: a control that did not balloon would leave "the
-/// allocation itself killed the shell" as a live alternative explanation for
-/// the subject's restart, and ruling that out is the control's whole job.
-///
-/// The growth is a shell string doubled in place, not a child process that
-/// allocates: `$$` — the pid the daemon tracks, arms the enforcer against,
-/// and records through [`record_pid_line`] — is the process whose resident
-/// set actually moves, so the case exercises the enforcer's reading of a real
-/// process table without also depending on its ppid walk finding a lamb.
-/// (`shep-daemon`'s `limits::sample` unit tier already owns that walk.)
-///
-/// Pure shell arithmetic, no `head`/`dd`/`/dev/zero`: `${#s}` and `"$s$s"`
-/// are POSIX, so the growth does not vary with which coreutils a platform
-/// ships. It costs about a quarter of a second, which is well inside the gap
-/// before the enforcer's first sampling tick.
+/// The growth is a shell string doubled in place, so `$$`, the pid the daemon
+/// arms the enforcer against, is the process whose resident set moves. Pure
+/// shell arithmetic, so it does not vary with a platform's coreutils, and it
+/// costs about a quarter of a second, inside the gap before the enforcer's
+/// first tick.
 fn write_ballooning_script(dir: &TempDir) -> PathBuf {
     write_script(dir, "balloon.sh", &balloon_body(dir))
 }
 
 /// Writes a script that emits one marker line on stdout, optionally one on
-/// stderr, and then sleeps. Same `0o755` requirement as [`write_test_script`],
-/// the same [`record_pid_line`] prologue, and the same forked trailing
-/// `sleep`, each for the reason given there.
+/// stderr, and then sleeps.
 ///
-/// `None` writes to stderr not at all — not an empty line. An empty line is
-/// still a line: it reaches the err file, `--no-follow` renders it, and
-/// case 4's byte-exact fixture gains a second object it did not predict.
-///
-/// The sleep is what makes the output countable: a script that exits is
-/// restarted, and each restart appends another copy of every marker, so a
-/// byte-exact fixture would stop being byte-exact after the first respawn.
+/// `None` writes to stderr not at all: an empty line still reaches the err
+/// file and gains the byte-exact fixture an object it did not predict. The
+/// sleep keeps the output countable, since a script that exits is restarted
+/// and appends another copy of every marker.
 fn write_logging_script(dir: &TempDir, out_marker: &str, err_marker: Option<&str>) -> PathBuf {
     let mut script = format!(
         "{}{}{}",
@@ -468,18 +322,13 @@ fn write_logging_script(dir: &TempDir, out_marker: &str, err_marker: Option<&str
     write_script(dir, "logging.sh", &script)
 }
 
-/// [`write_logging_script`] for a multi-instance app: one stdout line
-/// naming the slot the running instance occupies, read out of the
-/// `SHEP_INSTANCE` the daemon injects, then the same trailing sleep.
+/// [`write_logging_script`] for a multi-instance app: one stdout line naming
+/// the slot, read out of the `SHEP_INSTANCE` the daemon injects.
 ///
-/// The slot has to come from the child's own environment rather than from
-/// anything this harness substitutes, because the point is that the daemon
-/// gave each instance a different one. Two instances sharing one log file
-/// under `merge_logs` then write two distinguishable lines, which is what
-/// makes "printed once" a countable claim.
-///
-/// `name` is the script's basename, so several of these can live in one
-/// `$TMPDIR` without overwriting each other.
+/// The slot comes from the child's own environment, not from anything this
+/// harness substitutes, since the claim is that the daemon gave each instance
+/// a different one. `name` is the script's basename, so several can share one
+/// `$TMPDIR`.
 fn write_instance_logging_script(dir: &TempDir, name: &str, prefix: &str) -> PathBuf {
     let echo = {
         #[cfg(unix)]
@@ -504,19 +353,12 @@ fn write_instance_logging_script(dir: &TempDir, name: &str, prefix: &str) -> Pat
     )
 }
 
-/// Writes a script that prints [`ROTATE_BEFORE`], blocks until `gate`
-/// exists, prints [`ROTATE_AFTER`], and sleeps.
+/// Writes a script that prints [`ROTATE_BEFORE`], blocks until `gate` exists,
+/// prints [`ROTATE_AFTER`], and sleeps.
 ///
-/// One script, and it has to have both halves: a rotation is only observable
-/// in what happens to a line written AFTER the rename, and a script that
-/// wrote everything up front would leave a reopen that did nothing looking
-/// exactly like one that worked. The gate is what makes "after" a fact
-/// rather than a timing bet — the test creates it once the reopen has
-/// already returned.
-///
-/// Same `sleep 0.1` as [`write_ready_script`], for the reason given there:
-/// POSIX requires only whole seconds, and a `/bin/sleep` that refused the
-/// fraction degrades this into a busy-wait rather than a hang.
+/// A rotation is observable only in what happens to a line written after the
+/// rename, and the gate makes "after" a fact rather than a timing bet: the
+/// test creates it once the reopen has returned.
 fn write_rotating_script(dir: &TempDir, gate: &Path) -> PathBuf {
     write_script(
         dir,
@@ -536,22 +378,12 @@ fn write_rotating_script(dir: &TempDir, gate: &Path) -> PathBuf {
 /// Writes a script that blocks until `sentinel` exists, then announces
 /// readiness on the shepherd channel and sleeps.
 ///
-/// The gate is a file the test creates, never a delay. An app's
-/// `listen_timeout` takes a `wait_ready` sheep `Online` on elapse whether or
-/// not it ever signalled, so a script that merely slept would give the test a
-/// `starting` window bounded above by that timeout — and a window a test has
-/// to *race* is a window a loaded runner closes early, reddening the suite
-/// with no regression behind it. A sentinel makes the window as wide as the
-/// test needs it.
+/// A file, not a delay: `listen_timeout` takes a `wait_ready` sheep `Online`
+/// on elapse whether it signalled or not, so a script that merely slept would
+/// give a loaded runner a `starting` window it could close early.
 ///
-/// `>&3` is the fd the runner hands every sheep whose app asks for a
-/// shepherd channel, and `{"kind":"ready"}` is the wire string
-/// `shep-daemon`'s `ChildMessage::Ready` pins.
-///
-/// `sleep 0.1` is a fractional interval, which POSIX does not require but
-/// both platforms this file compiles on provide. If some `/bin/sleep` ever
-/// refuses it the loop degrades to a busy-wait rather than a hang, so the
-/// case still passes — it just spins for the moment the gate is shut.
+/// `>&3` is the fd the runner hands a sheep whose app asks for a channel, and
+/// `{"kind":"ready"}` is the wire string `ChildMessage::Ready` pins.
 fn write_ready_script(dir: &TempDir, sentinel: &Path) -> PathBuf {
     write_script(
         dir,
@@ -571,9 +403,8 @@ fn write_ready_script(dir: &TempDir, sentinel: &Path) -> PathBuf {
 fn write_script(dir: &TempDir, name: &str, contents: &str) -> PathBuf {
     let path = dir.path().join(script_name(name));
     std::fs::write(&path, contents).unwrap();
-    // The execute bit is what makes a `#!`-headed file runnable on unix.
-    // Windows has no such bit — `CreateProcess` decides from the extension,
-    // which `script_name` supplied — so there is nothing to set.
+    // Windows has no execute bit: `CreateProcess` decides from the extension,
+    // which `script_name` supplied.
     #[cfg(unix)]
     {
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
@@ -585,10 +416,8 @@ fn write_script(dir: &TempDir, name: &str, contents: &str) -> PathBuf {
 
 /// `name` with the extension this platform will actually execute.
 ///
-/// The callers all name their scripts `something.sh`, which is a hint to a
-/// reader on unix and a hard requirement on Windows: a file `CreateProcess`
-/// is asked to run must carry an extension `%PATHEXT%` knows, and `.sh` is
-/// not one. `.cmd` is.
+/// Callers all name their scripts `something.sh`. `CreateProcess` needs an
+/// extension `%PATHEXT%` knows, which `.sh` is not and `.cmd` is.
 fn script_name(name: &str) -> String {
     #[cfg(unix)]
     {
@@ -616,13 +445,9 @@ fn script_header() -> String {
 
 /// A line that keeps the script alive for roughly `secs` seconds.
 ///
-/// `ping` rather than `timeout` on Windows, and the difference is not
-/// cosmetic: `timeout.exe` refuses to run at all when stdin is not a console
-/// ("ERROR: Input redirection is not supported"), and every sheep shep
-/// spawns gets a null stdin. It would exit instantly instead of sleeping,
-/// silently turning a long-lived fixture into one that has already gone.
-/// `ping -n N` sends N packets a second apart, so it needs one more than the
-/// seconds wanted.
+/// `ping` rather than `timeout` on Windows: `timeout.exe` refuses a
+/// non-console stdin, and every sheep gets a null one. `ping -n N` sends N
+/// packets a second apart, so it takes one more than the seconds wanted.
 fn sleep_line(secs: u32) -> String {
     #[cfg(unix)]
     {
@@ -648,10 +473,8 @@ fn echo_line(text: &str) -> String {
 
 /// Lines that block until `path` exists, polling.
 ///
-/// `until [ -e ]` on unix; a labelled `if exist`/`goto` loop on Windows,
-/// since `cmd.exe` has no `until`. The batch arm polls with `ping -n 2`
-/// (~1s) rather than `sleep 0.1` — `cmd` has no sub-second sleep, and the
-/// cases using this are gated on a file a test writes, not on a deadline.
+/// `cmd.exe` has no `until` and no sub-second sleep, so the batch arm is an
+/// `if exist`/`goto` loop polling with `ping -n 2`.
 fn wait_for_path_lines(path: &Path) -> String {
     #[cfg(unix)]
     {
@@ -668,14 +491,8 @@ fn wait_for_path_lines(path: &Path) -> String {
 
 /// A line writing one `ready` shepherd-channel message.
 ///
-/// **The two platforms reach the channel completely differently, and that is
-/// the point of the cases using this.** On unix it is fd 3, inherited, so a
-/// shell redirect `>&3` is the whole of it — the contract
-/// `docs/shepherd-channel.md` publishes. Windows has no fd-3 inheritance, so
-/// the daemon exports `%SHEP_CHANNEL_PIPE%` and the app opens it by name;
-/// `cmd`'s own `>` redirect does exactly that, which makes this the shortest
-/// possible demonstration that the replacement contract is usable from a
-/// plain script rather than only from a real program.
+/// The channel is inherited fd 3 on unix. Windows has no fd-3 inheritance, so
+/// the daemon exports `%SHEP_CHANNEL_PIPE%` and the app opens it by name.
 fn ready_message_line() -> String {
     #[cfg(unix)]
     {
@@ -702,15 +519,10 @@ fn echo_err_line(text: &str) -> String {
 /// The body of [`write_ballooning_script`]: hold [`BALLOON_BYTES`] live, then
 /// stay up.
 ///
-/// `cmd.exe` cannot do this — its environment variables cap out around 8 KB,
-/// so there is no batch idiom for holding sixteen megabytes. The Windows arm
-/// shells out to PowerShell for the one line that allocates, which is a
-/// legitimate shape for the case: shep samples a sheep's whole process
-/// TREE, so memory held by a child of the `.cmd` counts exactly as the
-/// case intends.
+/// `cmd.exe` variables cap out around 8 KB, so the Windows arm allocates in
+/// PowerShell. shep samples a sheep's whole tree, so a child's memory counts.
 fn balloon_body(dir: &TempDir) -> String {
-    // Only the unix arm records a pid; the Windows arm holds its bytes in a
-    // PowerShell child and has nothing to write.
+    // Only the unix arm records a pid.
     #[cfg(windows)]
     let _ = dir;
     #[cfg(unix)]
@@ -734,18 +546,8 @@ fn balloon_body(dir: &TempDir) -> String {
 /// performs, so [`NEVER_READY_TIMEOUT`] elapses and the daemon writes
 /// [`READINESS_RECORD`] about it.
 ///
-/// The provocation the two log-plane cases needed, chosen because it was the
-/// one actually observed doing the job. The obvious alternative — an
-/// unresolvable `watch` root, whose `arm_watch` warning is the record
-/// `shep-daemon`'s own unit tier captures — does **not** work from this tier:
-/// `assemble` passes an app's `cwd` through to `Command::current_dir`
-/// unchanged, so a `cwd` that cannot be canonicalized is a `cwd` the child
-/// cannot chdir into, and the sheep comes up `errored` having logged nothing.
-///
-/// A plain [`write_test_script`] sheep is enough here: `wait_ready` opens the
-/// shepherd channel on fd 3 and the script simply never writes to it, which is
-/// exactly a real app that was configured for a handshake it does not
-/// implement.
+/// A plain [`write_test_script`] sheep is enough: `wait_ready` opens the
+/// channel on fd 3 and the script never writes to it.
 fn write_never_ready_flockfile(dir: &TempDir) -> PathBuf {
     let script = write_test_script(dir);
     write_flockfile(
@@ -788,24 +590,11 @@ fn assert_success(output: &Output) {
     );
 }
 
-/// Best-effort graceful shutdown, called at the end of a test's own success
-/// path.
+/// Best-effort graceful shutdown, called at the end of a test's success path.
 ///
-/// Mirrors `shep-daemon`'s own `daemon_e2e.rs` `Fixture::shutdown`
-/// precedent: on every success path this makes the trailing `DaemonGuard`
-/// Drop a no-op, and `DaemonGuard` only does real work on a panic path this
-/// function never reaches. It matters for more than tidiness here —
-/// `DaemonGuard`'s flock sweep is deliberately gated on
-/// `std::thread::panicking()` (see its own doc), so on this path nothing but
-/// `shep kill` reaps the sheep, and what it drives is the daemon's own
-/// graceful stop of each one rather than a `SIGKILL`. Verified empirically with
-/// `ps`/`kill` against a real daemon: three back-to-back runs of this suite
-/// before this helper existed left eight orphaned `sleep` processes behind,
-/// one per sheep started; after adding this call at the end of every case
-/// that does not already `kill` as its own subject, repeated runs left none.
-/// The other half of that original fix — making every script `exec` into its
-/// final `sleep` — was a workaround for a daemon bug since fixed at the
-/// source, and has been reverted (see [`write_test_script`]).
+/// [`DaemonGuard`]'s sweep is gated on `std::thread::panicking()`, so on a
+/// success path nothing but this reaps the sheep. Without it a run leaks one
+/// orphaned `sleep` per sheep started.
 fn graceful_kill(home: &Path) {
     let _ = shep(home).arg("kill").output();
 }
@@ -813,22 +602,13 @@ fn graceful_kill(home: &Path) {
 #[cfg(unix)]
 /// Boots a daemon on `dir`'s `$SHEP_HOME` with `env` set on the `shep start`
 /// that autostarts it, waits for [`write_never_ready_flockfile`]'s sheep to
-/// give up waiting, and hands back the daemon's own log.
+/// give up, and hands back the daemon's own log.
 ///
-/// The environment reaches the daemon because `launch::launch_command`
-/// deliberately does not `.env_clear()` the re-exec, so `SHEP_LOG_JSON` and
-/// `SHEP_LOG_LEVEL` are read by the child that installs the subscriber, not by
-/// the parent that spawns it.
-///
-/// Waiting for `online` is what orders the read: `handle_ready_result` writes
-/// [`READINESS_RECORD`] *before* it sets the status, so a sheep observed
-/// `online` has already had its record written and there is nothing to poll
-/// for — the same ordering argument [`a_real_memory_breach_restarts_a_sheep`]
-/// makes about its own record.
-///
-/// The daemon is killed before the log is returned, so a caller's assertion
-/// can panic without leaking a supervisor; its own [`DaemonGuard`] covers a
-/// panic inside this helper, before the kill.
+/// `launch::launch_command` does not `.env_clear()` the re-exec, so `env`
+/// reaches the child that installs the subscriber. Waiting for `online` orders
+/// the read: `handle_ready_result` writes [`READINESS_RECORD`] before it sets
+/// the status. The daemon is killed before the log is returned, so a caller's
+/// assertion can panic without leaking a supervisor.
 fn daemon_log_after_a_missed_handshake(dir: &TempDir, env: &[(&str, &str)]) -> String {
     let home = dir.path();
     let flockfile = write_never_ready_flockfile(dir);
@@ -854,88 +634,41 @@ fn daemon_log_after_a_missed_handshake(dir: &TempDir, env: &[(&str, &str)]) -> S
     log
 }
 
-/// A `$SHEP_HOME` whose daemon *and whole flock* this test is responsible
-/// for, reaped on `Drop` even if the test panics before its own assertions
-/// run.
+/// A `$SHEP_HOME` whose daemon and whole flock this test is responsible for,
+/// reaped on `Drop` even if the test panics first.
 ///
-/// # What the panic path costs, and how this closes it
+/// Every sheep has its own process group, so killing the daemon does not reach
+/// one; [`record_pid_line`] has each fixture script record its pid so this
+/// guard can reach a flock it cannot enumerate over RPC.
 ///
-/// SIGKILLing the daemon does not reach a sheep. `shep-daemon`'s
-/// `tokio_runner.rs` gives every sheep its own process group, deliberately,
-/// so the daemon's own `kill_tree` can target one sheep without also hitting
-/// itself — which means a sheep is never in the daemon's group, and the one
-/// signal this guard can send the daemon stops at the daemon. On the success
-/// path that costs nothing, because [`graceful_kill`] has already driven the
-/// daemon's real kill ladder over every sheep. On the *panic* path the case
-/// never reaches `graceful_kill`, and every sheep it started keeps running,
-/// reparented to init, until its own script exits.
-///
-/// The sweep below closes that: [`record_pid_line`] has every fixture script
-/// append its own pid to `<home>/`[`FIXTURE_PIDS`] as its first act, so the
-/// pids are on disk before the daemon has even reported the spawn, and this
-/// guard can reach a flock it has no RPC-free way to enumerate.
-///
-/// Two orderings are load-bearing:
-///
-/// - **The daemon dies first.** A sheep killed while its supervisor is still
-///   running is a sheep the restart brain brings straight back, so a sweep
-///   that ran first would kill a flock and hand the daemon a reason to
-///   respawn it.
-/// - **The sweep runs only while panicking**, exactly as
-///   `shep-daemon/tests/real_runner.rs`'s `Reaper` does and for the reason it
-///   already states: on the success path `graceful_kill` has proven these
-///   pids gone, and signalling a pid the OS may since have recycled is a
-///   hazard rather than a safety net.
-///
-/// `Drop` must not panic — panicking while already panicking aborts the
-/// process, taking the rest of the run's output with it — so an unreachable
-/// daemon is reported with `eprintln!` rather than asserted.
-///
-/// # `dog_pids`: the grandchild gap
-///
-/// A dog is a GRANDCHILD of this test process — the daemon spawns it, not
-/// the harness — and `tokio_runner.rs` gives it the same per-child process
-/// group a sheep gets (this file's own module doc on why a sheep is never
-/// in the daemon's group; `shep-daemon`'s own architecture supervises a dog
-/// through that exact code path, no special-casing). So `kill_group_of` on
-/// the daemon's own pid, the loop below, never reaches a dog any more than
-/// it reaches a sheep — [`sweep_flock`] is what closes that gap for a
-/// sheep, off pids its own fixture script records; a dog spawned by `shep
-/// dog <name>` writes to no such file, so a case that starts one registers
-/// its pid here directly with [`Self::adopt_dog_pid`] instead.
-///
-/// Swept unconditionally, unlike `sweep_flock`'s panic-only gate: on the
-/// success path [`graceful_kill`] has already stopped the dog through the
-/// shepherd's own kill ladder — the same one that stops every sheep, since
-/// nothing here special-cases a dog — so this is an `ESRCH` no-op there
-/// (`kill_group_of`'s own doc), not a second teardown path racing the first.
+/// Two orderings are load-bearing. The daemon dies first, or the restart brain
+/// brings each killed sheep back. The sweep runs only while panicking: on a
+/// success path [`graceful_kill`] has proven these pids gone, and the OS may
+/// have recycled them. `Drop` must not panic, so an unreachable daemon is
+/// reported with `eprintln!`.
 #[derive(Debug, Default)]
 struct DaemonGuard {
     homes: Vec<PathBuf>,
-    /// Dogs adopted by pid, reaped individually because they are not in any
-    /// home's flock. Unix only: the Windows arm reaps through `shep kill`,
-    /// which takes each dog's job object with it — see [`DaemonGuard`]'s
-    /// `Drop`.
+    /// Dogs adopted by pid, reaped individually because they are in no home's
+    /// flock. Unix only: the Windows arm reaps through `shep kill` and its job
+    /// objects.
     #[cfg(unix)]
     dog_pids: Vec<nix::unistd::Pid>,
 }
 
 impl DaemonGuard {
     /// Register a `$SHEP_HOME` whose daemon this test is responsible for.
-    /// Call it on the `Output` — that is, immediately after `.output()` and
-    /// BEFORE the assertion on `output.status`, which panics on failure.
-    /// Registering after the assertion leaks exactly the daemon the guard
-    /// exists to reap, in exactly the case (a failed autostart) where a
-    /// leaked daemon is most likely.
+    ///
+    /// Call it immediately after `.output()` and before the assertion on
+    /// `output.status`: registering after it leaks the daemon in exactly the
+    /// failed-autostart case where one is most likely.
     fn adopt_home(&mut self, home: &Path) {
         self.homes.push(home.to_path_buf());
     }
 
-    /// Register a dog's own pid — a grandchild the daemon spawned, whose
-    /// process group sits outside the daemon's own and so survives this
-    /// guard's ordinary `kill_group_of(daemon_pid)` untouched. See this
-    /// struct's own doc on `dog_pids` for why. Call it as soon as the pid
-    /// is known, same ordering rule [`Self::adopt_home`] gives.
+    /// Register a dog's own pid, a grandchild whose process group sits outside
+    /// the daemon's and so survives `kill_group_of(daemon_pid)` untouched.
+    /// Call it as soon as the pid is known, by [`Self::adopt_home`]'s ordering.
     #[cfg(unix)]
     fn adopt_dog_pid(&mut self, pid: nix::unistd::Pid) {
         self.dog_pids.push(pid);
@@ -943,31 +676,15 @@ impl DaemonGuard {
 }
 
 impl Drop for DaemonGuard {
-    /// # Windows
-    ///
-    /// The whole sweep collapses into `shep kill`, and that is not a
-    /// weaker cleanup — it is the same guarantee obtained one layer down.
-    /// The unix arm exists because a sheep that outlives its daemon is an
-    /// orphan reparented to init, which only an explicit `kill(-pgid)` will
-    /// reap; that is why the daemon pid is parsed, its group signalled, and
-    /// the recorded fixture pids swept individually.
-    ///
-    /// On Windows every sheep is assigned to a job object it cannot leave
-    /// (`shep_daemon::sys_windows`), so terminating the daemon terminates
-    /// the whole flock with it, transitively. There is no orphan class for
-    /// a sweep to catch, and no pid file to read — which is also why
-    /// `record_pid_line` writes nothing there.
-    ///
-    /// Mutation-checked upstream rather than here: disabling the runner's
-    /// job assignment left orphaned processes behind in
-    /// `real_runner_windows.rs`, which is the assertion this cleanup path
-    /// leans on.
+    /// On Windows the whole sweep collapses into `shep kill`: a job object
+    /// takes the flock with the daemon. The unix arm exists because a sheep
+    /// that outlives its daemon is an orphan only `kill(-pgid)` reaps.
     fn drop(&mut self) {
         #[cfg(windows)]
         {
             for home in &self.homes {
-                // Best-effort, exactly as the unix arm is: a guard runs on a
-                // panic path where the daemon may already be gone.
+                // Best-effort: a guard runs on a panic path where the daemon
+                // may already be gone.
                 let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("shep"))
                     .arg("--home")
                     .arg(home)
@@ -982,14 +699,11 @@ impl Drop for DaemonGuard {
             for home in &self.homes {
                 match daemon_pid(home) {
                     Some(pid) => kill_group_of(pid),
-                    // No parseable pid, and the case succeeded: the daemon's own
-                    // graceful shutdown unlinks the pidfile as its last act
-                    // (`boot.rs`'s teardown), so this is "already gone" rather
-                    // than "never wrote one".
+                    // A success path unlinks the pidfile as its last act, so
+                    // this is "already gone", not "never wrote one".
                     None if !panicking => {}
-                    // No parseable pid on the panic path: the case may have died
-                    // inside the empty-pidfile window GUARD_PID_DEADLINE
-                    // documents, so retry before concluding anything.
+                    // On the panic path the case may have died inside the
+                    // empty-pidfile window GUARD_PID_DEADLINE covers.
                     None => match wait_for_daemon_pid(home) {
                         Some(pid) => kill_group_of(pid),
                         None => eprintln!(
@@ -1017,32 +731,19 @@ impl Drop for DaemonGuard {
 /// SIGKILLs every process group named in `home`'s [`FIXTURE_PIDS`], resweeping
 /// until [`GUARD_SWEEP_WINDOW`] expires.
 ///
-/// The window, not the single read, is the fix. A sheep records its pid as its
-/// script's first line, but `shep start` reports `Online` off the *spawn*, not
-/// off the child's first executed statement — so a case that panics
-/// immediately after `start` returns reaches this code while its sheep is
-/// still somewhere between `fork` and `execve`, with an empty (or absent)
-/// pid file. Measured, not assumed: the first calibration run of this guard
-/// read `pids=[]` and left a live `/bin/sh sheep.sh` reparented to init, with
-/// the script on disk and correct. Resweeping catches that sheep the moment
-/// it writes.
+/// A sheep records its pid as its script's first line, but `shep start`
+/// reports `Online` off the spawn, so a case that panics straight after it
+/// reaches here with the pid file still empty. Bounded rather than convergent:
+/// no case tells this guard how many sheep to expect.
 ///
-/// Bounded rather than convergent on purpose: "the file stopped growing" is
-/// not observable from here (no case tells this guard how many sheep to
-/// expect), so a named deadline is the honest stopping rule. It costs nothing
-/// on the success path, which never calls this, and on the panic path the run
-/// is already red.
-///
-/// The daemon must already be dead when this runs — see [`DaemonGuard`] on
-/// why — since a sheep killed under a live supervisor is a sheep the restart
-/// brain brings straight back.
+/// The daemon must already be dead: a sheep killed under a live supervisor is
+/// one the restart brain brings straight back.
 fn sweep_flock(home: &Path) {
     let start = Instant::now();
     loop {
         for pid in recorded_fixture_pids(home) {
-            // `-pid`: every recorded pid is a `/bin/sh` that leads its own
-            // process group, so this reaches its forked lambs too. Re-signalling
-            // one already killed on an earlier pass is an ESRCH no-op.
+            // `-pid`: every recorded pid leads its own group, so this
+            // reaches its lambs. Re-signalling a dead one is an ESRCH no-op.
             let _ = nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(-pid.as_raw()),
                 nix::sys::signal::Signal::SIGKILL,
@@ -1064,10 +765,9 @@ fn daemon_pid(home: &Path) -> Option<nix::unistd::Pid> {
 }
 
 #[cfg(unix)]
-/// [`daemon_pid`], retried until it answers or [`GUARD_PID_DEADLINE`]
-/// expires. A daemon still alive populates the pidfile the moment its
-/// `PidfileLock::record` runs; one that never populates it is one that
-/// already exited, so the deadline is what separates the two.
+/// [`daemon_pid`], retried until it answers or [`GUARD_PID_DEADLINE`] expires.
+/// A live daemon fills the pidfile in `PidfileLock::record`; one that never
+/// fills it has already exited.
 fn wait_for_daemon_pid(home: &Path) -> Option<nix::unistd::Pid> {
     let start = Instant::now();
     loop {
@@ -1084,13 +784,10 @@ fn wait_for_daemon_pid(home: &Path) -> Option<nix::unistd::Pid> {
 #[cfg(unix)]
 /// SIGKILLs `pid`'s process group, or `pid` alone if it does not lead one.
 ///
-/// Group, not leader: the daemon's own children are in its group. But only
-/// while the daemon really IS its own group leader — signalling `-pid` when
-/// it is not reaches somebody else's group, and in a test runner that group
-/// contains the harness. Case 1 asserts the leader property holds; this
-/// checks it rather than assuming it, because `Drop` also runs on the path
-/// where case 1 failed. `ESRCH` from `getpgid` means already reaped: fall
-/// back to the leader-only signal, which is a no-op in that case.
+/// Leadership is checked, not assumed: `-pid` against a non-leader reaches
+/// somebody else's group, which in a test runner holds the harness. `ESRCH`
+/// from `getpgid` means already reaped, and the leader-only fallback is then a
+/// no-op.
 fn kill_group_of(pid: nix::unistd::Pid) {
     let target = match nix::unistd::getpgid(Some(pid)) {
         Ok(pgid) if pgid == pid => nix::unistd::Pid::from_raw(-pid.as_raw()),
@@ -1103,10 +800,8 @@ fn kill_group_of(pid: nix::unistd::Pid) {
 #[cfg(unix)]
 /// Every pid a fixture script recorded under `home`, in spawn order.
 ///
-/// A missing file means the case started no sheep — several do not — and an
-/// unparseable line is skipped rather than fatal: this runs on a path that
-/// is already failing, and the pids either side of it are still worth
-/// signalling.
+/// A missing file means the case started no sheep. An unparseable line is
+/// skipped: this runs on a path that is already failing.
 fn recorded_fixture_pids(home: &Path) -> Vec<nix::unistd::Pid> {
     let Ok(text) = std::fs::read_to_string(home.join(FIXTURE_PIDS)) else {
         return Vec::new();
@@ -1118,7 +813,7 @@ fn recorded_fixture_pids(home: &Path) -> Vec<nix::unistd::Pid> {
 }
 
 #[cfg(unix)]
-/// Reads the daemon pid recorded at `home`'s pidfile — the same path
+/// Reads the daemon pid recorded at `home`'s pidfile, the same path
 /// `shep_daemon::boot::pidfile` builds.
 fn read_daemon_pid(home: &Path) -> nix::unistd::Pid {
     let path = home.join("pids").join("shepd.pid");
@@ -1132,10 +827,10 @@ fn read_daemon_pid(home: &Path) -> nix::unistd::Pid {
 }
 
 #[cfg(unix)]
-/// Asserts `pid` is the leader of its own process group — the
+/// Asserts `pid` is the leader of its own process group, the
 /// `Command::process_group(0)` contract `launch.rs` relies on to detach the
 /// daemon from the parent's group and terminal. `std::process::Command`
-/// exposes no getter for this, so a real spawn is the only honest check.
+/// exposes no getter for this, so a real spawn is the only check.
 fn assert_group_leader(pid: nix::unistd::Pid) {
     assert_eq!(
         nix::unistd::getpgid(Some(pid)).unwrap(),
@@ -1148,12 +843,8 @@ fn assert_group_leader(pid: nix::unistd::Pid) {
 
 /// A port with nothing on it: bind `:0`, read what the OS chose, release it.
 ///
-/// Same idiom `shep-daemon/tests/daemon_e2e.rs`'s own `free_port` uses, and
-/// the same residual risk: a stranger could take the port between the
-/// release here and the metrics dog's own bind. That loss is loud rather
-/// than quiet — the dog refuses to run and `shep dogs` reports it errored —
-/// so a case that hits it fails with a named cause rather than measuring
-/// something else silently.
+/// A stranger taking it before the dog binds is a loud loss: the dog refuses
+/// to run and `shep dogs` reports it errored.
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .expect("the OS must have a free loopback port")
@@ -1163,15 +854,10 @@ fn free_port() -> u16 {
 }
 
 /// One attempt at a `GET /metrics` scrape against `addr`, over a plain
-/// `std::net::TcpStream` — no HTTP crate anywhere in this workspace
-/// (`crate::http`'s own module doc gives the reason), so the client side of
-/// this exchange is exactly as hand-rolled as the server side.
+/// `std::net::TcpStream`: this workspace carries no HTTP crate.
 ///
-/// Reads to EOF rather than to a declared `content-length`: the metrics
-/// dog's own `handle_connection` answers exactly one request per accepted
-/// connection and then drops the stream, so the peer closing *is* the end
-/// of the response, and there is no keep-alive loop on the other end to
-/// race.
+/// Reads to EOF: the dog answers one request per connection and then drops the
+/// stream, so the peer closing ends the response.
 ///
 /// # Errors
 /// Connection refused (nothing bound yet), or no full response within
@@ -1187,10 +873,9 @@ fn scrape_metrics(addr: std::net::SocketAddr) -> std::io::Result<String> {
 }
 
 /// [`scrape_metrics`], retried until it answers or [`METRICS_SCRAPE_DEADLINE`]
-/// expires, returning whatever the last attempt saw (`""` if every attempt
-/// failed to connect at all). Bounded the same way every other poll in this
-/// file is — a scrape target that never comes up must fail as a named
-/// assertion on an empty string, never hang the case.
+/// expires, returning the last attempt's body (`""` if none connected). A
+/// target that never comes up fails as an assertion on an empty string, never
+/// a hang.
 fn poll_metrics(addr: std::net::SocketAddr) -> String {
     let start = Instant::now();
     loop {
@@ -1204,17 +889,12 @@ fn poll_metrics(addr: std::net::SocketAddr) -> String {
     }
 }
 
-/// One attempt at a request against a `shep serve` worker, over a plain
-/// `std::net::TcpStream` — the same reasoning [`scrape_metrics`] gives, and
-/// safe for the same structural reason: `serve::worker`'s own handler
-/// answers `Connection: close` on every reply, so reading to EOF is reading
-/// the whole response.
+/// One attempt at a request against a `shep serve` worker. `serve::worker`
+/// answers `Connection: close`, so reading to EOF reads the whole response.
 ///
-/// Returns the status code off the response's first line, and everything
-/// after the blank line as the body. Not a real HTTP parser — this file has
-/// no HTTP crate in it any more than `serve::worker` does — but every
-/// response this tier's own fixtures produce is small enough to fit in one
-/// read, sent with no chunking.
+/// Returns the status code off the first line and everything after the blank
+/// line as the body. Not a real HTTP parser: nothing this tier produces is
+/// chunked.
 ///
 /// # Errors
 /// Connection refused (nothing bound yet), or no full response within
@@ -1268,22 +948,13 @@ fn poll_http_get(
 }
 
 #[cfg(unix)]
-/// Runs `shep --home <home> flock --format json` until it answers a `pid`
-/// for a dog named `name`, or [`FLOCK_DEADLINE`] expires — the same real
-/// gap [`poll_flock`] covers for a sheep: `shep enable` returning success
-/// means the `EnableDog` RPC landed, not that the daemon's own supervisor
-/// loop has already recorded a pid for the child it just spawned.
-/// `flock`, not `dogs`, on purpose: `Response::Flock` carries both
-/// populations in one array (`emit_flock`'s own doc — `Format::Json`
-/// renders it undivided), so this needs no verb of its own to reach a
-/// dog's pid, the same way [`poll_flock`] itself needs none to reach a
-/// sheep's.
+/// Runs `shep flock --format json` until it answers a `pid` for the dog named
+/// `name`, or [`FLOCK_DEADLINE`] expires. `shep enable` returning success means
+/// the `EnableDog` RPC landed, not that a pid is recorded.
 ///
-/// Panics on expiry rather than returning `None`: every case that calls
-/// this already has a `DaemonGuard` in scope to adopt the pid into once it
-/// is known, and a `None` here would leave a real, running dog process
-/// unregistered with the very guard that exists to reap it — worse than a
-/// named panic pointing straight at the cause.
+/// `flock`, not `dogs`: `Response::Flock` carries both populations in one
+/// array. Panics on expiry, since a `None` would leave a running dog
+/// unregistered with the guard that exists to reap it.
 fn wait_for_dog_pid(home: &Path, name: &str) -> nix::unistd::Pid {
     let flock = poll_flock_data(home, FLOCK_DEADLINE, |data| {
         data.as_array().is_some_and(|entries| {
@@ -1302,48 +973,30 @@ fn wait_for_dog_pid(home: &Path, name: &str) -> nix::unistd::Pid {
     nix::unistd::Pid::from_raw(i32::try_from(pid).expect("a real OS pid fits i32"))
 }
 
-/// Runs `shep --home <home> bleats --no-follow` with `args` appended, until
-/// its stdout is non-empty or [`BLEATS_DEADLINE`] expires, and returns the
-/// last attempt's `Output` either way. The selector and any global flag
-/// ride in `args` — `--format` is declared `global = true`
-/// (`crates/shep-cli/src/cli.rs`), so clap takes it after the subcommand.
+/// Runs `shep bleats --no-follow` with `args` appended until its stdout is
+/// non-empty or [`BLEATS_DEADLINE`] expires, returning the last `Output`.
 ///
-/// The retry covers a real gap: `shep start` returns once the sheep is
-/// registered and spawned, while the daemon's log pump is a separate task
-/// that has not necessarily written the child's first line yet. Polling the
-/// log file at its conventional path instead would tie this tier to a
-/// path-derivation rule the daemon is free to change (and which an app's
-/// own `out_file` overrides anyway); polling the command does not.
-///
-/// It returns on expiry rather than panicking, so the failure that reaches
-/// CI is the caller's own assertion naming its own marker. Each attempt
-/// still carries the same [`CMD_TIMEOUT`] every other case does, so nothing
-/// here can block unbounded.
+/// The retry covers the gap between `shep start` returning and the daemon's
+/// log pump writing the child's first line. Reading the log file directly
+/// would tie this tier to a path rule an app's `out_file` overrides.
 fn bleats_no_follow_until_written(home: &Path, args: &[&str]) -> Output {
     bleats_no_follow_until(home, args, |stdout| !stdout.is_empty())
 }
 
-/// [`bleats_no_follow_until_written`], for a caller that needs more than one
-/// line: waits until every string in `needles` is present in one reading.
+/// [`bleats_no_follow_until_written`] for a caller that needs more than one
+/// line: waits until every string in `needles` is in one reading.
 ///
-/// A sheep's two streams reach two files, and the daemon's log pump fills
-/// them independently, so "stdout is non-empty" is a weaker condition than
-/// "both markers are there". A caller asserting on both would otherwise take
-/// the first reading that had either, and read the other one's absence as a
-/// failure. That is a race rather than a slow runner: it went red on the
-/// Windows leg while every other platform passed the same commit.
+/// A sheep's two streams reach two files the pump fills independently, so a
+/// caller asserting on both would otherwise take the first reading with
+/// either.
 fn bleats_no_follow_until_contains(home: &Path, args: &[&str], needles: &[&str]) -> Output {
     bleats_no_follow_until(home, args, |stdout| {
         needles.iter().all(|needle| stdout.contains(needle))
     })
 }
 
-/// The retry loop both of the above share: runs the command until `done`
-/// accepts its stdout or [`BLEATS_DEADLINE`] expires.
-///
-/// Takes the condition as a parameter for the reason [`poll_flock_data`]
-/// does — the wait belongs to the caller's assertion, and a helper that
-/// decides it centrally can only ever be right for one caller.
+/// The shared retry loop: runs the command until `done` accepts its stdout or
+/// [`BLEATS_DEADLINE`] expires.
 fn bleats_no_follow_until(home: &Path, args: &[&str], done: impl Fn(&str) -> bool) -> Output {
     let start = Instant::now();
     loop {
@@ -1361,28 +1014,52 @@ fn bleats_no_follow_until(home: &Path, args: &[&str], done: impl Fn(&str) -> boo
 }
 
 /// Runs `shep flock --format json` until `done` accepts the whole `data`
-/// array, or `deadline` expires, and returns the last observation either way.
+/// array, or `deadline` expires, returning the last observation either way.
 ///
-/// Polls rather than sleeping once: nothing in this tier is synchronous with
-/// the daemon's own work, and every deadline in it is sized for a loaded
-/// runner. Returning the last observation instead of panicking on expiry
-/// keeps the failure that reaches CI the caller's own assertion, naming the
-/// value it wanted and the value it got.
-///
-/// The deadline is a parameter rather than [`FLOCK_DEADLINE`] outright
-/// because the two real-clock cases wait on wall-clock schedules — a minute
-/// boundary, a 15-second sampling tick — that it is an order of magnitude too
-/// short for. It stays a *named* deadline per caller either way: no case in
-/// this file sleeps once and asserts.
-///
-/// Each attempt carries the same [`CMD_TIMEOUT`] every other command here
-/// does, so nothing in the loop can block unbounded.
+/// Returning rather than panicking on expiry keeps the failure the caller's
+/// own assertion. The deadline is a parameter because the two real-clock cases
+/// need one an order of magnitude past [`FLOCK_DEADLINE`].
+/// Every attempt must succeed; the one case that signals a handover itself
+/// polls through [`poll_flock_data_across_a_handover`].
 fn poll_flock_data(
     home: &Path,
     deadline: Duration,
     done: impl Fn(&serde_json::Value) -> bool,
 ) -> serde_json::Value {
+    poll_flock_until(home, deadline, false, done)
+}
+
+/// [`poll_flock_data`] for the one case that signals a handover itself and
+/// then polls the shepherd being replaced.
+///
+/// The attempt whose reply is in flight at the `execve` fails with
+/// [`DROPPED_REPLY`]; asserting on it turns a tolerated event into a panic.
+/// One drop, and a second is still fatal: the poll is serial and the exec
+/// happens once, so at most one accepted connection is open at the swap.
+#[cfg(unix)]
+fn poll_flock_data_across_a_handover(
+    home: &Path,
+    deadline: Duration,
+    done: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    poll_flock_until(home, deadline, true, done)
+}
+
+/// The loop the two above share. `tolerate_one_drop` lets one attempt fail
+/// with a connection the shepherd closed after accepting it.
+///
+/// A tolerated attempt costs a retry and nothing else: it consults neither
+/// `done` nor `deadline`. The retry can land after `deadline` by one poll
+/// interval and one command, and that is wanted: a drop at the edge that
+/// ended the poll would be the flake this closes, one window narrower.
+fn poll_flock_until(
+    home: &Path,
+    deadline: Duration,
+    tolerate_one_drop: bool,
+    done: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
     let start = Instant::now();
+    let mut tolerance = tolerate_one_drop;
     loop {
         let output = shep(home)
             .arg("--format")
@@ -1390,6 +1067,11 @@ fn poll_flock_data(
             .arg("flock")
             .output()
             .unwrap();
+        if tolerance && !output.status.success() && closed_by_a_handover(&output) {
+            tolerance = false;
+            std::thread::sleep(FLOCK_POLL_INTERVAL);
+            continue;
+        }
         assert_success(&output);
         let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
             .unwrap_or_else(|e| panic!("flock stdout was not JSON: {e}"));
@@ -1401,29 +1083,27 @@ fn poll_flock_data(
     }
 }
 
+/// Whether `output` is a client whose connection the shepherd had accepted
+/// when it replaced its own image. The two sentences and nothing else, so a
+/// shepherd that is gone or refusing still fails the caller.
+fn closed_by_a_handover(output: &Output) -> bool {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stderr.contains(DROPPED_REPLY) || stderr.contains(DROPPED_HANDSHAKE)
+}
+
 /// [`poll_flock_data`] for the single-sheep cases: waits [`FLOCK_DEADLINE`]
-/// and hands `done` — and the caller — that one sheep's `ProcessInfo` rather
+/// and hands `done`, and the caller, that one sheep's `ProcessInfo` rather
 /// than the array around it.
 fn poll_flock(home: &Path, done: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
     poll_flock_data(home, FLOCK_DEADLINE, |data| done(&data[0]))[0].clone()
 }
 
-/// Runs `shep --home <home> --format json describe <name>` until its lamb
-/// tree is non-empty, or [`FLOCK_DEADLINE`] expires, returning the last
-/// `Output` either way — the fixture-comparison case's own version of the
-/// same wait [`describe_renders_a_real_sheeps_lamb_tree`] already does over
-/// the table renderer.
+/// Runs `shep --format json describe <name>` until its lamb tree is non-empty
+/// or `deadline` expires, returning the last `Output` either way.
 ///
-/// `describe` walks the live process tree only inside its own handler, so
-/// the very first call after `start` races the shell script's own fork: on
-/// this test's script, `/bin/sh` has to fork and exec the trailing `sleep`
-/// before the walk can see it, and that fork has not necessarily happened
-/// yet. Pinning a committed fixture with an empty `lambs` array — this
-/// file's original shape — bet on losing that race forever, which is
-/// exactly backwards: the sheep always eventually has the lamb, so the
-/// fixture should describe the state the sheep reaches, and this is what
-/// waits for it rather than sampling whatever the first call happened to
-/// catch.
+/// `describe` walks the live process tree in its own handler, so the first
+/// call after `start` races `/bin/sh` forking and exec'ing its trailing
+/// `sleep`.
 fn poll_describe_lambs(home: &Path, name: &str, deadline: Duration) -> Output {
     let start = Instant::now();
     loop {
@@ -1447,13 +1127,9 @@ fn poll_describe_lambs(home: &Path, name: &str, deadline: Duration) -> Output {
     }
 }
 
-/// The `data[]` element named `name`, for the two cases that run a control
-/// sheep beside the one under test.
-///
-/// By name rather than by index: the control exists to be read in the same
-/// observation as the subject, and `data[0]`/`data[1]` would quietly swap
-/// meanings if the daemon's id ordering or a Flockfile's app order ever
-/// moved.
+/// The `data[]` element named `name`, for the cases that run a control sheep
+/// beside the one under test. By name, since `data[0]`/`data[1]` would swap
+/// meanings if id or app ordering moved.
 fn sheep_named<'a>(data: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
     data.as_array()
         .unwrap_or_else(|| panic!("flock data must be an array: {data}"))
@@ -1464,18 +1140,12 @@ fn sheep_named<'a>(data: &'a serde_json::Value, name: &str) -> &'a serde_json::V
 
 // --- Dog index helpers -------------------------------------------------
 
-/// Serves `response` -- a complete raw HTTP response, status line and all
-/// -- once, on an ephemeral loopback port, on a background thread, and
-/// returns the `http://` URL to read it from. `SHEP_DOG_INDEX`'s own
-/// loopback carve-out (`dog_index::require_secure_url`'s own doc) is what
-/// makes this possible at all: this file drives the real `shep` binary as
-/// a subprocess, so there is no seam to skip the `https://` check the way
-/// `dog_index`'s own unit tests can from inside the crate.
+/// Serves `response`, a complete raw HTTP response, once on an ephemeral
+/// loopback port from a background thread, and returns its `http://` URL.
 ///
-/// Blocking `std::net`, not tokio: this file has no async runtime of its
-/// own, unlike `dog_index`'s own `serve_index` test harness, which this
-/// mirrors in every other respect -- drain the request just enough that
-/// the client's write never stalls, write the canned response, close.
+/// `SHEP_DOG_INDEX`'s loopback carve-out is what allows `http://` here: this
+/// file drives the real binary, so there is no seam to skip the `https://`
+/// check from.
 fn serve_raw_response(response: String) -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1491,8 +1161,7 @@ fn serve_raw_response(response: String) -> String {
     format!("http://127.0.0.1:{}/dogs.json", addr.port())
 }
 
-/// [`serve_raw_response`] wrapping `body` as a well-formed 200 -- the shape
-/// every case that serves a real index needs.
+/// [`serve_raw_response`] wrapping `body` as a well-formed 200.
 fn serve_dog_index(body: &str) -> String {
     serve_raw_response(format!(
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
@@ -1500,19 +1169,13 @@ fn serve_dog_index(body: &str) -> String {
     ))
 }
 
-/// A two-entry community index, shaped like the live one's own single
-/// entry (`web/public/dogs.json`, the same fixture `dog_index`'s own unit
-/// tests build from): Spot, clean; and Rex, whose description carries
-/// `\u{1b}[2J` -- a raw screen-clear escape a hostile pull request could
-/// add, and the whole reason `dog_index::sanitise` exists. Both are valid
-/// entries -- neither is dropped, so `skipped` stays zero and this fixture
-/// alone cannot exercise that count.
+/// A two-entry community index shaped like the live `web/public/dogs.json`:
+/// Spot, clean; and Rex, whose description carries a raw `\u{1b}[2J`
+/// screen-clear for `dog_index::sanitise` to strip. Both are valid, so
+/// `skipped` stays zero.
 ///
-/// Wrapped in the `{"$schema": ..., "version": 1, "dogs": [...]}` object
-/// the real `dogs.json` carries -- a bare array here is exactly the shape
-/// `the_old_bare_array_format_is_refused` (`dog_index.rs`'s own unit
-/// tests) proves `parse_index` now refuses, and this fixture has to stay
-/// on the accepted side of that line to test anything else.
+/// `parse_index` refuses a bare array, so the entries are wrapped in the
+/// `$schema`/`version`/`dogs` object.
 fn two_entry_index_json() -> String {
     serde_json::json!({
         "$schema": "https://shep-pm.com/dogs.schema.json",
@@ -1551,24 +1214,14 @@ fn two_entry_index_json() -> String {
 
 // --- JSON fixture helpers -------------------------------------------------
 
-/// Asserts `info` (one `data[]` element of a `flock`/`describe`/`start`
-/// envelope, or the `describe`d sheep itself) carries the dynamic fields a
-/// real spawned sheep must have, then blanks them to `null` so the rest of
-/// the object can be compared against a committed fixture verbatim.
+/// Asserts `info`, one `data[]` element of an envelope, carries the dynamic
+/// fields a real spawned sheep must have, then blanks them to `null` so the
+/// rest can be compared against a committed fixture verbatim.
 ///
-/// A real `pid` and `uptime_ms` cannot be pinned across runs, and
-/// `out_file`/`err_file` are rooted under this test's own tempdir, which
-/// differs on every run — the fixture would have to be rewritten by every
-/// test invocation to stay byte-exact. Blanking them is not a licence to
-/// skip checking them: each is asserted against its own real shape first.
-///
-/// `samples` says whether the verb this envelope answers takes a live
-/// resource reading — `flock` and `describe` do, every other verb answers
-/// with the numbers the actor holds, which are none. It is the whole reason
-/// this helper takes the argument: `memory_bytes` is a real reading off the
-/// host and cannot be pinned either, but WHETHER it is there is exactly the
-/// asymmetry worth asserting, and this is the only tier with a real sheep
-/// and a real sampler to assert it against.
+/// `pid`, `uptime_ms` and the tempdir-rooted `out_file`/`err_file` cannot be
+/// pinned across runs, so each is asserted against its own shape first.
+/// `samples` says whether this verb takes a live resource reading, which is
+/// the assertion `memory_bytes` gets in place of a value.
 fn normalize_process_info(info: &mut serde_json::Value, home: &Path, name: &str, samples: Samples) {
     let pid = info["pid"]
         .as_i64()
@@ -1606,21 +1259,16 @@ fn normalize_process_info(info: &mut serde_json::Value, home: &Path, name: &str,
             "a verb that takes no live sample must report no memory: {info}"
         ),
     }
-    // `cpu_percent` is not asserted either way. It needs a periodic baseline
-    // to measure against, and whether one has been recorded depends on
-    // whether the daemon happened to live through a poll interval before
-    // this line ran — a real condition, but a clock race to assert on.
+    // `cpu_percent` needs a periodic baseline, so whether one exists depends on
+    // the daemon living through a poll interval: a clock race either way.
     info["pid"] = serde_json::Value::Null;
     info["uptime_ms"] = serde_json::Value::Null;
     info["out_file"] = serde_json::Value::Null;
     info["err_file"] = serde_json::Value::Null;
     info["cpu_percent"] = serde_json::Value::Null;
     info["memory_bytes"] = serde_json::Value::Null;
-    // `lambs[].pid` races the same way the fields above do — the process
-    // table pid `describe`'s own walk found — so it is nulled the same way.
-    // `lambs[].name` stays: it names the program the OS reports for that
-    // pid, deterministic once the walk has actually caught it (the caller's
-    // job, via `poll_describe_lambs`, not this function's).
+    // `lambs[].pid` races the same way. `lambs[].name` stays: it is
+    // deterministic once the walk has caught the lamb.
     if let Some(lambs) = info["lambs"].as_array_mut() {
         for lamb in lambs {
             lamb["pid"] = serde_json::Value::Null;
@@ -1638,9 +1286,8 @@ enum Samples {
 }
 
 /// Parses `output.stdout` as a `flock`/`describe`/`start` envelope,
-/// normalizes its one `data[]` element (this whole file only ever starts
-/// one sheep per `$SHEP_HOME` in these cases), and compares the result
-/// against the committed fixture named `command`.
+/// normalizes its one `data[]` element, and compares the result against the
+/// committed fixture named `command`.
 fn assert_envelope_matches_fixture(
     output: &Output,
     home: &Path,
@@ -1669,10 +1316,9 @@ fn assert_envelope_matches_fixture(
     );
 }
 
-/// Asserts a failed `--format json` invocation kept `stdout` empty and put
-/// a parseable `{"schema_version", "error": {"code", "message"}}` object on
-/// `stderr` — the two-real-streams claim only this tier can prove
-/// (`output::emit_error` is handed one writer in a unit test).
+/// Asserts a failed `--format json` invocation kept `stdout` empty and put a
+/// parseable `{"schema_version", "error": {"code", "message"}}` object on
+/// `stderr`. Only this tier has two real streams.
 fn assert_json_error(output: &Output, expected_status: i32, expected_error_code: &str) {
     assert_eq!(
         output.status.code(),
@@ -1697,21 +1343,9 @@ fn assert_json_error(output: &Output, expected_status: i32, expected_error_code:
 // --- Case 1 ----------------------------------------------------------------
 
 #[cfg(unix)]
-/// `shep start <script>` with no daemon running autostarts one, the sheep
-/// reaches Online, and the daemon is its own process-group leader.
-///
-/// The leader assertion is the `Command::process_group(0)` contract
-/// `launch.rs` relies on; `std::process::Command` exposes no getter for it,
-/// so a real spawn (which this case already has) is the only honest test.
-///
-/// What a broken implementation this would catch: a `launch_command` that
-/// dropped `.process_group(0)` (the daemon inherits the test harness's own
-/// group, and `assert_group_leader` fails); a `main.rs` dispatch that
-/// routed `Start` through `connect_client` instead of
-/// `connect_or_spawn_client` (nothing would ever be listening, and the
-/// command would time out or exit `DaemonUnreachable` instead of
-/// `Success`); a supervisor that left a freshly spawned sheep `Starting`
-/// rather than `Online` (the JSON assertion below fails by itself).
+/// Also asserts the daemon is its own process-group leader, the
+/// `Command::process_group(0)` contract `launch.rs` relies on and which
+/// `std::process::Command` exposes no getter for.
 #[test]
 fn starting_with_no_daemon_running_autostarts_one_and_the_sheep_reaches_online() {
     let dir = tempfile::tempdir().unwrap();
@@ -1740,14 +1374,6 @@ fn starting_with_no_daemon_running_autostarts_one_and_the_sheep_reaches_online()
 // --- Case 2 ------------------------------------------------------------
 
 #[cfg(unix)]
-/// A second command reuses the daemon rather than spawning a second daemon.
-///
-/// What a broken implementation this would catch: a `connect_or_spawn`
-/// probe that always launched (never actually tried connecting first) —
-/// the second `start` would produce a distinct pid, failing the equality
-/// assertion; a daemon that did not persist registered sheep across
-/// requests on the same connection lineage — the final `flock` would be
-/// missing `alpha`.
 #[test]
 fn a_second_command_reuses_the_daemon_rather_than_spawning_a_second() {
     let dir = tempfile::tempdir().unwrap();
@@ -1804,26 +1430,9 @@ fn a_second_command_reuses_the_daemon_rather_than_spawning_a_second() {
     graceful_kill(home);
 }
 
-/// A lifecycle verb prints the whole flock, not only the sheep it touched.
-///
-/// A one-row table containing `koji` cannot answer the question an
-/// operator actually has after a lifecycle command: what does the flock
-/// look like now.
-///
-/// Driven over the real binary against a real daemon, because the unit tests
-/// for this behaviour drive `render_outcome` directly and so cannot say
-/// whether any verb is wired to it. The mutation they cannot catch is the one
-/// that matters most: a `stop` still calling `emit` with its own rows.
-///
-/// Three sheep and a stop of ONE, so the narrow answer and the full one differ
-/// by row count as well as by content. The name assertion is on the exact set
-/// -- a `contains("alpha")` would pass on the one-row table this replaces,
-/// since the row it prints is alpha's.
-///
-/// The `--format json` half is asserted in the same case, and it is not
-/// padding: the two surfaces answer different questions on purpose, so a
-/// change that widened both would fix the complaint and silently break every
-/// script reading `data[0]`.
+/// Three sheep and a stop of one, so the narrow answer and the full one differ
+/// by row count as well as by content. The name assertion is on the exact set:
+/// a `contains("alpha")` would pass on a one-row table too.
 #[test]
 fn a_lifecycle_verb_prints_the_whole_flock_and_json_still_prints_what_it_touched() {
     let dir = tempfile::tempdir().unwrap();
@@ -1880,50 +1489,22 @@ fn a_lifecycle_verb_prints_the_whole_flock_and_json_still_prints_what_it_touched
 // --- Case 3 --------------------------------------------------------------
 
 #[cfg(unix)]
-/// Two concurrent `shep start` invocations against a cold `$SHEP_HOME`
-/// produce exactly one daemon and no spurious error: this is the race
-/// `flock(2)` makes safe daemon-side, and `connect_or_spawn`
-/// (`shep-client/src/spawn.rs`) safe client-side — the loser's launched
-/// child exits carrying `DAEMON_ALREADY_RUNNING`, `connect_or_spawn` keeps
-/// probing instead of surfacing that as an error, and both invocations
-/// exit 0.
+/// `flock(2)` makes the race safe daemon-side and `connect_or_spawn`
+/// client-side: the loser's child exits carrying `DAEMON_ALREADY_RUNNING` and
+/// the client keeps probing rather than surfacing that as an error.
 ///
-/// A `std::sync::Barrier` synchronizes the two racer threads' `.output()`
-/// calls (the actual `Command::spawn()`), matching the synchronization
-/// `shep-daemon`'s own `two_concurrent_boots_on_a_stale_socket_exactly_one_wins`
-/// uses for the same reason: without it, OS scheduling could let one racer
-/// finish entirely before the other starts, which would still pass this
-/// test's assertions but would not actually be racing anything.
-///
-/// This test does not (and, from outside two black-box processes, cannot)
-/// observe the losing daemon's own exit status directly — that status is
-/// read internally by the `shep start` process that launched it, never
-/// exposed across the process boundary. What it asserts instead is the
-/// externally observable consequence the brief itself describes: both
-/// invocations succeed, and afterward there is exactly one live,
-/// group-leader daemon that both racers' sheep are registered against.
-///
-/// What a broken implementation this would catch: a client-side race in
-/// `connect_or_spawn` that treated `DAEMON_ALREADY_RUNNING` as a fatal
-/// error instead of "keep probing" — the losing invocation would exit
-/// non-zero, failing `assert_success`; two daemons somehow both surviving —
-/// `flock` would show one racer's sheep missing (whichever daemon that
-/// query happened to reach would only know about its own); and a daemon
-/// that inherits a racer's stdout pipe and holds it for life — that racer's
-/// `.output()` never returns, and [`RACER_DEADLINE`] fails the case instead
-/// of letting it stall. Each racer is collected over a channel rather than
-/// by joining its thread for exactly that reason: `JoinHandle::join` has no
-/// bounded form, so a stuck racer joined directly stops the suite rather
-/// than reporting.
+/// A `std::sync::Barrier` holds the two racers until both are ready, or
+/// scheduling could let one finish before the other starts. Each is collected
+/// over a channel, since `JoinHandle::join` has no bounded form and a stuck
+/// racer joined directly would stop the suite.
 #[test]
 fn concurrent_cold_starts_produce_exactly_one_daemon() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().to_path_buf();
     let script = write_test_script(&dir);
     let mut guard = DaemonGuard::default();
-    // Registered before racing at all, not on an `Output` — two racers
-    // means two Outputs and no single point that precedes every panic path,
-    // so the earliest safe point is before either thread starts.
+    // Two racers means two Outputs and no single point that precedes every
+    // panic path, so the earliest safe point is before either thread starts.
     guard.adopt_home(&home);
 
     let names = ["racer-a", "racer-b"];
@@ -1943,8 +1524,7 @@ fn concurrent_cold_starts_produce_exactly_one_daemon() {
                 .arg(name)
                 .output()
                 .unwrap();
-            // A closed receiver means the case already gave up on this
-            // racer and failed; there is no one left to report to.
+            // A closed receiver means the case already gave up on this racer.
             let _ = finished.send((name, output));
         });
     }
@@ -1995,29 +1575,14 @@ fn concurrent_cold_starts_produce_exactly_one_daemon() {
 // --- Case 4 ----------------------------------------------------------------
 
 #[cfg(unix)]
-/// `--format json` output validates against the committed fixture for
-/// `flock`, `describe`, `start` and `ping` (envelopes, compared structurally
-/// after normalizing the fields a real spawned sheep cannot pin across
-/// runs), and for `bleats --no-follow` (one JSON object, no envelope,
-/// compared byte-for-byte).
+/// Envelopes for `flock`, `describe`, `start` and `ping` are compared
+/// structurally after normalizing what a real spawn cannot pin;
+/// `bleats --no-follow` is one object with no envelope, compared byte for
+/// byte.
 ///
-/// One `$SHEP_HOME`, one sheep ("fixture", id 0 — a fresh `$SHEP_HOME`
-/// allocates ids from zero, `shep-daemon/src/supervisor.rs:299`) shared by
-/// all five checks: `start`'s own response, then `flock`/`describe`/`ping`
-/// against the same running daemon, then the bleats fixture — the sheep's
-/// single stdout marker is what keeps `bleats --no-follow`'s stdout to
-/// exactly the one line the fixture pins.
-///
-/// What a broken implementation this would catch, per surface: a renamed,
-/// reordered, or dropped `ProcessInfo`/`BleatLine`/`PingRow` field (the
-/// structural or byte-exact comparison fails); an `id` allocator that did
-/// not start from zero on a fresh home; a `command` string mismatched to
-/// its own verb (`describe`/`fold` sharing one code path is exactly the
-/// class of bug Task 9's own reviewer found — an envelope with `describe`
-/// and `flock` swapped would fail exactly one of these four checks); a
-/// `bleats --no-follow` that produced empty output (the byte-exact
-/// comparison against a non-empty fixture fails, unlike a mere
-/// `.is_empty()` check, which an empty stdout would also pass).
+/// One sheep named "fixture" at id 0, since a fresh home allocates ids from
+/// zero. Its single stdout marker is what keeps `bleats` to the one line the
+/// fixture pins.
 #[test]
 fn json_format_matches_the_committed_fixtures() {
     let dir = tempfile::tempdir().unwrap();
@@ -2068,10 +1633,8 @@ fn json_format_matches_the_committed_fixtures() {
         "ping's pid must be the daemon's own pid"
     );
     ping_envelope["data"]["pid"] = serde_json::Value::Null;
-    // `home` and `socket` are the flock's own paths, which is the point of
-    // them being in the envelope at all, and they are a tempdir here. Assert
-    // they are right, then null them the same way `pid` is: a fixture cannot
-    // hold a path that changes every run.
+    // `home` and `socket` are a tempdir here, so assert they are right and
+    // then null them: a fixture cannot hold a path that changes every run.
     assert_eq!(
         ping_envelope["data"]["home"].as_str().unwrap(),
         home.to_str().unwrap(),
@@ -2086,13 +1649,8 @@ fn json_format_matches_the_committed_fixtures() {
     );
     ping_envelope["data"]["home"] = serde_json::Value::Null;
     ping_envelope["data"]["socket"] = serde_json::Value::Null;
-    // `daemon_version` belongs with `pid`, `home` and `socket`: assert it is
-    // right, then null it. A fixture that freezes the version turns every
-    // release into a red test. release-plz bumps `[workspace.package]` and
-    // knows nothing about this file, so its release PR failed on exactly this
-    // (v0.1.1, 2026-08-26) and the alpha-to-0.1.0 bump did too. Comparing
-    // against the crate's own version still catches the drift worth catching,
-    // a ping that stops reporting a version or reports the wrong one.
+    // Asserted and then nulled: a frozen version would turn every release bump
+    // into a red test.
     assert_eq!(
         ping_envelope["data"]["daemon_version"].as_str().unwrap(),
         env!("CARGO_PKG_VERSION"),
@@ -2125,30 +1683,14 @@ fn json_format_matches_the_committed_fixtures() {
 
 // --- Case 5 ------------------------------------------------------------
 
-/// Exit codes and stream discipline, under `--format json`: a selector
-/// matching nothing exits `NotFound`; the malformed selector `/[/` exits
-/// `Usage` (`/unclosed` would not — it parses as a sheep literally named
-/// `/unclosed` and would exit `NotFound`, testing nothing); a nonexistent
-/// `--home` on a non-autostarting verb (`flock`) exits `DaemonUnreachable`.
-/// For each, stdout must stay empty and stderr must parse as a JSON object
-/// carrying `error.code`.
+/// A selector matching nothing exits `NotFound`; the malformed `/[/` exits
+/// `Usage` (`/unclosed` would parse as a literal name and exit `NotFound`); a
+/// daemonless `--home` exits `DaemonUnreachable` and an absent one exits
+/// `Usage`. For each, stdout stays empty and stderr parses as JSON.
 ///
-/// The first two need a live daemon: every non-`Start` verb connects
-/// *before* parsing its own selector (`main.rs`'s dispatch), so both
-/// failure modes only reach their own code path once a daemon has already
-/// answered — a cold `$SHEP_HOME` here would exit `DaemonUnreachable`
-/// before ever reaching the selector at all, hiding both.
-///
-/// What a broken implementation this would catch: `describe` skipping its
-/// client-side `ProcessSelector::parse` and shipping `/[/` to the daemon
-/// (it would come back `NotFound`, not `Usage`, and this is exactly the
-/// bug Task 8 documented three rejected-selector-string traps for); `start`
-/// substituted for `flock` in the third sub-case (`start` autostarts and
-/// would *create* the nonexistent directory, exiting `Success`); an
-/// `emit_error` call that wrote to `stdout` instead of `stderr`, or that
-/// wrote table-mode prose regardless of `--format` — both fail the
-/// structural stderr-is-JSON assertion in a way a `.contains(...)` check on
-/// combined output could not.
+/// The first two need a live daemon: every non-`Start` verb connects before
+/// parsing its selector, so a cold `$SHEP_HOME` would exit
+/// `DaemonUnreachable` first and hide both.
 #[test]
 fn exit_codes_and_stream_discipline() {
     let dir = tempfile::tempdir().unwrap();
@@ -2184,14 +1726,9 @@ fn exit_codes_and_stream_discipline() {
         .unwrap();
     assert_json_error(&usage, 2, "usage");
 
-    // A separate home that exists but has never had a daemon: `flock` never
-    // autostarts (only `start` does, per `main.rs`), so "nothing is
-    // listening" stays true for the whole invocation, unlike `start` against
-    // the same path.
-    //
-    // The directory is created deliberately. An absent `--home` is now its
-    // own refusal, asserted just below, so a never-created path would prove
-    // the wrong thing here — it would never reach the connect at all.
+    // A home that exists but has never had a daemon: `flock` never autostarts,
+    // so nothing is listening for the whole invocation. Created, because an
+    // absent `--home` is its own refusal and never reaches the connect.
     let cold = tempfile::tempdir().unwrap();
     let quiet_home = cold.path().join("no-daemon-here");
     std::fs::create_dir_all(&quiet_home).unwrap();
@@ -2203,10 +1740,8 @@ fn exit_codes_and_stream_discipline() {
         .unwrap();
     assert_json_error(&unreachable, 5, "daemon_unreachable");
 
-    // And a `--home` naming a directory that is not there is a usage error
-    // rather than an unreachable daemon, because there is no flock at that
-    // path to be unreachable. The likeliest cause is a typo, and creating it
-    // would leave a second empty flock for someone to lose processes in.
+    // An absent `--home` is a usage error, not an unreachable daemon: there is
+    // no flock at that path, and creating one would leave a second empty home.
     let missing_home = cold.path().join("gone");
     let absent = shep(&missing_home)
         .arg("--format")
@@ -2220,23 +1755,13 @@ fn exit_codes_and_stream_discipline() {
         "a refused --home must be left on disk exactly as it was found"
     );
 
-    // Neither of those homes ever had a daemon (that is the point of both
-    // sub-cases) — nothing to gracefully kill there. `home` does.
+    // Neither of those homes ever had a daemon, so there is nothing to kill.
 
     graceful_kill(home);
 }
 
 // --- Case 6 --------------------------------------------------------------
 
-/// `shep kill` stops the daemon and removes the socket.
-///
-/// What a broken implementation this would catch: a `kill` that reported
-/// success straight off `Response::ShuttingDown` without polling for the
-/// socket to actually disappear (`commands/admin.rs`'s own documented
-/// race) — on a slow teardown this would pass regardless, but a `kill` that
-/// never sent `Request::KillDaemon` at all, or that the daemon never wired
-/// to its own teardown, leaves the socket behind and fails the final
-/// assertion outright.
 #[test]
 fn kill_stops_the_daemon_and_removes_the_socket() {
     let dir = tempfile::tempdir().unwrap();
@@ -2248,17 +1773,9 @@ fn kill_stops_the_daemon_and_removes_the_socket() {
     guard.adopt_home(home);
     assert_success(&boot);
 
-    // The BEHAVIOUR under test — `kill` actually tears the daemon down — is
-    // the same on both platforms; only the evidence for it differs, so the
-    // evidence is what carries the `cfg` rather than the case being skipped.
-    //
-    // On unix the control address is a socket FILE, and the daemon unlinks
-    // it as its last teardown step, so its absence is the proof. On Windows
-    // it is a named pipe: there is no directory entry, and the pipe stops
-    // existing when its owner's last handle closes. `Path::exists` on
-    // `\\.\pipe\...` is not merely unhelpful there — it answers about a
-    // filesystem that has no such path, so it would read `false` before the
-    // kill and pass vacuously.
+    // On unix the control address is a socket file the daemon unlinks. On
+    // Windows it is a named pipe with no directory entry, so `Path::exists`
+    // would read `false` before the kill and pass vacuously.
     #[cfg(unix)]
     let socket = home.join("run").join("shep.sock");
     #[cfg(unix)]
@@ -2273,9 +1790,8 @@ fn kill_stops_the_daemon_and_removes_the_socket() {
     assert!(!socket.exists(), "kill must remove the socket file");
     #[cfg(windows)]
     {
-        // `shep flock` against a departed shepherd exits `DaemonUnreachable`
-        // rather than succeeding — the operator-visible form of the same
-        // fact the missing socket file states on unix.
+        // `shep flock` against a departed shepherd exits `DaemonUnreachable`,
+        // the same fact the missing socket file states on unix.
         let after = shep(home).arg("flock").output().unwrap();
         assert!(
             !after.status.success(),
@@ -2287,17 +1803,7 @@ fn kill_stops_the_daemon_and_removes_the_socket() {
 
 // --- Case 7 --------------------------------------------------------------
 
-/// `shep bleats --no-follow` prints what a sheep actually wrote to its log
-/// files: both of a sheep's streams by default, and only the requested one
-/// under `--out`.
-///
-/// What a broken implementation this would catch: a `--no-follow` that
-/// printed nothing at all (the old bus-backed drain arm this case was
-/// blocked on until Task 10a) — it would pass an `exits Success` check but
-/// fail the stdout-contains assertions here; a `--out`/`--err` that was
-/// accepted and ignored rather than actually selecting a file — the second
-/// half's negative assertion (`bleater-err-marker` absent) is what only a
-/// real file-selecting implementation can pass.
+/// Both of a sheep's streams by default, only the requested one under `--out`.
 #[test]
 fn bleats_no_follow_prints_what_a_sheep_actually_wrote() {
     let dir = tempfile::tempdir().unwrap();
@@ -2355,27 +1861,12 @@ fn bleats_no_follow_prints_what_a_sheep_actually_wrote() {
     graceful_kill(home);
 }
 
-/// `create`-mode rotation through the real binary: rename the live log, run
-/// `shep reopen`, and the sheep's next line reaches the recreated path where
-/// `shep bleats --no-follow` can print it.
+/// `create`-mode rotation: rename the live log, run `shep reopen`, and the
+/// sheep's next line reaches the recreated path.
 ///
-/// This is the symptom the verb was built for, end to end. Before it, a
-/// rotation left the pump filling the renamed inode: the live path was never
-/// recreated, `bleats --no-follow` printed nothing, and it exited 0 while
-/// doing so. `daemon_e2e` proves the same swap over the daemon's own socket,
-/// but nothing there runs the binary an operator's `postrotate` stanza
-/// actually invokes — the argv, the default selector, the exit code and the
-/// reading verb are all this tier's to prove.
-///
-/// Both directions are asserted. That the second line appears rules out a
-/// reopen that did nothing; that the first one does NOT rules out a `bleats`
-/// that found the archive instead, or a pump that never let go of the old
-/// inode — either of which would print both lines and pass a
-/// contains-the-marker check on its own.
-///
-/// The log path is read off `shep flock --format json` rather than derived
-/// here, so the test cannot disagree with the daemon about which file it is
-/// renaming.
+/// Both directions. The second line appearing rules out a reopen that did
+/// nothing; the first one being absent rules out a `bleats` that found the
+/// archive, or a pump still holding the old inode.
 #[test]
 fn reopen_puts_a_rotated_log_back_where_bleats_can_read_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -2394,8 +1885,8 @@ fn reopen_puts_a_rotated_log_back_where_bleats_can_read_it() {
     guard.adopt_home(home);
     assert_success(&boot);
 
-    // Through the reading verb rather than the file, so the precondition is
-    // the same observation the assertion at the bottom makes.
+    // Through the reading verb, so the precondition is the same observation the
+    // assertion at the bottom makes.
     let before = bleats_no_follow_until_written(home, &["all"]);
     let printed = String::from_utf8_lossy(&before.stdout);
     assert!(
@@ -2414,12 +1905,9 @@ fn reopen_puts_a_rotated_log_back_where_bleats_can_read_it() {
     std::fs::rename(&out_file, &archive).unwrap();
     assert!(!out_file.exists(), "sanity: the rename really moved it");
 
-    // The `postrotate` stanza itself: no selector, which is the verb's
-    // default and the whole-flock case an operator writes. `--format json`
-    // is the one addition, so the envelope's own `command` label is asserted
-    // rather than taken on trust: `reopen` and `flush` render an identical
-    // `FlockRows` table, so their two labels are swappable with no table, no
-    // exit code and no wire request moving at all.
+    // No selector, the verb's default, as a `postrotate` stanza calls it. The
+    // `command` label is asserted because `reopen` and `flush` render an
+    // identical table, so the labels are swappable with nothing else moving.
     let reopened = shep(home)
         .arg("reopen")
         .arg("--format")
@@ -2433,8 +1921,7 @@ fn reopen_puts_a_rotated_log_back_where_bleats_can_read_it() {
         "a reopen's envelope must say so: {envelope}"
     );
 
-    // Only now is the gate opened, so the line below cannot predate the
-    // reopen that had to happen for it to land anywhere readable.
+    // Opened only now, so the line below cannot predate the reopen.
     std::fs::write(&gate, "").unwrap();
 
     let after = bleats_no_follow_until_written(home, &["all"]);
@@ -2463,35 +1950,18 @@ fn reopen_puts_a_rotated_log_back_where_bleats_can_read_it() {
     graceful_kill(home);
 }
 
-/// A rotation that fails, end to end: the whole feedback loop an operator
-/// has when `shep reopen` cannot do what it was asked.
-///
-/// Every other case in this file drives the log plane's happy path. This one
-/// drives the chain nothing else touches — a pump that could not open a path
-/// again, `SupervisorError::ReopenFailed`, `rpc_error`'s `Internal`, and
-/// `ExitCode::Internal`'s 9 — and it is the chain that matters most, because
-/// a `postrotate` stanza is a shell script: exit 9 is the entire signal it
-/// gets, and a rotation reported as a success leaves that sheep writing one
-/// of its streams nowhere while logrotate goes on to compress the archive.
+/// The chain from a pump that cannot open a path again, through
+/// `SupervisorError::ReopenFailed` and `rpc_error`'s `Internal`, to exit 9.
 ///
 /// A directory in stdout's place is the failure with no permission games in
-/// it: `open(2)` on a directory fails for every uid, root included, so this
-/// cannot pass for the wrong reason on a privileged CI runner. The daemon's
-/// own tiers use the same construction one and two layers down.
-///
-/// stderr's path is left alone, so the message must name stdout's path and
-/// only stdout's — a daemon that reported the whole flock, or the wrong
-/// path, would still exit 9 and pass a bare status check.
-///
-// fails if any link in that chain stops carrying the failure: a
-// `spawn_reopen_task` that reported a refusing pump as a success, an
-// `rpc_error` arm answering a code other than `Internal`, or an
-// `ExitCode::from(RpcErrorCode)` that no longer sends `Internal` to 9.
+/// it: `open(2)` on a directory fails for every uid. stderr's path is left
+/// alone, so the message must name stdout's and only stdout's.
 #[test]
 fn a_reopen_that_cannot_open_a_path_again_exits_internal() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
-    let script = write_logging_script(&dir, "blocked-out-marker", None);
+    const MARKER: &str = "blocked-out-marker";
+    let script = write_logging_script(&dir, MARKER, None);
     let mut guard = DaemonGuard::default();
 
     let boot = shep(home)
@@ -2504,8 +1974,18 @@ fn a_reopen_that_cannot_open_a_path_again_exits_internal() {
     guard.adopt_home(home);
     assert_success(&boot);
 
-    // Read off the daemon's own snapshot rather than derived here, so the
-    // test cannot disagree with it about which file it is blocking.
+    // `online` says the daemon spawned the child, not that the pump opened the
+    // file. Without this wait the rename fails ENOENT.
+    let written = bleats_no_follow_until_written(home, &["all"]);
+    let printed = String::from_utf8_lossy(&written.stdout);
+    assert!(
+        printed.contains(MARKER),
+        "precondition: the pump must have opened the log before the rotation \
+         renames it: stdout={printed}"
+    );
+
+    // Off the daemon's own snapshot, so the test cannot disagree about which
+    // file it is blocking.
     let online = poll_flock(home, |info| info["status"] == "online");
     let out_file = PathBuf::from(
         online["out_file"]
@@ -2513,10 +1993,8 @@ fn a_reopen_that_cannot_open_a_path_again_exits_internal() {
             .unwrap_or_else(|| panic!("the daemon reports its own log paths: {online}")),
     );
 
-    // The rotator's rename, and then something in the recreated path's way.
-    // Renamed rather than deleted so the pump is in the state a real
-    // rotation leaves it in: holding a handle on an inode that answers to a
-    // different name, with the live path unopenable.
+    // Renamed, not deleted: a real rotation leaves the pump holding an inode
+    // under a different name, with the live path unopenable.
     std::fs::rename(&out_file, out_file.with_extension("log.1")).unwrap();
     std::fs::create_dir(&out_file).unwrap();
 
@@ -2534,10 +2012,8 @@ fn a_reopen_that_cannot_open_a_path_again_exits_internal() {
         message.contains(out_file.to_str().unwrap()),
         "the operator's one message must name the path that failed: {err}"
     );
-    // Taken from the daemon's own answer rather than assumed to be 0, and
-    // asserted as the whole `<name> (id <id>)` prefix — the log path already
-    // contains the name, so a bare name check would hold against a message
-    // that named no sheep at all.
+    // The whole `<name> (id <id>)` prefix: the log path already contains the
+    // name, so a bare name check would hold against a message naming no sheep.
     assert!(
         message.contains(&format!("blocked (id {})", online["id"])),
         "and the sheep it belongs to: {err}"
@@ -2549,39 +2025,13 @@ fn a_reopen_that_cannot_open_a_path_again_exits_internal() {
     graceful_kill(home);
 }
 
-/// `copytruncate`-mode rotation through the real binary: an external rotator
-/// copies the live log aside and empties it in place — no `shep` verb, no
-/// signal, nothing that tells the daemon it happened — and the sheep's next
-/// line lands at offset 0 of that same file.
+/// `copytruncate`-mode rotation: an external rotator copies the live log aside
+/// and empties it in place, telling the daemon nothing.
 ///
-/// The half of external rotation shep does nothing for, which is exactly why
-/// it is worth a case: it works only because a log file is opened `O_APPEND`
-/// (`shep-daemon`'s `open_append`), so every write seeks to end-of-file
-/// atomically and an external truncation moves the next one back to the
-/// start without the daemon being told. A handle carrying its own offset
-/// instead would put that line past a sparse hole the size of what was
-/// emptied, and a weekly rotation would turn a busy sheep's log into a file
-/// whose apparent size only ever grows.
-///
-/// The daemon's unit tier pins the same property against a pump harness, over
-/// a handle it reopened. What this adds is the stack an operator actually has
-/// — a real daemon, a real spawned sheep, the handle it has held since spawn,
-/// and a rotator acting on the file behind both of their backs.
-///
-/// The file's LENGTH is the whole assertion, for the reason
-/// [`flush_empties_a_log_the_sheep_goes_on_appending_to`] gives about its own:
-/// `bleats` prints the line either way, since a hole reads back as NUL bytes
-/// in front of it, and only the byte count tells an appending handle from a
-/// positional one.
-// fails if `open_append` stops asking for `.append(true)` — verified by
-// replacing it with `.write(true)`, under which this case reports 39 bytes
-// where 19 were expected: the hole the first line left, and then the second
-// line behind it. Blast radius, measured with `--no-fail-fast`: three cases,
-// this one plus `flush_empties_a_log_the_sheep_goes_on_appending_to` in this
-// file and `tokio_runner`'s
-// `a_reopened_handle_still_appends_so_a_truncation_leaves_no_hole`; every
-// other test in the workspace stays green, because a file nobody truncates
-// cannot tell the two handles apart.
+/// It works because a log file is opened `O_APPEND`, so every write seeks to
+/// end of file and the next one lands at offset 0. The file's length is the
+/// whole assertion: `bleats` prints the line either way, since a sparse hole
+/// reads back as NUL bytes in front of it.
 #[test]
 fn an_external_copytruncate_leaves_the_next_line_at_offset_zero() {
     let dir = tempfile::tempdir().unwrap();
@@ -2600,8 +2050,8 @@ fn an_external_copytruncate_leaves_the_next_line_at_offset_zero() {
     guard.adopt_home(home);
     assert_success(&boot);
 
-    // Through the reading verb rather than the file, so the first line is
-    // known to be on disk before the rotator below copies it.
+    // Through the reading verb, so the first line is known to be on disk before
+    // the rotator below copies it.
     let before = bleats_no_follow_until_written(home, &["all"]);
     let printed = String::from_utf8_lossy(&before.stdout);
     assert!(
@@ -2610,8 +2060,8 @@ fn an_external_copytruncate_leaves_the_next_line_at_offset_zero() {
          rotation: stdout={printed}"
     );
 
-    // Read off the daemon's own snapshot rather than derived here, so the
-    // test cannot disagree with it about which file this is.
+    // Off the daemon's own snapshot, so the test cannot disagree about which
+    // file this is.
     let online = poll_flock(home, |info| info["status"] == "online");
     let out_file = PathBuf::from(
         online["out_file"]
@@ -2619,9 +2069,8 @@ fn an_external_copytruncate_leaves_the_next_line_at_offset_zero() {
             .unwrap_or_else(|| panic!("the daemon reports its own log paths: {online}")),
     );
 
-    // `logrotate copytruncate`, spelled out: copy the file aside, then empty
-    // the original in place. Nothing here is a shep verb — the daemon is
-    // never told, and the pump goes on holding the same inode at size zero.
+    // `logrotate copytruncate` spelled out. Nothing here is a shep verb, so
+    // the daemon is never told and the pump holds the same inode at size zero.
     let archive = out_file.with_extension("log.1");
     std::fs::copy(&out_file, &archive).unwrap();
     std::fs::File::create(&out_file).unwrap();
@@ -2636,8 +2085,7 @@ fn an_external_copytruncate_leaves_the_next_line_at_offset_zero() {
         "sanity: the truncate really emptied it"
     );
 
-    // Only now is the gate opened, so the line below cannot predate the
-    // truncation it has to land after.
+    // Opened only now, so the line below cannot predate the truncation.
     std::fs::write(&gate, "").unwrap();
 
     let after = bleats_no_follow_until_written(home, &["all"]);
@@ -2652,15 +2100,12 @@ fn an_external_copytruncate_leaves_the_next_line_at_offset_zero() {
         stdout.contains(ROTATE_AFTER),
         "a truncated sheep must go on logging into the same file: stdout={stdout}"
     );
-    // The line above is the only thing the sheep wrote after the truncation,
-    // and the loop that read it back has already waited for it to be on disk.
+    // The line above is all the sheep wrote after the truncation, and the loop
+    // that read it back already waited for it to reach disk.
     assert_eq!(
         std::fs::metadata(&out_file).unwrap().len(),
-        // Stamp, line, newline. Counted in rather than stripped, because
-        // what is asserted here is a BYTE OFFSET: the point is that the
-        // file holds exactly one line's worth of bytes and no hole in
-        // front of it, and a length ignoring part of the line would not
-        // say that.
+        // Stamp, line, newline: the claim is that the file holds one line's
+        // worth of bytes with no hole in front of it.
         (shep_core::logstamp::LOG_STAMP_BYTES + ROTATE_AFTER.len() + 1) as u64,
         "the sheep's next line must land at offset 0 of the emptied file: a \
          handle that kept its offset across an external truncation would \
@@ -2671,26 +2116,12 @@ fn an_external_copytruncate_leaves_the_next_line_at_offset_zero() {
     graceful_kill(home);
 }
 
-/// `shep flush` through the real binary: empty a running sheep's log, and
-/// watch it keep logging into the same file afterwards.
+/// [`ROTATE_BEFORE`] being gone proves the truncate happened; [`ROTATE_AFTER`]
+/// arriving through the same untouched handle proves it survived.
 ///
-/// Two properties, and the second is why this reuses the rotating script
-/// rather than a simpler one. That [`ROTATE_BEFORE`] is gone proves the
-/// truncate happened. That [`ROTATE_AFTER`] — written by the same process,
-/// through the same handle the daemon never touched — arrives and is readable
-/// proves the handle survived it.
-///
-/// The file's LENGTH is what proves where that line landed. `O_APPEND` seeks
-/// to the end before every write, so an emptied file takes the next line at
-/// offset 0; a handle writing at its own preserved offset would put the same
-/// line past a sparse hole the size of what was truncated, and the reading
-/// verb would print it either way. Only the byte count tells the two apart —
-/// as a `contains` check cannot, and as reading the tail cannot, since the
-/// hole is behind the bytes it returns.
-///
-/// `daemon_e2e` proves the path-not-inode rule over the daemon's own socket,
-/// but nothing there runs the binary an operator actually types — the argv,
-/// the exit code and the reading verb are this tier's to prove.
+/// The file's length proves where that line landed: `O_APPEND` puts it at
+/// offset 0, while a preserved offset would put it past a sparse hole the
+/// reading verb prints the same either way.
 #[test]
 fn flush_empties_a_log_the_sheep_goes_on_appending_to() {
     let dir = tempfile::tempdir().unwrap();
@@ -2709,8 +2140,8 @@ fn flush_empties_a_log_the_sheep_goes_on_appending_to() {
     guard.adopt_home(home);
     assert_success(&boot);
 
-    // Through the reading verb rather than the file, so the precondition is
-    // the same observation the assertions below make.
+    // Through the reading verb, so the precondition is the same observation the
+    // assertions below make.
     let before = bleats_no_follow_until_written(home, &["all"]);
     let printed = String::from_utf8_lossy(&before.stdout);
     assert!(
@@ -2719,8 +2150,8 @@ fn flush_empties_a_log_the_sheep_goes_on_appending_to() {
          flush: stdout={printed}"
     );
 
-    // Read off the daemon's own snapshot rather than derived here, so the
-    // test cannot disagree with it about which file this is.
+    // Off the daemon's own snapshot, so the test cannot disagree about which
+    // file this is.
     let online = poll_flock(home, |info| info["status"] == "online");
     let out_file = PathBuf::from(
         online["out_file"]
@@ -2728,11 +2159,8 @@ fn flush_empties_a_log_the_sheep_goes_on_appending_to() {
             .unwrap_or_else(|| panic!("the daemon reports its own log paths: {online}")),
     );
 
-    // The selector is explicit because the verb requires one — a bare `shep
-    // flush` is a usage error, which the case below pins. `--format json`
-    // for the reason the reopen case gives about its own label: the two
-    // verbs render the same table, so nothing else here would notice them
-    // swapped.
+    // The selector is explicit because the verb requires one. `--format json`
+    // for the `command` label, since `flush` and `reopen` render one table.
     let flushed = shep(home)
         .arg("flush")
         .arg("all")
@@ -2747,8 +2175,7 @@ fn flush_empties_a_log_the_sheep_goes_on_appending_to() {
         "a flush's envelope must say so: {envelope}"
     );
 
-    // Only now is the gate opened, so the line below cannot predate the
-    // flush it has to survive.
+    // Opened only now, so the line below cannot predate the flush.
     std::fs::write(&gate, "").unwrap();
 
     let after = bleats_no_follow_until_written(home, &["all"]);
@@ -2767,15 +2194,12 @@ fn flush_empties_a_log_the_sheep_goes_on_appending_to() {
         !stdout.contains(ROTATE_BEFORE),
         "everything written before the flush is gone: stdout={stdout}"
     );
-    // The line above is the only thing the sheep wrote after the flush, and
-    // the loop that read it back has already waited for it to be on disk.
+    // The line above is all the sheep wrote after the flush, and the loop that
+    // read it back already waited for it to reach disk.
     assert_eq!(
         std::fs::metadata(&out_file).unwrap().len(),
-        // Stamp, line, newline. Counted in rather than stripped, because
-        // what is asserted here is a BYTE OFFSET: the point is that the
-        // file holds exactly one line's worth of bytes and no hole in
-        // front of it, and a length ignoring part of the line would not
-        // say that.
+        // Stamp, line, newline: the claim is that the file holds one line's
+        // worth of bytes with no hole in front of it.
         (shep_core::logstamp::LOG_STAMP_BYTES + ROTATE_AFTER.len() + 1) as u64,
         "the sheep's next line must land at offset 0 of the emptied file: a \
          handle that kept its offset across the truncate would leave a hole \
@@ -2786,24 +2210,12 @@ fn flush_empties_a_log_the_sheep_goes_on_appending_to() {
     graceful_kill(home);
 }
 
-/// The two halves of `shep flush` reach exactly one target each, asserted in
-/// the order that makes both facts stand: the flock half first, while the
-/// shepherd's own logs still hold a marker only this test wrote.
+/// The flock half runs first, while the shepherd's own logs still hold a
+/// marker only this test wrote: `flush all` must leave it byte for byte, and
+/// `flush --daemon` must leave the sheep's log untouched.
 ///
-/// The maintainer's requirement was that a flock flush never reach the shepherd's own
-/// logs without being named. That already held by construction — the daemon
-/// inherits those two files as fds 1 and 2 and has no path for a selector to
-/// match — but "by construction" is exactly the kind of claim a later
-/// refactor falsifies quietly, and `--daemon` is the door it now has to stay
-/// on the other side of. So both directions are pinned: `flush all` leaves
-/// the marker byte-for-byte, and `flush --daemon` leaves the sheep's own log
-/// untouched.
-///
-/// The marker is written through a handle of the test's own. The daemon holds
-/// fd 1 open on the same inode and writes nothing to stdout, so nothing races
-/// this — and after the `--daemon` flush that descriptor is `O_APPEND`, so
-/// whatever it writes next lands at offset 0 rather than past a hole (pinned
-/// directly, without a daemon, in `launch.rs`'s own case).
+/// The daemon holds fd 1 on the same inode and writes nothing to stdout, so
+/// nothing races the marker.
 #[test]
 fn a_daemon_flush_and_a_flock_flush_never_reach_each_others_files() {
     let dir = tempfile::tempdir().unwrap();
@@ -2829,7 +2241,7 @@ fn a_daemon_flush_and_a_flock_flush_never_reach_each_others_files() {
             .unwrap_or_else(|| panic!("the daemon reports its own log paths: {online}")),
     );
     // Read back rather than assumed: this is the precondition both halves of
-    // the case are measured against.
+    // the case are checked against.
     let before = bleats_no_follow_until_written(home, &["all"]);
     assert!(
         String::from_utf8_lossy(&before.stdout).contains(ROTATE_BEFORE),
@@ -2849,11 +2261,8 @@ fn a_daemon_flush_and_a_flock_flush_never_reach_each_others_files() {
         0,
         "the flock half must still empty the sheep it named"
     );
-    // Table mode, deliberately: the paths ride the JSON whatever the table
-    // does, so only the default rendering can show this regressing. An
-    // operator who ran a flush and was handed STATUS/PID/UPTIME was told
-    // nothing about the files it destroyed — which matters most exactly when
-    // an `out_file` was mistyped and the emptied path is not a log at all.
+    // Table mode: the paths ride the JSON whatever the table does, so only the
+    // default rendering can show an operator losing them.
     let printed = String::from_utf8_lossy(&flock_half.stdout);
     assert!(
         printed.contains(&out_file.display().to_string()),
@@ -2870,10 +2279,8 @@ fn a_daemon_flush_and_a_flock_flush_never_reach_each_others_files() {
         "a flock flush must not reach the shepherd's own stderr log"
     );
 
-    // Now the other direction. The sheep is gated shut and has written
-    // nothing since the truncate above, so its log staying empty is not what
-    // is asserted — its log is refilled first, so "untouched" is a fact with
-    // bytes behind it.
+    // The sheep has written nothing since the truncate above, so its log is
+    // refilled first and "untouched" is a fact with bytes behind it.
     std::fs::write(&gate, "").unwrap();
     let after = bleats_no_follow_until_written(home, &["all"]);
     assert!(
@@ -2916,16 +2323,9 @@ fn a_daemon_flush_and_a_flock_flush_never_reach_each_others_files() {
     graceful_kill(home);
 }
 
-/// Fails if `shep flush --daemon` grows a daemon round trip — a
-/// `connect_client` on its dispatch arm, or a `Request` of its own.
-///
-/// Emptying the shepherd's own logs is the one flush that must work while the
-/// shepherd is down, which is when an operator most often reaches for it: a
-/// daemon that filled a disk with its own diagnostics is not answering. The
-/// files belong to the CLI (`launch::launch_command` creates them), so there
-/// is nothing to ask. That no socket appears is asserted as well as the exit
-/// code, because a `connect_or_spawn` on this arm would autostart a daemon in
-/// order to be told to do nothing.
+/// The files belong to the CLI, since `launch::launch_command` creates them,
+/// so there is nothing to ask. The socket is asserted too: a `connect_or_spawn`
+/// here would autostart a daemon in order to be told to do nothing.
 #[test]
 fn a_daemon_flush_needs_no_daemon() {
     let dir = tempfile::tempdir().unwrap();
@@ -2951,14 +2351,9 @@ fn a_daemon_flush_needs_no_daemon() {
     );
 }
 
-/// Fails if `shep flush` ever runs without a selector.
-///
-/// The one command in this CLI whose slip of the finger cannot be undone, so
-/// it is pinned through the real binary and not only in clap's unit tests: a
-/// `default_value` added to the verb would make a bare `shep flush` empty
-/// every log file in the flock and exit 0. No daemon is started, because
-/// none is needed — clap refuses this before anything connects, and that it
-/// never reaches the socket is part of what is being asserted.
+/// A `default_value` on the selector would make a bare `shep flush` empty
+/// every log in the flock and exit 0. Clap must refuse before anything
+/// connects, which the socket assertion is for.
 #[test]
 fn flush_without_a_selector_is_a_usage_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -2979,33 +2374,13 @@ fn flush_without_a_selector_is_a_usage_error() {
 // --- Case 8 --------------------------------------------------------------
 
 #[cfg(unix)]
-/// `shep --home <tmp> start <script>` autostarts a daemon whose socket is
-/// under `<tmp>` — asserted on the location of the socket file, not on the
-/// command exiting 0, so a child that re-resolved `$SHEP_HOME` from ambient
-/// environment (rather than the `SHEP_HOME` `launch.rs` explicitly sets on
-/// the re-exec'd child) and bound elsewhere still fails this even though it
-/// would exit `Success`.
+/// Asserted on the socket file's location, not on exit 0, so a child that
+/// re-resolved `$SHEP_HOME` from the ambient environment and bound elsewhere
+/// still fails.
 ///
-/// `env_remove("SHEP_HOME")` is the point: without it, an ambient
-/// `$SHEP_HOME` the test process happened to inherit could make this pass
-/// for the wrong reason.
-///
-/// This case cannot use the [`shep`] helper — it needs `env_remove` and a
-/// hand-built argv — but it takes [`CMD_TIMEOUT`] from it rather than naming
-/// its own bound. An inline `Duration::from_secs(30)` here would be exactly
-/// `shep_client::spawn::SPAWN_DEADLINE`, exactly the value `CMD_TIMEOUT`'s
-/// own doc exists to forbid: a bound merely *equal* to the
-/// autostart budget races `assert_cmd`'s kill against the autostart path's own
-/// report, and on a loaded machine the kill wins. When it wins, this CLI dies
-/// with a daemon it launched still booting — and that daemon survives, because
-/// `probe_until_ready` never kills or waits its child and `launch.rs` gave it
-/// its own process group, so `assert_cmd`'s kill reaches the CLI and stops
-/// there. `spawn.rs` is deliberately not changed to close that: whether an
-/// autostart that exhausts its deadline should kill the daemon it launched is
-/// a product question, not a test-tier one. What follows from it is that
-/// nothing in `assert_cmd`'s timeout reaps a daemon, so [`DaemonGuard`] is the
-/// only thing that can — and the [`graceful_kill`] below is what keeps it from
-/// having to.
+/// Needs `env_remove` and a hand-built argv, so it cannot use the [`shep`]
+/// helper but borrows [`CMD_TIMEOUT`]. That timeout reaps no daemon: the
+/// launched child has its own process group, so a kill reaches the CLI only.
 #[test]
 fn home_reaches_the_spawned_daemon() {
     let dir = tempfile::tempdir().unwrap();
@@ -3021,12 +2396,12 @@ fn home_reaches_the_spawned_daemon() {
             script.to_str().unwrap(),
         ])
         .env_remove("SHEP_HOME") // the ambient value must not be what makes this pass
-        .timeout(CMD_TIMEOUT) // never block unbounded; see above
+        .timeout(CMD_TIMEOUT)
         .output()
         .unwrap();
 
-    // Registered on the Output, before anything that can panic — a failed
-    // autostart is precisely when a daemon is most likely to be left behind.
+    // Registered before anything that can panic: a failed autostart is when a
+    // daemon is most likely to be left behind.
     guard.adopt_home(dir.path());
     assert!(
         output.status.success(),
@@ -3046,21 +2421,9 @@ fn home_reaches_the_spawned_daemon() {
 // --- Case 9 --------------------------------------------------------------
 
 #[cfg(unix)]
-/// A write under a `watch = true` sheep's `cwd` restarts it: `restarts` goes
-/// from 0 to 1.
-///
-/// The watched tree is its own [`TempDir`], never this case's `$SHEP_HOME`.
-/// That separation is load-bearing rather than tidy: every fixture script
-/// appends its pid to `<home>/`[`FIXTURE_PIDS`] on each spawn, so a watch
-/// rooted at the home would see its own sheep's restart as the next change
-/// to restart on, and the case would never stop restarting.
-///
-/// What a broken implementation this would catch: a watch that was never
-/// armed, or armed against the wrong root (`restarts` stays 0 and this fails
-/// on the observed value); a `watch = true` that reached the daemon but
-/// normalized away (the sheep comes up and nothing ever restarts it); a
-/// debounce that swallowed the trailing event of a burst rather than firing
-/// after it (same observable).
+/// The watched tree is its own [`TempDir`], never this case's `$SHEP_HOME`: a
+/// watch rooted there would see [`FIXTURE_PIDS`] grow on each spawn and
+/// restart on its own sheep.
 #[test]
 fn a_write_under_a_watched_tree_restarts_the_sheep() {
     let dir = tempfile::tempdir().unwrap();
@@ -3098,22 +2461,9 @@ fn a_write_under_a_watched_tree_restarts_the_sheep() {
 // --- Case 10 -------------------------------------------------------------
 
 #[cfg(unix)]
-/// A write to a dot-file under the same watched tree restarts nothing — and
-/// the watcher was demonstrably alive the whole time it did not.
-///
-/// [`a_write_under_a_watched_tree_restarts_the_sheep`] alone cannot catch a
-/// dropped default-ignore set: it writes a plain file, which triggers either
-/// way. This case is the other half, and the second act is what makes its
-/// zero mean something. A dot-file, then a full [`FLOCK_DEADLINE`] of nothing
-/// happening, would also be what a watcher that was never armed produces —
-/// so afterwards it writes a plain file and requires the restart to land.
-/// One armed, delivering watcher; two writes; exactly one restart.
-///
-/// What a broken implementation this would catch: `DEFAULT_IGNORE_GLOBS`
-/// dropped or reduced to `**/.git/**` (the dot-file restarts the sheep and
-/// the first assertion fails); an ignore set applied to the wrong side of the
-/// filter, so *only* ignored paths triggered (the first assertion fails and
-/// the second one would too).
+/// A dot-file followed by a full [`FLOCK_DEADLINE`] of quiet is also what a
+/// watcher that was never armed produces, so a plain file is written
+/// afterwards and its restart must land. Two writes, exactly one restart.
 #[test]
 fn a_write_to_a_dot_file_under_a_watched_tree_restarts_nothing() {
     let dir = tempfile::tempdir().unwrap();
@@ -3138,9 +2488,8 @@ fn a_write_to_a_dot_file_under_a_watched_tree_restarts_nothing() {
     assert_eq!(before["restarts"], 0, "precondition: {before}");
 
     std::fs::write(watched.path().join(".hidden.swp"), "editor churn").unwrap();
-    // Polls for the restart that must NOT come, for the same deadline the
-    // positive case gives the restart that must: `done` never accepts, so
-    // this returns on expiry having asked the whole time.
+    // Polls for the restart that must not come, for the same deadline the
+    // positive case gives the one that must: `done` never accepts.
     let quiet = poll_flock(home, |_| false);
     assert_eq!(
         quiet["restarts"], 0,
@@ -3160,27 +2509,12 @@ fn a_write_to_a_dot_file_under_a_watched_tree_restarts_nothing() {
 // --- Case 11 -------------------------------------------------------------
 
 #[cfg(unix)]
-/// A `wait_ready` sheep stays `starting` until it writes `{"kind":"ready"}`
-/// to the shepherd channel, and only then reads `online`.
+/// The only tier that exercises the real fd-3 channel end to end; every other
+/// test of this gate hands the supervisor a `ChildMessage` directly.
 ///
-/// The only tier that exercises the real fd-3 channel end to end: every
-/// other test of this gate hands the supervisor a `ChildMessage` directly.
-///
-/// Two deliberate choices keep it from being a race dressed as a test. The
-/// script blocks on a sentinel file rather than a delay (see
-/// [`write_ready_script`]), and the app raises `listen_timeout` far above its
-/// 3000ms default — because on elapse the daemon takes a `wait_ready` sheep
-/// `Online` anyway, so leaving it at the default would make the observation
-/// window and the timeout window the same window, and a slow runner would
-/// then see `online` for the wrong reason.
-///
-/// What a broken implementation this would catch: a spawn that ignored
-/// `wait_ready` and reported `Online` immediately (the `starting` assertion
-/// fails before the sentinel is ever created); a shepherd channel that was
-/// never opened on fd 3, or opened and never read (the sheep stays `starting`
-/// past the sentinel and the second poll expires); a `Ready` message parsed
-/// under a different wire string (same observable, and the byte string here
-/// is the one `ChildMessage::Ready` pins).
+/// `listen_timeout` is raised far above its 3000ms default because the daemon
+/// takes a `wait_ready` sheep `Online` on elapse anyway, which would make the
+/// observation window and the timeout window the same window.
 #[test]
 fn a_wait_ready_sheep_goes_online_only_once_it_signals_ready() {
     let dir = tempfile::tempdir().unwrap();
@@ -3226,26 +2560,10 @@ fn a_wait_ready_sheep_goes_online_only_once_it_signals_ready() {
 // --- Case 12 -------------------------------------------------------------
 
 #[cfg(unix)]
-/// A `cron_restart` pattern that is not a cron pattern is a config error:
-/// exit `4`, JSON on stderr, and the offending pattern in the message.
-///
-/// This and [`an_https_probe_target_is_a_config_error`] are the proof that
-/// spec §5's "typos fail loudly at parse time" survives the whole trip —
-/// `normalize` rejects the app, the daemon answers `InvalidConfig` over RPC,
-/// and the CLI turns that into an exit code. Nothing before this tier spans
-/// all three.
-///
-/// The message is asserted on the presence of the pattern, not on wording:
-/// the reason text is croner's and is not ours to pin.
-///
-/// What a broken implementation this would catch: a `normalize` that
-/// validated `cron_restart` only when some other field was set, or not at all
-/// (`shep start` exits 0 and the sheep comes up with a schedule that never
-/// fires — the silent-failure shape this project keeps rooting out); an RPC
-/// layer that mapped `NormalizeError` onto `Internal` or `SpawnFailed`
-/// instead of `InvalidConfig` (the exit code is 1 or 6, not 4); a CLI that
-/// dropped the daemon's message and substituted its own (the pattern is
-/// absent from stderr).
+/// Exit `4`, JSON on stderr, and the offending pattern in the message. Spans
+/// `normalize`'s rejection, the daemon's `InvalidConfig` over RPC, and the
+/// CLI's exit code. Asserted on the pattern, not the wording, which is
+/// croner's.
 #[test]
 fn a_bad_cron_pattern_is_a_config_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -3283,21 +2601,10 @@ fn a_bad_cron_pattern_is_a_config_error() {
 // --- Case 13 -------------------------------------------------------------
 
 #[cfg(unix)]
-/// An `https://` probe target is a config error: exit `4`, JSON on stderr,
-/// and the offending target in the message.
-///
-/// The daemon's HTTP prober is hand-rolled and carries no TLS stack, and a
-/// probe that silently failed every poll would look exactly like a down app —
-/// so the target is refused at config time instead (decision D1). Same shape
-/// and same three-layer reach as
-/// [`a_bad_cron_pattern_is_a_config_error`].
-///
-/// What a broken implementation this would catch: a `ProbeTarget` parser that
-/// accepted any URL scheme and left the prober to fail at runtime
-/// (`shep start` exits 0, and the app is unreachable in a way indistinguishable
-/// from being down); a `normalize` that validated `liveness_probe` but not
-/// `readiness_probe`, or the reverse — this case configures the readiness
-/// one, and `normalize`'s own unit tier covers the other.
+/// Exit `4`, JSON on stderr, and the offending target in the message. The
+/// daemon's prober carries no TLS stack, and a probe failing every poll would
+/// look like a down app, so the target is refused at config time. This case
+/// configures the readiness probe; `normalize`'s unit tier covers liveness.
 #[test]
 fn an_https_probe_target_is_a_config_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -3336,44 +2643,13 @@ fn an_https_probe_target_is_a_config_error() {
 // --- Case 14 -------------------------------------------------------------
 
 #[cfg(unix)]
-/// A `* * * * *` occurrence restarts a real sheep on the real system clock:
-/// `restarts` goes from 0 to 1 at a wall-clock minute boundary.
+/// The only place the cron subsystem runs on `SystemClock`; every other cron
+/// test drives `TestClock` over a paused runtime.
 ///
-/// The only place the cron subsystem ever runs on `SystemClock`. Every other
-/// cron test drives `TestClock` over a paused runtime, and `SystemClock`
-/// itself appears in exactly one dyn-compatibility smoke test that constructs
-/// one and never reads it — so "an occurrence fires against real wall time"
-/// was, before this case, a claim spec §4 makes and no tier proved. The
-/// nearest existing e2e case, [`a_bad_cron_pattern_is_a_config_error`], only
-/// ever asserts that a *bad* pattern is rejected, which says nothing about a
-/// good one firing.
-///
-/// `unscheduled` is the control, and it is what rules out the competing
-/// explanation. It runs the same script under the same daemon and differs
-/// only in configuring no `cron_restart`, so a restart that came from the
-/// script exiting and being brought back — a crash loop, not an occurrence —
-/// would move both counters rather than one. The script's
-/// [`SLOW_SCRIPT_SLEEP_SECS`] sleep is the other half of that argument:
-/// it outlasts [`CRON_DEADLINE`] twice over, so neither sheep can reach its
-/// own exit inside the window at all.
-///
-/// Measured cost: 26s, 34s, 42s, 54s and 61s over five runs — a `* * * * *`
-/// pattern armed at an arbitrary moment is a uniform draw on the minute it
-/// lands in, so the only bound worth stating is the upper one: a minute plus
-/// the restart's own round trip. See [`CRON_DEADLINE`] for why that is spent
-/// rather than `#[ignore]`d.
-///
-/// What a broken implementation this would catch: a `SystemClock` that
-/// returned a fixed instant instead of reading the clock — the worker parks,
-/// wakes, finds `now` still short of `next`, and loops forever while
-/// `restarts` stays 0; an `arm_cron` never reached from the real `Online`
-/// transition, which no unit tier can see because every one of them arms the
-/// registry by hand; a `cron_restart` accepted by `normalize` and then
-/// dropped on the way to the daemon (the config-error case above passes
-/// either way, since it never gets as far as a schedule that runs).
-// fails if `SystemClock::now_utc` stops reading the real clock — verified by
-// replacing its body with `DateTime::UNIX_EPOCH`, which reddens this case and
-// nothing else in the workspace.
+/// `unscheduled` is the control: same script, same daemon, no `cron_restart`,
+/// so a restart from the script exiting would move both counters. Its
+/// [`SLOW_SCRIPT_SLEEP_SECS`] sleep outlasts [`CRON_DEADLINE`] twice over.
+/// Costs 26s to 61s, a uniform draw on the minute the arming lands in.
 #[test]
 fn a_cron_occurrence_restarts_a_sheep_on_the_real_clock() {
     let dir = tempfile::tempdir().unwrap();
@@ -3429,57 +2705,14 @@ fn a_cron_occurrence_restarts_a_sheep_on_the_real_clock() {
 // --- Case 15 -------------------------------------------------------------
 
 #[cfg(unix)]
-/// A real RSS breach restarts a real sheep: a script that grows its resident
-/// set past its app's `max_memory` is restarted by the real `PollingEnforcer`
-/// sampling the real process table.
-///
 /// The only place `PollingEnforcer` and `SysinfoSampler` run together on real
-/// time against a real spawned process. The enforcer's own tier drives it
-/// through a `ScriptedSampler` on a paused clock; the registry's tier drives
-/// arming through a `RecordingEnforcer` that measures nothing. Neither can
-/// see the chain this case does: the actor arming the real enforcer at the
-/// `Online` transition, a 15-second sampling tick landing on a process whose
-/// resident set really moved, the breach reaching the reporter, and
-/// `extra_restart`'s guards letting it through to a real kill ladder and a
-/// real respawn.
+/// time against a real spawned process.
 ///
-/// `unlimited` is the control, and it is what makes the restart attributable.
-/// It runs the *same ballooning script* under the same daemon, grows the same
-/// resident set, and differs only in naming no `max_memory` — so a restart
-/// caused by the script exiting, or by the shell dying under its own
-/// allocation, would move both counters. Only a breach moves exactly one. The
-/// script's [`SLOW_SCRIPT_SLEEP_SECS`] sleep is the other half: it outlasts
-/// [`BREACH_DEADLINE`] five times over, so neither sheep can reach its own
-/// exit inside the window.
-///
-/// Measured cost: 16s — one `MEMORY_POLL_INTERVAL` plus a restart — bounded
-/// by [`BREACH_DEADLINE`]. It runs beside the rest of this tier rather than
-/// after it, and the cron case above has never been observed finishing
-/// sooner, so it has yet to be what any run of this file waited on.
-///
-/// It reads the daemon's own log, as cases 16 and 17 do — but it is the only
-/// one that reads a record for its *contents* rather than for its presence,
-/// and the only one whose record is a consequence of the behaviour under test
-/// rather than a provocation staged to produce it. The breach record carries
-/// the observed RSS and the ceiling it crossed, which no bus event does, and
-/// it is written on this very restart.
-///
-/// What a broken implementation this would catch: a `SysinfoSampler` that
-/// stopped reading the real process table; an `arm_instance` that never
-/// reached the real enforcer from the real `Online` transition; a breach that
-/// reached the reporter and was logged rather than restarted; an enforcer
-/// armed against the sheep's id where its pid belongs, which
-/// `extra_restart`'s own pid guard would then silently drop for the whole
-/// life of the daemon; and a daemon that renders none of its own records,
-/// because no subscriber was installed or its sink was not stderr.
-// fails if `SysinfoSampler::sample` stops reading the machine's process table
-// — verified by replacing its body with `Vec::new()`, which reddens this case
-// plus two unit tests: the sampler's own smoke test, and `extras`'
-// `real_extras_wire_the_enforcer_to_the_reports_channel`. Those two are why
-// this is the narrower of the two gaps this file closes — the real sampler and
-// the real breach channel each already had a unit-tier claim on them. What
-// neither asserts, and what nothing asserted before this case, is that a
-// breach restarts anything.
+/// `unlimited` is the control: same ballooning script, same daemon, no
+/// `max_memory`, so a restart caused by the shell dying under its own
+/// allocation would move both counters. Its [`SLOW_SCRIPT_SLEEP_SECS`] sleep
+/// outlasts [`BREACH_DEADLINE`] five times over. Costs about 16s, one
+/// `MEMORY_POLL_INTERVAL` plus a restart.
 #[test]
 fn a_real_memory_breach_restarts_a_sheep() {
     let dir = tempfile::tempdir().unwrap();
@@ -3529,27 +2762,10 @@ fn a_real_memory_breach_restarts_a_sheep() {
          share is the script dying, not its ceiling being enforced: {after}"
     );
 
-    // The daemon's own log, end to end: `commands::daemon` installs the
-    // subscriber on stderr, `launch.rs` redirects the re-exec'd daemon's
-    // stderr into this file, and the breach record is the ONLY place the
-    // observed RSS and the ceiling it crossed are ever stated — the bus event
-    // says `restart` and never why.
-    //
-    // Read rather than polled: `spawn_extras_reporter` writes the record
-    // BEFORE it asks for the restart, so the counter above reaching 1 has
-    // already ordered the write ahead of this read.
-    //
-    // fails if no subscriber is installed at all — a user watching a sheep
-    // restart over and over then has nothing, anywhere, telling them it is
-    // memory — and fails if the daemon's records stop going to stderr, which
-    // is the one sink `launch.rs` captures.
-    //
-    // It also fails if `main::run`'s `daemon` arm goes back to holding a
-    // `stderr().lock()` guard for the daemon's whole life. That guard makes
-    // this very record block forever on a worker thread and wedges the
-    // daemon, which this case sees as the *next* `shep flock` failing its
-    // handshake rather than as an empty file — the wedge is what turned an
-    // empty log into a dead supervisor.
+    // `launch.rs` redirects the daemon's stderr into this file, and the breach
+    // record is the only place the observed RSS and its ceiling are stated.
+    // Read rather than polled: `spawn_extras_reporter` writes it before asking
+    // for the restart the counter above already saw.
     let daemon_log = std::fs::read_to_string(home.join("logs").join("shepd.err.log")).unwrap();
     assert!(
         daemon_log.contains("exceeded its max_memory"),
@@ -3566,31 +2782,11 @@ fn a_real_memory_breach_restarts_a_sheep() {
 // --- Case 16 -------------------------------------------------------------
 
 #[cfg(unix)]
-/// `SHEP_LOG_JSON=1` renders the daemon's own records as JSON — one object per
-/// line, in the file `launch.rs` redirects the daemon's stderr into.
+/// `SHEP_LOG_JSON=1` renders the daemon's own records as JSON, one object per
+/// line, in the file `launch.rs` redirects its stderr into.
 ///
-/// `shep-core` already pins that `SHEP_LOG_JSON` *parses* into
-/// `DaemonConfig::daemon::log_json`, and [`a_real_memory_breach_restarts_a_sheep`]
-/// already pins that a record reaches `shepd.err.log` at all. Between the two
-/// sat the knob's actual job — choosing a renderer — which nothing asserted:
-/// dropping the `.json()` call left the whole workspace green while the flag
-/// silently did nothing.
-///
-/// Every non-empty line is parsed, not only the one under test. `log_json`
-/// exists so `shepd.err.log` can be read by a machine, and a file where one
-/// line in twenty is prose is not that file — the assertion has to be about
-/// the stream, not about a record that happens to be well-formed.
-///
-/// What a broken implementation this would catch: a `log_json` branch that
-/// selects the human renderer anyway (no line parses); a subscriber whose
-/// records go somewhere other than the stderr `launch.rs` captures (the file
-/// is empty); and a `--format json` error envelope torn in half by a record
-/// written from a worker thread mid-write, which is the one way this file
-/// could gain a line that is *almost* JSON.
-// fails if `install_log_subscriber` stops selecting the JSON renderer for
-// `log_json` — verified by replacing `builder.json().try_init()` with
-// `builder.try_init()`, which reddens this case, and only this case, across
-// `cargo test --workspace --all-features`.
+/// Every non-empty line is parsed, not only the one under test: a file where
+/// one line in twenty is prose is not machine-readable.
 #[test]
 fn shep_log_json_makes_the_daemons_own_records_json() {
     let dir = tempfile::tempdir().unwrap();
@@ -3624,24 +2820,10 @@ fn shep_log_json_makes_the_daemons_own_records_json() {
 // --- Case 17 -------------------------------------------------------------
 
 #[cfg(unix)]
-/// The daemon's own records reach `shepd.err.log` with no ANSI escapes in
-/// them.
-///
-/// `install_log_subscriber` passes `.with_ansi(ansi_enabled(..))`, and
-/// `tracing_subscriber`'s own default is colour ON whenever its `ansi`
-/// feature is compiled in — it does not consult the terminal by itself. So
-/// deleting that one call, or handing it a `true`, fills the daemon's log
-/// with escape sequences: unreadable in `less`, and a trap for every
-/// substring assertion in this file, since an escape can land in the middle
-/// of a field name.
-///
-/// Asserted on purpose here because it is otherwise pinned only by accident.
-/// `a_real_memory_breach_restarts_a_sheep` checks its log for `limit=`, which
-/// escapes happen to break — an incidental guard, one rewritten assertion
-/// away from being gone, and one that names colour nowhere.
-///
-// fails if `install_log_subscriber` drops its `.with_ansi(..)` call, or
-// passes a constant `true` in place of `ansi_enabled`.
+/// `tracing_subscriber` defaults to colour whenever its `ansi` feature is
+/// compiled in, so `install_log_subscriber`'s `.with_ansi(ansi_enabled(..))`
+/// is what keeps escapes out of `shepd.err.log`. Without it they land mid
+/// field name and break every substring assertion in this file.
 #[test]
 fn the_daemons_own_log_carries_no_ansi_escapes() {
     let dir = tempfile::tempdir().unwrap();
@@ -3658,41 +2840,13 @@ fn the_daemons_own_log_carries_no_ansi_escapes() {
 }
 
 #[cfg(unix)]
-/// `SHEP_LOG_LEVEL` decides which of the daemon's records survive: the same
-/// `WARN` is written at the default level and filtered out at `error`.
+/// The same `WARN` record is written at the default level and filtered out at
+/// `error`. Both halves provoke it on identical configuration, so the absent
+/// half means filtered rather than never happened.
 ///
-/// The env variable, not the `[daemon] log_level` file key it overrides —
-/// that is all this body sets, and it is all this file can set: no case here
-/// writes a `shep.toml` at all, so every `[daemon]` key reaches the daemon
-/// through `SHEP_*` layering or not at all. What that leaves uncovered end to
-/// end is the file half of `DaemonConfig` — discovery, parse, and the
-/// precedence between a file value and the variable that overrides it — which
-/// is pinned in `shep-core`'s own tests and nowhere above them.
-///
-/// Both halves provoke the identical record on identical configuration, so the
-/// only thing that differs between them is the knob — which is what makes the
-/// absent half mean "filtered" rather than "never happened". A one-sided case
-/// asserting only the absence would pass just as well against a daemon that
-/// had stopped writing the record at all, and one asserting only the presence
-/// would pass against a hard-coded filter.
-///
-/// `error` rather than `off` on purpose: `off` also happens to be what an
-/// `EnvFilter` built from an empty or unparseable directive degrades toward,
-/// so a half that only proved silence would be consistent with the level never
-/// having been read. `error` is a level with records above and below it, and
-/// the record under test sits on the far side.
-///
-/// What a broken implementation this would catch: a filter built from a
-/// literal instead of from the configured level (the `error` half still logs);
-/// a `SHEP_LOG_LEVEL` parsed into config and then never handed to the
-/// subscriber, which is the same silent-knob shape `log_json` had (same
-/// observable); and a subscriber installed with no filter at all (both halves
-/// log, plus every `debug!` in the daemon).
-// fails if `install_log_subscriber` stops building its filter from
-// `config.daemon.log_level` — verified by replacing
-// `EnvFilter::new(config.daemon.log_level.as_str())` with
-// `EnvFilter::new("warn")`, which reddens this case, and only this case,
-// across `cargo test --workspace --all-features`.
+/// `error` rather than `off`: an `EnvFilter` built from an empty or
+/// unparseable directive also degrades toward `off`, so silence alone would be
+/// consistent with the level never being read.
 #[test]
 fn shep_log_level_decides_which_of_the_daemons_records_survive() {
     let at_default = tempfile::tempdir().unwrap();
@@ -3714,29 +2868,12 @@ fn shep_log_level_decides_which_of_the_daemons_records_survive() {
 // --- Interpreter / spawn-failure parity -----------------------------------
 
 #[cfg(unix)]
-/// `shep start <name>` on a sheep that cannot spawn must report the failure
-/// the same way `shep start <path>` against the identical broken script
-/// does, rather than exiting 0 with nothing on either stream.
+/// `Response::Restarted` has no per-id error slot, so a respawn that cannot
+/// spawn answers `Ok` with an `errored` row rather than an RPC error;
+/// `resume`'s `any_restart_failed` check is what closes that gap.
 ///
-/// Reproduces the gap the maintainer found live 2026-08-19: the daemon's
-/// `Response::Restarted` (what `shep start <name>` sends once the sheep is
-/// already registered — see `lifecycle::resume`) has no per-id error slot,
-/// so a respawn that fails to spawn still answers `Ok` with an `errored`
-/// row rather than an RPC error (`shep-daemon/src/supervisor.rs`'s
-/// `respawn`, `Err` arm). `shep start <path>`'s own `Request::Start` does
-/// not share that gap — `do_start` returns `Err(SpawnFailed)` from the
-/// identical failure — which is what let the by-name form exit 0 and print
-/// nothing while the by-path form against the same script reported
-/// `error[spawn_failed]`.
-///
-/// The script is valid shell but not executable (`0o644`), so every spawn
-/// of it fails with `EACCES` regardless of which request registered or
-/// restarted it — the same shape the maintainer's own repro used.
-///
-/// What a broken implementation would let through: reverting `resume`'s
-/// `any_restart_failed` check (`lifecycle.rs`) makes the second `start`
-/// below exit `Success` with an empty stderr again, exactly the bug this
-/// pins.
+/// The script is valid shell but not executable (`0o644`), so every spawn of
+/// it fails `EACCES` whichever request drove it.
 #[test]
 fn starting_an_errored_sheep_by_name_reports_the_same_failure_as_by_path() {
     let dir = tempfile::tempdir().unwrap();
@@ -3747,9 +2884,8 @@ fn starting_an_errored_sheep_by_name_reports_the_same_failure_as_by_path() {
     std::fs::set_permissions(&script, perms).unwrap();
     let mut guard = DaemonGuard::default();
 
-    // By path: exit 7 (spawn_failed), stderr names the reason, stdout
-    // empty. Also autostarts the daemon the second command below reuses,
-    // and registers the sheep this test's second half restarts by name.
+    // Also autostarts the daemon the second command reuses, and registers the
+    // sheep the second half restarts by name.
     let by_path = shep(dir.path())
         .arg("--format")
         .arg("json")
@@ -3760,18 +2896,15 @@ fn starting_an_errored_sheep_by_name_reports_the_same_failure_as_by_path() {
     guard.adopt_home(dir.path());
     assert_json_error(&by_path, 7, "spawn_failed");
 
-    // The sheep must actually be sitting in the flock as `errored`, or the
-    // second command below is not exercising `resume`'s `Request::Restart`
-    // path at all — it would fall through to `resolve_target`'s path arm
-    // instead, which is the already-working case this test is not about.
+    // Must be `errored` in the flock, or the second command takes
+    // `resolve_target`'s path arm instead of `resume`'s.
     let flock = poll_flock(dir.path(), |info| info["status"] == "errored");
     assert_eq!(
         flock["status"], "errored",
         "the by-path failure must leave the sheep registered as errored: {flock}"
     );
 
-    // By name, same broken script, same failure: must report it exactly
-    // like the by-path command above did, not silently succeed.
+    // By name, same broken script, same failure.
     let name = script.file_stem().unwrap().to_str().unwrap();
     let by_name = shep(dir.path())
         .arg("--format")
@@ -3786,24 +2919,13 @@ fn starting_an_errored_sheep_by_name_reports_the_same_failure_as_by_path() {
 }
 
 #[cfg(unix)]
-/// `shep restart <name>` must report a respawn that cannot spawn, the same
-/// way `shep start` does in both its forms.
+/// Same `Response::Restarted` gap as the sibling above. `restart` still prints
+/// its table, being a multi-target verb; the exit code and the stderr line are
+/// what change.
 ///
-/// The sibling test above fixed `start <name>`; `restart` reached the same
-/// daemon reply through its own handler and kept exiting 0 in silence. The
-/// cause is shared: `Response::Restarted` has no per-id error slot, so a
-/// spawn that failed comes back as an ordinary `errored` row inside an `Ok`
-/// (`shep-daemon/src/supervisor.rs`'s `respawn`, `Err` arm), and a caller
-/// that trusts the `Ok` reports success.
-///
-/// Unlike `start <name>`, `restart` still prints its table: it is a
-/// multi-target verb, and an operator restarting a flock wants to see which
-/// members came back. What changes is the exit code and the line on stderr.
-///
-/// The script is valid shell at `0o644`, so every spawn fails `EACCES`. It
-/// deliberately has NO extension: `.sh` now maps to `sh` through the
-/// starter interpreter mapping, which would run a non-executable file
-/// perfectly well and quietly delete this test's whole premise.
+/// The script is valid shell at `0o644`, so every spawn fails `EACCES`, and it
+/// has no extension: `.sh` maps to `sh` through the interpreter mapping, which
+/// would run a non-executable file and delete the premise.
 #[test]
 fn restarting_a_sheep_that_cannot_spawn_reports_it_rather_than_exiting_zero() {
     let dir = tempfile::tempdir().unwrap();
@@ -3848,24 +2970,15 @@ fn restarting_a_sheep_that_cannot_spawn_reports_it_rather_than_exiting_zero() {
 #[cfg(unix)]
 /// The missing-node sentence, produced for real rather than quoted.
 ///
-/// `deferred.md` recorded this as untestable: producing it needs a `PATH`
-/// with no node on it, and `std::env::set_var` is `unsafe` in edition 2024
-/// inside a crate that forbids unsafe code. That is true of a UNIT test,
-/// which would have to mutate its own process. It is not true here: this
-/// tier already runs shep as a subprocess, and `Command::env` sets the
-/// CHILD's environment without touching the parent's, so there is nothing
-/// unsafe and nothing racy about it.
-///
-/// `docs/migration.md` quotes this sentence for an operator without node
-/// installed. Until now nothing re-checked that quote against the `format!`
-/// that produces it, and the two were kept in step by hand.
+/// It needs a `PATH` with no node on it, which a unit test could only get by
+/// mutating its own process. `docs/migration.md` quotes this sentence, and
+/// this is what holds the quote to the `format!` that produces it.
 #[test]
 fn a_js_flockfile_without_node_says_so_and_says_what_to_do() {
     let dir = tempfile::tempdir().unwrap();
     let flockfile = dir.path().join("Flockfile.js");
-    // Declares a real app, so the ONLY thing that can fail here is the
-    // missing interpreter. With node present this Flockfile is valid, which
-    // is what makes the assertion below about node rather than about shape.
+    // Declares a real app, so the only thing that can fail is the missing
+    // interpreter: with node present this Flockfile is valid.
     std::fs::write(
         &flockfile,
         "module.exports = { app: [{ name: 'web', script: './server.js' }] };\n",
@@ -3873,8 +2986,8 @@ fn a_js_flockfile_without_node_says_so_and_says_what_to_do() {
     .unwrap();
     let mut guard = DaemonGuard::default();
 
-    // An empty PATH for the child only. `node` cannot be found, which is the
-    // whole condition under test, and the parent's environment is untouched.
+    // An empty PATH for the child only, so `node` cannot be found and the
+    // parent's environment is untouched.
     let output = shep(dir.path())
         .env("PATH", "")
         .arg("start")
@@ -3908,21 +3021,11 @@ fn a_js_flockfile_without_node_says_so_and_says_what_to_do() {
     graceful_kill(dir.path());
 }
 
-// --- shep init (lesson 3) ---------------------------------------------------
+// --- shep init ---------------------------------------------------------------
 //
-// These fail until the verb exists. `shep init` has no clap subcommand at
-// all yet, so every one of them currently dies on "unrecognized subcommand" --
-// which is exactly the point: the scaffold functions in
-// `crates/shep-cli/src/commands/init.rs` are unreachable from the command
-// line, and nothing until now has said so out loud.
-//
-// They live in the e2e tier rather than beside the functions they exercise
-// for two reasons. Writing a file is the behaviour under test, and a
-// subprocess is the only place `shep init` can actually be run; and this
-// file compiles whether or not the verb exists, so the handoff does not
-// depend on any particular shape of the implementation.
+// Writing a file is the behaviour under test, and a subprocess is the only
+// place `shep init` runs.
 
-/// The plain case: a directory with no Flockfile gets one.
 #[test]
 fn shep_init_writes_a_flockfile_where_there_is_none() {
     let dir = tempfile::tempdir().unwrap();
@@ -3949,10 +3052,8 @@ fn shep_init_writes_a_flockfile_where_there_is_none() {
 }
 
 #[cfg(unix)]
-/// What it writes must be loadable, not merely present.
-///
-/// The unit tests already prove the scaffold parses; this proves the bytes
-/// that reach disk are the same ones, which is a different claim.
+/// The unit tests prove the scaffold parses; this proves the bytes that reach
+/// disk are the same ones.
 #[test]
 fn what_shep_init_writes_is_a_flockfile_shep_can_read() {
     let dir = tempfile::tempdir().unwrap();
@@ -3962,9 +3063,8 @@ fn what_shep_init_writes_is_a_flockfile_shep_can_read() {
         .output()
         .unwrap();
 
-    // Uncommenting is what makes it a live Flockfile; `shep start` against
-    // the file as written would refuse it for declaring no apps, which is
-    // its own correct behaviour and not what this test is about.
+    // Uncommenting is what makes it a live Flockfile: as written it declares
+    // no apps and `shep start` refuses it.
     let body = std::fs::read_to_string(dir.path().join("Flockfile.toml")).unwrap();
     let live: String = body
         .lines()
@@ -4002,14 +3102,9 @@ fn what_shep_init_writes_is_a_flockfile_shep_can_read() {
 }
 
 #[cfg(unix)]
-/// Refuse rather than clobber, and prove it by metadata rather than by
-/// content.
-///
-/// This project has been bitten twice by exactly this. `shep style`'s writer
-/// shipped a refusal that still rewrote the file (`d023465`): the bytes were
-/// identical, so a content check passed, while the inode had changed and a
-/// symlinked config would have been replaced by a regular file. Compare what
-/// the filesystem says, not what the file says.
+/// Proved by metadata, not content: a refusal that still rewrites the file
+/// leaves identical bytes while the inode has changed and a symlinked config
+/// has become a regular file.
 #[test]
 fn shep_init_refuses_an_existing_flockfile_without_touching_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -4056,7 +3151,6 @@ fn shep_init_refuses_an_existing_flockfile_without_touching_it() {
     );
 }
 
-/// `--force` is the one destructive path, so it has to actually work.
 #[test]
 fn shep_init_force_replaces_an_existing_flockfile() {
     let dir = tempfile::tempdir().unwrap();
@@ -4103,28 +3197,13 @@ fn shep_init_all_writes_the_full_scaffold() {
 // --- Reload ---------------------------------------------------------------
 
 #[cfg(unix)]
-/// `shep reload` reaches the reload verb, and the swap it starts really
-/// finishes against real processes.
+/// The envelope's `command` is what pins which handler `Commands::Reload`
+/// reaches, since `main`'s dispatch arms have no unit coverage. The polled id
+/// is the other half: a reload ends in a new id in the same instance slot,
+/// where a restart would leave the id alone and a stop the sheep down.
 ///
-/// Two halves, and each covers something no other tier does. The envelope's
-/// `command` is the only thing anywhere that pins which handler
-/// `Commands::Reload` reaches — `main`'s dispatch arms have no unit coverage,
-/// and an arm wired to `lifecycle::restart` would answer `"restart"` here
-/// while otherwise behaving plausibly. The polled id is the other half: a
-/// reload is the one verb whose success is a *new* id in the same instance
-/// slot, so a restart in its place leaves the id where it was and a stop
-/// leaves the sheep down.
-///
-/// The reply is asserted to carry the ORIGINAL id, which is the acceptance
-/// contract — `shep reload` exits before the swap commits — and the poll is
-/// what waits for the swap itself. A default `listen_timeout` of 3s plus a
-/// drain fits inside [`FLOCK_DEADLINE`] with room to spare.
-///
-/// What a broken implementation this would catch: the dispatch misroute
-/// above; a reload that answers and then never swaps (the poll expires and
-/// the id assertion names what it wanted); a swap that leaves the drainee
-/// registered, since the flock would still hold two entries and `data[0]`
-/// would still be the original id.
+/// The reply carries the original id, which is the acceptance contract:
+/// `shep reload` exits before the swap commits, and the poll waits for it.
 #[test]
 fn reload_swaps_a_sheep_for_a_fresh_instance_under_a_new_id() {
     let dir = tempfile::tempdir().unwrap();
@@ -4176,32 +3255,12 @@ fn reload_swaps_a_sheep_for_a_fresh_instance_under_a_new_id() {
 // --- Trigger ---------------------------------------------------------------
 
 #[cfg(unix)]
-/// `shep trigger` reaches the trigger verb and no other, against a real
-/// daemon and a real sheep.
+/// The envelope's `command` is what pins which handler `Commands::Trigger`
+/// reaches, since `main`'s dispatch arms have no unit coverage.
 ///
-/// The envelope's `command` is the only thing anywhere that pins which
-/// handler `Commands::Trigger` reaches — `main`'s dispatch arms have no unit
-/// coverage (this file's own `reload_swaps_a_sheep_for_a_fresh_instance_
-/// under_a_new_id` names the same gap for `Commands::Reload`) — so an arm
-/// wired to some other verb's module would answer plausibly here (most of
-/// them accept a selector, some even accept a second positional the shell
-/// would happily supply) while never sending `Request::Trigger` at all.
-///
-/// The sheep here is started with no `channel`/`wait_ready`/
-/// `shutdown_with_message`, so its own real reply is deterministic without
-/// a companion process that speaks the shepherd channel: `no_channel`,
-/// every time, on real wall-clock and a real daemon. That is also this
-/// crate's own `output/rows.rs` `TriggeredRows` rendering exercised for
-/// real, end to end, for the one outcome an operator hits by default —
-/// building and driving a channel-speaking companion process for the other
-/// three outcomes is real work of its own, left for later.
-///
-/// What a broken implementation this would catch: the dispatch misroute
-/// above (verified by hand — routing `Commands::Trigger` to `query::ping`
-/// instead of `trigger::trigger` leaves every unit test in the crate green
-/// and only this case red); `TriggerArgs`'s `action` positional silently
-/// dropped before it reaches `Request::Trigger`; and `no_channel`'s own
-/// `DETAIL` text losing its `channel = true` callout.
+/// The sheep has no `channel`/`wait_ready`/`shutdown_with_message`, so its
+/// reply is `no_channel` every time without a companion that speaks the
+/// shepherd channel. The other three outcomes need one and are not covered.
 #[test]
 fn trigger_reaches_the_trigger_verb_and_names_the_missing_channel() {
     let dir = tempfile::tempdir().unwrap();
@@ -4245,13 +3304,8 @@ fn trigger_reaches_the_trigger_verb_and_names_the_missing_channel() {
 // --- Signal ------------------------------------------------------------
 
 #[cfg(unix)]
-/// `shep signal` reaches the signal verb and no other, against a real
-/// daemon and a real sheep — the same dispatch-misroute gap `trigger`'s own
-/// case names, for `Commands::Signal` instead.
-///
-/// `SIGWINCH` is the right signal for an e2e case: harmless to essentially
-/// everything, so the assertion is about delivery reaching the sheep at all,
-/// not about what the child did with it.
+/// `SIGWINCH` is harmless to essentially everything, so the assertion is that
+/// delivery reached the sheep, not what the child did with it.
 #[test]
 fn signal_reaches_the_signal_verb_and_delivers() {
     let dir = tempfile::tempdir().unwrap();
@@ -4294,14 +3348,9 @@ fn signal_reaches_the_signal_verb_and_delivers() {
 // --- Stock -------------------------------------------------------------
 
 #[cfg(unix)]
-/// `shep stock` reaches the stock verb and no other, against a real daemon:
-/// stocking up spawns the new instances, stocking back down drains the extras.
-///
-/// Both directions are polled through `shep flock` rather than trusted off
-/// `stock`'s own exit — a stock-down accepts before the departing instances'
-/// stop ladders finish (see `Commands::Stock`'s own doc), so the flock
-/// settling to one row is the real assertion, and a stock-down that never
-/// settles fails the test on `FLOCK_DEADLINE` rather than hanging it (IR-46).
+/// Both directions are polled through `shep flock` rather than taken off
+/// `stock`'s own exit: a stock-down accepts before the departing instances'
+/// stop ladders finish, so the flock settling is the real assertion.
 #[test]
 fn stock_reaches_the_stock_verb_and_settles_the_flock() {
     let dir = tempfile::tempdir().unwrap();
@@ -4371,9 +3420,8 @@ fn stock_reaches_the_stock_verb_and_settles_the_flock() {
 }
 
 #[cfg(unix)]
-/// `shep scale` is `stock`'s visible alias: it must still reach a real
-/// daemon and produce the same primary-command name in its envelope as
-/// `shep stock` does — the alias reaches the same verb, not a shadow of it.
+/// `shep scale` is `stock`'s visible alias, and must produce the same primary
+/// command name in its envelope.
 #[test]
 fn scale_alias_reaches_stock_against_a_real_daemon() {
     let dir = tempfile::tempdir().unwrap();
@@ -4411,17 +3459,8 @@ fn scale_alias_reaches_stock_against_a_real_daemon() {
 // --- Lambs ---------------------------------------------------------------
 
 #[cfg(unix)]
-/// `shep describe` renders a real sheep's lamb tree: the forked `sleep`
-/// child appears in its own table, captioned with what the parent-pid walk
-/// is and what it is not — the same caveat `output/mod.rs`'s own unit tests
-/// pin against a hand-built `ProcessInfo` (Step 17.0/17.1), exercised here
-/// over a real process tree end to end.
-///
-/// Polled rather than asserted on the first `describe`: the daemon walks for
-/// lambs only inside its own `Describe` handler, against whatever the OS
-/// process table happens to report at that instant, and the forked child's
-/// appearance there is a real race against this test's own process —
-/// bounded by `FLOCK_DEADLINE` rather than a fixed sleep (IR-46).
+/// Polled, not asserted once: the daemon walks lambs inside `Describe` against
+/// the live process table, so the forked child's appearance races this test.
 #[test]
 fn describe_renders_a_real_sheeps_lamb_tree() {
     let dir = tempfile::tempdir().unwrap();
@@ -4438,19 +3477,10 @@ fn describe_renders_a_real_sheeps_lamb_tree() {
     guard.adopt_home(dir.path());
     assert_success(&started);
 
-    // Polls for `sleep` specifically, not merely for a `Lambs of` section:
-    // a walk can catch the forked child mid-exec, still reporting the
-    // parent shell's own name — `sh` — rather than the program that pid is
-    // about to become, so this loop rides out the `execve` as well as the
-    // fork.
-    //
-    // Not a sampling tick, and the distinction is what makes the loop able
-    // to ride it out at all: the 15-second memory poll is a different walk
-    // entirely, and `MemorySampler::identify` builds a process table of its
-    // own per call. Sharing the poll's retained table instead would make
-    // this loop futile rather than slow — sysinfo never revises a name it
-    // has already recorded for a pid, so every later iteration would read
-    // the same `sh` back until the daemon restarted.
+    // Polls for `sleep`, not merely a `Lambs of` section: a walk can catch the
+    // child mid-exec still reporting the shell's name. It rides that out only
+    // because `MemorySampler::identify` builds a process table per call;
+    // sysinfo never revises a name it has recorded for a pid.
     let start = Instant::now();
     let described = loop {
         let output = shep(dir.path())
@@ -4479,30 +3509,12 @@ fn describe_renders_a_real_sheeps_lamb_tree() {
 // --- Save / Muster ---------------------------------------------------------
 
 #[cfg(unix)]
-/// `shep save` writes the muster roll and `shep muster` reads it back — the
-/// §13.4 flagship "import, muster, save, reboot" shape, minus the reboot: a
-/// muster against the same still-live daemon that just saved exercises the
-/// already-running idempotence rule (`snapshot::restorable`) for real, since
-/// nothing here ever goes down in between.
+/// Nothing goes down in between, so the muster exercises the already-running
+/// idempotence rule in `snapshot::restorable`.
 ///
-/// Both dispatch arms carried no coverage beyond a clap-parsing pin
-/// (`save_parses_to_its_own_command`/`muster_parses_to_its_own_command`,
-/// `main.rs`) until this case: a dispatch arm in `run`'s `match` that calls
-/// the wrong verb's function still compiles and still passes every
-/// clap-parsing test, because nothing below the parse layer ever calls the
-/// verb it parsed to. This case closes that gap for both verbs — confirmed
-/// by rewiring `Commands::Save`/`Commands::Muster` to each other's function
-/// in turn and watching this case redden each time.
-///
-/// What a broken implementation this would catch, beyond the dispatch
-/// misroute above: a `save` that reports the wrong app count (`data.apps`
-/// pins it at 1); a `muster` that reports `Started`'s shape instead of
-/// `Mustered`'s, or that starts a *second* instance of `roundtrip` rather
-/// than recognising the one already running (`flock.len()` pins exactly
-/// one, `pid` pins it as the SAME process `start` reported, not a fresh
-/// one) — the exact failure decision 3/4 exist to rule out, since a
-/// duplicate or a restarted sheep here would silently double a real flock
-/// on every reboot.
+/// `flock.len()` pins exactly one instance and `pid` pins it as the process
+/// `start` reported, so a muster that duplicated or restarted the sheep fails
+/// here.
 #[test]
 fn saving_the_roll_then_mustering_reports_the_same_flock() {
     let dir = tempfile::tempdir().unwrap();
@@ -4582,26 +3594,10 @@ fn saving_the_roll_then_mustering_reports_the_same_flock() {
 // --- Import -----------------------------------------------------------
 
 #[cfg(unix)]
-/// `shep import` reads a pm2 dump and writes a Flockfile shep can read
-/// back, without ever touching a daemon.
-///
-/// The envelope's `command` is asserted for the same reason
-/// `saving_the_roll_then_mustering_reports_the_same_flock` asserts it on
-/// `save`/`muster`: `run`'s dispatch arms carry no unit coverage of their
-/// own, and an arm reaching the wrong function (or handing it the wrong
-/// args) would still exit 0 here without this. The written file is checked
-/// against the REAL parser (`shep_core::config::Flockfile::parse`), not
-/// merely "the process exited 0" — a Flockfile shep itself refuses to read
-/// back is not an import. That no socket ever appears is the other half:
-/// `import` takes no `Client` and starts nothing, and a dispatch arm that
-/// somehow reached `connect_or_spawn_client` first would autostart a
-/// daemon this verb never needs.
-///
-/// What a broken implementation this would catch: the dispatch misroute
-/// above; a source resolution that ignores `--from` and reads the real
-/// `~/.pm2/dump.pm2` instead; an `--out` silently ignored in favour of the
-/// default `./Flockfile.toml`; and a renderer whose output this crate's own
-/// `Flockfile::parse` refuses.
+/// The written file is parsed back through the real
+/// `shep_core::config::Flockfile::parse`: a Flockfile shep refuses to read is
+/// not an import. That no socket appears is the other half, since `import`
+/// takes no `Client`.
 #[test]
 fn import_writes_a_flockfile_shep_can_read_back_and_starts_no_daemon() {
     let dir = tempfile::tempdir().unwrap();
@@ -4653,13 +3649,9 @@ fn import_writes_a_flockfile_shep_can_read_back_and_starts_no_daemon() {
 
 // --- Dogs / Barks -----------------------------------------------------
 
-/// Writes `$SHEP_HOME/shep.toml` directly, before any daemon has booted off
-/// it. `shep enable`/`shep adopt` are this binary's only other writers of
-/// that file, and neither has a flag for `[dog.metrics] bind` — a case that
-/// needs a specific port (every case below does, to avoid colliding with a
-/// real `9615` on the machine running this suite) has to put it there
-/// itself, the same way [`write_flockfile`] writes a Flockfile directly
-/// rather than driving `shep start` to produce one.
+/// Writes `$SHEP_HOME/shep.toml` directly, before any daemon boots off it.
+/// Neither `shep enable` nor `shep adopt` has a flag for `[dog.metrics] bind`,
+/// which every case below needs to avoid colliding with a real `9615`.
 fn write_shep_toml(dir: &TempDir, body: &str) -> PathBuf {
     let path = dir.path().join("shep.toml");
     std::fs::write(&path, body).unwrap();
@@ -4667,20 +3659,12 @@ fn write_shep_toml(dir: &TempDir, body: &str) -> PathBuf {
 }
 
 #[cfg(unix)]
-/// The phase's own success criterion, at the only tier that can check it: a
-/// real binary, a real shepherd, and a real dog PROCESS spawned by that
-/// shepherd. Every tier below this one scripts the runner or fakes the
-/// client, so none of them has ever exec'd `shep dog metrics` — an argv
-/// branch that did not exist would fail at exec, which no unit test can
-/// see.
+/// The only tier that exec's `shep dog metrics`: every other scripts the
+/// runner or fakes the client.
 ///
-/// Fails if the dog is not spawned (`wait_for_dog_pid` never sees a pid and
-/// panics), if it cannot reach the socket from `$SHEP_HOME` — the one
-/// variable a dog inherits (`dog/mod.rs`'s own module doc) — if it cannot
-/// fetch its own `[dog.metrics]` section, or if it cannot bind and serve:
-/// any of those leaves `poll_metrics` polling a refused connection for its
-/// whole deadline and the body assertions below fail against an empty
-/// string. Those four are the whole contract this case exists to prove.
+/// Four things fail here as a refused connection: the dog being spawned, its
+/// reaching the socket from `$SHEP_HOME`, its fetching its own
+/// `[dog.metrics]` section, and its bind.
 #[test]
 fn a_real_shepherd_runs_a_real_metrics_dog_that_answers_a_scrape() {
     let dir = tempfile::tempdir().unwrap();
@@ -4713,11 +3697,8 @@ fn a_real_shepherd_runs_a_real_metrics_dog_that_answers_a_scrape() {
     let enabled = shep(home).arg("enable").arg("metrics").output().unwrap();
     assert_success(&enabled);
 
-    // Registered before the scrape, not after: a scrape that hangs or
-    // panics on assertion must not leak the grandchild the daemon just
-    // spawned. `wait_for_dog_pid` itself panics rather than returning
-    // `None` on a pid that never arrives, for exactly this reason — see its
-    // own doc.
+    // Registered before the scrape: one that hangs or panics on an assertion
+    // must not leak the grandchild the daemon just spawned.
     let dog_pid = wait_for_dog_pid(home, "metrics");
     guard.adopt_dog_pid(dog_pid);
 
@@ -4741,19 +3722,9 @@ fn a_real_shepherd_runs_a_real_metrics_dog_that_answers_a_scrape() {
 }
 
 #[cfg(unix)]
-/// [`poll_metrics`], retried until the exposition CONTAINS `needle` rather
-/// than merely until it answers.
-///
-/// The distinction is the whole of what a carried dog needs proving about
-/// it. A dog that survived the exec holding a dead socket answers 503
-/// forever, so "it answered" is already worth asserting -- but a dog that
-/// answered from a cached reading, or from a connection to a shepherd that
-/// no longer exists, would answer 200 too. Only content the predecessor
-/// never saw can tell those apart.
-///
-/// Bounded exactly as [`poll_metrics`] is, and for the same reason: a dog
-/// that never comes back must fail as a named assertion on the last body
-/// it did produce, never hang the case.
+/// [`poll_metrics`], retried until the exposition contains `needle` rather
+/// than merely until it answers: a dog answering from a cached reading still
+/// answers 200, so only content the predecessor never saw tells them apart.
 fn poll_metrics_containing(addr: std::net::SocketAddr, needle: &str) -> String {
     let start = Instant::now();
     let mut last = String::new();
@@ -4772,31 +3743,12 @@ fn poll_metrics_containing(addr: std::net::SocketAddr, needle: &str) -> String {
 }
 
 #[cfg(unix)]
-/// The whole of phase 3, at the only tier that can see it: a real dog
-/// PROCESS, carried across a real `execve`, still able to talk to the
-/// shepherd that replaced the one it handshook with.
+/// A real dog process, carried across a real `execve`, still able to talk to
+/// the shepherd that replaced the one it handshook with.
 ///
-/// **A pid check cannot see this defect, which is why every assertion below
-/// the pids is here.** Carrying a dog's process is free -- it is a child of
-/// a daemon whose pid does not change -- and carrying its accepted
-/// connection is impossible, so a carried dog was a live process holding a
-/// dead socket: pid unmoved, restarts 0, status `online`, stderr empty, and
-/// HTTP 503 to every scrape, for as long as the daemon lived. Six real
-/// reloads read exactly like a healthy dog on every column a listing has.
-///
-/// So the decisive assertion is CONTENT: a sheep started AFTER the reload
-/// has to appear in the exposition. No cached reading, no replayed body and
-/// no connection to the predecessor could produce that row.
-///
-/// Three more things this case pins, each of which was broken at some point
-/// in the phase and none of which a scrape would notice:
-///
-/// - the dog keeps its `dog` marker across the blob, so `shep dogs` still
-///   lists it and `shep flock`'s table does not (`CarriedSheep::dog`);
-/// - neither restart count moves, which is what G7 asks for and what
-///   separates a carry from the stop-and-start arm;
-/// - the reload says nothing about the dogs, because it waited for them and
-///   found nothing stale (`report_dog_staleness`).
+/// A pid check cannot see the defect: a dog holding a dead socket reads as
+/// healthy on every column a listing has. The decisive assertion is content, a
+/// sheep started after the reload appearing in the exposition.
 #[test]
 fn a_carried_dog_answers_a_scrape_after_a_real_reload() {
     let dir = tempfile::tempdir().unwrap();
@@ -4840,10 +3792,8 @@ fn a_carried_dog_answers_a_scrape_after_a_real_reload() {
         String::from_utf8_lossy(&reloaded.stdout),
         String::from_utf8_lossy(&reloaded.stderr)
     );
-    // The exact sentence `handover::RefusedReason`'s `Display` ends with. A
-    // looser probe would pass whether or not the reload was refused, which
-    // is precisely the failure this assertion exists to catch: the stop arm
-    // restarts every dog from disk and satisfies "the scrape works".
+    // The exact sentence `handover::RefusedReason`'s `Display` ends with: the
+    // stop arm restarts every dog from disk and would satisfy a looser probe.
     assert!(
         !text.contains("falls back to a stop-and-start"),
         "a flock with a dog in it is carried now, not refused: {text}"
@@ -4889,10 +3839,8 @@ fn a_carried_dog_answers_a_scrape_after_a_real_reload() {
         sheep_row["restarts"], 0,
         "the sheep's restart count moved: {after}"
     );
-    // The marker, which is what keeps the two populations apart. JSON
-    // carries both in one undivided array (`emit_flock`'s own doc), so this
-    // is where the marker is readable; the two TABLES below are what an
-    // operator actually sees it through.
+    // JSON carries both populations in one undivided array, so the marker is
+    // what keeps them apart here; the tables below are what an operator sees.
     assert_eq!(
         dog_row["dog"]["kind"], "built_in",
         "a carried dog that lost its marker is one `shep dogs` has lost: {after}"
@@ -4941,14 +3889,10 @@ fn a_carried_dog_answers_a_scrape_after_a_real_reload() {
          and no connection to the predecessor could produce: {body}"
     );
 
-    // The muster roll, which a successor rebuilds from the blob rather than
-    // from disk. A dog has never been in it -- `spawn_enabled_dogs`
-    // registers dogs straight through the supervisor and never touches
-    // `FlockRegistry` -- so carrying one would put it there for the first
-    // time, and permanently: the roll outlives the daemon, so a later cold
-    // boot would restore `metrics` as an ordinary unmarked sheep before
-    // `spawn_enabled_dogs` ran. `boot::apps_for_the_roll` has a unit case of
-    // its own; this is the only tier that reaches `boot`'s USE of it.
+    // A successor rebuilds the roll from the blob, not from disk.
+    // `spawn_enabled_dogs` never touches `FlockRegistry`, so a dog in the roll
+    // would outlive the daemon and a later cold boot would restore `metrics`
+    // as an ordinary unmarked sheep.
     let saved = shep(home)
         .arg("--format")
         .arg("json")
@@ -4966,19 +3910,8 @@ fn a_carried_dog_answers_a_scrape_after_a_real_reload() {
 }
 
 #[cfg(unix)]
-/// Fails if `shep dogs` renders the sheep, or `shep flock` renders the dogs
-/// into the sheep table. The two-table split (`FlockRows`/`DogRows`, and
-/// `emit_flock`'s partition between them) has unit coverage of its own;
-/// what this case adds is that the real verbs reach the real renderers over
-/// a real daemon — the gap that would let a dispatch arm in `main::run`
-/// point `Commands::Dogs` at the wrong function unnoticed workspace-wide,
-/// the same class of bug `saving_the_roll_then_mustering_reports_the_same_
-/// flock`'s own doc names for `save`/`muster`.
-///
 /// Table format, not JSON: `Format::Json`'s `flock` answer carries both
-/// populations in one undivided array on purpose (`emit_flock`'s own doc),
-/// so the "two populations, right way round" claim only exists in the
-/// TABLE rendering this case has to read as text.
+/// populations in one undivided array.
 #[test]
 fn dogs_and_flock_render_the_two_populations_the_right_way_round() {
     let dir = tempfile::tempdir().unwrap();
@@ -5034,11 +3967,6 @@ fn dogs_and_flock_render_the_two_populations_the_right_way_round() {
     graceful_kill(home);
 }
 
-/// Fails if `shep barks` needs a shepherd. The history is on disk so it
-/// outlives the daemon, and the case it exists for is an operator reading
-/// it after a crash — this case never starts one at all, which is the
-/// point: `shep barks` against a `$SHEP_HOME` with no `run/shep.sock` must
-/// still succeed and render what `shep_core::barks::append` put on disk.
 #[test]
 fn barks_reads_the_history_with_no_shepherd_running() {
     let dir = tempfile::tempdir().unwrap();
@@ -5090,23 +4018,9 @@ fn barks_reads_the_history_with_no_shepherd_running() {
 }
 
 #[cfg(unix)]
-/// The whole store, through the real binary, with no shepherd anywhere. That
-/// last part is the assertion that matters: `shep set` has to work on a
-/// machine where nothing is running, because that is when provisioning
-/// happens — the same claim [`barks_reads_the_history_with_no_shepherd_running`]
-/// makes for `shep barks`.
-///
-/// Folds in the file-mode claim `shep_core::kv`'s own module doc makes
-/// (`OWNER_ONLY_FILE_MODE`, `0600`) rather than giving it a separate case: the file
-/// this test's own first `set` creates is the one to check, and creating a
-/// second store just to stat it would prove nothing this one doesn't.
-///
-/// What a broken implementation this would catch: a `set`/`get`/`unset`
-/// dispatch that reached for `connect_client` instead of going straight to
-/// `shep_core::kv` (any step here would then hang or exit
-/// `DaemonUnreachable` instead of the codes asserted below); a store
-/// created with the wrong mode; `unset` on a present key reporting anything
-/// but success, or on an absent one reporting anything but `NotFound`.
+/// The whole store through the real binary, with no shepherd anywhere:
+/// provisioning happens when nothing is running. Also checks the `0600` mode
+/// `shep_core::kv` documents, on the store the first `set` creates.
 #[test]
 fn the_kv_store_works_with_no_shepherd_running() {
     let dir = tempfile::tempdir().unwrap();
@@ -5186,20 +4100,9 @@ fn the_kv_store_works_with_no_shepherd_running() {
     assert_eq!(bad_key.status.code(), Some(2), "usage; {bad_key:?}");
 }
 
-/// `shep --format json get` on the same shape of store `shep get` renders
-/// as a table above: the envelope's `data` is an array of `{key, value}`
-/// objects (never a JSON map — `KvRows`' own doc gives the reason), and
-/// `schema_version` is `1` — pinned as a literal rather than imported from
-/// `output::SCHEMA_VERSION`, since `shep-cli` is `[[bin]]`-only and this
-/// file, an external test binary, has no lib target to import it from. Same
-/// envelope shape every other verb in this binary produces. A key that is
-/// not there and a key outside the grammar are checked here too, since
-/// both surface as this envelope's error half.
-///
-/// What a broken implementation this would catch: `get`'s whole-store
-/// listing degrading to a JSON object keyed by name (the one shape every
-/// other consumer of this envelope would have to special-case); `unset`
-/// reaching `NotFound` for a bad key instead of `Usage`, or the reverse.
+/// `data` is an array of `{key, value}` objects, never a JSON map keyed by
+/// name. An absent key and a key outside the grammar surface as this
+/// envelope's error half.
 #[test]
 fn kv_json_envelope_is_an_array_with_the_schema_version() {
     let dir = tempfile::tempdir().unwrap();
@@ -5240,30 +4143,10 @@ fn kv_json_envelope_is_an_array_with_the_schema_version() {
     assert_json_error(&bad_key, 2, "usage");
 }
 
-/// Two real `shep set` PROCESSES — not two threads sharing one process's
-/// open-file-description table — writing to the same store at once. This is
-/// the CLI's own version of `shep_core::kv`'s own
-/// `two_concurrent_writers_lose_nothing` unit test, and it exists because
-/// that unit test's own two racers are `std::thread::spawn` inside ONE
-/// `cli_e2e` test process: real, but not the claim `shep set` makes to two
-/// operators running it from two separate shells. Proving that needs two
-/// separate processes actually contending for `kv.json.lock`'s `flock(2)`,
-/// which is what `Command::spawn` (via `shep`, wrapping `assert_cmd`) gives
-/// here that two threads in this test binary could not.
-///
-/// The [`std::sync::Barrier`] is [`concurrent_cold_starts_produce_exactly_one_daemon`]'s
-/// own synchronization, for the same reason: without it, OS scheduling could
-/// let one writer finish its whole batch before the other starts a single
-/// process, which would still pass the assertions below but would not
-/// actually be racing anything.
-///
-/// What a broken implementation this would catch: a lock taken on the store
-/// file itself rather than the sibling `.lock` file (the `rename` that
-/// installs new content would then race the very lock guarding it); a fixed
-/// temp-file name (one writer's `rename` consuming the other's staging file,
-/// which reads here as a spurious `Io` error on one of the racers' outputs
-/// rather than a clean loss of keys — either way `data.len()` comes up
-/// short).
+/// Two real processes, not two threads sharing one open-file-description
+/// table: only separate processes contend for `kv.json.lock`'s `flock(2)`.
+/// The barrier matters: without it one writer can finish its whole batch
+/// before the other starts, racing nothing.
 #[test]
 fn two_real_shep_processes_writing_concurrently_lose_no_keys() {
     let dir = tempfile::tempdir().unwrap();
@@ -5318,12 +4201,8 @@ fn two_real_shep_processes_writing_concurrently_lose_no_keys() {
     );
 }
 
-/// fails if `shep lookout` writes terminal escapes into a pipe. `assert_cmd`
-/// captures stdout, so this exercises the not-a-tty refusal exactly as a
-/// `shep lookout > dash.txt` would — and it is the case that keeps a redirected
-/// dashboard from corrupting a file. Also proves the verb does not HANG
-/// without a terminal, which is the regression that would cost CI a job rather
-/// than a test (IR-46: `.timeout(CMD_TIMEOUT)` is on the chain).
+/// `assert_cmd` captures stdout through a pipe, so this is the not-a-tty
+/// refusal a `shep lookout > dash.txt` meets.
 #[test]
 fn shep_lookout_refuses_when_stdout_is_not_a_terminal() {
     let home = TempDir::new().unwrap();
@@ -5337,8 +4216,6 @@ fn shep_lookout_refuses_when_stdout_is_not_a_terminal() {
     assert!(stderr.contains("needs a terminal"));
 }
 
-/// fails if the `dash` alias stops reaching the same verb. Same refusal, same
-/// code, through the other spelling.
 #[test]
 fn shep_dash_is_the_same_verb() {
     let home = TempDir::new().unwrap();
@@ -5355,20 +4232,9 @@ fn shep_dash_is_the_same_verb() {
     );
 }
 
-/// fails if `--help` stops naming the gate. `--help` is where an operator
-/// learns that the dashboard is read-only by default, and the flag's own text
-/// is where they learn the gate is not a security boundary.
-///
-/// **Two assertions this test deliberately does not make.** It does not assert
-/// `text.contains("dash")`: the verb's own about-text says "live dashboard"
-/// and the flag's help says "the dashboard", so that substring is there
-/// whether or not the alias is — delete `visible_alias` and it still passes.
-/// The alias is pinned in `cli.rs`'s `alias_visibility_and_hiding_are_pinned`,
-/// through `get_visible_aliases()`, which is the only assertion that can tell
-/// the difference. And it asserts on `security boundary`, not on the whole
-/// sentence: `wrap_help` is enabled on this crate's clap, so clap re-wraps
-/// long help at the detected terminal width and a longer phrase can land
-/// across a line break on one machine and not another.
+/// The assertion is on `security boundary` alone: `wrap_help` re-wraps long
+/// help at the detected terminal width, so a longer phrase can land across a
+/// line break on one machine and not another.
 #[test]
 fn shep_lookout_help_names_the_gate() {
     let home = TempDir::new().unwrap();
@@ -5385,27 +4251,19 @@ fn shep_lookout_help_names_the_gate() {
 
 // ---------------------------------------------------------------------------
 // whistle: the MCP interface, driven over real pipes.
-//
-// This is the only tier where whistle's stdout discipline can be observed at
-// all — a real child process, real stdin/stdout, not a fake transport — so
-// [`whistle_speaks_mcp_and_writes_nothing_else_to_stdout`]'s line-by-line
-// assertion is this file's, not any lower tier's, to make.
 // ---------------------------------------------------------------------------
 
-/// Serializes `value` as compact JSON followed by `\n` — the newline-
-/// delimited framing `transport-io`'s codec expects on both sides of the
-/// pipe.
+/// Serializes `value` as compact JSON followed by `\n`, the newline-delimited
+/// framing `transport-io`'s codec expects on both sides of the pipe.
 fn push_mcp_line(buf: &mut Vec<u8>, value: &serde_json::Value) {
     buf.extend_from_slice(value.to_string().as_bytes());
     buf.push(b'\n');
 }
 
 /// Stdin for one MCP session: the `initialize` handshake (id `1`), the
-/// `notifications/initialized` that follows it, then each of `requests` in
-/// order. `"2025-06-18"` is one of `ProtocolVersion::KNOWN_VERSIONS`
-/// (rmcp `model.rs:181-187`) rather than the crate's current `LATEST`, so an
-/// rmcp version bump does not redden this suite for no behavioural reason —
-/// negotiation falls back to the server's own configured version either way.
+/// `notifications/initialized`, then each of `requests`. `"2025-06-18"` is a
+/// `ProtocolVersion::KNOWN_VERSIONS` entry rather than `LATEST`, so an rmcp
+/// bump does not redden this suite.
 fn mcp_session(requests: &[serde_json::Value]) -> Vec<u8> {
     let mut buf = Vec::new();
     push_mcp_line(
@@ -5436,9 +4294,8 @@ fn tools_list_request(id: i64) -> serde_json::Value {
     serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/list"})
 }
 
-/// A `tools/call` request with the given id, tool name, and (optional)
-/// arguments object — omitted entirely rather than sent as `{}` when a tool
-/// takes none, matching what a real client sends.
+/// A `tools/call` request. `arguments` is omitted rather than sent as `{}`
+/// when a tool takes none, matching what a real client sends.
 fn call_tool_request(
     id: i64,
     name: &str,
@@ -5454,18 +4311,10 @@ fn call_tool_request(
     serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": params})
 }
 
-/// Parses every line of `stdout` as JSON-RPC, panicking naming the
-/// offending line if any line fails to parse as JSON or lacks the
-/// `"jsonrpc"` key.
-///
-/// This is this file's load-bearing assertion: a test that only searched
-/// stdout for the reply it wanted would pass even if the verb also printed a
-/// stray `println!`, a `--format json` error envelope, or a tracing record
-/// onto the same wire. That includes a BARE `println!()`: `str::lines`
-/// never yields a trailing empty entry for a well-formed final newline, so
-/// any empty line left after splitting is a stray blank line the verb
-/// wrote, not framing artefact, and a blank line is not JSON-RPC either —
-/// filtering it out here would let one through unnoticed.
+/// Parses every line of `stdout` as JSON-RPC, panicking with the offending
+/// line otherwise. A search for the wanted reply alone would pass with a stray
+/// `println!` or a tracing record on the same wire. `str::lines` yields no
+/// trailing empty entry, so an empty line is one the verb wrote.
 fn assert_every_stdout_line_is_jsonrpc(stdout: &[u8]) -> Vec<serde_json::Value> {
     let text = String::from_utf8(stdout.to_vec()).expect("whistle's stdout is valid UTF-8");
     text.lines()
@@ -5482,9 +4331,8 @@ fn assert_every_stdout_line_is_jsonrpc(stdout: &[u8]) -> Vec<serde_json::Value> 
         .collect()
 }
 
-/// The reply among `lines` whose `"id"` matches — a response, told apart
-/// from a request/notification of the same shape by carrying `"result"` or
-/// `"error"`.
+/// The reply among `lines` whose `"id"` matches, told apart from a request or
+/// notification of the same shape by carrying `"result"` or `"error"`.
 fn find_reply(lines: &[serde_json::Value], id: i64) -> &serde_json::Value {
     lines
         .iter()
@@ -5495,12 +4343,8 @@ fn find_reply(lines: &[serde_json::Value], id: i64) -> &serde_json::Value {
         .unwrap_or_else(|| panic!("no reply with id {id} in {lines:#?}"))
 }
 
-/// A `shep` invocation that reaches `$SHEP_HOME` through the `SHEP_HOME`
-/// environment variable rather than `--home`. `GlobalArgs::home` carries
-/// `env = "SHEP_HOME"` (`crates/shep-cli/src/cli.rs:29-31`), so clap folds
-/// this the same way it folds the flag — [`shep`] and this must resolve the
-/// same gate for [`the_shep_toml_gate_decides_the_tool_list_in_a_real_process`]
-/// to mean anything.
+/// A `shep` invocation reaching `$SHEP_HOME` through the environment rather
+/// than `--home`; `GlobalArgs::home` carries `env = "SHEP_HOME"`.
 fn shep_via_env(home: &Path) -> Command {
     let mut cmd = Command::cargo_bin("shep").unwrap();
     cmd.env("SHEP_HOME", home).timeout(CMD_TIMEOUT);
@@ -5528,15 +4372,9 @@ fn whistle_tool_names(mut cmd: Command) -> Vec<String> {
         .collect()
 }
 
-/// fails if `shep whistle` stops speaking MCP, or starts writing anything
-/// else to stdout. Drives the real binary: an `initialize` request and a
-/// `tools/list` request, newline-delimited on stdin, replies read back from
-/// stdout.
-///
-/// The stdout assertion is the load-bearing one and it is exact: EVERY line
-/// stdout produces must parse as JSON with a `"jsonrpc"` key — see
-/// [`assert_every_stdout_line_is_jsonrpc`]'s own doc for what that catches
-/// that a search for the reply alone would not.
+/// Drives the real binary: an `initialize` and a `tools/list` request,
+/// newline-delimited on stdin, replies read back from stdout. Every stdout
+/// line must parse as JSON-RPC.
 #[test]
 fn whistle_speaks_mcp_and_writes_nothing_else_to_stdout() {
     let home = TempDir::new().unwrap();
@@ -5558,20 +4396,10 @@ fn whistle_speaks_mcp_and_writes_nothing_else_to_stdout() {
     assert!(list_reply["result"]["tools"].is_array());
 }
 
-/// fails if the gate stops being read from `shep.toml`, end to end, in a
-/// real process. THREE runs against two `$SHEP_HOME`s: no `[whistle]`
-/// section (via the environment, five tools), `allow_control = true` (via
-/// the environment, nine), and that same open directory again through
-/// `--home` instead of the environment.
-///
-/// The five/nine split is checked by name, not only by count — a count
-/// alone would pass if the gate accidentally registered a read tool twice.
-///
-/// Run 3 is not redundant: it pins that the launcher chooses which
-/// `shep.toml` is read in argv exactly as it does in the environment (see
-/// "Why there is no `--allow-control` flag" in the phase plan), which
-/// reddens here if `resolve_paths` ever stops folding `--home` the same way
-/// it folds `SHEP_HOME` (`crates/shep-cli/src/main.rs:112-123`).
+/// Three runs against two `$SHEP_HOME`s: no `[whistle]` section (five tools),
+/// `allow_control = true` (nine), and that same open directory again through
+/// `--home`. The split is checked by name, not only by count: a count alone
+/// would pass if the gate registered a read tool twice.
 #[test]
 fn the_shep_toml_gate_decides_the_tool_list_in_a_real_process() {
     let control_tools = ["start_sheep", "stop_sheep", "restart_sheep", "reload_sheep"];
@@ -5608,19 +4436,9 @@ fn the_shep_toml_gate_decides_the_tool_list_in_a_real_process() {
     }
 }
 
-/// fails if a `shep.toml` that exists but will not parse ever reaches
-/// stdout, or opens the gate it failed to read. Every other case in this
-/// file uses a `$SHEP_HOME` with either no `shep.toml` at all or one that
-/// parses, so `whistle::whistle`'s one `output::emit_error` call — the
-/// malformed-config stderr notice, the only thing whistle ever writes
-/// outside the JSON-RPC wire — had never run under
-/// [`assert_every_stdout_line_is_jsonrpc`]'s per-line check before this
-/// test existed. That call sits right next to the stdout handle; a mistake
-/// that pointed it at stdout instead of stderr would have gone uncaught.
-///
-/// Pins both halves: stdout stays pure JSON-RPC, and the gate reads SHUT —
-/// a config that fails to parse must not fail OPEN — which is a behaviour
-/// worth pinning on its own, not just a side effect of the stdout check.
+/// The malformed-config notice is the only thing whistle writes outside the
+/// JSON-RPC wire, and it sits next to the stdout handle. A config that fails
+/// to parse leaves the gate shut.
 #[test]
 fn a_malformed_shep_toml_stays_off_stdout_and_keeps_the_gate_shut() {
     let home = TempDir::new().unwrap();
@@ -5671,13 +4489,9 @@ fn a_malformed_shep_toml_stays_off_stdout_and_keeps_the_gate_shut() {
     );
 }
 
-/// fails if a gated-off control tool becomes callable. With the gate shut,
-/// `tools/call` for `stop_sheep` must answer JSON-RPC error `-32602` with
-/// `"tool not found"` — rmcp's own answer for a name its router does not
-/// hold (`handler/server/router/tool.rs:570-571`).
-///
-/// This is the one case that proves ABSENCE rather than a refusal message: a
-/// tool that existed and refused would answer a `result`, not an `error`.
+/// With the gate shut, `tools/call` for `stop_sheep` answers JSON-RPC error
+/// `-32602`, rmcp's answer for a name its router does not hold. A tool that
+/// existed and refused would answer a `result`.
 #[test]
 fn a_gated_off_control_tool_is_not_merely_refused_it_is_absent() {
     let home = TempDir::new().unwrap();
@@ -5706,13 +4520,9 @@ fn a_gated_off_control_tool_is_not_merely_refused_it_is_absent() {
     assert_eq!(error["message"], "tool not found");
 }
 
-/// fails if whistle stops starting when no shepherd is running. An MCP
-/// server must answer `initialize` regardless — its transport is the
-/// launcher's, not the shepherd's — and report the missing daemon per call
-/// instead.
-///
-/// `$SHEP_HOME` here is a fresh tempdir with no daemon and no socket, so a
-/// whistle that dialled at startup would fail to come up at all.
+/// Whistle's transport is the launcher's, not the shepherd's, so it answers
+/// `initialize` against a home with no daemon and no socket, and reports the
+/// missing shepherd per call.
 #[test]
 fn whistle_starts_with_no_shepherd_and_reports_it_per_call() {
     let home = TempDir::new().unwrap();
@@ -5743,17 +4553,9 @@ fn whistle_starts_with_no_shepherd_and_reports_it_per_call() {
 
 // --- Dogs / Available index -----------------------------------------------
 
-/// fails if `shep dogs --available` renders the raw parsed entry instead of
-/// the sanitised one -- the failure this whole feature exists to prevent
-/// (`dog_index`'s own module doc names it as the module's security
-/// boundary). Rex's description carries a raw `\u{1b}[2J` screen-clear
-/// escape; this asserts on the RAW stdout bytes, not a lossy string, so a
-/// regression cannot hide behind `String::from_utf8_lossy`'s own
-/// replacement character.
-///
-/// Also the "table lists a known index" case: both entries' NAME/PACKAGE/
-/// CATEGORY reach the table, and the one sanitised entry is named in a
-/// footer notice on stderr.
+/// Rex's description carries a raw `\u{1b}[2J` screen-clear escape. The
+/// assertion is on raw stdout bytes, so a regression cannot hide behind
+/// `String::from_utf8_lossy`'s replacement character.
 #[test]
 fn available_dogs_lists_the_index_and_never_leaks_a_raw_escape() {
     let home = TempDir::new().unwrap();
@@ -5799,12 +4601,8 @@ fn available_dogs_lists_the_index_and_never_leaks_a_raw_escape() {
     );
 }
 
-/// fails if the detail view's adopt line is built from `name` or `package`
-/// instead of `adopt_as` -- `AvailableDog::adopt_as`'s own doc names this
-/// as the one thing this feature must never get wrong: a dog cannot learn
-/// the name it was adopted under, so the wrong name here ships a
-/// copy-pasteable command that silently discards the dog's whole
-/// `[dog.<name>]` config section.
+/// A dog cannot learn the name it was adopted under, so a wrong name here
+/// ships a copy-pasteable command that discards its whole config section.
 #[test]
 fn available_dogs_detail_view_uses_adopt_as_never_name() {
     let home = TempDir::new().unwrap();
@@ -5838,8 +4636,6 @@ fn available_dogs_detail_view_uses_adopt_as_never_name() {
     );
 }
 
-/// fails if a filter matching nothing exits non-zero — decision (task-3
-/// brief): an empty search result is an answer, not a failure.
 #[test]
 fn available_dogs_zero_matches_exits_zero_and_says_so() {
     let home = TempDir::new().unwrap();
@@ -5860,14 +4656,8 @@ fn available_dogs_zero_matches_exits_zero_and_says_so() {
     );
 }
 
-/// fails if `--available` reaches `connect_client` at all — the property
-/// its guard arm in `main`'s dispatch (`lib.rs`) exists to guarantee.
-/// `$SHEP_HOME` here is a fresh tempdir where no daemon has ever run,
-/// mirroring `whistle_starts_with_no_shepherd_and_reports_it_per_call`'s
-/// own setup; beyond the exit code, this checks that neither a socket nor
-/// a pidfile exists afterwards, so a regression that autostarts a
-/// shepherd as a side effect would be caught even if it still answered
-/// successfully.
+/// Neither a socket nor a pidfile may exist afterwards, so an autostart is
+/// caught even when the command still answers successfully.
 #[test]
 fn available_dogs_needs_no_shepherd() {
     let home = TempDir::new().unwrap();
@@ -5890,11 +4680,8 @@ fn available_dogs_needs_no_shepherd() {
     );
 }
 
-/// fails if a non-2xx from the index host panics, hangs, or reports an
-/// error that does not name the URL — `IndexError` deliberately carries
-/// the URL on none of its variants but its own `InsecureUrl`, so the
-/// caller (`available_dogs`) is what has to tell the operator which URL
-/// failed.
+/// `IndexError` carries the URL on no variant but `InsecureUrl`, so
+/// `available_dogs` is what names it.
 #[test]
 fn available_dogs_reports_a_server_error_naming_the_url() {
     let home = TempDir::new().unwrap();
@@ -5920,14 +4707,11 @@ fn available_dogs_reports_a_server_error_naming_the_url() {
     assert!(stderr.contains("500"), "stderr: {stderr}");
 }
 
-/// fails if a connection that closes mid-body panics or hangs instead of
-/// reporting a clear, URL-naming error — the other server misbehaviour the
-/// task-3 brief calls out by name, alongside the plain 500 above.
 #[test]
 fn available_dogs_reports_a_truncated_body_naming_the_url() {
     let home = TempDir::new().unwrap();
-    // Declares 100 bytes of body, sends 2, then the server thread closes —
-    // `fetch::get`'s own `Truncated` refusal (`fetch.rs`'s own doc).
+    // Declares 100 bytes of body, sends 2, then closes: `fetch::get`'s
+    // `Truncated` refusal.
     let url = serve_raw_response("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n[]".to_string());
 
     let output = shep(home.path())
@@ -5951,9 +4735,8 @@ fn available_dogs_reports_a_truncated_body_naming_the_url() {
 // --- `shep serve` --------------------------------------------------------
 
 #[cfg(unix)]
-/// fails if `shep serve` does not register a sheep, or registers one that
-/// cannot actually serve. The assertion is an HTTP GET against the port, not
-/// a `shep flock` row — a row says the process is up, and up is not serving.
+/// The assertion is an HTTP GET against the port, not a `shep flock` row: a
+/// row says the process is up, and up is not serving.
 #[test]
 fn serve_registers_a_sheep_that_answers_on_its_port() {
     let dir = tempfile::tempdir().unwrap();
@@ -5984,8 +4767,6 @@ fn serve_registers_a_sheep_that_answers_on_its_port() {
 }
 
 #[cfg(unix)]
-/// fails if a missing docroot registers a crash-looping sheep instead of
-/// failing immediately.
 #[test]
 fn serve_refuses_a_docroot_that_is_not_a_directory() {
     let dir = tempfile::tempdir().unwrap();
@@ -6005,9 +4786,8 @@ fn serve_refuses_a_docroot_that_is_not_a_directory() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains(&missing.display().to_string()), "{stderr}");
 
-    // No daemon was ever spawned to register anything against — the
-    // strongest available proof that the refusal happened before any
-    // `Request::Start`, not that a registered sheep crash-looped after one.
+    // No daemon was ever spawned to register anything against, so the
+    // refusal happened before any `Request::Start`.
     assert!(
         daemon_pid(dir.path()).is_none(),
         "a refused root must not even bring a shepherd up"
@@ -6015,13 +4795,8 @@ fn serve_refuses_a_docroot_that_is_not_a_directory() {
 }
 
 #[cfg(unix)]
-/// fails if the worker ignores SIGTERM. Step 6.2 copies the metrics dog's
-/// signal handling and states the failure mode — a worker that only handles
-/// SIGINT rides the whole kill ladder to SIGKILL on every `shep stop`, which
-/// is slow and looks like a hang.
-///
-/// See [`SERVE_STOP_DEADLINE`]'s own doc for why this is a deterministic
-/// assertion on `shep stop`'s own wall-clock rather than a flaky one.
+/// A worker that only handles SIGINT rides the kill ladder to SIGKILL on
+/// every `shep stop`. [`SERVE_STOP_DEADLINE`] carries the bound's basis.
 #[test]
 fn a_served_sheep_stops_on_sigterm_rather_than_riding_the_ladder_to_sigkill() {
     let dir = tempfile::tempdir().unwrap();
@@ -6062,10 +4837,8 @@ fn a_served_sheep_stops_on_sigterm_rather_than_riding_the_ladder_to_sigkill() {
 }
 
 #[cfg(unix)]
-/// Layout shared by the two `--follow-symlinks` cases below:
-/// `<root>/releases/2026-08-15/index.html` and
-/// `<root>/current -> releases/2026-08-15` — the exact deploy shape the maintainer's
-/// ruling names.
+/// Layout shared by the two `--follow-symlinks` cases below: a dated release
+/// directory holding `index.html`, and a `current` symlink pointing at it.
 fn write_deploy_layout(root: &Path) {
     let release = root.join("releases").join("2026-08-15");
     std::fs::create_dir_all(&release).unwrap();
@@ -6074,18 +4847,8 @@ fn write_deploy_layout(root: &Path) {
 }
 
 #[cfg(unix)]
-/// fails if the per-refusal stderr line (decision 5, the maintainer's ruling) never
-/// reaches the sheep's own bleats. This is the one claim in the ruling that
-/// Task 3's and Task 6's in-process tests cannot make: they run inside the
-/// test binary's own process, sharing its stderr with every other test in
-/// the suite, so asserting real output there would mean hijacking a
-/// process-global stream under `cargo test`'s default thread-per-test
-/// concurrency — flaky by construction. A registered sheep is a real child
-/// process with its own captured stderr, which is exactly what `shep
-/// bleats` already reads; that is the one place this claim can be checked
-/// honestly.
-///
-/// Registered WITHOUT `--follow-symlinks`.
+/// Registered without `--follow-symlinks`. A registered sheep is a real child
+/// with its own captured stderr, which is what `shep bleats` reads.
 #[test]
 fn a_refused_symlink_writes_the_path_and_the_flag_to_the_sheeps_bleats() {
     let dir = tempfile::tempdir().unwrap();
@@ -6125,11 +4888,8 @@ fn a_refused_symlink_writes_the_path_and_the_flag_to_the_sheeps_bleats() {
 }
 
 #[cfg(unix)]
-/// fails if `--follow-symlinks` does not actually serve the deploy layout
-/// end to end, through registration and a restart, and fails if setting it
-/// stops being loud at startup. Two assertions in one test because they are
-/// one scenario: the flag that makes the deploy layout work is the same
-/// flag `follow_symlinks_notice` announces.
+/// One scenario: the flag that makes the deploy layout work is the flag
+/// `follow_symlinks_notice` announces.
 #[test]
 fn a_served_sheep_with_follow_symlinks_serves_the_deploy_layout_and_says_so() {
     let dir = tempfile::tempdir().unwrap();
@@ -6169,28 +4929,11 @@ fn a_served_sheep_with_follow_symlinks_serves_the_deploy_layout_and_says_so() {
     graceful_kill(dir.path());
 }
 
-/// fails if `shep runtime` does not exit on its own when the flock empties,
-/// or exits with the wrong code for the reason it emptied.
-///
-/// Two runs of the same shape, sharing one test so the harness's own
-/// `Command::cargo_bin` lookup is paid once: one app that exits 0 with
-/// `autorestart = false` (exit 0, a clean batch job), and one that exits 1
-/// with `max_restarts = 1` (exit 11) — `max_restarts = 1` errors on the
-/// FIRST unstable exit (`shep-daemon`'s `entry.rs::exhausted`: N = 1 means
-/// N-1 = 0 restarts performed), so this needs no wait through a restart
-/// delay. The second case is decision 13's whole contract.
-///
-/// Each takes at least 6 seconds (`commands::empty::STRIKES` × `INTERVAL` =
-/// 3 × 2s) — the debounce is not shortened to make this fast, per Step
-/// 9.5's own plan text — so this one test costs a bit over 12 seconds of
-/// the suite's wall clock.
-///
-/// No [`DaemonGuard`] here, unlike almost every other case in this file:
-/// `shep runtime` never leaves a daemon behind on either path (that is the
-/// whole point of the verb — no daemonizing, no re-exec, nothing left
-/// running once the flock empties), so there is nothing for a guard to
-/// adopt. A hang instead of a clean exit is caught by `shep()`'s own
-/// `CMD_TIMEOUT`.
+/// Two runs in one test so the `Command::cargo_bin` lookup is paid once: an
+/// app that exits 0 with `autorestart = false` (exit 0), and one that exits 1
+/// with `max_restarts = 1` (exit 11), which errors on the first unstable exit
+/// so neither run waits through a restart delay. Each takes at least 6 seconds
+/// (`commands::empty::STRIKES` × `INTERVAL`).
 #[test]
 fn runtime_exits_when_the_flock_empties_with_a_code_that_says_why() {
     // Clean emptying: one app exits 0 and is told not to restart.
@@ -6240,24 +4983,12 @@ fn runtime_exits_when_the_flock_empties_with_a_code_that_says_why() {
 
 #[cfg(unix)]
 /// Fails if `shep runtime` serves a dog the compiled default instead of the
-/// bind an operator wrote.
+/// bind an operator wrote. `runtime` reaches `boot_supervisor` directly, never
+/// `run_daemon`, so the dog-config migration has to run on both paths; a
+/// container that only runs `shep runtime` otherwise brings its dogs up on
+/// compiled defaults with no warning and no file written.
 ///
-/// `runtime` reaches `boot_supervisor` directly, never `run_daemon`, and
-/// the dog-config migration used to live in the latter -- so `runtime`
-/// started dogs out of a `dogs.toml` that would never exist. Measured
-/// before the fix, with exactly this shep.toml: nothing listened on the
-/// configured port and the compiled default 9615 served instead, with no
-/// warning and no file written. Permanent, since a container that only ever
-/// runs `shep runtime` never migrates; for bark it would mean every sink
-/// disappearing and alerting stopping silently.
-///
-/// The port is the assertion rather than the file, because the file is the
-/// mechanism and the port is what an operator loses. `dogs.toml` is
-/// asserted too, as the cheap direct evidence of which of the two ran.
-///
-/// `#[cfg(unix)]`, like the other cases that scrape a real dog process:
-/// they share [`wait_for_dog_pid`]'s `nix::unistd::Pid` and
-/// [`DaemonGuard`]'s dog sweep.
+/// `#[cfg(unix)]`: [`wait_for_dog_pid`] uses `nix::unistd::Pid`.
 #[test]
 fn runtime_migrates_dog_config_and_serves_the_bind_an_operator_wrote() {
     let dir = tempfile::tempdir().unwrap();
@@ -6295,11 +5026,8 @@ fn runtime_migrates_dog_config_and_serves_the_bind_an_operator_wrote() {
     discard_in_background(child.stdout.take().expect("piped stdout"));
     discard_in_background(child.stderr.take().expect("piped stderr"));
 
-    // `wait_for_dog_pid` shells out to `shep flock` and asserts success on
-    // the first try, so it cannot be the first thing aimed at a shepherd
-    // booting inside a process this test only just spawned. Every other
-    // case in this file reaches its daemon through a `shep start` that has
-    // already returned; `runtime` gives no such moment.
+    // `wait_for_dog_pid` asserts success on its first `shep flock`, so it
+    // cannot be the first thing aimed at a shepherd still booting.
     let start = Instant::now();
     while !shep(home).arg("flock").output().unwrap().status.success() {
         assert!(
@@ -6332,9 +5060,7 @@ fn runtime_migrates_dog_config_and_serves_the_bind_an_operator_wrote() {
 // --- `shep dev` -------------------------------------------------------
 
 /// A `shep dev` invocation with `$SHEP_DEV_HOME` set to `dev_home`, timeout
-/// already attached. Never `--home` — decision 15: `dev` ignores it, so a
-/// helper that carried one would misrepresent what a real invocation looks
-/// like.
+/// already attached. Never `--home`: `dev` ignores it.
 fn shep_dev(dev_home: &Path) -> Command {
     let mut cmd = Command::cargo_bin("shep").unwrap();
     cmd.env("SHEP_DEV_HOME", dev_home)
@@ -6343,12 +5069,8 @@ fn shep_dev(dev_home: &Path) -> Command {
     cmd
 }
 
-/// Copies `source` to nowhere, on a background thread. `shep dev` streams
-/// the flock's bleats to its own stdout for as long as it runs; if nothing
-/// drains that pipe it eventually fills and blocks the child, wedging
-/// [`spawn_shep_dev`]'s caller. Mirrors `tests/init.rs`'s own helper of the
-/// same name and shape — a shared one is not worth a `tests/support` module
-/// for the two files that need it.
+/// Copies `source` to nowhere, on a background thread. An undrained pipe
+/// fills and blocks the child.
 fn discard_in_background<R: Read + Send + 'static>(mut source: R) {
     std::thread::spawn(move || {
         let _ = std::io::copy(&mut source, &mut std::io::sink());
@@ -6356,11 +5078,8 @@ fn discard_in_background<R: Read + Send + 'static>(mut source: R) {
 }
 
 /// Spawns `shep dev <flockfile>` with `$SHEP_DEV_HOME` set to `dev_home`,
-/// stdout and stderr both piped and immediately drained in the background.
-/// Unlike [`shep_dev`]'s `.output()` shape, this leaves the process alive so
-/// a caller can signal it — the point of
-/// [`dev_tidies_up_when_it_is_signalled_rather_than_when_the_flock_empties`],
-/// which needs `shep dev` still running when `SIGTERM` arrives.
+/// stdout and stderr piped and drained in the background. Leaves the process
+/// alive, so a caller can signal it.
 fn spawn_shep_dev(dev_home: &Path, flockfile: &Path) -> Child {
     let mut child = std::process::Command::cargo_bin("shep")
         .expect("locate the built shep binary")
@@ -6377,11 +5096,9 @@ fn spawn_shep_dev(dev_home: &Path, flockfile: &Path) -> Child {
     child
 }
 
-/// Polls `shep --home <dev_home> --format json flock` until the one app's
-/// row reports `online`, and returns that row. Tolerates the early window
-/// where `shep dev` has not bound its socket yet — unlike
-/// [`poll_flock_data`], which asserts success on every attempt and is only
-/// safe once a socket is already known to exist.
+/// Polls `shep --home <dev_home> --format json flock` until the one app's row
+/// reports `online`. Tolerates the early window before `shep dev` has bound
+/// its socket, unlike [`poll_flock_data`].
 fn wait_for_dev_online(dev_home: &Path, deadline: Duration) -> serde_json::Value {
     let start = Instant::now();
     loop {
@@ -6407,10 +5124,9 @@ fn wait_for_dev_online(dev_home: &Path, deadline: Duration) -> serde_json::Value
     }
 }
 
-/// Polls `child.try_wait()` until it exits, or `timeout` elapses — a named
-/// panic instead of relying on `CMD_TIMEOUT`'s own kill inside `.output()`,
-/// which does not apply here since this file's `spawn_shep_dev` never calls
-/// `.output()`. Mirrors `tests/init.rs`'s own `wait_bounded`.
+/// Polls `child.try_wait()` until it exits, or `timeout` elapses with a named
+/// panic. `CMD_TIMEOUT`'s kill lives inside `.output()`, which
+/// [`spawn_shep_dev`] never calls.
 fn wait_bounded(child: &mut Child, timeout: Duration) -> std::process::ExitStatus {
     let deadline = Instant::now() + timeout;
     loop {
@@ -6426,18 +5142,10 @@ fn wait_bounded(child: &mut Child, timeout: Duration) -> std::process::ExitStatu
     }
 }
 
-/// fails if `shep dev` leaves a shepherd or a flock behind. Runs a script
-/// that exits immediately with `autorestart = false`, so the auto-exit
-/// fires (the same debounce `runtime_exits_when_the_flock_empties_with_a_
-/// code_that_says_why` drives, `commands::empty::STRIKES` × `INTERVAL` = 3
-/// × 2s), then asserts the dev home has no live socket and that a `shep`
-/// pointed at that same home afterward finds no shepherd left to answer
-/// `flock` — decision 15's `tidy_up: true`, the one setting this case
-/// actually exercises (Step 11.4's own mutation: `tidy_up: false` reddens
-/// this on the second assertion, not the first).
-///
-/// `$SHEP_DEV_HOME` points at its own tempdir, never the harness's real
-/// `~/.shep-dev` — decision 15's second reason for the variable existing.
+/// The auto-exit fires after `commands::empty::STRIKES` × `INTERVAL` (3 × 2s).
+/// The setting under test is `tidy_up: true`, which reddens the no-shepherd
+/// assertion when flipped, not the socket one. `$SHEP_DEV_HOME` points at its
+/// own tempdir, never the real `~/.shep-dev`.
 #[test]
 fn dev_tidies_up_after_itself() {
     let dir = tempfile::tempdir().unwrap();
@@ -6465,24 +5173,10 @@ fn dev_tidies_up_after_itself() {
 }
 
 #[cfg(unix)]
-/// fails if Ctrl-C out of `shep dev` leaves a shepherd or a flock behind —
-/// on disk as well as in the process table.
-///
-/// The auto-exit path above never sends a signal, and the signal path is
-/// the one people actually use — "a dev mode that leaks a supervisor is a
-/// dev mode people stop trusting" is `commands::dev`'s own claim and
-/// nothing else in this file checks it. Runs a long-lived script so nothing
-/// exits on its own, waits for the flock to reach `online` (proof the
-/// shepherd is up and the sheep is running, not merely that the process
-/// exists) and records the sheep's own pid, sends `SIGTERM` to the `shep
-/// dev` process itself, and asserts the same two things the auto-exit case
-/// does — no live socket, no shepherd left running — plus two only this
-/// case can make: the held sheep did not outlive its supervisor, and
-/// `flock.json` does not still list it as running: a signal reaches
-/// `commands::foreground::run`'s own `RunningDaemon::run` teardown
-/// directly, never through the `Stop`/`Delete` pair `tidy_up` sends over
-/// the wire, so only
-/// `BootOptions::delete_flock_on_shutdown` closes this half of the gap).
+/// A signal reaches `commands::foreground::run`'s `RunningDaemon::run`
+/// teardown directly, never the `Stop`/`Delete` pair `tidy_up` sends over the
+/// wire, so `BootOptions::delete_flock_on_shutdown` is what keeps `flock.json`
+/// from still listing the sheep as running.
 #[test]
 fn dev_tidies_up_when_it_is_signalled_rather_than_when_the_flock_empties() {
     let dir = tempfile::tempdir().unwrap();
@@ -6542,17 +5236,9 @@ fn dev_tidies_up_when_it_is_signalled_rather_than_when_the_flock_empties() {
     );
 }
 
-/// fails if `shep-dev` or `shep-runtime` is not built, is not installed
-/// under that name, or does not reach its own verb. `--help` rather than a
-/// real run, so the test starts no shepherd and writes to no home.
-///
-/// **The assertion is the usage line, not the verb's name.** Once Tasks 9
-/// and 11 add the verbs, the ROOT `shep --help` lists `dev` and `runtime`
-/// among its subcommands — so `text.contains("dev")` passes even if
-/// `alias_argv` is deleted entirely and the binary prints root help.
-/// `Usage: shep dev` is printed only by that subcommand's own help. This is
-/// the plan's sixth dead-check shape, in the one test that covers the alias
-/// binaries at all.
+/// The assertion is the usage line, not the verb's name: the root `shep
+/// --help` lists `dev` and `runtime` among its subcommands, so
+/// `text.contains("dev")` passes even with `alias_argv` deleted.
 #[test]
 fn the_alias_binaries_exist_and_reach_their_own_verbs() {
     for (bin, verb) in [("shep-dev", "dev"), ("shep-runtime", "runtime")] {
@@ -6574,12 +5260,10 @@ fn the_alias_binaries_exist_and_reach_their_own_verbs() {
     }
 }
 
-// --- Whole-branch review item 4 -------------------------------------------
+// --- Piped stdout stays bare ----------------------------------------------
 
-/// Shared by the case below: no ANSI escape byte, and none of the
-/// box-drawing glyphs `render_boxed` (`shep-cli/src/output/table.rs`) draws
-/// -- the hard rule's own two failure shapes, named once so a second verb's
-/// assertion cannot silently drift from the first's.
+/// Asserts no ANSI escape byte and none of the box-drawing glyphs
+/// `render_boxed` draws.
 fn assert_no_box_or_escape_reached_the_pipe(stdout: &str, verb: &str) {
     assert!(
         !stdout.contains('\u{1b}'),
@@ -6594,33 +5278,12 @@ fn assert_no_box_or_escape_reached_the_pipe(stdout: &str, verb: &str) {
 }
 
 #[cfg(unix)]
-/// The spec's own claim (§5): "The existing e2e suite is the pipe test...
-/// If a border or an escape reaches piped stdout, it fails. No new test
-/// needed." False as this file stood: every table-shaped assertion above is
-/// `--format json`, which `must_render_bare` forces to `Bare` on its own
-/// separate axis regardless of terminal-ness, and the only table-mode
-/// stdout assertions anywhere in this file are `.contains(...)` checks on
-/// `bleats` log lines. A box border reaching piped `shep flock` at the
-/// default style would have left all of this file green.
-///
-/// `assert_cmd`'s `.output()` captures stdout through an OS pipe, never a
-/// pty, so `std::io::stdout().is_terminal()` is `false` for every
-/// invocation in this whole suite -- exactly `must_render_bare`'s own
-/// trigger (`lib.rs`), exercised here with no `--format json` and no
-/// `--style` flag at all: the plain `shep flock | less` / `shep flock >
-/// file` an operator actually types. This is the safety net for the single
-/// most important rule on the branch, and until this case it was guarded
-/// only by a unit test of the predicate (`must_render_bare_is_true...`,
-/// `lib.rs`) plus renderer tests handed `Presentation::BARE` by hand
-/// (`table.rs`'s own snapshots) -- never the real wiring between clap
-/// parsing a piped invocation and the byte this binary actually writes to
-/// the pipe `assert_cmd` opened.
-///
-/// Two verbs, not one: `flock` and `describe` go through `emit_flock`/
-/// `emit_described` respectively, both bespoke wrappers around `table_of`
-/// rather than a plain `emit` call (`output/mod.rs`'s own module doc), so a
-/// regression scoped to just one of the two would still pass a case that
-/// only ever tried the other.
+/// The only place in the suite a table verb runs with no `--format json` and
+/// no `--style`. `.output()` captures stdout through an OS pipe, never a pty,
+/// so `std::io::stdout().is_terminal()` is `false`, which is
+/// `must_render_bare`'s trigger. Two verbs, since `emit_flock` and
+/// `emit_described` wrap `table_of` separately and a regression scoped to one
+/// would pass a case trying the other.
 #[test]
 fn piped_table_output_at_the_default_style_carries_no_box_or_escape() {
     let dir = tempfile::tempdir().unwrap();
@@ -6666,20 +5329,10 @@ fn piped_table_output_at_the_default_style_carries_no_box_or_escape() {
 
 // --- Issue 1/2/3: adopt ergonomics and `shep <dogname>` dispatch ---------
 
-/// Spells a path the way shep spells it, so a comparison is between two
-/// spellings of the same file rather than between two files.
-///
-/// Anywhere shep canonicalizes a path and then prints it, canonicalizing
-/// does two things a test cannot spell for itself. It adds Windows'
-/// `\?\` prefix, which shep strips back off so `shep.toml` stays
-/// hand-editable, and it expands 8.3 short names. The second is what
-/// actually bit: `%TEMP%` on a GitHub Windows runner is `C:\Users\RUNNER~1\...`,
-/// which canonicalizes to `runneradmin`, so the substring check failed on a
-/// box whose username is longer than eight characters and passed on every
-/// developer machine whose username is not.
-///
-/// Two callers, and they are unrelated: what `shep adopt` records in
-/// `shep.toml`, and the `cwd` a failed spawn reports.
+/// Spells a path the way shep spells it: canonicalized, with Windows' `\?\`
+/// prefix stripped back off so `shep.toml` stays hand-editable, and 8.3 short
+/// names expanded (`%TEMP%` on a Windows runner is `C:\Users\RUNNER~1\...`,
+/// which canonicalizes to `runneradmin`).
 fn as_shep_spells_it(path: &Path) -> String {
     let canonical = std::fs::canonicalize(path).expect("canonicalize the recorded binary");
     shep_core::paths::strip_verbatim_prefix(&canonical)
@@ -6687,8 +5340,6 @@ fn as_shep_spells_it(path: &Path) -> String {
         .to_string()
 }
 
-/// fails if `shep adopt` cannot find a binary on `$PATH` by its bare name
-/// — the shape `cargo install shep-log-rotate` puts it there in.
 #[test]
 fn shep_adopt_finds_a_binary_on_path_by_bare_name() {
     let home = TempDir::new().unwrap();
@@ -6717,8 +5368,7 @@ fn shep_adopt_finds_a_binary_on_path_by_bare_name() {
 }
 
 #[cfg(unix)]
-/// Issue 1's second repro, verbatim: a literal `~/` path, which worked in
-/// a Flockfile (2026-08-19) but not at `shep adopt` until now.
+/// A literal `~/` path, expanded by `shep adopt` as it is in a Flockfile.
 #[test]
 fn shep_adopt_expands_a_leading_tilde_path() {
     let shep_home = TempDir::new().unwrap();
@@ -6752,20 +5402,11 @@ fn shep_adopt_expands_a_leading_tilde_path() {
     );
 }
 /// Writes a script that records its own argv and `$SHEP_HOME` into `marker`
-/// (inside `dir`), prints a distinctive stdout line, and exits `code` --
-/// the fixture [`an_adopted_dog_runs_directly_with_its_own_argv_and_shep_home`]
-/// and [`a_built_in_verb_always_wins_over_a_same_named_adopted_dog`] both
-/// build on.
+/// (inside `dir`), prints a distinctive stdout line, and exits `code`.
 fn write_marker_script(dir: &TempDir, marker: &Path, code: u8) -> PathBuf {
     // `$*`/`$SHEP_HOME` in a shell script, `%*`/`%SHEP_HOME%` in a `.cmd`.
-    // Those two expansions ARE the subject of the case using this — that an
-    // adopted dog receives the argv it was invoked with and the `$SHEP_HOME`
-    // the CLI resolved — so the spelling follows the interpreter rather than
-    // the case being skipped on one platform.
-    //
-    // No space before `>` in the batch arm, deliberately: `echo foo > x`
-    // writes a trailing space in `cmd.exe`, and the assertion is on an exact
-    // line.
+    // No space before `>` in the batch arm: `echo foo > x` writes a trailing
+    // space in `cmd.exe`, and the assertion is on an exact line.
     #[cfg(unix)]
     let body = format!(
         "#!/bin/sh\necho \"argv:$*\" > \"{marker}\"\necho \"home:$SHEP_HOME\" >> \"{marker}\"\necho from-the-dog\nexit {code}\n",
@@ -6779,20 +5420,9 @@ fn write_marker_script(dir: &TempDir, marker: &Path, code: u8) -> PathBuf {
     write_script(dir, "dog.sh", &body)
 }
 
-/// `shep <dogname> [args...]` (issue 3): once a dog is adopted, invoking
-/// its name directly runs it -- with the operator's own argv passed
-/// through untouched and `$SHEP_HOME` set, the "operator-invoked" contract
-/// that is deliberately distinct from the supervised one (no argv, that
-/// same one env entry) a shepherd-started dog gets.
-///
-/// The dispatch call itself carries no `--home` flag at all -- `$SHEP_HOME`
-/// is set through the environment instead, exercising `home_before`'s
-/// fallback to the real environment alongside its `--home`-flag form,
-/// which the lib-tier `home_before_*` tests already cover directly.
-///
-/// Mutation check: reverting `lib.rs`'s `dispatch_adopted_dog` to always
-/// return `None` reddens this immediately -- clap's own "unrecognized
-/// subcommand" error and exit code 2 instead of the dog's own exit code 7.
+/// `shep <dogname> [args...]` runs an adopted dog with the operator's argv
+/// passed through untouched and `$SHEP_HOME` set. The dispatch call carries no
+/// `--home`, exercising `home_before`'s fallback to the real environment.
 #[test]
 fn an_adopted_dog_runs_directly_with_its_own_argv_and_shep_home() {
     let home = TempDir::new().unwrap();
@@ -6838,18 +5468,10 @@ fn an_adopted_dog_runs_directly_with_its_own_argv_and_shep_home() {
     );
 }
 
-/// Built-in verbs always win, structurally (issue 3): a `[daemon]
-/// adopted_dogs` entry named `stop` -- written directly, bypassing `shep
-/// adopt`'s own refusal of the name, the way a hand-edited `shep.toml`
-/// could -- must never shadow the real `shep stop`. `dispatch_adopted_dog`
-/// only ever runs once clap has already failed to match a token against a
-/// real subcommand, so `stop` never reaches it at all.
-///
-/// `shep stop all` against a `$SHEP_HOME` with no shepherd running exits
-/// `DaemonUnreachable` (5) -- `commands::lifecycle::stop` goes through
-/// `connect_client`, which does not autostart -- so that exit code, and the
-/// marker file never appearing, are both proof the built-in ran (or at
-/// least was the one dispatch attempted) rather than the dog's script.
+/// `dispatch_adopted_dog` runs only once clap has failed to match a token
+/// against a real subcommand, so an adopted dog named `stop` never shadows the
+/// verb. Exit 5 (`DaemonUnreachable`, since `stop` does not autostart) and the
+/// marker file never appearing are what say the built-in was dispatched.
 #[test]
 fn a_built_in_verb_always_wins_over_a_same_named_adopted_dog() {
     let home = TempDir::new().unwrap();
@@ -6877,11 +5499,8 @@ fn a_built_in_verb_always_wins_over_a_same_named_adopted_dog() {
     );
 }
 
-/// An unrecognized verb with no matching adopted dog stays an ordinary
-/// unknown-verb error, suggestions included -- `dispatch_adopted_dog`
-/// finding nothing must fall all the way through to clap's own rendering,
-/// not a silent or different failure. No dog is adopted at all here, and
-/// `$SHEP_HOME` does not even exist yet.
+/// `dispatch_adopted_dog` finding nothing falls through to clap's own
+/// unknown-verb rendering, suggestions included.
 #[test]
 fn an_unknown_verb_with_no_matching_dog_keeps_claps_own_suggestion() {
     let home = TempDir::new().unwrap();
@@ -6901,40 +5520,10 @@ fn an_unknown_verb_with_no_matching_dog_keeps_claps_own_suggestion() {
 }
 
 /// A Flockfile edit reaches a registered sheep only where the first load
-/// established nothing, and what it reaches is reported, naming the sheep and
-/// every field that changed and naming no VALUE.
-///
-/// The defect this verb replaced: changing `cwd` on two apps and re-running
-/// `shep start` left both running the old one, with no error and no warning.
-/// `Request::Start` on an existing name adds instances rather than
-/// reconciling config, so the edit was simply not applied, and the apps then
-/// crash-looped against a path that no longer applied.
-///
-/// The rule that decides which half an edit gets is the additive default. A
-/// key the first load established belongs to whoever set it, and a later file
-/// may not overwrite it however often it is loaded -- a Flockfile arrives
-/// through a pull request, so that bound is the whole point. A key nobody has
-/// established is appended, applied where it can be and parked where it
-/// cannot, and the line that names a parked field names `shep reload` too: a
-/// list an operator cannot act on is a report nobody can use.
-///
-/// This test asserted the opposite until 2026-09-02, and was green because
-/// the migration clause was never implemented: a fresh `shep start` wrote
-/// nothing to the override store, so the SECOND load found every key
-/// unestablished and overwrote all of them. It now pins the silence on the
-/// second load and the report on the third.
-///
-/// What a broken implementation this catches: the establishment dropped (the
-/// second load reports `cwd` and parks it); the load dropped entirely (no
-/// `max_memory` in stderr on the third); the merge computed against an
-/// unnormalized config (every default the file did not spell out reported as
-/// changed); the report carrying values rather than names, which is what the
-/// `hunter2` assertion is for (IR-41).
-///
-/// A one-app Flockfile where the real report had two: one sheep is enough to
-/// prove the message exists, and the daemon-side unit tier
-/// (`supervisor.rs`'s apply cases) is where multiple fields and an
-/// unregistered app are pinned, at no process-spawning cost.
+/// established nothing, and what it reaches is reported by name, never by
+/// value. A key the first load established belongs to whoever set it. A key
+/// nobody has established is appended, applied where it can be and parked
+/// where it cannot, and the line naming a parked field names `shep reload`.
 #[test]
 fn a_flockfile_edit_reaches_a_sheep_only_where_the_first_load_established_nothing() {
     let dir = tempfile::tempdir().unwrap();
@@ -6959,18 +5548,14 @@ fn a_flockfile_edit_reaches_a_sheep_only_where_the_first_load_established_nothin
     assert_success(&boot);
     poll_flock(home, |info| info["status"] == "online");
 
-    // The edit, over the same path the daemon was told about. Both keys are
-    // ones the first load established, so both belong to whoever set them
-    // and this load may do nothing at all.
+    // The edit, over the same path the daemon was told about. The first load
+    // established both keys, so this load may do nothing at all.
     write_flockfile(
         &dir,
         &body(elsewhere.path(), "API_TOKEN = \"hunter2-after\"", ""),
     );
     let again = shep(home).arg("start").arg(&flockfile).output().unwrap();
-    // A load reports, it does not fail. Without this the test reads only
-    // stderr, so a change that turned the report into a refusal would keep
-    // it green while breaking every operator script that runs `shep start`
-    // twice.
+    // A load reports, it does not fail.
     assert_success(&again);
     let stderr = String::from_utf8_lossy(&again.stderr);
     assert!(
@@ -7014,10 +5599,8 @@ fn a_flockfile_edit_reaches_a_sheep_only_where_the_first_load_established_nothin
         !stderr.contains("hunter2") && !stderr.contains("blue"),
         "a field's VALUE must never reach an operator's terminal (IR-41): {stderr}"
     );
-    // The half that separates a load from the warning it replaced: an env
-    // change is baked into a running child, so the report has to say what
-    // brings it into effect. Naming the field and stopping there is the
-    // failure this whole feature set out to fix, one step further along.
+    // An env change is baked into a running child, so the report has to say
+    // what brings it into effect, not only which field moved.
     assert!(
         stderr.contains("shep reload edited"),
         "a pending field travels with the verb that promotes it: {stderr}"
@@ -7027,36 +5610,17 @@ fn a_flockfile_edit_reaches_a_sheep_only_where_the_first_load_established_nothin
 }
 
 /// A load that refused one app exits non-zero, and still reports the app it
-/// applied.
-///
-/// The warning this replaced was advisory, so exiting zero was right for it.
-/// A refusal is not: it means some of the configuration the operator
-/// declared did not land, and `shep start Flockfile.toml && deploy` exiting
-/// zero on that tells CI to carry on. That is the silent-edit failure this
-/// verb exists to fix, arriving through the report rather than through the
-/// merge. `shep stock`'s partial scale-up is the same shape and has returned
-/// non-zero since it shipped.
-///
-/// The refusal is a real one from the real daemon rather than a fake's
-/// script: a plain load never reshapes a flock, so a file that grows an
-/// `instances` line is refused that one field by name and told which flag
-/// would take it. Reaching it needs no fault injection and no timing.
-///
-/// What a broken implementation this catches: the exit code left at zero
-/// (`code` is 0); every refusal flattened into a wholesale failure that
-/// swallows the rest of the file (`applied` is missing from stderr); the
-/// report stopped at the first refusal, which for a two-app file would drop
-/// whichever app came second.
+/// applied. The refusal is a real one: a plain load never reshapes a flock, so
+/// a file that grows an `instances` line is refused that one field by name and
+/// told which flag would take it.
 #[test]
 fn a_load_that_refused_one_app_exits_non_zero_and_still_reports_the_other() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
     let script = write_test_script(&dir);
     // `steady` carries the field that lands, `stocky` the one that cannot.
-    // `max_restarts` is read when a sheep exits, so it is in force the
-    // moment it reaches the stored spec and reports as APPLIED.
-    // One closure for both writes, so the only difference between the run
-    // that registers and the run that loads is the two lines under test.
+    // `max_restarts` is read when a sheep exits, so it is in force the moment
+    // it reaches the stored spec and reports as applied.
     let body = |steady: &str, stocky: &str| {
         format!(
             "[[app]]\nname = \"steady\"\nscript = '{}'\n{steady}\
@@ -7078,10 +5642,8 @@ fn a_load_that_refused_one_app_exits_non_zero_and_still_reports_the_other() {
     let again = shep(home).arg("start").arg(&flockfile).output().unwrap();
 
     let stderr = String::from_utf8_lossy(&again.stderr);
-    // Pinned at 4 rather than merely non-zero. `InvalidConfig` is the code
-    // the rest of this CLI uses for a configuration the daemon would not
-    // accept, and pinning it is what makes a later change to the mapping a
-    // decision somebody takes rather than a drift nobody notices.
+    // Pinned at 4: `InvalidConfig` is the code the rest of this CLI uses for a
+    // configuration the daemon would not accept.
     assert_eq!(
         again.status.code(),
         Some(4),
@@ -7100,28 +5662,15 @@ fn a_load_that_refused_one_app_exits_non_zero_and_still_reports_the_other() {
 }
 
 /// One app whose script does not exist refuses the whole Flockfile, before
-/// anything is registered, and names every app that failed.
-///
-/// The defect: the third app of eleven pointed at an unbuilt binary. Apps
-/// one and two registered and started, app three failed to spawn, and apps
-/// four through eleven were never reached. The flock matched neither the
-/// file nor its previous state, and only `shep delete all` recovered it.
-///
-/// The empty listing at the end is the assertion that matters and the one
-/// the exit code alone cannot make: `start` reported a failure before this
-/// change too, with `good` left registered and running behind it.
-///
-/// What a broken implementation this catches: the check dropped (`good` is
-/// in the listing); the check run inside the registering loop rather than
-/// before it (`good` is registered before `unbuilt` is reached, same
-/// symptom); the error reporting only the count and not the path (the
-/// `never-built` assertion).
+/// anything is registered, and names every app that failed. Without the check,
+/// an app that fails to spawn partway through leaves the apps before it
+/// registered and the apps after it unreached.
 #[test]
 fn one_absent_script_refuses_the_whole_flockfile_and_registers_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
     let script = write_test_script(&dir);
-    // `good` FIRST, so a check that runs per app as it registers would have
+    // `good` first, so a check that runs per app as it registers would have
     // registered it by the time it reached `unbuilt`.
     let flockfile = write_flockfile(
         &dir,
@@ -7171,19 +5720,11 @@ fn one_absent_script_refuses_the_whole_flockfile_and_registers_nothing() {
 }
 
 /// A spawn that fails for a reason no preflight could see still names the
-/// sheep and the path it tried, and the `cwd` it tried it in.
+/// sheep, the path it tried, and the `cwd` it tried it in. A bare
+/// `SpawnFailed` names none of them.
 ///
-/// The whole error an operator got was `error[spawn_failed]: the daemon
-/// reported SpawnFailed: process spawn failed: No such file or directory
-/// (os error 2)`. On an eleven-app Flockfile that named neither which app
-/// had failed nor which path had been tried.
-///
-/// A script that EXISTS and cannot be exec'd, deliberately: the batch check
-/// (`one_absent_script_refuses_the_whole_flockfile_and_registers_nothing`)
-/// tests existence only, so this reaches the real `spawn` and its real
-/// `EACCES` rather than being refused before it. That is also the honest
-/// residue of that check: something can always still fail at exec, and this
-/// is what an operator reads when it does.
+/// The script exists and cannot be exec'd, so this reaches the real `spawn`
+/// and its real `EACCES` rather than the batch existence check.
 #[test]
 fn a_spawn_that_no_check_could_have_caught_still_names_the_sheep_and_the_path() {
     let dir = tempfile::tempdir().unwrap();
@@ -7234,35 +5775,18 @@ fn a_spawn_that_no_check_could_have_caught_still_names_the_sheep_and_the_path() 
     graceful_kill(home);
 }
 
-/// A bare command that is not on the shepherd's PATH does NOT take the rest
-/// of the flock down with it. It is reported, its own app fails to spawn as
-/// it always did, and every other app in the Flockfile comes up.
-///
-/// The asymmetry against
-/// [`one_absent_script_refuses_the_whole_flockfile_and_registers_nothing`] is
-/// the whole point, and it is a line between two kinds of claim. A `script`
-/// with a `/` in it is a claim about the filesystem, which the daemon can
-/// settle and an operator can fix with a typo correction, so the batch is
-/// refused. A bare command is a claim about an ENVIRONMENT, and the one that
-/// decides is the daemon's, not the shell an operator tested in: a `shep
-/// startup` unit gets whatever `PATH` launchd or systemd hands it, and
-/// `assemble`'s fallback is `/usr/local/bin:/usr/bin:/bin`. Node from
-/// homebrew on Apple Silicon lives in `/opt/homebrew/bin` and nvm's under
-/// `$HOME`, so a real Flockfile's `script = "node"` resolves in a terminal
-/// and not under the unit. Refusing the batch there would keep twelve
-/// working apps down over one app's interpreter.
-///
-/// What a broken implementation this catches: the bare-command case
-/// promoted back to a batch refusal (`resolvable` is missing from the
-/// listing, which is the assertion that matters); the report dropped
-/// altogether, so an operator whose interpreter vanished gets no clue in the
-/// shepherd's log (the log assertion).
+/// A bare command not on the shepherd's PATH is reported, fails to spawn, and
+/// takes no other app in the Flockfile down with it. A `script` with a `/` in
+/// it is a filesystem claim the daemon can settle, so that one is refused as a
+/// batch instead. The `PATH` deciding a bare command is the daemon's: under a
+/// `shep startup` unit, whatever launchd or systemd hands it, with
+/// `assemble`'s fallback of `/usr/local/bin:/usr/bin:/bin`.
 #[test]
 fn a_bare_command_off_the_path_takes_only_its_own_app_down() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
     let script = write_test_script(&dir);
-    // `resolvable` FIRST: it is the app that must survive, and a refusal of
+    // `resolvable` first: it is the app that must survive, and a refusal of
     // the whole batch would leave it unregistered rather than online.
     let flockfile = write_flockfile(
         &dir,
@@ -7277,19 +5801,14 @@ fn a_bare_command_off_the_path_takes_only_its_own_app_down() {
     let output = shep(home).arg("start").arg(&flockfile).output().unwrap();
     guard.adopt_home(home);
 
-    // Exit 7 all the same: one app really did fail. What changed is what it
-    // took with it.
+    // Exit 7 all the same: one app really did fail.
     assert_eq!(
         output.status.code(),
         Some(7),
         "the one app that cannot run still fails the command: {output:?}"
     );
-    // The useful sentence reaches the operator's own terminal, not only the
-    // shepherd's log. The batch check can never send it here -- a doubt must
-    // not fail a batch, and the `Start` reply is about the batch -- but once
-    // THIS app's spawn has failed the reply is about this app, and
-    // `SpawnFailed` already carries free-form text, so it needs no protocol
-    // change to say so.
+    // The useful sentence reaches the operator's terminal, not only the
+    // shepherd's log; `SpawnFailed` carries free-form text.
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("is not on the shepherd's PATH"),
@@ -7308,9 +5827,8 @@ fn a_bare_command_off_the_path_takes_only_its_own_app_down() {
         })
     });
     // Found by hand rather than through `sheep_named`, which panics with its
-    // own message: the regression this case exists for makes the row ABSENT,
-    // and a red run has to say that rather than report a lookup failure deep
-    // in a helper.
+    // own message: the regression makes the row absent, and a red run has to
+    // say that.
     let survivor = data
         .as_array()
         .and_then(|rows| rows.iter().find(|row| row["name"] == "resolvable"));
@@ -7336,34 +5854,10 @@ fn a_bare_command_off_the_path_takes_only_its_own_app_down() {
 }
 
 /// A real multi-instance flock through the real binary: distinct slots, a
-/// grouped `shep flock` table, and a `merge_logs` app whose backlog prints
-/// each line exactly once.
-///
-/// Spec Testing section, and the only e2e in this branch's instances work.
-/// Every other test the redesign added is a unit test over a fake, and the
-/// design doc says in its own voice that reading code did not find the
-/// original defects: running a two-instance app did. The `merge_logs` case
-/// is named there specifically, because it is where the duplication bug bit
-/// hardest.
-///
-/// # The duplication guard
-///
-/// `merged` runs two instances that share one log file, and each writes a
-/// line naming its own slot from `SHEP_INSTANCE`. So the file holds
-/// `merged-slot-0` and `merged-slot-1`, once each. `shep bleats` matched two
-/// rows and read a file per row, so it printed the whole shared file twice
-/// and every line came out doubled. Counting occurrences is what catches
-/// that; a `contains` check passes either way, which is how the bug survived
-/// to be found by hand.
-///
-/// # Why a shell script rather than node
-///
-/// The spec says "node app", but every fixture in this file is a `sh`/`.cmd`
-/// script written by the helpers above, and those are what make the file run
-/// on Windows as well as unix. What the case actually needs from the child
-/// is a distinct line per slot and a process that stays up, and nothing about
-/// that is node's. Adding a node dependency to one case would make it the
-/// only one in the file that skips where node is absent.
+/// grouped `shep flock` table, and a `merge_logs` app whose backlog prints each
+/// line exactly once. A `shep bleats` that reads a file per matched row doubles
+/// every line, which counting occurrences catches and a `contains` check does
+/// not. A `sh`/`.cmd` script rather than node, so the case runs on Windows too.
 #[test]
 fn a_multi_instance_flock_gets_distinct_slots_a_grouped_table_and_undoubled_bleats() {
     let dir = tempfile::tempdir().unwrap();
@@ -7408,17 +5902,9 @@ fn a_multi_instance_flock_gets_distinct_slots_a_grouped_table_and_undoubled_blea
     assert_eq!(slots_of("web"), vec![0, 1, 2], "distinct slots: {data}");
     assert_eq!(slots_of("merged"), vec![0, 1], "distinct slots: {data}");
 
-    // 2. The table names each row by its own slot, so an operator can tell
-    // three rows of one app apart.
-    //
-    // This is the FLAT shape of the grouping rule, not the boxed one, and
-    // that is forced rather than chosen: `lib.rs`'s `must_render_bare` drops
-    // any run whose stdout is not a terminal to `StyleLevel::Bare`, and
-    // `--style plain` does not override it. Every process in this file runs
-    // on a pipe, so no e2e can reach the `web x3` header and its `:2` slot
-    // rows -- `output::rows`'s own unit tests are where those live. What
-    // this tier proves is the half a pipe can see, and it is the half that
-    // was broken: before this branch all three rows read `web`.
+    // 2. The table names each row by its own slot. The flat shape, not the
+    // boxed one: `must_render_bare` drops any run whose stdout is not a
+    // terminal to `StyleLevel::Bare`, and `--style plain` does not override it.
     let table = shep(home).arg("flock").output().unwrap();
     assert_success(&table);
     let rendered = String::from_utf8_lossy(&table.stdout);
@@ -7434,9 +5920,7 @@ fn a_multi_instance_flock_gets_distinct_slots_a_grouped_table_and_undoubled_blea
     );
 
     // 3. The regression guard. First, that `merge_logs` really did collapse
-    // the two instances onto one path -- without that the count below is
-    // vacuous, since two separate files hold one line each whatever `bleats`
-    // does with them.
+    // both instances onto one path: without that the count below is vacuous.
     let out_files: Vec<&str> = data
         .as_array()
         .expect("flock data is an array")
@@ -7481,10 +5965,8 @@ fn a_multi_instance_flock_gets_distinct_slots_a_grouped_table_and_undoubled_blea
 /// How long [`counting_lines`] waits for a counter sheep to reach a line
 /// count, and [`wait_for_pid`] for a sheep to be online with a pid.
 ///
-/// Sized like [`FLOCK_DEADLINE`] rather than shorter. The counter emits five
-/// lines a second, so the longest wait any caller here asks for is six lines,
-/// which an idle machine satisfies in a little over a second. Ten seconds is
-/// therefore a loaded runner's margin and not the sheep's own pace.
+/// The counter emits five lines a second and the longest wait here is six
+/// lines, so twenty seconds is a loaded runner's margin, not the sheep's pace.
 #[cfg(unix)]
 const HANDOVER_DEADLINE: Duration = Duration::from_secs(20);
 
@@ -7495,21 +5977,17 @@ const HANDOVER_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// How long [`a_sheep_owed_a_restart_still_gets_one_after_a_daemon_reload`]
 /// waits for a re-armed backoff to fire.
 ///
-/// Its app's `restart_delay` is 8s and the successor re-arms with that same
-/// figure, so the honest wait is 8s plus a respawn. Four times that is a
-/// loaded runner's margin rather than a second schedule.
+/// The app's `restart_delay` is 8s and the successor re-arms with the same
+/// figure, so five times that is a loaded runner's margin.
 #[cfg(unix)]
 const RESTARTED_DEADLINE: Duration = Duration::from_secs(40);
 
-/// Writes a script that counts from 1 upwards on stdout, one number per
-/// line, forever.
+/// Writes a script that counts from 1 upwards on stdout, one number per line,
+/// forever.
 ///
-/// The sequence is what makes a log gap visible. A sheep printing the same
-/// marker over and over proves only that it is still alive; a sheep counting
-/// proves that nothing between it and the file was lost, reordered, or cut
-/// in half, which is the failure a handover can introduce and a restart
-/// cannot (a restarted sheep starts again at 1, which is a different and
-/// equally visible break).
+/// The sequence is what makes a log gap visible: a counting sheep proves
+/// nothing between it and the file was lost, reordered or cut in half. A
+/// restarted sheep starts again at 1.
 #[cfg(unix)]
 fn write_counting_script(dir: &TempDir) -> PathBuf {
     write_script(
@@ -7523,15 +6001,8 @@ fn write_counting_script(dir: &TempDir) -> PathBuf {
     )
 }
 
-/// A log file's contents with the daemon's per-line timestamp taken back
-/// off, which is what these cases mean when they say what a sheep wrote.
-///
-/// Through `shep_core::logstamp::strip`, the same call `shep bleats` makes
-/// when it reads one of these files, so an assertion here is about what an
-/// operator is shown and not about a prefix this test invented.
-///
-/// Not gated: reading a file and stripping a fixed-width prefix is portable,
-/// and both callers are cases that run on every platform.
+/// A log file's contents with the daemon's per-line timestamp taken back off,
+/// through `shep_core::logstamp::strip`, the same call `shep bleats` makes.
 fn unstamped_file(path: &Path) -> String {
     let text = std::fs::read_to_string(path).unwrap();
     let mut out = String::new();
@@ -7544,9 +6015,8 @@ fn unstamped_file(path: &Path) -> String {
 
 /// Reads `path` until it holds at least `want` lines, or
 /// [`HANDOVER_DEADLINE`] expires, and returns what it held on the last read.
-///
-/// Returns rather than panicking on expiry, so the failure that reaches CI is
-/// the caller's own assertion naming what it wanted.
+/// Returns rather than panicking on expiry, so the failure is the caller's own
+/// assertion.
 #[cfg(unix)]
 fn counting_lines(path: &Path, want: usize) -> Vec<String> {
     let start = Instant::now();
@@ -7565,32 +6035,11 @@ fn counting_lines(path: &Path, want: usize) -> Vec<String> {
 }
 
 /// Fails unless `lines` is `1, 2, 3, …`, one number per line, with nothing
-/// missing, nothing repeated and nothing cut in half.
-///
-/// A torn line is the reason this is stricter than "the file grew". The log
-/// pump reads its sheep's pipe through a `BufReader`, so bytes it has
-/// consumed without yet forming a line die with the process image; the
-/// successor's fresh reader then starts mid-line and appends the remainder as
-/// a line of its own. That shows up here as a number that is not the one
-/// expected next, and not as a shorter file, which is why counting lines
-/// alone would pass over it.
-///
-/// **The tear is real, and this is what measured it.** With the counter's
-/// `sleep` removed so it emits as fast as the pipe will take it, three runs
-/// out of three broke here: `7385` was followed by `2`, `4872` by `00`, and
-/// `10917` by `1916`. The last of those is the shape of the whole problem:
-/// `1916` is not a suffix of `10918`, so what died was not one line but
-/// every line the reader had consumed and not yet emitted, and the resume
-/// landed in the middle of a number a thousand further on. The flush a
-/// handover performs empties the log file's write buffer; nothing empties
-/// the reader's. Carrying it is 2b's, and until then a sheep that fills the
-/// reader between the flush and the exec loses what is in it.
-///
-/// The counter therefore emits five lines a second rather than as fast as it
-/// can. That is not the assertion being weakened, since it is still every
-/// number, once, in order. It is the difference between exercising the
-/// handover and exercising a gap that is already known, measured and
-/// written down.
+/// missing, nothing repeated and nothing cut in half. The log pump reads
+/// through a `BufReader`, so bytes consumed without yet forming a line die with
+/// the process image and the successor's reader starts mid-line. The counter
+/// emits five lines a second rather than as fast as it can: the handover's
+/// flush empties the log file's write buffer, not the reader's.
 #[cfg(unix)]
 fn assert_unbroken_sequence(lines: &[String], what: &str) {
     for (index, line) in lines.iter().enumerate() {
@@ -7607,18 +6056,12 @@ fn assert_unbroken_sequence(lines: &[String], what: &str) {
     }
 }
 
-/// The two assertions that define the whole handover: a sheep keeps its pid
-/// across `shep daemon reload`, and its log gains no gap.
+/// A sheep keeps its pid across `shep daemon reload`, and its log gains no
+/// gap. Neither implies the other: a handover that respawned the sheep keeps
+/// the log growing while moving the pid, and one that carried the pid while
+/// dropping the pipe leaves the sheep blocked on `write()`.
 ///
-/// A version passing neither is the stop arm, which restarts the flock:
-/// every sheep gets a new pid and a counter starts again at 1. Both halves
-/// are therefore load-bearing and neither is implied by the other: a
-/// handover that respawned the sheep would keep the log growing while
-/// moving the pid, and one that carried the pid while dropping the pipe
-/// would leave the sheep blocked on `write()` with the log frozen.
-///
-/// Unix only, as the whole handover is: Windows has no `execve`, and the arm
-/// selection there never chooses one.
+/// Unix only, as the whole handover is: Windows has no `execve`.
 #[cfg(unix)]
 #[test]
 fn a_sheep_keeps_its_pid_and_its_log_across_a_daemon_reload() {
@@ -7681,13 +6124,10 @@ fn a_sheep_keeps_its_pid_and_its_log_across_a_daemon_reload() {
     graceful_kill(dir.path());
 }
 
-/// Fails if a bad `shep.toml` can orphan a running flock.
-///
-/// Writes a value that parses as TOML and not as config, runs `shep daemon
-/// reload`, then asserts the flock is still supervised: the refusal must
+/// Fails if a bad `shep.toml` can orphan a running flock: the refusal must
 /// happen before anything is signalled, on both the handover arm and the
-/// stop-and-start arm, so this case carries no `#[cfg(unix)]` -- the
-/// pre-flight in `reload_with_wait` runs before the arm is even chosen.
+/// stop-and-start arm. No `#[cfg(unix)]`, since the pre-flight in
+/// `reload_with_wait` runs before the arm is chosen.
 #[test]
 fn a_bad_shep_toml_refuses_the_reload_and_leaves_the_flock_supervised() {
     let dir = tempfile::tempdir().unwrap();
@@ -7748,19 +6188,10 @@ fn a_bad_shep_toml_refuses_the_reload_and_leaves_the_flock_supervised() {
 
 /// Fails if a dog section shep cannot move can orphan a running flock.
 ///
-/// The dog-config migration runs at the top of every boot, so on the
-/// handover arm it runs in a successor whose predecessor is already gone: a
-/// refusal there used to exit the successor with the flock still running
-/// and nothing supervising it. Measured before the fix, with exactly this
-/// setup: the reload failed, the sheep survived reparented to init, `shep
-/// flock` reported it stopped, and a recovering `shep muster` started a
-/// second copy alongside the orphan.
-///
-/// `metrics` configured in both `shep.toml` and `dogs.toml` is the refusal
-/// with the fewest moving parts (`DogMigrationError::WouldOverwrite`), and
-/// it is one an operator reaches by hand-writing `dogs.toml` before
-/// upgrading. No `#[cfg(unix)]`, for the same reason the bad-`shep.toml`
-/// case above carries none: the pre-flight runs before the arm is chosen.
+/// The dog-config migration runs at the top of every boot, so on the handover
+/// arm it runs in a successor whose predecessor is already gone, and a refusal
+/// there leaves the flock running with nothing supervising it. No
+/// `#[cfg(unix)]`: the pre-flight runs before the arm is chosen.
 #[test]
 fn a_refused_dog_migration_refuses_the_reload_and_leaves_the_flock_supervised() {
     let dir = tempfile::tempdir().unwrap();
@@ -7824,27 +6255,11 @@ fn a_refused_dog_migration_refuses_the_reload_and_leaves_the_flock_supervised() 
     graceful_kill(dir.path());
 }
 
-/// Pins the ruling behind the file-only pre-flight: an env var set on the
-/// `shep daemon reload` invocation itself must not rescue a file that is
-/// invalid on its own, because a handover successor execs with the OLD
-/// daemon's argv and environment, not this CLI invocation's. The daemon
-/// here is started with no `SHEP_MAX_CRON_SLEEP` at all, so a pre-flight
-/// that layered THIS process's environment would see the reload command's
-/// own `SHEP_MAX_CRON_SLEEP`, load clean, and let a handover proceed into a
-/// successor that never had that variable and still fails.
-///
-/// `max_cron_sleep` is the field this needs: a value below `MIN_CRON_SLEEP`
-/// is syntactically valid TOML and fails only at `DaemonConfig`'s own
-/// validation pass, which is exactly the shape `SHEP_MAX_CRON_SLEEP` is
-/// documented to rescue under `file < env < flags` -- so this is a genuine
-/// rescue case, not a value nothing could ever save.
-///
-/// This is the test that actually exercises `Command::env` on a real child
-/// process: mutating the CURRENT process's environment is `unsafe` in
-/// edition 2024 and this crate forbids unsafe code outright, but setting
-/// environment on a child through `Command::env` is not, and is exactly
-/// what the pre-flight's own risk is about (a value only this invocation's
-/// environment, not the running daemon's, ever saw).
+/// An env var set on the `shep daemon reload` invocation must not rescue a
+/// file that is invalid on its own: a handover successor execs with the old
+/// daemon's argv and environment. The variable is set on the child through
+/// `Command::env`; mutating this process's own environment is `unsafe` in
+/// edition 2024 and the crate forbids unsafe code.
 #[test]
 fn a_bad_shep_toml_an_env_var_would_rescue_is_still_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -7870,8 +6285,8 @@ fn a_bad_shep_toml_an_env_var_would_rescue_is_still_refused() {
         .as_u64()
         .unwrap_or_else(|| panic!("an online sheep reports a pid: {before}"));
 
-    // Below MIN_CRON_SLEEP (1s): syntactically valid, refused only at
-    // DaemonConfig's own validation pass.
+    // Below MIN_CRON_SLEEP (1s): valid TOML, refused only at DaemonConfig's
+    // own validation pass.
     write_shep_toml(&dir, "[daemon]\nmax_cron_sleep = \"500ms\"\n");
 
     let reloaded = shep(dir.path())
@@ -7906,15 +6321,10 @@ fn a_bad_shep_toml_an_env_var_would_rescue_is_still_refused() {
     graceful_kill(dir.path());
 }
 
-/// A script that says which slot it is and which process it is, on every
-/// line.
-///
-/// `$SHEP_INSTANCE` is injected by the daemon at the spawn and is fixed for
-/// the life of the process, so a line naming a slot is the CHILD's own claim
-/// about which instance it is rather than the shepherd's. That is what makes
-/// a slot swap visible: a successor that rehydrated two instances into each
-/// other's rows leaves every pid alive and every log growing, and the only
-/// evidence is that the row for slot 0 names a file whose lines say slot 1.
+/// A script that says which slot it is and which process it is, on every line.
+/// `$SHEP_INSTANCE` is injected at the spawn and fixed for the life of the
+/// process, so a line naming a slot is the child's claim rather than the
+/// shepherd's, which is what makes a slot swap visible.
 #[cfg(unix)]
 fn write_slot_script(dir: &TempDir) -> PathBuf {
     write_script(
@@ -7928,11 +6338,9 @@ fn write_slot_script(dir: &TempDir) -> PathBuf {
     )
 }
 
-/// Every line of `path` that names a slot, as `(slot, pid)` pairs.
-///
-/// Panics on a line it cannot parse rather than skipping it: a torn line is
-/// the failure these cases are looking for, and silently dropping it would
-/// turn a lost write into a shorter list.
+/// Every line of `path` that names a slot, as `(slot, pid)` pairs. Panics on a
+/// line it cannot parse: a torn line is the failure these cases look for, and
+/// dropping it would turn a lost write into a shorter list.
 #[cfg(unix)]
 fn slot_lines(path: &Path) -> Vec<(u32, u32)> {
     std::fs::read_to_string(path)
@@ -7971,19 +6379,9 @@ fn poll_slot_lines(path: &Path, want: usize) -> Vec<(u32, u32)> {
 /// Polls `path` until the lines written after the first `before` of them
 /// satisfy `ready`, or the handover deadline passes.
 ///
-/// A line COUNT is the wrong wait for a `merge_logs` app, and
-/// [`poll_slot_lines`] offers nothing else. Both instances write to one
-/// file, so "two more lines" is satisfied the moment EITHER of them writes
-/// twice. The sampled window can then legitimately hold no line from the
-/// instance being asked about, and the assertion blames the handover for a
-/// race in the test's own sampling. Measured on a loaded macOS runner: both
-/// fresh lines were slot 1, and slot 0 was reported as having written
-/// nothing after a reload it had in fact survived.
-///
-/// So the caller says what it is waiting FOR, rather than how many lines it
-/// expects to read before finding it. Waiting too long is harmless here and
-/// returning early is the whole defect, which is why the deadline is the
-/// only other way out.
+/// A line count is the wrong wait for a `merge_logs` app: both instances write
+/// to one file, so "two more lines" is satisfied by either of them writing
+/// twice. The caller therefore says what it is waiting for.
 #[cfg(unix)]
 fn poll_fresh_lines(
     path: &Path,
@@ -8003,25 +6401,13 @@ fn poll_fresh_lines(
     }
 }
 
-/// A clustered app is carried, and every instance comes back in its own
-/// slot.
+/// A clustered app is carried, and every instance comes back in its own slot.
 ///
-/// Two apps, because `merge_logs` is the whole reason multi-instance was the
-/// one to distrust. It points every instance of an app at ONE log file, and
+/// Two apps, because `merge_logs` points every instance at one log file and
 /// `handover::adopt::refuse_repeated_fds` refuses the entire blob when a
-/// descriptor number appears twice. Sharing one inode does not share a
-/// number, since each instance's pump runs its own `open`, but the failure
-/// that would follow if it did is a permanent refusal of every merged
-/// clustered app, blaming a descriptor rather than the config that produced
-/// it. So both shapes are exercised here rather than only the one with
-/// separate files.
-///
-/// The pid check is not the assertion. Every handover defect measured so far
-/// left the flock healthy and the pids intact, and a slot swap is exactly
-/// that shape: two live processes, both adopted, each answering to the
-/// other's name and writing under the other's `SHEP_INSTANCE`. So each row's
-/// own `out_file` is read back and the lines in it have to agree with the
-/// row about which slot and which pid they came from.
+/// descriptor number appears twice. A slot swap leaves two live processes
+/// adopted under each other's names, so each row's `out_file` is read back and
+/// its lines have to agree with the row about slot and pid.
 #[cfg(unix)]
 #[test]
 fn a_clustered_flock_keeps_every_pid_and_every_slot_across_a_daemon_reload() {
@@ -8060,10 +6446,8 @@ fn a_clustered_flock_keeps_every_pid_and_every_slot_across_a_daemon_reload() {
         4,
         "two apps at two instances each: {before}"
     );
-    // The fixture check. `merge_logs` collapsing both instances onto one
-    // path is the premise of half this case, and a version where it had
-    // quietly stopped applying would pass every assertion below for the
-    // wrong reason.
+    // The fixture check: `merge_logs` collapsing both instances onto one path
+    // is the premise of half this case.
     assert_eq!(
         rows_before[&("merged".to_owned(), 0)].1,
         rows_before[&("merged".to_owned(), 1)].1,
@@ -8091,10 +6475,8 @@ fn a_clustered_flock_keeps_every_pid_and_every_slot_across_a_daemon_reload() {
         String::from_utf8_lossy(&reloaded.stdout),
         String::from_utf8_lossy(&reloaded.stderr)
     );
-    // The exact sentence the gate prints when it refuses -- see
-    // `handover::RefusedReason`'s `Display`, which ends on it. A looser
-    // probe would pass whether or not the reload was refused, which is the
-    // failure this assertion is here to catch.
+    // The exact sentence `handover::RefusedReason`'s `Display` ends with. A
+    // looser probe would pass whether or not the reload was refused.
     assert!(
         !text.contains("falls back to a stop-and-start"),
         "a clustered flock is carried now, not refused: {text}"
@@ -8114,28 +6496,22 @@ fn a_clustered_flock_keeps_every_pid_and_every_slot_across_a_daemon_reload() {
         "every instance keeps its pid and its own log file: {after}"
     );
 
-    // The mark is taken HERE, after the reload has returned, and not before
-    // it was issued. A pid is CARRIED across a handover -- that is the
-    // property this test exists to prove -- so a line written before the
-    // swap names the same pid as one written after it. A mark taken early
-    // therefore lets a pre-reload line satisfy "this instance wrote again",
-    // and the test passes while proving nothing about the successor. Every
-    // line past this point is unambiguously the new shepherd's.
+    // The mark is taken after the reload returned, not before it was issued. A
+    // pid is carried across a handover, so an early mark lets a pre-reload line
+    // satisfy "this instance wrote again".
     let counts_before: HashMap<(String, u32), usize> = rows_after
         .iter()
         .map(|(key, (_, out_file))| (key.clone(), slot_lines(out_file).len()))
         .collect();
 
-    // The slot assertion, and the one a pid check cannot make. Each row is
-    // asked for its own file, and every line written into that file AFTER
-    // the reload has to name that row's slot and that row's pid.
+    // The slot assertion, the one a pid check cannot make. Each row is asked
+    // for its own file, and every line written into that file after the
+    // reload has to name that row's slot and that row's pid.
     for ((name, slot), (pid, out_file)) in &rows_after {
         let before = counts_before[&(name.clone(), *slot)];
-        // What this row waits for depends on who else writes into the file.
         // A split app's file holds nobody else, so two more lines in it are
         // two more lines from this row. A merged app's file holds both
-        // instances, so the only wait that means "this row wrote again" is
-        // this row's own pid turning up.
+        // instances, so the wait is this row's own pid turning up.
         let lines = if *name == "merged" {
             poll_fresh_lines(out_file, before, |fresh| {
                 fresh.iter().any(|(_, line_pid)| line_pid == pid)
@@ -8151,8 +6527,7 @@ fn a_clustered_flock_keeps_every_pid_and_every_slot_across_a_daemon_reload() {
         );
         if *name == "merged" {
             // One file for both slots, so the row's own lines are the ones
-            // carrying its pid. Both instances have to be present, or a
-            // handle was lost rather than carried.
+            // carrying its pid. Both must be present, or a handle was lost.
             assert!(
                 fresh.iter().any(|(_, line_pid)| line_pid == pid),
                 "merged:{slot} wrote nothing after the reload: {fresh:?}"
@@ -8183,10 +6558,8 @@ fn a_clustered_flock_keeps_every_pid_and_every_slot_across_a_daemon_reload() {
     graceful_kill(dir.path());
 }
 
-/// `shep flock`'s JSON rows as `(name, instance) -> (pid, out_file)`.
-///
-/// Keyed on the pair rather than on the name, because a name now matches as
-/// many rows as the app has instances.
+/// `shep flock`'s JSON rows as `(name, instance) -> (pid, out_file)`. Keyed on
+/// the pair, since a name matches as many rows as the app has instances.
 #[cfg(unix)]
 fn rows_by_slot(data: &serde_json::Value) -> BTreeMap<(String, u32), (u32, PathBuf)> {
     data.as_array()
@@ -8219,20 +6592,12 @@ fn rows_by_slot(data: &serde_json::Value) -> BTreeMap<(String, u32), (u32, PathB
         .collect()
 }
 
-/// A `/bin/sh` sheep that signals readiness on fd 3 and answers every
-/// shepherd message with the same reply.
-///
-/// Three features in one script, because they share one socketpair and the
-/// case below is about that socket surviving an `execve`. The `ready` line
-/// is what `wait_ready` holds the sheep at `starting` for; the loop is what
-/// `shep trigger` gets an answer from; and `read -r line <&3` is a plain
-/// blocking read, which is what an app author writes and what a channel that
-/// came back non-blocking would break.
-///
-/// The reply names the action verbatim rather than echoing what it was sent:
-/// extracting a JSON field in POSIX sh would be its own source of failure,
-/// and `ActionWaits` correlates on the action name when the app echoes no
-/// dispatch id.
+/// A `/bin/sh` sheep that signals readiness on fd 3 and answers every shepherd
+/// message with the same reply. The `ready` line is what `wait_ready` holds the
+/// sheep at `starting` for, the loop is what `shep trigger` gets an answer
+/// from, and `read -r line <&3` is a plain blocking read, which a channel that
+/// came back non-blocking would break. The reply names the action verbatim:
+/// `ActionWaits` correlates on the action name when the app echoes no id.
 #[cfg(unix)]
 fn write_channel_script(dir: &TempDir) -> PathBuf {
     write_script(
@@ -8248,10 +6613,8 @@ fn write_channel_script(dir: &TempDir) -> PathBuf {
     )
 }
 
-/// Runs `shep trigger chatty ping` and returns the one row's outcome.
-///
-/// Its own helper because the case below asks the identical question twice,
-/// once either side of the reload, and the whole point is that the two
+/// Runs `shep trigger chatty ping` and returns the one row's outcome. Asked
+/// identically either side of the reload, and the point is that the two
 /// answers are the same.
 #[cfg(unix)]
 fn trigger_ping(home: &Path) -> serde_json::Value {
@@ -8270,18 +6633,11 @@ fn trigger_ping(home: &Path) -> serde_json::Value {
 }
 
 /// A sheep's shepherd channel survives `shep daemon reload`, in both
-/// directions and against a real app.
-///
-/// The end-to-end case for what 2b task 5 carries, and the one a pid check
-/// cannot stand in for. A socketpair can survive as a NUMBER and be attached
-/// to the wrong end, or be adopted with only one of its two pumps rebuilt,
-/// and every one of those leaves the flock healthy and the pid unmoved. What
-/// separates them is whether the app still answers.
-///
-/// `wait_ready` is on as well as `channel`, so `online` before the reload is
-/// itself proof that the child's `{"kind":"ready"}` came up the channel, and
-/// the second `trigger` is proof that both directions still work over the
-/// same socket afterwards.
+/// directions and against a real app. A socketpair can survive as a number
+/// attached to the wrong end, or be adopted with only one of its two pumps
+/// rebuilt, and both leave the flock healthy and the pid unmoved. `wait_ready`
+/// is on as well as `channel`, so `online` before the reload is itself proof
+/// the child's `{"kind":"ready"}` came up the channel.
 #[cfg(unix)]
 #[test]
 fn a_channel_sheep_still_answers_a_trigger_across_a_daemon_reload() {
@@ -8349,11 +6705,9 @@ fn a_channel_sheep_still_answers_a_trigger_across_a_daemon_reload() {
 #[cfg(unix)]
 const ROWS_IN_THE_MIXED_FLOCK: usize = 8;
 
-/// Writes one line to `sheep`'s stdin and asserts shep accepted it.
-///
-/// `sent` says the bytes reached the pipe, never that the app read them, so
-/// the caller still has to look in the sheep's own log for the echo. This
-/// helper covers only the half that can fail loudly.
+/// Writes one line to `sheep`'s stdin and asserts shep accepted it. `sent`
+/// says the bytes reached the pipe, never that the app read them, so the
+/// caller still has to look in the sheep's own log for the echo.
 #[cfg(unix)]
 fn whisper(home: &Path, sheep: &str, line: &str) {
     let sent = shep(home)
@@ -8366,12 +6720,9 @@ fn whisper(home: &Path, sheep: &str, line: &str) {
 }
 
 /// Reads `path` until it holds a line equal to `want`, or
-/// [`HANDOVER_DEADLINE`] expires.
-///
-/// Equality rather than `contains`, so a prefix of a longer line cannot
-/// answer for the line itself. Returns rather than panicking, for
-/// [`counting_lines`]' reason: the failure that reaches CI should be the
-/// caller's own assertion naming what it wanted.
+/// [`HANDOVER_DEADLINE`] expires. Equality rather than `contains`, so a prefix
+/// of a longer line cannot answer for the line itself. Returns rather than
+/// panicking, so the failure is the caller's own assertion.
 #[cfg(unix)]
 fn await_log_line(path: &Path, want: &str) -> bool {
     let start = Instant::now();
@@ -8391,19 +6742,9 @@ fn await_log_line(path: &Path, want: &str) -> bool {
 }
 
 /// A `/bin/sh` sheep that waits for `gate` to appear, deletes it, and then
-/// grows its resident set past [`BALLOON_BYTES`].
-///
-/// [`write_ballooning_script`] with a trigger in front of it, and the
-/// trigger is the whole reason this is a second script rather than that one.
-/// A sheep already over its ceiling before the reload proves nothing about
-/// the successor: the predecessor armed that enforcer. Growing only after
-/// the exec is what makes the breach attributable to an arming the
-/// successor performed.
-///
-/// It deletes the gate as it passes, so the breach happens exactly once. A
-/// restarted instance waits at a gate that is not there, which keeps the
-/// restart count a fact the assertion can pin rather than a race with the
-/// enforcer's next tick.
+/// grows its resident set past [`BALLOON_BYTES`]. Growing only after the exec
+/// makes the breach attributable to the successor's arming, and deleting the
+/// gate on the way past makes it happen exactly once.
 #[cfg(unix)]
 fn write_gated_ballooning_script(dir: &TempDir, name: &str, gate: &Path) -> PathBuf {
     write_script(
@@ -8420,42 +6761,15 @@ fn write_gated_ballooning_script(dir: &TempDir, name: &str, gate: &Path) -> Path
     )
 }
 
-/// Every lifecycle extra is armed again by the successor, and each one is
-/// proved by the behaviour rather than by a handle existing.
+/// Every lifecycle extra is armed again by the successor, proved by behaviour
+/// rather than by a handle existing. [`ExtrasRegistry::arm`] fans out to five
+/// mechanisms across two scopes: sampling, the memory limit and the liveness
+/// loop per instance, the cron worker and the filesystem watch per name.
 ///
-/// The spec's H2 stages "re-arming watch, cron and memory limits" into this
-/// phase, and `Actor::install_adopted` does it in one line: `arm_extras` for
-/// an adopted sheep that is already `Online`. What that line covers is not
-/// self-evident, because [`ExtrasRegistry::arm`] fans out to five separate
-/// mechanisms across two scopes -- sampling, the memory limit and the
-/// liveness loop per instance, the cron worker and the filesystem watch per
-/// name -- and a successor that armed four of them would look identical from
-/// the outside to one that armed five.
-///
-/// **Every trigger here fires after the exec, and that ordering is the case.**
-/// A watch armed by the predecessor and a watch armed by the successor are
-/// indistinguishable if the file is written before the reload; the same goes
-/// for a resident set already over its ceiling and a probe already failing.
-/// So the reload happens first, on a flock where nothing has yet been asked
-/// to do anything, and only then does the case write the file, open the
-/// balloon gates and trip the probe.
-///
-/// `control` is what makes the memory restart attributable. It runs the same
-/// ballooning script, grows the same resident set through the same gate, and
-/// differs only in naming no `max_memory`, so a restart caused by the shell
-/// dying under its own allocation would move both counters. It doubles as
-/// the control for the other three: it configures no watch, no schedule and
-/// no probe, and a `restarts` of 0 at the end says nothing in this case
-/// restarts sheep in general.
-///
-/// What a broken implementation this would catch: an `install_adopted` that
-/// never calls `arm_extras` (all four counters stay 0 and nothing in
-/// `shep flock` says why); one that arms the per-instance extras and skips
-/// the name group, or the reverse (two of the four); an `arm_watch` given
-/// the entry before its log paths were assembled, which would leave the
-/// watch ignoring the wrong files; and an enforcer armed against the sheep's
-/// id where its pid belongs, which the pid guard in `handle_extra_restart`
-/// would then drop silently for the rest of the daemon's life.
+/// Every trigger fires after the exec, and that ordering is the case: a watch
+/// armed by the predecessor is indistinguishable from one armed by the
+/// successor if the file is written before the reload. `control` configures no
+/// extra at all, so its `restarts` of 0 says nothing here restarts sheep.
 #[cfg(unix)]
 #[test]
 fn every_lifecycle_extra_is_re_armed_across_a_daemon_reload() {
@@ -8467,12 +6781,10 @@ fn every_lifecycle_extra_is_re_armed_across_a_daemon_reload() {
     let watched = tempfile::tempdir().unwrap();
     let greedy_gate = dir.path().join("greedy.gate");
     let control_gate = dir.path().join("control.gate");
-    // A file the probe REQUIRES, so the test trips it by DELETING and
-    // heals it by writing. The opposite polarity raced the fixture: a
-    // script that clears its own trigger on the way up does so whenever
-    // the shell is first scheduled, which under a loaded debug build was
-    // half a second after `shep flock` already called the sheep `online`,
-    // and it deleted the file this case had just written.
+    // A file the probe requires, so the test trips it by deleting and heals it
+    // by writing. The opposite polarity races the fixture: a script clearing
+    // its own trigger on the way up can do so after `shep flock` already called
+    // the sheep `online`.
     let healthy = dir.path().join("probe.healthy");
     std::fs::write(&healthy, "ok").unwrap();
     let sleeper = write_slow_script(&dir);
@@ -8546,11 +6858,9 @@ fn every_lifecycle_extra_is_re_armed_across_a_daemon_reload() {
             "{name} was respawned, so this reload took the stop arm: {after}"
         );
     }
-    // The sampling arm, and the cheapest of the five to lose silently.
-    // `StatsState::sample_now` reports only WATCHED roots and
-    // `with_live_stats` fills a row only from a reading it finds, so a
-    // successor that never called `stats.watch` leaves this null for the
-    // life of the daemon while every other column looks right.
+    // The sampling arm, the cheapest of the five to lose silently. A successor
+    // that never called `stats.watch` leaves this null for the life of the
+    // daemon while every other column looks right.
     for name in pids_before.keys() {
         assert!(
             !sheep_named(&after, name)["memory_bytes"].is_null(),
@@ -8563,10 +6873,9 @@ fn every_lifecycle_extra_is_re_armed_across_a_daemon_reload() {
     std::fs::write(&greedy_gate, "go").unwrap();
     std::fs::write(&control_gate, "go").unwrap();
     std::fs::remove_file(&healthy).unwrap();
-    // One wait for the three fast arms. The memory limit is the slow one of
-    // the three: the enforcer's ticks are phased off daemon boot rather than
-    // off the breach, so the honest worst case is a whole
-    // `MEMORY_POLL_INTERVAL` after the resident set moves.
+    // One wait for the three fast arms. The enforcer's ticks are phased off
+    // daemon boot rather than off the breach, so the memory limit's worst case
+    // is a whole `MEMORY_POLL_INTERVAL` after the resident set moves.
     let fired = poll_flock_data(home, BREACH_DEADLINE, |data| {
         ["watched", "probed", "greedy"]
             .iter()
@@ -8590,8 +6899,8 @@ fn every_lifecycle_extra_is_re_armed_across_a_daemon_reload() {
     std::fs::write(&healthy, "ok").unwrap();
 
     // The cron worker, and the slow one. A `* * * * *` pattern armed at an
-    // arbitrary moment is a uniform draw on the minute it lands in, so the
-    // only bound worth stating is a minute plus the restart's round trip.
+    // arbitrary moment lands uniformly in the minute, so the bound is a minute
+    // plus the restart's round trip.
     let cronned = poll_flock_data(home, CRON_DEADLINE, |data| {
         sheep_named(data, "scheduled")["restarts"]
             .as_u64()
@@ -8613,10 +6922,9 @@ fn every_lifecycle_extra_is_re_armed_across_a_daemon_reload() {
          {cronned}"
     );
 
-    // The daemon's own log, which is the only place the observed resident
-    // set and the ceiling it crossed are ever stated. Read rather than
-    // polled: `spawn_extras_reporter` writes the record before it asks for
-    // the restart, so the counter above reaching 1 has already ordered it.
+    // The daemon's own log, the only place the observed resident set and the
+    // ceiling it crossed are stated. Read rather than polled:
+    // `spawn_extras_reporter` writes the record before it asks for the restart.
     let daemon_log = std::fs::read_to_string(home.join("logs").join("shepd.err.log")).unwrap();
     assert!(
         daemon_log.contains("exceeded its max_memory"),
@@ -8641,32 +6949,15 @@ fn restart_counts(data: &serde_json::Value) -> BTreeMap<String, u64> {
         .collect()
 }
 
-/// A sheep already owed a respawn when the shepherd is replaced still gets
-/// it.
+/// A sheep already owed a respawn when the shepherd is replaced still gets it.
 ///
-/// The strand this pins is silent, permanent and reachable on a released
-/// build. `Actor::schedule_restart` spawns a task that sleeps and then
-/// sends `Msg::RestartDue`, and that task dies with the process image;
+/// `Actor::schedule_restart` spawns a task that sleeps and then sends
+/// `Msg::RestartDue`, and that task dies with the process image, while
 /// `handle_restart_due` is the only thing that moves a sheep off
-/// `WaitingRestart`. A successor that installs the status without re-arming
-/// the timer therefore leaves the sheep down for the rest of its life while
-/// `shep flock` keeps printing `waiting-restart`, which an operator reads as
-/// "coming back".
-///
-/// Not a narrow race either, which is why it earns its own case rather than
-/// a line in the mixed flock above. The default backoff climbs to 15s, so a
-/// crash-looping app spends most of its time in this status -- and upgrading
-/// the shepherd is exactly what an operator does about a crash-looping app.
-///
-/// The precondition is asserted twice, before and immediately after the
-/// reload, and the second one is load-bearing. If the delay elapsed while
-/// `daemon reload` was running, the predecessor would have respawned the
-/// sheep before the exec and the final assertion would pass without proving
-/// anything.
-///
-/// `steady` is what says the reload was a handover at all: it never exits,
-/// so a moved pid means the stop arm ran and restarted the whole flock,
-/// which would bring `flapper` back for a reason this case is not about.
+/// `WaitingRestart`. The precondition is asserted before and immediately after
+/// the reload: if the delay elapsed during `daemon reload`, the predecessor
+/// respawned the sheep and the final assertion proves nothing. `steady` never
+/// exits, so a moved pid means the stop arm ran.
 #[cfg(unix)]
 #[test]
 fn a_sheep_owed_a_restart_still_gets_one_after_a_daemon_reload() {
@@ -8682,8 +6973,8 @@ fn a_sheep_owed_a_restart_still_gets_one_after_a_daemon_reload() {
         &dir,
         &format!(
             // Long enough that a loaded runner cannot let the wait expire
-            // between the observation below and the reload after it, and
-            // short enough that the case then waits it out once.
+            // between the observation below and the reload after it, and short
+            // enough that the case then waits it out once.
             "[[app]]\nname = \"flapper\"\nscript = '{flapper}'\nrestart_delay = \"8s\"\n\n\
              [[app]]\nname = \"steady\"\nscript = '{steady}'\n",
             flapper = flapper.display(),
@@ -8757,16 +7048,10 @@ fn a_sheep_owed_a_restart_still_gets_one_after_a_daemon_reload() {
 }
 
 /// A `/bin/sh` sheep that echoes every line it is whispered, prefixed.
-///
-/// `stdin = true` is the only thing that gives a sheep a readable fd 0, and
-/// the loop is what makes a whisper observable: the line comes back in the
-/// sheep's own log, from the same process, so a pipe that survived as a
-/// number but was attached to the wrong end delivers nothing.
-///
-/// No trailing `sleep`. The `read` parks the script for as long as the
-/// daemon holds the write end open, which is exactly as long as the sheep is
-/// registered, so this fixture stays alive on the descriptor under test
-/// rather than on a timer.
+/// `stdin = true` is the only thing that gives a sheep a readable fd 0, and the
+/// echo comes back in the sheep's own log, so a pipe that survived as a number
+/// attached to the wrong end delivers nothing. No trailing `sleep`: the `read`
+/// parks the script for as long as the daemon holds the write end open.
 #[cfg(unix)]
 fn write_echoing_script(dir: &TempDir) -> PathBuf {
     write_script(
@@ -8780,16 +7065,13 @@ fn write_echoing_script(dir: &TempDir) -> PathBuf {
     )
 }
 
-/// A `/bin/sh` sheep that writes down whatever the shepherd tells it and
-/// then exits cleanly.
+/// A `/bin/sh` sheep that writes down whatever the shepherd tells it and then
+/// exits cleanly.
 ///
-/// For `shutdown_with_message`, which is the third feature routed through
-/// the channel refusal and the one neither of the other two channel cases
-/// reaches: `wait_ready` is the child writing UP the socket and a `trigger`
-/// is a round trip, while this is the daemon writing down it on the stop
-/// path, with no reply to correlate. The line in the log is the whole of the
-/// evidence, and the clean `exit 0` beside it is what says the message
-/// arrived rather than the kill ladder.
+/// For `shutdown_with_message`: the daemon writes down the socket on the stop
+/// path, with no reply to correlate. The line in the log is the evidence, and
+/// the clean `exit 0` beside it says the message arrived rather than the kill
+/// ladder.
 #[cfg(unix)]
 fn write_farewell_script(dir: &TempDir) -> PathBuf {
     write_script(
@@ -8803,30 +7085,13 @@ fn write_farewell_script(dir: &TempDir) -> PathBuf {
     )
 }
 
-/// Every kind of sheep phase 2b carries, in one flock, across one reload.
+/// Every kind of sheep, in one flock, across one reload.
 ///
-/// 2a's case widened, and the reason it is one flock rather than five is
-/// that the descriptor rules are whole-flock rules.
-/// `handover::adopt::refuse_repeated_fds` refuses the ENTIRE blob over one
-/// repeated number, and the blob a mixed flock produces is the only place
-/// six kinds of descriptor -- two log files, two pipe read ends, a stdin
-/// pipe and a socketpair, times seven sheep -- are ever numbered together.
-///
-/// Every assertion here is one a pid check cannot make, which is the lesson
-/// of this whole phase: three separate defects have now been found that left
-/// the flock healthy, every pid intact and the suite green.
-///
-/// - `counter` is the log plane. Its sequence is unbroken or it is not.
-/// - `echoer` answers a whisper, so its stdin pipe is still the end the
-///   child reads from and still attached to that child.
-/// - `chatty` reaches `online` only by writing `{"kind":"ready"}` up fd 3,
-///   and answers a `trigger` afterwards with the CHILD's own reply.
-/// - `bye` is told `{"kind":"shutdown"}` down the same kind of socket at the
-///   end, which is the direction a `trigger` alone does not isolate.
-/// - `split` and `merged` are the clustered halves, and each row's own file
-///   has to name that row's slot and that row's pid: a successor that
-///   rehydrated two instances into each other's rows leaves every pid alive
-///   and every log growing.
+/// One flock rather than five: `handover::adopt::refuse_repeated_fds` refuses
+/// the entire blob over one repeated number, and a mixed flock is the only
+/// place six kinds of descriptor (two log files, two pipe read ends, a stdin
+/// pipe and a socketpair, times eight sheep) are numbered together. Every
+/// assertion below is one a pid check cannot make.
 #[cfg(unix)]
 #[test]
 fn a_flock_of_every_carried_kind_survives_a_daemon_reload() {
@@ -8879,9 +7144,8 @@ fn a_flock_of_every_carried_kind_survives_a_daemon_reload() {
         "six apps, two of them clustered: {before}"
     );
 
-    // Every feature is exercised BEFORE the reload too. A case where the
-    // whisper or the trigger never worked at all would otherwise read as a
-    // handover defect, and the point of this one is to separate those.
+    // Every feature is exercised before the reload too, so a whisper or a
+    // trigger that never worked at all does not read as a handover defect.
     let out_file = |name: &str| rows_before[&(name.to_owned(), 0)].1.clone();
     let counter_log = out_file("counter");
     let echoer_log = out_file("echoer");
@@ -8919,9 +7183,8 @@ fn a_flock_of_every_carried_kind_survives_a_daemon_reload() {
         String::from_utf8_lossy(&reloaded.stdout),
         String::from_utf8_lossy(&reloaded.stderr)
     );
-    // The exact sentence `handover::RefusedReason`'s `Display` ends with.
-    // Without this the case would pass on a stop-and-start, which restarts
-    // the flock and satisfies "everything still works".
+    // The exact sentence `handover::RefusedReason`'s `Display` ends with;
+    // without it the case would pass on a stop-and-start.
     assert!(
         !text.contains("falls back to a stop-and-start"),
         "every kind in this flock is carried now, not refused: {text}"
@@ -8999,27 +7262,51 @@ fn a_flock_of_every_carried_kind_survives_a_daemon_reload() {
 
     // `shutdown_with_message`, last because it ends its sheep. The message
     // goes down the carried socket, the child writes it to its own log and
-    // exits 0, so a `stopped` row with `told` in the file is the write
-    // direction working on the stop path four assertions after the exec.
+    // exits 0.
     let stopped = shep(dir.path()).arg("stop").arg("bye").output().unwrap();
     assert_success(&stopped);
+    // The row rides along in the message: a `bye` killed by the stop ladder
+    // never got the message, and a `bye` that got it and had the line dropped
+    // on the way to the file (what `tokio_runner`'s `FINAL_DRAIN` guards) both
+    // leave the log empty.
     assert!(
         await_log_line(&bye_log, "told {\"kind\":\"shutdown\"}"),
-        "the stop message must reach the child down the carried channel: {}",
-        std::fs::read_to_string(&bye_log).unwrap_or_default()
+        "the stop message must reach the child down the carried channel. \
+         The log holds {:?}; the flock reads {}",
+        std::fs::read_to_string(&bye_log).unwrap_or_default(),
+        poll_flock_data(dir.path(), Duration::ZERO, |_| true),
     );
 
     graceful_kill(dir.path());
 }
 
+/// Gap between the dials [`the_control_socket_accepts_throughout_a_handover`]
+/// makes at the control address. A dial is a `connect(2)` and a close, so
+/// this decides how narrow an outage the case can see, not what it costs:
+/// every real way the address goes away spans a daemon teardown or a fresh
+/// bind, hundreds of milliseconds.
+#[cfg(unix)]
+const DIAL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// `ExitCode::DaemonUnreachable`, the one failing exit `shep ping` has,
+/// whatever the reason. Any other failing exit is a usage error or a
+/// refusal, which no handover produces, and the prober refuses it rather
+/// than counting it as the one drop the exec is allowed.
+#[cfg(unix)]
+const PING_OFFLINE: i32 = 5;
+
 /// The control socket answers throughout a handover.
 ///
 /// The successor inherits the listening descriptor rather than binding the
-/// address again, so a client that connects while the image is being
-/// replaced waits in the kernel's backlog and is served by whichever image
-/// gets to it. Nothing may be refused, and the socket file may never
-/// disappear, since a rebind would race the predecessor's socket file and
-/// lose whatever connection a client had already made.
+/// address again, so a client that connects mid-replacement waits in the
+/// kernel's backlog. Nothing may be refused, and the socket file may never
+/// disappear: a rebind would race the predecessor's socket file.
+///
+/// Two probers and one file check. A `connect(2)` dialer sees an outage at
+/// least `DIAL_INTERVAL` wide; the socket file's inode sees a rebind, which
+/// is too brief for any poller; a ping loop sees a request still served.
+/// Ping failures are counted, not read: `shep ping` prints nothing on
+/// stderr and exits `DaemonUnreachable` for every reason it has.
 #[cfg(unix)]
 #[test]
 fn the_control_socket_accepts_throughout_a_handover() {
@@ -9038,32 +7325,78 @@ fn the_control_socket_accepts_throughout_a_handover() {
     assert_success(&started);
     let _ = poll_flock(dir.path(), |info| info["status"] == "online");
 
+    // One deadline for both threads, so the two answers describe the same
+    // window.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let socket = dir.path().join("run").join("shep.sock");
+    // The file's identity before anything happens to it. A successor that
+    // binds fresh instead of adopting must unlink and recreate the file,
+    // which changes the inode; that takes a microsecond no poller can see.
+    let inode_before = std::fs::metadata(&socket)
+        .expect("the control socket must exist before the handover")
+        .ino();
+    let dial_socket = socket.clone();
+    let dialer = std::thread::spawn(move || {
+        let mut refused = Vec::new();
+        let mut dials = 0_usize;
+        while Instant::now() < deadline {
+            dials += 1;
+            // Dropped where the `if let` ends: the daemon's accept loop meets
+            // an EOF and logs it at `debug!`. The answer wanted is the
+            // syscall's; anything more would be the bucket this case fixes.
+            if let Err(err) = std::os::unix::net::UnixStream::connect(&dial_socket) {
+                refused.push(format!("dial {dials}: {:?}: {err}", err.kind()));
+            }
+            std::thread::sleep(DIAL_INTERVAL);
+        }
+        (refused, dials)
+    });
+
     let home = dir.path().to_path_buf();
     // The prober says when it is really probing, and the reload waits for
     // that. Without the handshake the reload could finish before the first
-    // `ping` ever ran, and the case would pass with every probe served by the
-    // successor alone, which proves nothing about the address staying bound
-    // across the exec.
+    // `ping` ran, and every probe would be served by the successor alone.
     let (probing, started_probing) = std::sync::mpsc::channel();
     let prober = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(8);
-        let mut refused = Vec::new();
+        let mut before_reload = Vec::new();
+        let mut dropped = Vec::new();
+        let mut pings = 0_usize;
         let mut announced = false;
         while Instant::now() < deadline {
+            pings += 1;
             let out = shep(&home).arg("ping").output().unwrap();
-            if !out.status.success() {
-                refused.push(format!(
-                    "exit {:?}: {}",
+            let served = out.status.success();
+            if !served {
+                // The failure has to be the one shape a handover can cause.
+                // Its reason cannot be read (see the case's doc), but its
+                // exit can: anything but `DaemonUnreachable` is a different
+                // defect wearing the tolerated drop's clothes.
+                assert_eq!(
                     out.status.code(),
+                    Some(PING_OFFLINE),
+                    "ping {pings} failed for a reason no handover produces: {}{}",
+                    String::from_utf8_lossy(&out.stdout),
                     String::from_utf8_lossy(&out.stderr)
-                ));
+                );
             }
             if !announced {
-                announced = true;
-                let _ = probing.send(());
+                // The reload waits for a ping the predecessor ANSWERED. A
+                // failure before that has no exec to blame, since none has
+                // been asked for, and it must not spend the one drop the
+                // exec is allowed: it is kept apart and refused below.
+                if served {
+                    announced = true;
+                    let _ = probing.send(());
+                } else {
+                    before_reload.push(pings);
+                }
+                continue;
+            }
+            if !served {
+                dropped.push(pings);
             }
         }
-        refused
+        (before_reload, dropped, pings)
     });
     started_probing
         .recv_timeout(FLOCK_DEADLINE)
@@ -9075,32 +7408,49 @@ fn the_control_socket_accepts_throughout_a_handover() {
         .output()
         .unwrap();
     assert_success(&reloaded);
-
-    // What the listener crossing the exec actually buys, and what it does
-    // not. The listener's descriptor is carried, so no client ever finds the
-    // address unbound. An ACCEPTED connection is not carried, deliberately:
-    // rebuilding a half-read frame's protocol state is not something the
-    // successor can do, and the spec's H2 records the consequence as a client
-    // seeing its connection drop and retrying.
-    //
-    // So a ping whose reply was in flight at the instant of the exec fails,
-    // and must be tolerated. A ping that could not connect at all means the
-    // address went away, which is the property this test exists to defend.
-    //
-    // Asserting the stronger thing was wrong rather than merely strict, and
-    // it passed on macOS purely because the window is narrow: the four Linux
-    // jobs on the first CI run of this test all caught it.
-    let refused = prober.join().unwrap();
-    let (dropped, unreachable): (Vec<_>, Vec<_>) = refused
-        .into_iter()
-        .partition(|line| line.contains("the connection closed before a reply arrived"));
+    // The premise, checked. A reload that fell back to stopping and starting
+    // really did unbind the address, and the dialer would report that as
+    // the defect. Both fallback arms say so on stderr (`commands/daemon.rs`'s
+    // two `aside("reload", ...)` calls).
+    let reload_aside = String::from_utf8_lossy(&reloaded.stderr);
     assert!(
-        unreachable.is_empty(),
-        "the control address must stay bound across the handover: {unreachable:?}"
+        !reload_aside.contains("starting one instead")
+            && !reload_aside.contains("stopping and starting instead"),
+        "this case is about the handover arm and the reload took the other one: {reload_aside}"
+    );
+    // Same file, same inode: the successor adopted the carried listener. A
+    // rebind at the same path passed the dialer 10 of 10; the inode is the
+    // deterministic reading of the same property.
+    let inode_after = std::fs::metadata(&socket)
+        .expect("the control socket must still exist after the handover")
+        .ino();
+    assert_eq!(
+        inode_after, inode_before,
+        "the successor bound a fresh listener instead of adopting the carried one: \
+         the socket file's inode changed across the handover"
+    );
+
+    // The listener's descriptor is carried, so no client ever finds the
+    // address unbound; an accepted connection is not, so the one reply in
+    // flight at the exec may fail. One at most: the prober is sequential.
+    let (refused, dials) = dialer.join().unwrap();
+    let (before_reload, dropped, pings) = prober.join().unwrap();
+    assert!(
+        before_reload.is_empty(),
+        "a ping failed before any reload was asked for, at {before_reload:?} of \
+         {pings}: the predecessor was not answering, which is not the handover's \
+         doing"
+    );
+    assert!(
+        refused.is_empty(),
+        "the control address must stay bound across the handover, \
+         {} of {dials} dials refused: {refused:?}",
+        refused.len()
     );
     assert!(
         dropped.len() <= 1,
-        "at most the one request in flight at the exec may drop, got {}: {dropped:?}",
+        "at most the one request in flight at the exec may drop, got {} of {pings} \
+         pings, at {dropped:?}",
         dropped.len()
     );
 
@@ -9110,10 +7460,8 @@ fn the_control_socket_accepts_throughout_a_handover() {
 /// Reads `roll` until it records exactly `want` apps, or [`FLOCK_DEADLINE`]
 /// expires, and returns the bytes it held on the last read.
 ///
-/// The muster roll is written by a debounced task, so "the flock changed"
-/// and "the roll on disk says so" are two events and the second is the one a
-/// caller here needs. Returns rather than panicking on expiry, so the
-/// failure that reaches CI is the caller's own assertion.
+/// The muster roll is written by a debounced task, so "the flock changed" and
+/// "the roll on disk says so" are two events, and callers here need the second.
 #[cfg(unix)]
 fn roll_recording(roll: &Path, want: usize) -> Vec<u8> {
     let start = Instant::now();
@@ -9129,43 +7477,16 @@ fn roll_recording(roll: &Path, want: usize) -> Vec<u8> {
     }
 }
 
-/// A successor that inherited an EMPTY flock must not fall back to the roll.
+/// A successor that inherited an empty flock must not fall back to the roll.
+/// A boot either installs the flock it was handed or restores the roll, and
+/// what decides is whether it was handed a flock at all, not how large.
 ///
-/// The two things a boot can do with a muster roll are mutually exclusive,
-/// and which one it does turns on a single fact: was this image handed a
-/// flock, or did it start fresh? A successor was handed one, so it installs
-/// what it was handed and skips the restore. The SIZE of that flock is not
-/// the question and must never be mistaken for it, because a handover skips
-/// the predecessor's teardown: the roll on disk is whatever the last
-/// debounced write left, not the flock as it was at the exec.
-///
-/// The empty case is the one where the two questions give different answers.
-/// `ghost` is started, saved into the roll, then deleted, and the stale roll
-/// is put back under an idle shepherd that has no sheep left to write over
-/// it. The handover from there carries nothing, so a boot deriving "was I a
-/// successor?" from the count of what it carried decides it was a fresh boot
-/// and starts `ghost` again from a roll describing a flock the operator has
-/// already thrown away.
-///
-/// SIGHUP directly, not `shep daemon reload`. The verb runs `shep muster`
-/// against the shepherd it gets back, which would start `ghost` from the
-/// same stale roll through the CLI whatever the boot decided, and a test
-/// that cannot tell those two apart proves nothing about either. The signal
-/// is the whole of the daemon-side handover and nothing else.
-///
-/// The pid check at the end is what keeps this from passing vacuously.
-/// SIGHUP has exactly two outcomes and no third: this image execs into a
-/// successor, or it cannot and stops gracefully instead. On the second, the
-/// polling below finds no shepherd and spawns a fresh one, which is a NEW
-/// pid and a boot that does restore the roll. So a shepherd still answering
-/// on the original pid is a successor and nothing else.
-///
-/// The final wait is on the WRONG outcome deliberately. A restore that is
-/// going to happen happens inside the successor's own boot, and nothing in
-/// this tier is synchronous with that boot, so asserting emptiness once
-/// could pass by looking too early. Waiting [`FLOCK_DEADLINE`] for a sheep
-/// to appear and then asserting none did is the version that cannot pass by
-/// being quick.
+/// SIGHUP directly, not `shep daemon reload`, which would start `ghost`
+/// through `shep muster` whatever the boot decided. A failed exec leaves no
+/// shepherd, so the poll fails on its own `assert_success` and the pid check
+/// says a successor answered. The wait is for a sheep to appear, so asserting
+/// none did cannot pass by looking too early; it goes through
+/// [`poll_flock_data_across_a_handover`] since the raw signal can drop one reply.
 #[cfg(unix)]
 #[test]
 fn a_successor_inheriting_an_empty_flock_does_not_restore_the_roll() {
@@ -9204,15 +7525,15 @@ fn a_successor_inheriting_an_empty_flock_does_not_restore_the_roll() {
         Some(0),
         "the delete must leave an idle shepherd: {emptied}"
     );
-    // Waited out rather than assumed: the debounced writer is about to
-    // record the empty flock, and a stale roll put back before that write
-    // lands would simply be overwritten by it.
+    // Waited out rather than assumed: the debounced writer is about to record
+    // the empty flock, and a stale roll put back before that write lands would
+    // be overwritten by it.
     let _ = roll_recording(&roll, 0);
     std::fs::write(&roll, &stale).unwrap();
 
     nix::sys::signal::kill(shepherd, nix::sys::signal::Signal::SIGHUP).unwrap();
 
-    let after = poll_flock_data(home, FLOCK_DEADLINE, |data| {
+    let after = poll_flock_data_across_a_handover(home, FLOCK_DEADLINE, |data| {
         data.as_array().is_some_and(|rows| !rows.is_empty())
     });
     assert_eq!(
@@ -9233,28 +7554,14 @@ fn a_successor_inheriting_an_empty_flock_does_not_restore_the_roll() {
 }
 
 /// `shep add` registers a sheep, starts nothing, and a later `shep start`
-/// brings that same sheep up.
+/// brings that same sheep up. Without it, `shep start Flockfile.toml` on a
+/// template shipping `env = { DB_HOST = "", DB_PASSWORD = "" }` spawns against
+/// an empty database URL and spends the restart budget before it can be
+/// configured.
 ///
-/// The whole sequence the verb exists for. A Flockfile is a template, and one
-/// shipping `env = { DB_HOST = "", DB_PASSWORD = "" }` is the endorsed
-/// pattern -- the `.env.example` convention. Without `add`, the first thing an
-/// operator does with such a file is `shep start Flockfile.toml`, which spawns
-/// a process against an empty database URL: it crashes, `autorestart` spends
-/// the restart budget, and the app has to be stopped before it can be
-/// configured. With `add` the order is register, fill in, start.
-///
-/// The listing is read ONCE and not polled, deliberately. `Request::Add` is
-/// answered after the actor has registered, exactly as `Request::Start` is
-/// answered after the actor has spawned, so a build that routed `add` through
-/// the start path reports `online` on this very first read. Polling for
-/// `stopped` would spin out the deadline and reach the same assertion a lot
-/// later; a single read fails immediately and names the same cause.
-///
-/// What a broken implementation this catches: `add` wired to
-/// `Request::Start` (the row is `online`, and on unix the script's pid file
-/// exists); `add` registering nothing at all (the row is missing, and the
-/// `start` below cannot find it); the app registered under a status a later
-/// `start` cannot resume from (the final poll never reaches `online`).
+/// The listing is read once, not polled: `Request::Add` is answered after the
+/// actor has registered, so a build routing `add` through the start path
+/// reports `online` on this first read.
 #[test]
 fn add_registers_a_stopped_sheep_that_a_later_start_brings_up() {
     let dir = tempfile::tempdir().unwrap();
@@ -9294,19 +7601,17 @@ fn add_registers_a_stopped_sheep_that_a_later_start_brings_up() {
         "a sheep that was never spawned has no pid: {envelope}"
     );
 
-    // The strongest form of "nothing spawned" available here: the script
-    // itself appends its pid to this file on every run, so an empty one is
+    // The script appends its pid to this file on every run, so an empty one is
     // the child's own evidence that it never executed. Unix only, because
-    // `record_pid_line` writes nothing on Windows and says why.
+    // `record_pid_line` writes nothing on Windows.
     #[cfg(unix)]
     assert!(
         !dir.path().join(FIXTURE_PIDS).exists(),
         "the script never ran, so it never recorded a pid"
     );
 
-    // Registered rather than merely reported: a row `shep flock` cannot see
-    // is not a flock member, and `shep start pending` below would have
-    // nothing to name.
+    // Registered rather than merely reported: a row `shep flock` cannot see is
+    // not a flock member.
     let listed = shep(home)
         .arg("--format")
         .arg("json")
@@ -9318,9 +7623,8 @@ fn add_registers_a_stopped_sheep_that_a_later_start_brings_up() {
     assert_eq!(flock["data"][0]["name"], "pending", "it is in the flock");
     assert_eq!(flock["data"][0]["status"], "stopped", "and still at rest");
 
-    // By NAME, which is the half of the sequence that proves the
-    // registration was the real thing: a name reads no file, so this can only
-    // reach a sheep the flock already holds.
+    // By name: a name reads no file, so this can only reach a sheep the flock
+    // already holds.
     let started = shep(home).arg("start").arg("pending").output().unwrap();
     assert_success(&started);
     let running = poll_flock(home, |info| info["status"] == "online");
@@ -9333,19 +7637,11 @@ fn add_registers_a_stopped_sheep_that_a_later_start_brings_up() {
 }
 
 /// `shep add` with no target and no Flockfile in the current directory is a
-/// usage error, where bare `shep start` brings a shepherd up.
-///
-/// The one thing the two verbs disagree about. `start`'s empty-directory case
-/// means "give me a shepherd with nothing running yet", which is the only way
-/// to get one without also starting a process. `add` cannot mean that: a
-/// shepherd holding nothing is what it would produce either way, so the
-/// operator has named something that is not there.
-///
-/// The temporary directory is the working directory as well as the home, so
-/// there is genuinely no Flockfile to discover.
-///
-/// What a broken implementation this catches: `add` falling through to
-/// `start_bare_shepherd` (exit 0, and a daemon left running behind it).
+/// usage error, where bare `shep start` brings a shepherd up: `start`'s
+/// empty-directory case means "give me a shepherd with nothing running yet",
+/// and `add` produces a shepherd holding nothing either way. The temporary
+/// directory is the working directory as well as the home, so there is no
+/// Flockfile to discover.
 #[test]
 fn add_with_nothing_to_add_is_a_usage_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -9366,5 +7662,57 @@ fn add_with_nothing_to_add_is_a_usage_error() {
     assert!(
         !home.join("run").join("shep.sock").exists(),
         "and no shepherd was started to answer a request nobody made"
+    );
+}
+
+/// `$SUDO_USER` names `nobody` (passwd home `/var/empty` on macOS,
+/// `/nonexistent` on Linux) and `$HOME` is a throwaway standing in for
+/// root's. The refusal must name nobody's `~/.shep`, not `$HOME/.shep`.
+/// Skipped as root: a broken gate would really install a unit.
+#[cfg(unix)]
+#[test]
+fn a_sudo_startup_without_home_carries_the_target_users_home_not_this_processes() {
+    if nix::unistd::geteuid().is_root() {
+        eprintln!("skipping: as root this would really install a unit if the gate were broken");
+        return;
+    }
+    let Ok(Some(nobody)) = nix::unistd::User::from_name("nobody") else {
+        eprintln!("skipping: no `nobody` user to stand in for $SUDO_USER");
+        return;
+    };
+    let fake_root_home = TempDir::new().unwrap();
+
+    let output = Command::cargo_bin("shep")
+        .unwrap()
+        .env("HOME", fake_root_home.path())
+        .env("SUDO_USER", "nobody")
+        .env_remove("SHEP_HOME")
+        .arg("startup")
+        .arg("--init")
+        .arg("systemd")
+        .timeout(CMD_TIMEOUT)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let target_home = nobody.dir.join(".shep");
+    let refusal = format!(
+        "error[usage]: no directory at {}; create it first (any shep verb run as nobody \
+         creates that user's own ~/.shep), or pass --home with the $SHEP_HOME this unit \
+         should carry",
+        target_home.display()
+    );
+    assert!(
+        stderr.lines().any(|line| line == refusal),
+        "the refusal names nobody's own home and both ways out: {stderr}"
+    );
+    assert!(
+        !stderr.contains(fake_root_home.path().to_str().unwrap()),
+        "and never this process's $HOME: {stderr}"
+    );
+    assert!(
+        !fake_root_home.path().join(".shep").exists(),
+        "nothing is created under a $HOME that is not the target user's"
     );
 }

@@ -1,44 +1,16 @@
 name: test
-# Runs automatically on pushes to main and on pull requests, by the maintainer's call on
-# 2026-08-16.
+# Every Rust job carries `Swatinem/rust-cache@v2` after its toolchain
+# install, so the key sees the toolchain that builds. `benches/` names it
+# explicitly since it is its own workspace; `privileged`'s container ships
+# a toolchain already.
 #
-# The repository is public, so these runs are free regardless of job count or
-# platform. That was not always true, and docs/specs/deferred.md keeps the
-# billing arithmetic (GitHub charges private-repo Actions minutes per
-# platform: Linux 1x, Windows 2x, macOS 10x) for the day it might matter
-# again.
+# Every job carries `timeout-minutes`: a ceiling against a hang, not a
+# performance budget, at roughly three times the last green runtime with a
+# floor of ten minutes. GitHub's default when absent is 360.
 #
-# The weekly `schedule: [{ cron: "0 0 * * SUN" }]` the earlier comment listed
-# is deliberately NOT enabled: a full matrix run every week against an
-# unchanged tree spends the most expensive part of this file to learn nothing.
-# Worth adding if dependency rot against an idle tree becomes a real concern —
-# that decision is the maintainer's, not made here just because the runs are free.
-#
-# Every job that compiles Rust carries `Swatinem/rust-cache@v2`, placed after
-# its `rustup toolchain install` so the cache key picks up the toolchain that
-# will actually build. There was no caching here at all until 2026-08-27, so
-# all twelve jobs rebuilt the whole dependency tree from scratch on every push,
-# and the Windows legs paid for it worst: a run that should take four minutes
-# stalled past fifty. `benches/` is its own workspace with its own target dir,
-# so that leg names it explicitly; `privileged` installs no toolchain because
-# its container ships one.
-#
-# Cache scope is per-branch, so the first run on a new PR is still cold. The
-# win is the second and every push after it, which is the shape of most work
-# here.
-#
-# Every job also carries `timeout-minutes`. These are ceilings against a hang,
-# NOT performance budgets: each is roughly three times the job's runtime on
-# the last green run, rounded up, with a floor of ten minutes so a cold cache
-# on a fresh branch cannot trip one. A job that gets slower is not what this
-# file is trying to catch; a job that stops making progress is.
-#
-# GitHub's default when the key is absent is 360 minutes, which is why the
-# omission was expensive rather than merely untidy. Three runs on 2026-08-27
-# were cancelled by hand at 40-plus minutes each because a Windows test hung
-# and nothing here bounded it -- left alone, the first would have held a
-# runner for six hours before Actions said a word. Add a job below and give it
-# a timeout, whatever else you do.
+# Every `uses:` is pinned by commit, and .github/dependabot.yml moves the
+# pins. No secrets here, but a moved tag could rewrite the cache every job
+# restores or the filter that decides whether the matrix runs at all.
 on:
   push:
     branches: [main]
@@ -46,49 +18,28 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+# One run per ref. A newer push cancels a pull request's run, since the old
+# head's verdict is no longer the question. A push to main cancels nothing:
+# main's runs are the record the release workflows and the ruleset read.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
-  # Decides which of the jobs below a change actually needs, so a docs-only
-  # pull request stops paying for the full Rust matrix. Everything below
-  # except `typos` is gated on this job's `rust` output; `typos` reads prose,
-  # which is exactly what a docs-only change edits, so it always runs.
+  # Decides which jobs below need the full Rust matrix. `typos` always runs
+  # regardless, since it reads prose and a docs-only change edits exactly that.
   #
-  # The skip lives at the JOB level (`needs` + `if`) and deliberately NOT at
-  # the workflow level (`on.push.paths`), and the difference is the `main`
-  # ruleset. A job skipped by its `if:` still reports, as "skipped", which
-  # SATISFIES a required status check. A workflow filtered out by `paths:`
-  # never reports at all, so every required check sits at "Expected" forever
-  # and a docs pull request can never merge. Same feature, opposite outcomes.
+  # Skips at the JOB level (`needs` + `if`), not `on.push.paths`: a skipped
+  # job still reports as "skipped", which satisfies a required check, while a
+  # workflow filtered out by `paths:` never reports at all and a docs PR sits
+  # at "Expected" forever. `test` and `features` are matrix jobs, so they gate
+  # every step instead: a job-level skip never expands the matrix, and the
+  # required contexts are the per-leg names.
   #
-  # EXCEPT for a matrix job, and the canary run for this gate is what proved
-  # it: a matrix job skipped at the job level never expands its matrix, so it
-  # reports one check run named `test`, and the ruleset's required contexts
-  # are the per-leg names, `test (ubuntu-latest, stable)` and friends. Those
-  # never get created and sit at "Expected" forever, which is the docs-PR
-  # deadlock again through a side door. So the two matrix jobs with required
-  # legs, `test` and `features`, gate every STEP instead of the job: each leg
-  # spins up, skips its steps in seconds, and reports SUCCESS under its own
-  # required name. Every non-matrix job keeps the job-level skip, which the
-  # same canary showed the ruleset accepting.
+  # Every gated `if:` also runs on `needs.changes.result != 'success'`, so a
+  # failed filter runs the full matrix rather than skipping everything.
   #
-  # The fail-open corner is closed in the gate expression itself, not in the
-  # ruleset. If this job errors its outputs are empty, and a naive gate would
-  # skip every job while skipped-counts-as-success waves the pull request
-  # through with nothing run. So every gated `if:` also runs on
-  # `needs.changes.result != 'success'`: a filter failure runs the FULL
-  # matrix, which is the pre-gate behaviour and the safe direction. The
-  # `!cancelled()` prefix is what lets a job with a failed dependency run at
-  # all; without it, GitHub skips dependants of a failed job before reading
-  # their condition.
-  #
-  # Three docs paths count as RUST on purpose, because Rust tests pin them:
-  # `docs/whistle/tools.md` is read at test runtime by whistle::catalogue's
-  # `the_checked_in_catalogue_is_current`, and the two `docs/lookout/frames.*`
-  # files are the lookout deliverables whose renderer is snapshot-pinned.
-  # Editing any of them without the suite is how they drift.
-  #
-  # `workflow_dispatch` runs everything regardless: someone pressing the
-  # button by hand is asking for the full matrix, and the paths-filter action
-  # has no pull request to diff there anyway.
+  # `docs/whistle/tools.md` and `docs/lookout/frames.*` count as `rust`: Rust
+  # tests pin both.
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -97,13 +48,11 @@ jobs:
       bench: ${{ steps.filter.outputs.bench }}
       packaging: ${{ steps.filter.outputs.packaging }}
     steps:
-      - uses: actions/checkout@v4
-      # Pinned by commit like Swatinem/rust-cache above, not by moving tag
-      # like checkout and typos. This workflow holds no secrets, but this
-      # action's OUTPUT decides whether any test runs at all, so a moved tag
-      # here could silently skip the whole matrix rather than merely run
-      # different action code.
-      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3.0.4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Pinned by commit, not a moving tag: this action's output decides
+      # whether any test runs at all, so a moved tag could silently skip the
+      # whole matrix.
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         with:
           filters: |
@@ -117,6 +66,11 @@ jobs:
               - 'docs/whistle/tools.md'
               - 'docs/lookout/frames.txt'
               - 'docs/lookout/frames.ansi'
+              # cargo-deny's config, and the report that runs after every
+              # nextest leg. A change to either is a change to what the
+              # Rust jobs do.
+              - 'deny.toml'
+              - '.github/actions/**'
             # benches/ is its own workspace, excluded from the root one, so
             # the main matrix never compiles it and only the bench job below
             # cares when it changes.
@@ -128,11 +82,9 @@ jobs:
             packaging:
               - 'packaging/**'
               - '.github/workflows/test.yml'
-  # Parses the Chocolatey package's PowerShell and its nuspec, on a runner
-  # that has both. Neither is compiled by anything else here, and the only
-  # other thing that reads them is `release-artifacts.yml`'s `chocolatey`
-  # job, which runs once per release and pushes straight to a moderation
-  # queue. A syntax error found there is found in public, days later.
+  # Parses the Chocolatey package's PowerShell and nuspec; nothing else here
+  # reads them, and `release-artifacts.yml`'s `chocolatey` job only does at
+  # release time.
   #
   # A parse, not an execution: the scripts call Chocolatey helper functions
   # that only exist inside a real install.
@@ -142,7 +94,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -166,23 +118,18 @@ jobs:
             [xml](Get-Content $_.FullName -Raw) | Out-Null
             Write-Host "ok $($_.FullName)"
           }
-  # `brew style` on the Homebrew formula, which is rubocop with Homebrew's own
-  # cops. Same argument as the `packaging` job above: nothing else parses this
-  # file, and the only other thing that reads it is the release-time push to
-  # the tap.
+  # `brew style` on the Homebrew formula; nothing else parses it.
   #
-  # The formula is copied to a `Formula/` directory first, which is not
-  # ceremony. Homebrew's rubocop config keys several cops off the path, so
-  # linting `packaging/homebrew/shep.rb` in place reports a
-  # `Style/FrozenStringLiteralComment` offense that no formula in a real tap
-  # has or wants.
+  # Copied to `Formula/` first: Homebrew's rubocop keys several cops off the
+  # path, and linting `packaging/homebrew/shep.rb` in place reports a
+  # `Style/FrozenStringLiteralComment` offense no real formula has.
   formula:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.outputs.packaging == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
     runs-on: macos-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: |
           mkdir -p tap/Formula
           cp packaging/homebrew/shep.rb tap/Formula/shep.rb
@@ -193,9 +140,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install 1.93 --profile minimal --component clippy,rustfmt
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo +1.93 fmt --all -- --check
       # `--all-features` mirrors the project's own task gate (CLAUDE.md).
       # Without it, everything behind shep-daemon's `test-fakes` feature is
@@ -208,9 +155,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install nightly --profile minimal
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo +nightly doc --workspace --all-features --no-deps
         env: { RUSTDOCFLAGS: "-Dwarnings --cfg docsrs" }
   typos:
@@ -218,27 +165,22 @@ jobs:
     timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: crate-ci/typos@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: crate-ci/typos@d43b6c087ac471e2ea7b8af622ff15f05c0c365b # v1.50.1
   test:
     needs: changes
-    # `!cancelled()` and nothing else. Without it, a FAILED `changes` job
-    # skips this job before matrix expansion, and the per-leg required checks
-    # go missing again through the one path the step gates cannot reach. With
-    # it, the legs always expand, and a failed filter makes every step's
-    # `result != 'success'` term true, so the full suite runs: fail closed,
-    # same as the job-level gates. The steps themselves deliberately do NOT
-    # carry `!cancelled()`; on a step it replaces the implicit `success()`,
-    # which would run `cargo test` after a failed toolchain install.
+    # `!cancelled()` only: without it, a failed `changes` job skips this job
+    # before matrix expansion, losing the per-leg required checks. Steps gate
+    # on `result != 'success'` instead of `!cancelled()`, since on a step that
+    # would replace the implicit `success()` and run `cargo test` after a
+    # failed toolchain install.
     if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
       matrix:
-        # `ubuntu-24.04-arm` is the leg that matters most and the one this
-        # matrix went nine phases without: shep-client's handshake-close test
-        # was red on linux/arm64 for five phases (platform audit #1) and
-        # nothing here would have said so. Billed as a standard Linux runner,
-        # not at the macOS/Windows multiplier.
+        # `ubuntu-24.04-arm` catches linux/arm64-only breaks (shep-client's
+        # handshake-close test was red there for phases) at the standard
+        # Linux runner price, not the macOS/Windows multiplier.
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
         toolchain: [stable, "1.88"]
     runs-on: ${{ matrix.os }}
@@ -246,15 +188,28 @@ jobs:
     # slowest one: `windows-latest` / stable, 355s on the last green run.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       - run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
-      # `--all-features` mirrors the task gate, as in `lint` above.
-      - run: 'cargo +${{ matrix.toolchain }} test --workspace --locked --all-features -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps --skip a_reload_costs_a'
+      # `--all-features` mirrors the task gate (CLAUDE.md).
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with: { tool: nextest }
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
+      - run: "cargo +${{ matrix.toolchain }} nextest run --profile ci --workspace --locked --all-features -E 'not (test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a))'"
+        if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
+      # nextest does not run doctests at all, so they need their own line
+      # or they stop running on this platform. 14 of them, 6.8s warm.
+      - run: 'cargo +${{ matrix.toolchain }} test --workspace --locked --all-features --doc'
+        if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
+      # `!cancelled()`: this runs after a failed test step, when the junit is
+      # worth reading; after a failed toolchain install it finds no file.
+      - uses: ./.github/actions/nextest-report
+        if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+        with:
+          name: junit-test-${{ matrix.os }}-${{ matrix.toolchain }}
   minimal-versions:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
@@ -263,11 +218,18 @@ jobs:
     # gets the cache hit the other Linux jobs do.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install nightly stable --profile minimal
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo +nightly generate-lockfile -Z minimal-versions
-      - run: 'cargo +stable test --workspace -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps --skip a_reload_costs_a'
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with: { tool: nextest }
+      - run: "cargo +stable nextest run --profile ci --workspace -E 'not (test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a))'"
+      - run: 'cargo +stable test --workspace --doc'
+      - uses: ./.github/actions/nextest-report
+        if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+        with:
+          name: junit-minimal-versions
   musl:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
@@ -276,52 +238,34 @@ jobs:
     # of a branch.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
-      # `--test-threads=2`, and the reason is musl rather than this job's
-      # own tests. `cli_e2e` spawns a real shepherd and real sheep per case,
-      # roughly ninety of them, and libtest runs them at one thread per core.
-      # musl's allocator is markedly slower than glibc's under exactly that
-      # load, so a suite that fits its budgets everywhere else does not fit
-      # them here: a case that waits twenty seconds for a line its child
-      # never got scheduled to write reports as a product failure.
-      #
-      # Twice now, and both times the triage cost more than the fix. The
-      # second was worse, because the branch it failed on was changing
-      # restart timing and the failure could not be dismissed until the log
-      # arrived.
-      #
-      # Two rather than one: this is a contention problem, not a wall-clock
-      # tier like `slow`, so the storm wants capping rather than the suite
-      # serialising. The number is a judgement call and the headroom is
-      # large, since this job has been running 132 to 185 seconds against a
-      # twenty-minute timeout. If it flakes here again, one is affordable.
-      - run: 'cargo test --workspace --locked --target x86_64-unknown-linux-musl -- --test-threads=2 --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps --skip a_reload_costs_a'
-  # CLAUDE.md's phase-gate cross-check
-  # (`cargo check --workspace --all-targets --all-features --target
-  # x86_64-pc-windows-gnu`) had no workflow behind it, so it only ran when a
-  # human remembered -- and it went three phases unrun that way before Phase
-  # 10 caught it (docs/specs/deferred-history.md, "the windows-gnu cross-check
-  # went three phases unrun"). It is `cargo check`, deliberately, not
-  # `clippy -- -D warnings`: shep-daemon's `boot`/`sys`/`server`/
-  # `tokio_runner` are `cfg(unix)`-gated, so the Windows target reports 51
-  # dead-code warnings for code that is not dead on any platform shep ships.
-  # Silencing them would mean `#[allow(dead_code)]` on live code. The
-  # question this job asks is only whether the tree still compiles for a
-  # target nobody has implemented yet.
+      # `--test-threads 2`: musl's allocator is markedly slower than glibc's
+      # under `cli_e2e`'s roughly ninety real shepherd/sheep spawns, so full
+      # parallelism reports scheduling delay as a product failure. Two, not
+      # one: this is contention, not a wall-clock tier like `slow`, and the
+      # job has headroom against its twenty-minute timeout.
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with: { tool: nextest }
+      - run: "cargo nextest run --profile ci --workspace --locked --target x86_64-unknown-linux-musl --test-threads 2 -E 'not (test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a))'"
+      - run: 'cargo test --workspace --locked --target x86_64-unknown-linux-musl --doc'
+      - uses: ./.github/actions/nextest-report
+        if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+        with:
+          name: junit-musl
+  # `cargo check`, not clippy: shep-daemon's unix-gated `boot`/`sys`/
+  # `server`/`tokio_runner` report 51 dead-code warnings on this target that
+  # are not dead on any platform shep ships, and silencing them would need
+  # `#[allow(dead_code)]` on live code. This job only asks whether the tree
+  # still compiles for the target.
   #
-  # Cross-compiled from ubuntu-latest rather than run natively on
-  # windows-latest: `ring`'s build script needs a real GNU `cc` for this
-  # target regardless of host OS -- MSVC's `cl.exe` cannot produce it -- and
-  # `apt-get install mingw-w64` supplies one in seconds, the same shape the
-  # `musl` job above already uses for its own cross target. A GNU-target
-  # binary cross-compiled on Linux cannot be executed there either way, which
-  # is the other reason this stays `check` rather than `test`. The `test`
-  # job's own `windows-latest` legs already give the MSVC target full
-  # `cargo test` execution on native Windows; this job's only job is the GNU
-  # target's compile-time coverage.
+  # Cross-compiled from ubuntu-latest: `ring`'s build script needs a real
+  # GNU `cc`, which MSVC's `cl.exe` cannot supply, and the resulting binary
+  # cannot run on Linux either way, so this stays `check` rather than
+  # `test`. `test`'s own `windows-latest` legs already exercise the MSVC
+  # target with a real `cargo test`.
   windows-gnu:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
@@ -329,21 +273,16 @@ jobs:
     # 39s on the last green run; the floor is doing all the work.
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install stable --profile minimal --target x86_64-pc-windows-gnu
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: sudo apt-get update && sudo apt-get install -y mingw-w64
       - run: cargo check --workspace --all-targets --all-features --locked --target x86_64-pc-windows-gnu
   features:
     needs: changes
-    # `!cancelled()` and nothing else. Without it, a FAILED `changes` job
-    # skips this job before matrix expansion, and the per-leg required checks
-    # go missing again through the one path the step gates cannot reach. With
-    # it, the legs always expand, and a failed filter makes every step's
-    # `result != 'success'` term true, so the full suite runs: fail closed,
-    # same as the job-level gates. The steps themselves deliberately do NOT
-    # carry `!cancelled()`; on a step it replaces the implicit `success()`,
-    # which would run `cargo test` after a failed toolchain install.
+    # `!cancelled()` only: without it, a failed `changes` job skips this job
+    # before matrix expansion, losing the per-leg required checks. Steps
+    # gate on `result != 'success'` instead.
     if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
@@ -354,80 +293,55 @@ jobs:
     # `windows-latest` last time it was green.
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       - run: rustup toolchain install stable --profile minimal
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
-      - run: 'cargo test -p shep-daemon --locked --no-default-features -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps --skip a_reload_costs_a'
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with: { tool: nextest }
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
-      # shep-client's `schema` feature is ON by default and a dog is
-      # allowed to turn it off, so the opt-out needs a leg of its own: the
-      # shep-daemon line above says nothing about it. Without one, the
-      # crate's `#[cfg(test)] mod tests` named `schemars` in a build that
-      # has no schemars and nothing noticed, because the task gate is
-      # `--all-features`. `cargo test` rather than `cargo check`, both to
-      # match the line above and because the doctest was broken the same
-      # way and only a doctest run reads it.
+      - run: "cargo nextest run --profile ci -p shep-daemon --locked --no-default-features -E 'not (test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a))'"
+        if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
+      # This job runs nextest twice under the one `ci` profile, and both
+      # runs write the same junit path, so the second overwrites the first
+      # before anything reads it. One report per run, named for its tier.
+      - uses: ./.github/actions/nextest-report
+        if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+        with:
+          name: junit-features-${{ matrix.os }}-daemon-no-default-features
+      - run: 'cargo test -p shep-daemon --locked --no-default-features --doc'
+        if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
+      # shep-client's `schema` feature defaults on; a dog can turn it off,
+      # so the opt-out needs its own leg. `cargo test`, not `check`: the
+      # doctest broke under this feature set too, and only a test run reads it.
       - run: cargo test -p shep-client --locked --no-default-features
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
-      - run: 'cargo test --workspace --locked --all-features -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps --skip a_reload_costs_a'
+      - run: "cargo nextest run --profile ci --workspace --locked --all-features -E 'not (test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a))'"
+        id: all-features
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
-  # Tests that need a quiet machine, run serially in a job of their own.
+      - run: 'cargo test --workspace --locked --all-features --doc'
+        if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
+      # Only once the workspace run has run: after a red first tier it is
+      # skipped and the junit on disk is still the first tier's.
+      - uses: ./.github/actions/nextest-report
+        if: ${{ !cancelled() && steps.all-features.outcome != 'skipped' && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+        with:
+          name: junit-features-${{ matrix.os }}
+  # Runs serially on a quiet machine: `::slow::` waits on real FSEvents/
+  # inotify delivery and real elapsed time, the boot race asserts exactly
+  # one of two threads wins for one `$SHEP_HOME`, the signal test gives a
+  # shell 100ms to install a trap before signalling it, and the reload pair
+  # asserts a connection count across a fixture window that closes its
+  # listener only after `accept` returns `WouldBlock`, which a busy machine
+  # can widen past an already-queued connection. Not `#[ignore]`d: every
+  # other job just skips them.
   #
-  # Two groups belong here and neither is a flaky test in the usual sense:
-  # both assert something real that a contended runner cannot hold still for.
-  # The `::slow::` modules wait on actual FSEvents/inotify delivery and actual
-  # elapsed time, so an assertion like "writes inside `delay` land in one
-  # batch" is measuring the debouncer against a wall clock that a noisy
-  # neighbour can stretch. `two_concurrent_boots_on_a_stale_socket_exactly_one_wins`
-  # races two threads for the same $SHEP_HOME and asserts exactly one wins,
-  # which depends on the loser looking after the winner has bound.
-  # `signal_ignored_then_kill_tree_reaps` is the same shape: it gives a shell
-  # 100ms to install `trap "" TERM` before signalling it, then asserts the
-  # process survived, so a runner that cannot schedule that shell inside the
-  # window reports a working trap as a broken one. The test's own comment
-  # names the race. Seen failing once on macos/1.88 while passing five of
-  # five locally at 0.41s each.
-  #
-  # `a_reload_costs_a` is a prefix, and it matches exactly the two halves of
-  # the reload measurement: the draining app and the defiant one. Each reloads
-  # a `reuse_port_sheep` while a caller opens a connection every 4ms, and each
-  # asserts a COUNT rather than a duration -- the drainer must lose nothing,
-  # the defier must be seen to lose something. No millisecond budget appears
-  # in either, which is why they did not look like timing tests, and both are.
-  # The fixture closes its listener only once `accept` has returned
-  # `WouldBlock` with the stop flag set, so a connection the kernel queues
-  # between those two instructions is reset when the fd closes. That window is
-  # microseconds wide on a quiet machine and as wide as a descheduled thread
-  # on a busy one, and no socket API makes the two steps atomic. Three
-  # failures in the eighteen days to 2026-09-03, all on Linux, all the same
-  # cause pointing opposite ways: the drainer lost 1 of 109 and 1 of 111 to
-  # `Connection reset by peer`, and the defier lost 0 of 297 when it needs to
-  # lose at least one.
-  #
-  # Every other job skips these groups so the matrix stays fast and honest.
-  # This job runs them with `--test-threads=1` so the only load is their own.
-  # They are NOT `#[ignore]`d: the tier's own doc says it exists so the full
-  # suite covers the real backend, and this project has already found a Linux
-  # branch that went five phases without a compiler reading it.
-  #
-  # One leg per watcher backend -- FSEvents, inotify, ReadDirectoryChangesW --
-  # since for the `::slow::` tier the backend is the thing under test. No
-  # second Linux leg: the arm runner would exercise the same inotify, and for
-  # the reload pair the same kernel's SO_REUSEPORT balancing. That does cost
-  # the reload pair the leg two of its three failures came from, which was the
-  # slowest Linux runner rather than a different Linux, and running serially
-  # is what those failures needed. Stable only, for the same reason; the
-  # compiler is not what varies here. `--workspace`, matching the skip the
-  # other jobs apply, so a `mod slow` added outside shep-daemon later cannot
-  # end up skipped everywhere and run nowhere.
-  #
-  # libtest takes these filters positionally, so this is one command. On
-  # Windows the boot and reload halves both match nothing, because `boot.rs`'s
-  # tests and `daemon_e2e`'s reload pair are `cfg(unix)` -- that is the
-  # platform split, not a filter typo.
+  # One leg per watcher backend; no second Linux leg, since arm exercises
+  # the same inotify. Stable only. `--workspace`, so a `mod slow` outside
+  # shep-daemon is not skipped everywhere and run nowhere. Windows: the
+  # boot and reload filters match nothing, both `cfg(unix)`.
   slow:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
@@ -440,27 +354,26 @@ jobs:
     # runs single-threaded, so this one gets more headroom than 3x.
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install stable --profile minimal
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: 'cargo test --workspace --locked --all-features -- --test-threads=1 ::slow:: two_concurrent_boots signal_ignored_then_kill_tree_reaps a_reload_costs_a'
-  # `cargo llvm-cov` on its own runs `cargo test --tests`, and `--tests` does
-  # not build a package's examples. Four of `daemon_e2e`'s reload tests exec
-  # `examples/reuse_port_sheep`, the SO_REUSEPORT fixture the whole reload
-  # measurement rests on, and fail without it. The two counting ones moved to
-  # `slow` above and this job skips them now, so the reason this job still
-  # needs the example is the other two: a probed reload of a release that
-  # serves, and of one that does not. `--all-targets` does not help:
-  # it compiles examples in test mode into `deps/` rather than uplifting a
-  # plain binary into `examples/`, which is the path the test looks in.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with: { tool: nextest }
+      - run: "cargo nextest run --profile ci-slow --workspace --locked --all-features -E 'test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a)'"
+      - uses: ./.github/actions/nextest-report
+        if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+        with:
+          name: junit-slow-${{ matrix.os }}
+          profile: ci-slow
+  # `cargo llvm-cov`'s default `--tests` skips examples, and two of
+  # `daemon_e2e`'s reload tests exec `examples/reuse_port_sheep`, the
+  # SO_REUSEPORT fixture the reload measurement rests on. `--all-targets`
+  # does not help: it compiles examples in test mode into `deps/` rather
+  # than a plain binary in `examples/`, which is where the test looks.
   #
-  # So this drives llvm-cov by hand instead. `show-env` exports the wrapper and
-  # profile settings, an ordinary `cargo test` builds examples the same way
-  # every other job does, and `report` reads the profile data afterwards.
-  #
-  # The bug is older than the `slow` split above and was hidden by it: cargo
-  # stops at the first failing test binary, and the lib tier used to fail
-  # first, so this job never reached `daemon_e2e`.
+  # So this drives llvm-cov by hand: `show-env` exports the profiling
+  # wrapper, an ordinary `cargo test` builds the example the same way every
+  # other job does, and `report` reads the profile data after.
   coverage:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
@@ -469,26 +382,51 @@ jobs:
     # also installs a tool before it starts.
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install stable --profile minimal --component llvm-tools
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        # Block style: in a flow mapping the comma is YAML's separator, so
+        # `{ tool: a,b }` installs `a` and passes a stray `b` key.
+        with:
+          tool: cargo-llvm-cov,nextest
       - run: |
+          # shellcheck disable=SC1090
           source <(cargo llvm-cov show-env --sh)
           cargo llvm-cov clean --workspace
-          cargo test --workspace --locked -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps --skip a_reload_costs_a
+          cargo nextest run --profile ci --workspace --locked --all-features -E 'not (test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a))'
           cargo llvm-cov report --lcov --output-path lcov.info
-      - uses: actions/upload-artifact@v4
+      - uses: ./.github/actions/nextest-report
+        if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+        with:
+          name: junit-coverage
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with: { name: coverage, path: lcov.info }
+  # cargo-deny against deny.toml: RustSec advisories, licences, duplicate
+  # versions and sources. On the `rust` filter, which includes Cargo.lock
+  # and deny.toml, so a Dependabot bump gets it too. Ten minutes is a
+  # ceiling; the check runs in under one.
+  deny:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          # `[graph] all-features = true` in deny.toml already covers the
+          # feature set; this is the action's own default, stated so it
+          # cannot drift from the file.
+          arguments: --all-features
   bench:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.bench == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
-    # `benches/` is its own `[workspace]` (see benches/Cargo.toml), excluded
-    # from the root workspace on purpose so a bench-only dependency can never
-    # end up in a shipped binary's tree. That means the `test` job's `1.88`
-    # matrix leg never touches it — nothing else in this file checks
-    # `benches/Cargo.toml`'s own `rust-version = "1.88"` floor without this
-    # job carrying the same two-toolchain matrix itself.
+    # `benches/` is its own `[workspace]`, excluded from the root one so a
+    # bench-only dependency can never end up in a shipped binary's tree.
+    # `test`'s `1.88` matrix leg never touches it, so this job carries its
+    # own two-toolchain matrix to check `benches/Cargo.toml`'s MSRV floor.
     strategy:
       fail-fast: false
       matrix:
@@ -496,27 +434,23 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with: { workspaces: benches }
-      # `--test` runs each benchmark exactly once and asserts nothing: the
-      # point on a shared runner is proving the harness still compiles and
-      # executes, not collecting a timing (see benches/benches/memory_sample.rs).
+      # `--test` runs each benchmark once and asserts nothing: the point on a
+      # shared runner is proving the harness compiles and executes, not
+      # collecting a timing.
       - run: cargo +${{ matrix.toolchain }} bench --manifest-path benches/Cargo.toml -- --test
   privileged:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
-    # The one `#[ignore]`d test that is ignored for want of privilege rather
-    # than by design: `real_runner.rs`'s privilege-drop case needs a real uid
-    # change and a real supplementary-group clear, which needs root. The other
-    # two ignores in the workspace are child halves of cross-process race
-    # tests, re-exec'd by their own parents, and must stay ignored.
+    # `real_runner.rs`'s privilege-drop case needs a real uid change and a
+    # real supplementary-group clear, both root-only.
     #
-    # A container, not `sudo` on the runner: the test asserts a root daemon
-    # can drop to `nobody` and that std cleared root's supplementary groups
-    # on the way, so it has to actually START as root. A throwaway container
-    # filesystem is the cheap way to have that.
+    # A container, not `sudo` on the runner: the daemon has to actually
+    # start as root to prove it can drop to `nobody` and that std cleared
+    # root's supplementary groups on the way.
     runs-on: ubuntu-latest
     # One test, but the container has to build shep-daemon's test tier to get
     # to it.
@@ -524,13 +458,11 @@ jobs:
     container:
       image: rust:1.88
     steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      # `--exact` with the one path, not a bare `--ignored`: the other two
-      # `#[ignore]`s in the workspace (`barks.rs`'s `bark_race_child`,
-      # `shep_toml.rs`'s `config_race_child`) are child halves that assert
-      # nothing and are re-exec'd by their own parents. Running them here
-      # would add two green lines that mean nothing.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # `--exact` on this one test, not a bare `--ignored`: the workspace's
+      # other two `#[ignore]`s are child halves of cross-process race tests,
+      # re-exec'd by their own parents, and assert nothing on their own.
       - run: >
           cargo test -p shep-daemon --test real_runner --locked --all-features
           -- --ignored --exact a_dropped_child_runs_as_the_requested_user

@@ -1,30 +1,13 @@
 //! The lookout's state and its reducer: `Msg` in, `Effect` out.
 //!
-//! Everything about this module is chosen so it can be tested without a
-//! terminal, a runtime, a socket, or a sleep:
+//! No I/O, no terminal types, no clock. [`App::update`] is synchronous, work
+//! for the outside comes back as an [`Effect`] the caller runs, and every
+//! `Instant` arrives on a message.
 //!
-//! - **No I/O.** [`App::update`] is a synchronous function of `&mut self` and
-//!   one [`Msg`]. Work that has to happen outside comes back out as an
-//!   [`Effect`] for the caller in `super::mod` to run.
-//! - **No terminal types.** Nothing here imports `ratatui` beyond
-//!   [`super::theme::Palette`] (which is a style value, not a widget) or
-//!   `crossterm` at all — `super::input` maps a `KeyEvent` to a [`KeyPress`]
-//!   before it reaches this module.
-//! - **No clock.** Every `Instant` arrives on the message
-//!   ([`Msg::Tick`], [`Msg::Snapshot`]). A test asserts on uptime arithmetic
-//!   exactly rather than sleeping and hoping.
-//!
-//! **The flock map is keyed by sheep id, and the poll is the truth.** The bus
-//! is lossy by construction (`tokio::sync::broadcast` drops for a lagging
-//! subscriber), so a flock view built from events alone WILL drift.
-//! [`Msg::Event`] upserts for latency; [`Msg::Snapshot`] replaces the whole map
-//! and wins every conflict. The cursor this module carries is a **selected
-//! sheep id**, not a row index — the flock map is replaced wholesale every two
-//! seconds, so an index cursor would silently point at a different sheep the
-//! moment an earlier row is deleted. [`App::reseat`] is what puts the
-//! selection back on a real sheep after the map changes; the viewport offset
-//! the flock table scrolls to is derived from the selection rather than
-//! stored beside it ([`super::view::flock::scroll_offset`]).
+//! The bus is lossy, so [`Msg::Event`] upserts and [`Msg::Snapshot`] replaces
+//! the whole flock map. The cursor is a [`RowKey`], not a row index: the map is
+//! replaced wholesale every two seconds, and [`App::reseat`] puts the cursor
+//! back on a real row.
 
 use core::fmt;
 use std::collections::BTreeMap;
@@ -49,30 +32,18 @@ use crate::vocabulary::Reported;
 
 /// Whether this lookout may act on a sheep.
 ///
-/// Default is [`Self::ReadOnly`], per the maintainer's ruling, mirroring the
-/// `allow_control` precedent spec §9 sets for whistle. Turned on by
-/// `--allow-control` or by `lookout.allow_control` in the KV store.
-///
-/// **This is a fat-finger catch, not a security boundary.** lookout runs as the
-/// operator's own process under the operator's own uid; anyone who can run it
-/// can run `shep stop`. The gate exists so a keystroke in a dashboard someone
-/// is reading does not become an action they did not intend.
-// Every public item below this point is wired together by `super::mod`'s
-// `lookout` and `run_ui` — the real caller for `App`, `Msg` and friends.
+/// Turned on by `--allow-control` or `lookout.allow_control` in the KV store.
+/// A fat-finger catch, not a security boundary: anyone who can run lookout can
+/// run `shep stop`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Control {
     /// Actions refuse. The default.
     ReadOnly,
-    /// Actions are permitted. Three keys arm a confirm — `x` (stop), `R`
-    /// (restart) and `L` (reload) — and Enter sends it.
+    /// Actions are permitted: `x`, `R` and `L` arm a confirm, Enter sends it.
     Allowed,
 }
 
 /// Which keymap is in force.
-///
-/// Held by the reducer and passed to [`super::input::map_key`] at the call
-/// site, so the crossterm edge stays in one file and this module keeps
-/// holding no terminal types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
     /// The ordinary dashboard keys.
@@ -81,41 +52,35 @@ pub enum InputMode {
     Text,
 }
 
-/// The keys lookout binds, named by what they mean rather than by which key
-/// produces them.
+/// The keys lookout binds, named by meaning rather than by keystroke.
 ///
-/// A plain enum, rather than `crossterm::event::KeyEvent`, so this module and
-/// its tests never touch a terminal crate: `super::input::map_key` does the
-/// translation at the edge.
+/// `super::input::map_key` builds these at the edge, so this module never
+/// touches a terminal crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyPress {
     /// `q` in normal mode, or `Ctrl-C` in either.
     Quit,
-    /// `Esc` in normal mode. Cancels an armed confirm if there is one, else
-    /// clears the filter if there is one, else quits. The reducer decides,
-    /// because the keymap cannot see any of those three states.
+    /// `Esc` in normal mode: cancels an armed confirm, else clears the filter,
+    /// else quits. The reducer decides; the keymap sees none of those states.
     Escape,
-    /// `k` or `Up` — the selection moves up one row.
+    /// `k` or `Up`: the selection moves up one row.
     SelectUp,
-    /// `j` or `Down` — the selection moves down one row.
+    /// `j` or `Down`: the selection moves down one row.
     SelectDown,
-    /// `g` or `Home` — the first sheep in the flock.
+    /// `g` or `Home`: the first sheep in the flock.
     SelectFirst,
-    /// `G` or `End` — the last one.
+    /// `G` or `End`: the last one.
     SelectLast,
-    /// `r` — poll now.
+    /// `r`: poll now.
     Refresh,
-    /// `x`, `R` or `L` — arms a confirm for the given verb, or refuses and
-    /// says why. See [`ActionVerb`].
+    /// `x`, `R` or `L`: arms a confirm for the verb, or refuses and says why.
     Action(ActionVerb),
     /// `Enter` in normal mode. Sends an armed confirm; does nothing
     /// otherwise.
     Confirm,
-    /// `/` — open the filter box, carrying whatever query is already set.
+    /// `/`: open the filter box, carrying whatever query is already set.
     FilterStart,
     /// One printable character typed into whichever text field is open.
-    /// The reducer decides which that is, the same division `Escape`'s own
-    /// doc argues for, because the keymap cannot see it.
     TextChar(char),
     /// `Backspace` in whichever text field is open.
     TextBackspace,
@@ -123,13 +88,10 @@ pub enum KeyPress {
     TextApply,
     /// `Esc` in whichever text field is open: abandon the edit and leave.
     TextAbandon,
-    /// `s`: open the settings screen from the dashboard, or close it again
-    /// from inside the screen. The reducer decides which, the same division
-    /// [`Self::Escape`]'s own doc argues for.
+    /// `s`: opens the settings screen, or closes it from inside.
     Settings,
-    /// `space`: cycle the value under the settings screen's own cursor.
-    /// Meaningless from the dashboard; refuses the same way an action key
-    /// does when the control gate is closed.
+    /// `space`: cycles the value under the settings screen's cursor. Nothing on
+    /// the dashboard; refuses like an action key when the gate is closed.
     Cycle,
     /// `e`: open the config pane for the selected sheep on the dashboard,
     /// and close it again from inside it. The reducer decides which, the
@@ -150,9 +112,8 @@ pub enum Msg {
     },
     /// One frame off the bus.
     Event(BusEvent),
-    /// This client's own receiver fell behind and discarded frames — the
-    /// local half of the drop problem, distinct from
-    /// [`BusEvent::Dropped`], which is the shepherd's own queue.
+    /// This client's own receiver fell behind and discarded frames.
+    /// [`BusEvent::Dropped`] is the shepherd's queue instead.
     BusLagged {
         /// How many frames this process lost.
         count: u64,
@@ -165,10 +126,6 @@ pub enum Msg {
     /// The link task reconnected and re-subscribed.
     Relinked,
     /// The reconnect ladder is exhausted. Everything on screen is now frozen.
-    ///
-    /// `at_local` is a pre-formatted local timestamp rather than an instant to
-    /// format here: this module holds no clock and no formatter, and a frozen
-    /// banner whose text is supplied is a banner a snapshot test can pin.
     Frozen {
         /// When the link was declared lost, already rendered for display.
         at_local: String,
@@ -182,19 +139,15 @@ pub enum Msg {
     },
     /// The terminal changed size; nothing to update but the frame is stale.
     Resize,
-    /// One reading of the machine this lookout is running on, off the 1-second
-    /// heartbeat. `None` means `sysinfo` does not support this platform —
-    /// which is a real, expected case, not a failure.
-    ///
-    /// Refused once the link is lost: see this arm in [`App::update`].
+    /// One reading of the machine this lookout runs on, off the 1s heartbeat.
+    /// `None` means `sysinfo` does not support this platform. Refused once the
+    /// link is lost.
     Host {
         /// What the sampler saw, or `None` on an unsupported platform.
         sample: Option<super::source::HostSample>,
     },
-    /// One refresh of the selected sheep's log files, in answer to an
-    /// [`Effect::RefreshFeed`] this reducer asked for.
-    ///
-    /// Returns [`Effect::None`] unconditionally; see its arm.
+    /// One refresh of the selected sheep's log files, answering an
+    /// [`Effect::RefreshFeed`]. Always yields [`Effect::None`].
     Bleats {
         /// What the read found, including what it could not show.
         tail: super::tail::Tail,
@@ -208,73 +161,51 @@ pub enum Msg {
     },
     /// A request the caller could not hand to the link task.
     ///
-    /// The reducer has already entered the in-flight state by the time
-    /// `run_ui` tries to send, so a `try_send` that fails has to come back:
-    /// otherwise the bar keeps saying "sent, waiting for the shepherd" about a
-    /// request nobody has, and the one-action-at-a-time guard refuses every
-    /// later action for the life of the process.
+    /// The reducer is already in the in-flight state when `run_ui` tries to
+    /// send, so a failed `try_send` has to come back, or the
+    /// one-action-at-a-time guard refuses everything from then on.
     Unsent {
         /// What could not be sent.
         sent: Sent,
     },
-    /// The settings screen's read of `shep.toml` landed, in answer to an
-    /// [`Effect::LoadSettings`] this reducer asked for.
-    ///
-    /// `Result<_, String>` rather than `commands::settings::SettingError`,
-    /// because this reducer holds no error types from `commands` and a
-    /// notice needs a rendered sentence anyway: `super::run_ui` is what
-    /// calls `to_string()` on the way in.
+    /// The settings screen's read of `shep.toml` landed, answering an
+    /// [`Effect::LoadSettings`]. A `String` error, since this reducer holds no
+    /// error types from `commands`.
     Settings {
         /// The rendered snapshot, or why it could not be read.
         result: Result<SettingsSnapshot, String>,
     },
-    /// An [`Effect::WriteSetting`] this reducer asked for has landed.
-    ///
-    /// `Result<(), String>` for the same reason [`Self::Settings`]'s own doc
-    /// gives: this reducer holds no error types from `commands`, and
-    /// `super::run_ui` is what calls `to_string()` on a
-    /// `commands::settings::SettingError` on the way in.
+    /// An [`Effect::WriteSetting`] has landed.
     SettingWritten {
-        /// The edit that was sent, echoed back so the reducer can update the
-        /// right row without re-deriving it from whatever is armed now: the
-        /// cursor, and what is armed, can both have moved on while the write
-        /// was in flight.
+        /// The edit that was sent, echoed back: the cursor can have moved on
+        /// while the write was in flight.
         edit: SettingEdit,
         /// Whether the write landed, or why it did not.
         result: Result<(), String>,
     },
     /// An [`Effect::LoadDogPane`]'s schema probe has answered.
     ///
-    /// The SCHEMA half only. The section arrives separately, over the wire
-    /// as [`Sent::DogSection`], because the two come from different places:
-    /// the schema from the dog's own binary and the section from the
-    /// shepherd. This arm parks the schema and raises the request for the
-    /// second half; the pane is built when that lands.
+    /// The schema half only: the section arrives separately over the wire
+    /// as [`Sent::DogSection`], since it comes from the shepherd rather
+    /// than the dog's own binary. This arm parks the schema and raises the
+    /// request for the section; the pane is built once that lands.
     ///
-    /// `Result<_, String>` for the reason [`Self::Settings`]'s own doc
-    /// gives: this reducer holds no error types from `commands`, and the
-    /// refusal an operator reads is a rendered sentence either way.
+    /// `Result<_, String>`, like [`Self::Settings`]: this reducer holds no
+    /// error types from `commands`.
     DogPane {
         /// The dog.
         name: String,
         /// The adopted binary, or [`None`] for a built-in, echoed back so
         /// the pane records what it probed.
         adopted_path: Option<PathBuf>,
-        /// The dog's schema, or why there is no pane for it (decision 10).
+        /// The dog's schema, or why there is no pane for it.
         result: Result<serde_json::Value, String>,
     },
-    /// An [`Effect::WriteDog`] this reducer asked for has landed.
-    ///
-    /// `Result<DogSource, String>` rather than the config commands' own
-    /// error types, for the same reason [`Self::SettingWritten`]'s own doc
-    /// gives: `super::run_ui` is what calls `to_string()` on the way in.
-    /// `Ok` carries the [`DogSource`] the write resolved, which is what
-    /// [`Sent::Dog`] rides to the shepherd -- the request cannot disagree
-    /// with the file this way.
+    /// An [`Effect::WriteDog`] has landed. `Ok` carries the [`DogSource`] the
+    /// write resolved, which [`Sent::Dog`] then rides to the shepherd, so the
+    /// request cannot disagree with the file.
     DogWritten {
-        /// The toggle that was sent, echoed back the same reason
-        /// [`Self::SettingWritten`]'s own `edit` is: the cursor, and what
-        /// is armed, can both have moved on while the write was in flight.
+        /// The toggle that was sent, echoed back.
         edit: DogEdit,
         /// Whether the write landed and what it resolved to, or why it did
         /// not.
@@ -284,50 +215,23 @@ pub enum Msg {
 
 /// The one gate on writing `shep.toml` from the settings screen.
 ///
-/// Lives in its own module with a private field so that [`Control`] is
-/// checked ONCE, structurally, rather than remembered key by key. Nothing
-/// outside this module can build a [`WriteAuthority`] -- not `App`, not the
-/// key handlers, not the tests -- so the only way to reach it is
-/// [`WriteAuthority::granted`], which hands back [`None`] for
+/// [`WriteAuthority`]'s field is private, so [`WriteAuthority::granted`] is the
+/// only way to build one, and it hands back [`None`] under
 /// [`Control::ReadOnly`]. [`Effect::WriteSetting`] and [`Effect::WriteDog`]
-/// each carry one, so a settings write is not something a handler is
-/// trusted to check before performing: it is something the handler cannot
-/// name without having passed the check.
-///
-/// That matters because the first version of this gate was a check on one
-/// key (`space`, [`App::cycle_setting`]), and the editor `Enter` added
-/// later walked straight around it: a read-only lookout could type a new
-/// `socket` and apply it. A fourth door added tomorrow cannot repeat that,
-/// because it cannot construct the effect it would have to return.
-///
-/// [`WriteAuthority::granted`] takes `&App` rather than a bare [`Control`]
-/// on purpose: a bare `Control` can be built anywhere (`Control::Allowed`
-/// is a unit variant, not a secret), so a call site free to hand in a
-/// literal `Control::Allowed` instead of the app's own field would grant
-/// itself the token by construction, which is exactly the shape the first
-/// review mutation of this gate took, and it compiled. Reading the field
-/// off `App` closes that: the only `Control` `granted` ever sees is the one
-/// the app was actually built with.
+/// each carry one, so a handler cannot name a write without the check.
 mod authority {
     use super::App;
 
     /// Proof that `--allow-control` was on when a settings write was built.
-    ///
-    /// `Debug` is derived rather than redacted (IR-41): a zero-sized token
-    /// with no field a `{:?}` could print.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct WriteAuthority(());
 
     impl WriteAuthority {
-        /// A token when `app`'s own [`Control`](super::Control) permits
-        /// writing, [`None`] otherwise.
+        /// A token when `app`'s [`Control`](super::Control) permits writing,
+        /// [`None`] otherwise.
         ///
-        /// The sole constructor. The unit field above is private to this
-        /// module, so every other module in this crate reaches a
-        /// [`WriteAuthority`] through here or not at all. Takes `&App`
-        /// rather than a `Control` so the only reachable answer is the
-        /// app's own gate -- see this module's own doc for what a bare
-        /// `Control` parameter let slip past review once already.
+        /// The sole constructor, taking `&App` rather than a `Control` so the
+        /// answer can only be the app's own gate.
         #[must_use]
         pub fn granted(app: &App) -> Option<Self> {
             match app.control {
@@ -341,10 +245,6 @@ mod authority {
 pub use authority::WriteAuthority;
 
 /// What the caller has to do after an update.
-///
-/// Not `Copy`: [`Self::Send`] carries a [`Sent`], whose `Sent::Action`
-/// variant carries a `String`. Nothing matches on an `Effect` by reference,
-/// so no call site changes for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     /// Nothing.
@@ -352,48 +252,27 @@ pub enum Effect {
     /// Ask the link task for a `ListFlock` now, rather than at the next tick.
     PollNow,
     /// Re-read the selected sheep's log files and hand the result back as
-    /// [`Msg::Bleats`].
-    ///
-    /// The feed has no timer of its own. It rides this: a snapshot produces
-    /// one (so the two-second listing, a drop repair, a lag repair and `r`
-    /// all refresh it), and so does a selection that actually moved. See the
-    /// phase plan's design decision 2.
+    /// [`Msg::Bleats`]. The feed has no timer of its own; it rides this.
     RefreshFeed,
-    /// Re-read the selected sheep's log files AND ask the shepherd for its
-    /// lambs.
-    ///
-    /// Held apart from [`Self::RefreshFeed`] because the two triggers differ:
-    /// a snapshot must refresh the feed, since the selected row's log paths
-    /// can have changed, and must not fetch lambs, since it fires every two
-    /// seconds. Returned by `select_at` when the selection actually moved, and
-    /// by the callers of `reseat` on the same condition they already use to
-    /// choose between `RefreshFeed` and `None`.
+    /// Re-read the selected sheep's log files and ask the shepherd for its
+    /// lambs. Raised only when the selection moved: a snapshot refreshes the
+    /// feed alone, since it fires every two seconds.
     RefreshSelected,
     /// Send a request to the shepherd. Raised by [`App::confirm`] once an
-    /// armed action's Enter lands; `super::run_ui` is what actually sends it.
+    /// armed action's Enter lands; `super::run_ui` sends it.
     Send(Sent),
     /// Leave.
     Quit,
     /// Read `shep.toml`'s settings snapshot; the result lands as
-    /// [`Msg::Settings`].
-    ///
-    /// Raised by the dashboard's own `s`, never by the settings screen's:
-    /// once the screen is open, `s` closes it instead. See [`App::on_key`].
+    /// [`Msg::Settings`]. Raised by the dashboard's `s`; once the screen is
+    /// open, `s` closes it instead.
     LoadSettings,
     /// Apply one edit to `shep.toml`; the result lands as
     /// [`Msg::SettingWritten`].
     ///
-    /// Raised by [`App::confirm_setting`] once an armed scalar's Enter
-    /// lands. `super::run_ui` runs it on `spawn_blocking`, and that is
-    /// load-bearing rather than a convention: `commands::settings`'s
-    /// `ConfigLock::acquire` blocks with no deadline
-    /// (`FlockArg::LockExclusive`), so a concurrent `shep adopt` on the same
-    /// file would freeze the UI task's redraw, its tick and its bus drain
-    /// right along with the write.
-    ///
-    /// The [`WriteAuthority`] is not decoration: it is the only thing that
-    /// makes `--allow-control` a property of this effect rather than a
-    /// check each key handler has to remember. See its own doc.
+    /// Must run on `spawn_blocking`: `ConfigLock::acquire` blocks with no
+    /// deadline, and the UI task's redraw, tick and bus drain would block with
+    /// the write.
     WriteSetting(SettingEdit, WriteAuthority),
     /// Probe one dog for its config schema; the answer lands as
     /// [`Msg::DogPane`].
@@ -416,16 +295,9 @@ pub enum Effect {
     },
     /// Apply one dog's file half; the result lands as [`Msg::DogWritten`].
     ///
-    /// Raised by [`App::confirm_setting`] once an armed dog row's Enter
-    /// lands. Its own [`Effect`], not [`Self::WriteSetting`] again: the two
-    /// carry different payloads (a [`DogEdit`] rather than a
-    /// [`SettingEdit`]) and end differently -- a scalar write ends in a
-    /// notice, a dog write ends in a request to the shepherd
-    /// ([`Sent::Dog`]). `super::run_ui` runs this on `spawn_blocking`, the
-    /// same reason [`Self::WriteSetting`]'s own doc gives.
-    ///
-    /// Carries a [`WriteAuthority`] for the same reason
-    /// [`Self::WriteSetting`] does.
+    /// Its own effect, not [`Self::WriteSetting`]: it ends in a request to the
+    /// shepherd ([`Sent::Dog`]) where a scalar write ends in a notice.
+    /// `spawn_blocking`, for [`Self::WriteSetting`]'s reason.
     WriteDog(DogEdit, WriteAuthority),
 }
 
@@ -441,7 +313,7 @@ pub enum Link {
         attempt: u32,
     },
     /// The ladder is exhausted. Terminal: nothing moves this state, and the
-    /// values on screen stay exactly as they were.
+    /// values on screen stay as they were.
     Lost {
         /// When it was declared lost, already rendered for display.
         at_local: String,
@@ -453,31 +325,19 @@ pub enum Link {
 pub struct Row {
     /// The shepherd's own snapshot of this sheep.
     pub info: ProcessInfo,
-    /// When [`Self::info`] was received — the origin for this row's live
+    /// When [`Self::info`] was received: the origin for this row's live
     /// uptime, so a value two seconds old is never rendered as current.
     pub anchor: Instant,
 }
 
 impl Row {
-    /// What this row's STATUS cell reports: [`Self::info`]'s lifecycle
-    /// status, or [`Reported::Silent`] for a dog whose process is up and
-    /// which has never handshook this shepherd.
+    /// What this row's STATUS cell reports: [`Self::info`]'s status, or
+    /// [`Reported::Silent`] for a dog whose process is up and which has never
+    /// handshook this shepherd.
     ///
-    /// Mirrors `output::rows::reported` exactly, guard included: the `dog`
-    /// check is read here rather than left to [`Reported::of`] alone, so a
-    /// sheep -- which has no handshake and no version relationship with the
-    /// shepherd at all -- can never be painted silent by a future
-    /// daemon-side bug that leaves `handshook` set on a non-dog row. One
-    /// method for both panes that need it ([`super::view::flock`] and
-    /// [`super::view::detail`]), so they cannot drift on what a dog's
-    /// STATUS cell says the way the table and the dashboard did before this
-    /// existed.
-    ///
-    /// `pub(crate)` rather than `pub(super)`: `output::rows`' own test
-    /// module drives this method alongside `output::rows::reported` to pin
-    /// the agreement between the two copies (see
-    /// `the_flock_table_and_the_lookout_read_a_dogs_silence_the_same_way`),
-    /// and that test lives outside `lookout` entirely.
+    /// Mirrors `output::rows::reported`. The `dog` check is read here rather
+    /// than left to [`Reported::of`], so a non-dog row can never be painted
+    /// silent by a stray `handshook`.
     #[must_use]
     pub(crate) fn reported(&self) -> Reported {
         if self.info.dog.is_none() {
@@ -489,13 +349,9 @@ impl Row {
 
 /// One app's rolled-up numbers, computed from its own instances.
 ///
-/// The same fields `output::rows`'s own `GroupTotals` sums for `shep
-/// flock`'s table (task 9), kept here so the two surfaces sum the exact same
-/// fields off the exact same [`ProcessInfo`]s -- an operator seeing
-/// different numbers in `shep flock` and `shep lookout` for the same app
-/// would be right to distrust both. Restarts, cpu and memory are summed;
-/// uptime is the MINIMUM, so a group reads as time since the app was last
-/// disturbed rather than as the age of its luckiest instance.
+/// The fields `output::rows`'s own `GroupTotals` sums for `shep flock`.
+/// Restarts, cpu and memory are summed; uptime is the minimum, so a group reads
+/// as time since the app was last disturbed.
 #[derive(Debug, Clone)]
 pub struct GroupTotals {
     /// How many instances make up this group.
@@ -505,9 +361,10 @@ pub struct GroupTotals {
     /// Every instance's CPU reading summed, `None` only when not one
     /// instance has a live reading.
     pub cpu: Option<f32>,
-    /// Every instance's memory reading summed, `None` for the same reason.
+    /// Every instance's memory reading summed, `None` only when not one
+    /// instance has a live reading.
     pub memory: Option<u64>,
-    /// The MINIMUM live uptime across instances, `None` only when the group
+    /// The minimum live uptime across instances, `None` only when the group
     /// has none.
     pub uptime_ms: Option<u64>,
 }
@@ -515,10 +372,8 @@ pub struct GroupTotals {
 /// One request the dashboard asked the link task to send, carried back on the
 /// reply so it can be routed.
 ///
-/// An echo tag rather than a correlation id: the answer to a request can be an
-/// `Err` that carries no shape of its own, so the only thing that reliably
-/// says which request a reply belongs to is the request itself, handed along
-/// beside it.
+/// An echo tag rather than a correlation id: an `Err` reply carries no shape of
+/// its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Sent {
     /// The selected sheep's process tree.
@@ -538,8 +393,7 @@ pub enum Sent {
         name: String,
     },
     /// One dog's daemon half, after its file half landed. `source` is what
-    /// the write returned, so the request cannot disagree with the file --
-    /// see [`DogEdit`]'s own doc for the file half this follows.
+    /// the write returned, so the request cannot disagree with the file.
     Dog {
         /// The dog's name.
         name: String,
@@ -712,12 +566,8 @@ impl Sent {
     }
 }
 
-/// One dog toggle, ready for the file half: [`Effect::WriteDog`] carries
-/// one, and [`Msg::DogWritten`] echoes it back once
-/// `dogs::enable_in_config`/`dogs::disable_in_config` has answered.
-///
-/// `Debug` is derived rather than redacted (IR-41): a bare name and a bool,
-/// nothing a `{:?}` could leak.
+/// One dog toggle, ready for the file half: [`Effect::WriteDog`] carries one
+/// and [`Msg::DogWritten`] echoes it back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DogEdit {
     /// The dog's name.
@@ -750,11 +600,8 @@ pub struct DogProbe {
 /// What the cursor can sit on: one sheep, or the header above an app's
 /// instances.
 ///
-/// Grouping is [`App::visible_rows`]'s own call, made the same way
-/// `output::rows::FlockRows`'s own `name_groups`/`slotted` rule makes it
-/// (task 9): more than one instance of a name, every one of them reporting
-/// its slot. An app whose listing carries no slot at all (an older shepherd)
-/// never earns a [`Self::Group`], and renders exactly as it always has.
+/// A name earns a [`Self::Group`] only with more than one instance, every one
+/// of them reporting its slot ([`App::is_grouped`]).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RowKey {
     /// One app's group header, carrying its name.
@@ -763,13 +610,8 @@ pub enum RowKey {
     Sheep(u32),
 }
 
-/// What one lamb fetch came back with.
-///
-/// Three variants because `ProcessInfo::lambs` distinguishes three states and
-/// the pane says three different sentences. The CLI has wording for only one
-/// of them: `output::emit_described` skips the lamb caption for `None` and for
-/// an empty vector alike, so there is nothing to borrow for the other two and
-/// the pane says its own.
+/// What one lamb fetch came back with. The pane says a different sentence for
+/// each variant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LambWalk {
     /// The shepherd walked the process table. Possibly to no descendants.
@@ -795,7 +637,7 @@ pub struct LambReading {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
     text: String,
-    /// True for a refusal or a damage report — the status bar picks
+    /// True for a refusal or a damage report: the status bar picks
     /// [`Palette::refusal`] over [`Palette::attention`].
     grave: bool,
 }
@@ -816,9 +658,6 @@ impl fmt::Display for Notice {
 }
 
 /// One row the settings screen's cursor can sit on.
-///
-/// `Debug` is derived rather than redacted (IR-41): a bare field name or a
-/// bare index, nothing a `{:?}` could leak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsRow {
     /// One of the six scalar fields, in [`Settings::rows`]'s fixed order.
@@ -828,10 +667,6 @@ pub enum SettingsRow {
 }
 
 /// The settings screen's own state. `None` on [`App`] is the dashboard.
-///
-/// `Debug` is derived rather than redacted (IR-41): the snapshot underneath
-/// carries no secret ([`SettingsSnapshot`]'s own note says why) and the
-/// cursor is a bare index.
 #[derive(Debug, Clone)]
 pub struct Settings {
     snapshot: SettingsSnapshot,
@@ -846,25 +681,16 @@ pub struct Settings {
     /// sitting past its new end.
     view: Viewport,
     /// The screen's one in-flight edit, or `None`. One field rather than
-    /// several `Option`s, so typing, armed and sent cannot overlap -- the
-    /// same claim [`Action`]'s own doc makes for the sheep confirm, made in
-    /// the type instead of in a guard.
+    /// several `Option`s, so typing, armed and sent cannot overlap.
     pending: Option<Pending>,
 }
 
 /// The settings screen's own in-flight edit.
-///
-/// `Debug` is derived rather than redacted (IR-41): a field name, a
-/// candidate value and the rendered prompt sentence built from it -- none of
-/// the four scalars this task reaches carries a secret.
 #[derive(Debug, Clone)]
 enum Pending {
-    /// A free-text edit under construction. Only [`SettingField::Socket`]
-    /// and [`SettingField::MaxCronSleep`] ever reach this: `Enter` on
-    /// either row opens it, seeded with that field's own on-disk value
-    /// ([`App::confirm_setting`]), and [`App::on_settings_text_key`] is
-    /// the only place a [`KeyPress::TextChar`] or [`KeyPress::TextBackspace`]
-    /// ever reaches it while [`Settings`] owns the keyboard.
+    /// A free-text edit under construction. Only [`SettingField::Socket`] and
+    /// [`SettingField::MaxCronSleep`] reach this, seeded with the field's
+    /// on-disk value.
     Typing {
         /// Which scalar.
         field: SettingField,
@@ -875,35 +701,23 @@ enum Pending {
     Armed {
         /// The candidate, ready to send.
         edit: SettingEdit,
-        /// The question this candidate reads as, rendered once at arm time
-        /// so [`Settings::pending`] can hand back a borrowed `&str` without
-        /// re-rendering it on every read.
+        /// The question this candidate reads as, rendered once at arm time.
         text: String,
-        /// When it was armed. Only an armed edit expires -- see the
-        /// `Msg::Tick` arm.
+        /// When it was armed. Only an armed edit expires.
         at: Instant,
     },
-    /// Armed on a [`SettingsRow::Dog`] row instead: waiting for the
-    /// operator's `Enter`, same as [`Self::Armed`], but for a [`DogEdit`]
-    /// rather than a [`SettingEdit`] -- the two carry different payloads and
-    /// [`App::confirm_setting`] sends them through different effects
-    /// ([`Effect::WriteDog`] rather than [`Effect::WriteSetting`]).
+    /// [`Self::Armed`] for a [`DogEdit`] on a [`SettingsRow::Dog`] row, which
+    /// [`App::confirm_setting`] sends through [`Effect::WriteDog`].
     DogArmed {
         /// The candidate toggle, ready to send.
         edit: DogEdit,
-        /// The question this candidate reads as, rendered once at arm time,
-        /// same as [`Self::Armed`]'s own `text`.
+        /// The question this candidate reads as, rendered once at arm time.
         text: String,
-        /// When it was armed. Only an armed edit expires -- see the
-        /// `Msg::Tick` arm.
+        /// When it was armed. Only an armed edit expires.
         at: Instant,
     },
-    /// Sent: [`Effect::WriteSetting`] or [`Effect::WriteDog`] is in flight,
-    /// waiting on [`Msg::SettingWritten`] or [`Msg::DogWritten`]. Carries no
-    /// `edit`: nothing reads the sent candidate back off `Pending` -- the
-    /// landing message's own `edit` (the one the effect round-trips) is what
-    /// every match site actually uses, so this variant only ever needs the
-    /// rendered question, and one variant covers both origins.
+    /// [`Effect::WriteSetting`] or [`Effect::WriteDog`] is in flight. Carries
+    /// no `edit`: every match site reads the landing message's own copy.
     Sent {
         /// The same rendered question, so the prompt line does not change
         /// wording between the question and its own answer.
@@ -912,13 +726,10 @@ enum Pending {
 }
 
 /// What the settings screen's status line shows for its one in-flight edit.
-///
-/// `Debug` is derived rather than redacted (IR-41): a rendered sentence and
-/// a bool, nothing a `{:?}` could leak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SettingsPrompt<'a> {
-    /// The confirm sentence: what will change, and what applying it does
-    /// and does not do.
+    /// The confirm sentence: what will change, and what applying it does and
+    /// does not do.
     pub text: &'a str,
     /// False while it is a question, true once it has gone out.
     pub sent: bool,
@@ -947,14 +758,9 @@ impl Settings {
         }
     }
 
-    /// Whether an [`Pending::Armed`] or [`Pending::DogArmed`] candidate is
-    /// waiting on `Enter` -- the one state a stray key on this screen
-    /// (movement, `Escape`, `Settings`, `Refresh`) has to eat rather than
-    /// also doing its ordinary job. `Pending::Typing` and `Pending::Sent`
-    /// are both left out on purpose: a free-text edit has its own keymap
-    /// ([`App::on_settings_text_key`]), and a request already sent is not
-    /// cancellable by a keypress, the same rule the sheep confirm's own
-    /// `Stage::Sent` follows.
+    /// Whether a candidate is waiting on `Enter`: the one state a stray key
+    /// (movement, `Escape`, `Settings`, `Refresh`) eats rather than also doing
+    /// its ordinary job.
     fn is_armed(&self) -> bool {
         matches!(
             self.pending,
@@ -962,12 +768,7 @@ impl Settings {
         )
     }
 
-    /// The field and buffer of an in-flight free-text edit, or `None` --
-    /// including while nothing is armed, while a cycled candidate is
-    /// `Armed` or `Sent`, and once the screen is closed. The view's own
-    /// window into [`Pending::Typing`], the same way [`Self::pending`] is
-    /// its window into `Armed`/`Sent`; the two never overlap; see
-    /// [`Self::pending`]'s own `Typing` arm.
+    /// The field and buffer of an in-flight free-text edit, or `None`.
     #[must_use]
     pub fn typing(&self) -> Option<(&SettingField, &str)> {
         match &self.pending {
@@ -976,26 +777,14 @@ impl Settings {
         }
     }
 
-    /// The next candidate for `field`, or `None` for a field this task does
-    /// not cycle ([`SettingField::Socket`], [`SettingField::MaxCronSleep`]
-    /// -- free text, task 8's own `Pending::Typing`) and for a
-    /// [`SettingsRow::Dog`] row, which is never a [`SettingField`] at all.
+    /// The next candidate for `field`, or `None` for the two free-text fields.
     ///
-    /// Advances from whatever is already armed for THIS field, so a second
-    /// `space` walks one step further along the cycle rather than
-    /// re-deriving the same next value the file itself would produce --
-    /// without that, six log levels behind one cycle key would leave the
-    /// fourth unreachable without a cancel in between. An armed candidate
-    /// for a DIFFERENT field (the cursor moved after arming) is not a base:
-    /// this starts fresh from the snapshot instead.
-    ///
-    /// From nothing armed, the base is what the FILE says, which is
-    /// [`Self::current_value`] for five of the six fields and
-    /// [`SettingsSnapshot::style_level_in_file`] for `[style] level`. That
-    /// one field's [`ScalarView::value`] is the level in force rather than
-    /// the level on disk, so with `$SHEP_STYLE=bare` over a file saying
-    /// `full` a cycle from the resolved value proposes `full` -- a write
-    /// that changes nothing, reported to the operator as a change.
+    /// Advances from a candidate already armed for this field, so a second
+    /// `space` walks one step further along the cycle. From nothing armed the
+    /// base is what the file says, which for `[style] level` is
+    /// [`SettingsSnapshot::style_level_in_file`] rather than the level in
+    /// force: cycling the resolved level could propose a write that changes
+    /// nothing.
     fn next_candidate(&self, field: SettingField) -> Option<String> {
         let armed_here = match &self.pending {
             Some(Pending::Armed {
@@ -1013,9 +802,8 @@ impl Settings {
             .flatten();
         let base: String = match (armed_here, in_file) {
             (Some(value), _) | (None, Some(value)) => value.to_string(),
-            // A `[style]` document that declares nothing falls back to
-            // `StyleLevel`'s own compiled default, which is what
-            // `style::resolve` returns for the same absence.
+            // A `[style]` document declaring nothing falls back to
+            // `StyleLevel`'s compiled default, as `style::resolve` does.
             (None, None) if field == SettingField::StyleLevel => STYLE_LEVEL_ORDER[0].to_string(),
             (None, None) => self.current_value(field)?.to_string(),
         };
@@ -1027,8 +815,8 @@ impl Settings {
         })
     }
 
-    /// The snapshot's own rendered value for one of the four scalars this
-    /// task cycles. `None` for the two this task does not.
+    /// The snapshot's own rendered value for one of the four cycled scalars.
+    /// `None` for the two free-text ones.
     fn current_value(&self, field: SettingField) -> Option<&str> {
         Some(match field {
             SettingField::LogLevel => self.snapshot.log_level.value.as_str(),
@@ -1039,9 +827,8 @@ impl Settings {
         })
     }
 
-    /// Which layer `field`'s value came from, off the snapshot. Only
-    /// [`confirm_text`] reads it, and only its `[style]` arm does anything
-    /// with it -- see [`style_confirm_text`].
+    /// Which layer `field`'s value came from. Only [`confirm_text`]'s `[style]`
+    /// arm acts on it.
     fn source_of(&self, field: SettingField) -> StyleSource {
         match field {
             SettingField::LogLevel => self.snapshot.log_level.source,
@@ -1053,12 +840,8 @@ impl Settings {
         }
     }
 
-    /// The snapshot's own rendered value for one of the two free-text
-    /// fields [`Self::current_value`] does not cover -- what
-    /// [`App::confirm_setting`] seeds [`Pending::Typing`]'s buffer with.
-    /// Only ever called with [`SettingField::Socket`] or
-    /// [`SettingField::MaxCronSleep`]: the other four are cycled, not
-    /// typed, and never open an editor.
+    /// The rendered value [`App::confirm_setting`] seeds [`Pending::Typing`]'s
+    /// buffer with. Only the two free-text fields reach it.
     fn text_seed(&self, field: SettingField) -> &str {
         match field {
             SettingField::Socket => self.snapshot.socket.value.as_str(),
@@ -1072,13 +855,12 @@ impl Settings {
         }
     }
 
-    /// What the screen reads off disk. `view::settings::content_lines` is
-    /// the real caller, reading it to render every row's value and source.
-    /// A landed write does not update this in place any more: `App`'s own
-    /// `Msg::SettingWritten` `Ok` arm raises a fresh [`Effect::LoadSettings`]
-    /// instead, the same read `r` and the initial `s` both already go
-    /// through, so `Set` and `Unset` land the same way and neither can
-    /// drift from whatever else changed in the document meanwhile.
+    /// What the screen reads off disk, and renders every row's value and source
+    /// from.
+    ///
+    /// A landed write does not update this in place: it raises a fresh
+    /// [`Effect::LoadSettings`], so `Set` and `Unset` land the same way and
+    /// neither can drift from the rest of the document.
     #[must_use]
     pub fn snapshot(&self) -> &SettingsSnapshot {
         &self.snapshot
@@ -1105,14 +887,8 @@ impl Settings {
         &self.fields
     }
 
-    /// The row the cursor sits on. `None` only if [`Self::rows`] is somehow
-    /// empty, which cannot happen today (the six scalars are unconditional),
-    /// but the type stays honest about it rather than asserting.
-    ///
-    /// `view::settings::content_lines` is the real caller, reading it to
-    /// highlight the selected row -- and [`App::cycle_setting`] reads it
-    /// through this same accessor to decide which field, if any, `space`
-    /// arms.
+    /// The row the cursor sits on. `None` only if [`Self::rows`] is empty,
+    /// which the six unconditional scalars make unreachable.
     #[must_use]
     pub fn cursor(&self) -> Option<SettingsRow> {
         let rows = self.rows();
@@ -1120,20 +896,18 @@ impl Settings {
             .copied()
     }
 
-    /// Moves the cursor by `delta` rows, clamped to [`Self::rows`] rather
-    /// than wrapping, the same rule the flock table's own cursor follows.
+    /// Moves the cursor by `delta` rows, clamped to [`Self::rows`], never
+    /// wrapping.
     fn move_by(&mut self, delta: isize) {
         let len = self.rows().len();
         self.view.move_by(delta, len);
     }
 
-    /// Moves the cursor to the first row.
     fn move_to_first(&mut self) {
         let len = self.rows().len();
         self.view.move_to(0, len);
     }
 
-    /// Moves the cursor to the last row.
     fn move_to_last(&mut self) {
         let len = self.rows().len();
         self.view.move_to(len.saturating_sub(1), len);
@@ -1152,8 +926,7 @@ impl Settings {
     }
 }
 
-/// `Off, Error, Warn, Info, Debug, Trace`, [`LogLevel`]'s own declared
-/// order, wrapping from `Trace` back to `Off`.
+/// [`LogLevel`]'s own declared order, wrapping from `Trace` back to `Off`.
 pub(crate) const LOG_LEVEL_ORDER: [LogLevel; 6] = [
     LogLevel::Off,
     LogLevel::Error,
@@ -1163,11 +936,8 @@ pub(crate) const LOG_LEVEL_ORDER: [LogLevel; 6] = [
     LogLevel::Trace,
 ];
 
-/// One step along [`LOG_LEVEL_ORDER`] from `current`. A string this crate
-/// did not itself render (should not happen -- every candidate and every
-/// snapshot value comes from [`LogLevel::as_str`]) reads as
-/// [`LogLevel::default`]'s own place in the ladder (`Warn`), so a corrupt
-/// value still produces a legal next one rather than panicking.
+/// One step along [`LOG_LEVEL_ORDER`] from `current`. An unparseable value
+/// reads as `Warn`, so it still produces a legal next one.
 fn next_log_level(current: &str) -> String {
     let index = LogLevel::from_name(current)
         .and_then(|level| {
@@ -1181,19 +951,17 @@ fn next_log_level(current: &str) -> String {
         .to_string()
 }
 
-/// Flips `"true"`/`"false"`. Anything else (should not happen, the same
-/// reason [`next_log_level`] states) reads as `false` and flips to `true`.
+/// Flips `"true"`/`"false"`. Anything else reads as `false`.
 fn next_bool(current: &str) -> String {
     (current != "true").to_string()
 }
 
-/// `Full, Plain, Bare`, [`StyleLevel`]'s own declared order, wrapping from
-/// `Bare` back to `Full`.
+/// [`StyleLevel`]'s own declared order, wrapping from `Bare` back to `Full`.
 pub(crate) const STYLE_LEVEL_ORDER: [StyleLevel; 3] =
     [StyleLevel::Full, StyleLevel::Plain, StyleLevel::Bare];
 
-/// One step along [`STYLE_LEVEL_ORDER`] from `current`, the same fallback
-/// [`next_log_level`] takes for an unparseable value.
+/// One step along [`STYLE_LEVEL_ORDER`] from `current`. An unparseable value
+/// reads as `Full`.
 fn next_style_level(current: &str) -> String {
     let index = StyleLevel::parse(current)
         .and_then(|level| {
@@ -1205,24 +973,11 @@ fn next_style_level(current: &str) -> String {
     STYLE_LEVEL_ORDER[(index + 1) % STYLE_LEVEL_ORDER.len()].to_string()
 }
 
-/// The confirm sentence for `field`'s candidate `value` -- verbatim, per the
-/// task 7 spec's own table. `value` is always the candidate a
-/// `next_*` function above just produced, never re-derived here: this
-/// function only ever renders it into the sentence.
+/// The confirm sentence for `field`'s candidate `value`, verbatim. `value` is
+/// what a `next_*` function produced, never re-derived here.
 ///
-/// Called only with a field [`Settings::next_candidate`] returned `Some`
-/// for, so [`SettingField::Socket`] and [`SettingField::MaxCronSleep`]
-/// never reach the two arms below -- named rather than wildcarded so a
-/// future field added to the match cannot fall through unnoticed.
-///
-/// `source` is the field's own [`ScalarView::source`], and only
-/// [`SettingField::StyleLevel`] reads it. The other three carry a caveat
-/// about a layer lookout CANNOT see (the shepherd's env and flags), and a
-/// caveat is all they can carry. `[style]`'s layers are lookout's own
-/// process, so this is the one field where the screen knows -- and it was
-/// the one field promising "the next command reads it" unconditionally,
-/// which is false the moment `$SHEP_STYLE` or `--style` is set. See
-/// [`style_confirm_text`].
+/// Only [`SettingField::StyleLevel`] reads `source`: the other three can only
+/// warn about the shepherd's env and flags, which lookout cannot see.
 fn confirm_text(field: SettingField, value: &str, source: StyleSource) -> String {
     match field {
         SettingField::LogLevel => format!(
@@ -1242,21 +997,10 @@ fn confirm_text(field: SettingField, value: &str, source: StyleSource) -> String
     }
 }
 
-/// The `[style] level` half of [`confirm_text`], split out because it is
-/// the only arm that reads a second fact.
+/// The `[style] level` half of [`confirm_text`].
 ///
-/// `StyleSource` is what `shep style` already reports and what the row's
-/// own SOURCE cell already shows, so this sentence never tells an operator
-/// something the screen contradicts two lines above it. The split is by
-/// what the layer above the file DOES, not by which layer it is:
-///
-/// - `Config`, `Default` -- nothing outranks the file, so the write is the
-///   whole story and the sentence says so, as it always did.
-/// - `Env`, `Flag` -- the write lands and the level in force does not
-///   move. Naming the layer is the point: the failure this avoids is the
-///   one `StyleSource`'s own doc exists for, an operator editing
-///   `shep.toml`, seeing nothing change, and never thinking of the
-///   `$SHEP_STYLE` in a shell profile they have forgotten about.
+/// Under `Env` or `Flag` the write lands and the level in force does not move,
+/// so the sentence names the layer that keeps winning.
 fn style_confirm_text(value: &str, source: StyleSource) -> String {
     match source {
         StyleSource::Config | StyleSource::Default => {
@@ -1271,16 +1015,11 @@ fn style_confirm_text(value: &str, source: StyleSource) -> String {
     }
 }
 
-/// The confirm sentence for a free-text edit -- verbatim, per the design
-/// spec's own table, and the pair this repository's voice review already
-/// signed off on. Only ever built from [`App::on_settings_text_key`]'s
-/// `TextApply` arm, and only ever with an edit naming
-/// [`SettingField::Socket`] or [`SettingField::MaxCronSleep`]: the other
-/// four fields build their sentence through [`confirm_text`] instead,
-/// which never sees an [`SettingEdit::Unset`] because none of the four is
-/// optional. The `Socket` sentence says both halves on purpose: that a
-/// reload will not move it, and that an env var or a boot flag may shadow
-/// it anyway even after this edit lands.
+/// The confirm sentence for a free-text edit, verbatim.
+///
+/// Only [`SettingField::Socket`] and [`SettingField::MaxCronSleep`] reach it;
+/// the other four go through [`confirm_text`] and, not being optional, are
+/// never [`SettingEdit::Unset`].
 fn confirm_text_for_edit(edit: &SettingEdit) -> String {
     match edit {
         SettingEdit::Set {
@@ -1309,12 +1048,9 @@ fn confirm_text_for_edit(edit: &SettingEdit) -> String {
     }
 }
 
-/// What [`App`]'s `Msg::SettingWritten` `Err` arm reopens
-/// [`Pending::Typing`] with, for the two free-text fields: the field and
-/// the text the operator typed, recovered from the edit
-/// [`Effect::WriteSetting`] carried. `None` for the four cycled fields,
-/// which reopen nothing -- a refusal there clears the row's pending state
-/// and raises the notice on its own, same as before this task.
+/// What `Msg::SettingWritten`'s `Err` arm reopens [`Pending::Typing`] with: the
+/// field and the text the operator typed. `None` for the four cycled fields,
+/// which have no editor to reopen.
 fn typed_text_of(edit: &SettingEdit) -> Option<(SettingField, String)> {
     match edit {
         SettingEdit::Set {
@@ -1329,12 +1065,6 @@ fn typed_text_of(edit: &SettingEdit) -> Option<(SettingField, String)> {
 }
 
 /// What an action key does.
-///
-/// Three verbs, and deliberately not four: `start` is whistle's and the CLI's,
-/// by the maintainer's ruling. Delete, scale, signal and whisper stay CLI-only for
-/// whistle's own reasons: each takes a parameter a dashboard has nowhere to
-/// put, or removes an app from the registry, which is the one action no
-/// keypress should be one Enter away from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionVerb {
     /// `x`. Stops the sheep; it stays registered.
@@ -1368,24 +1098,18 @@ enum Stage {
 
 /// The one action this dashboard is in the middle of.
 ///
-/// The target is captured HERE, by [`RowKey`] and by name, and never re-read
-/// from the selection: a snapshot can land between the arming keypress and
-/// the Enter, and a confirmation that re-read the cursor could act on a
-/// sheep the operator never pointed at.
+/// The target is captured at arm time and never re-read from the selection: a
+/// snapshot can land between the keypress and the Enter.
 ///
 /// One field on [`App`] rather than two `Option`s, so "armed" and "in flight"
-/// cannot both be true. That is the same claim the one-action-at-a-time rule
-/// makes, made in the type instead of in a guard.
+/// cannot both be true.
 #[derive(Debug, Clone)]
 struct Action {
     verb: ActionVerb,
     target: RowKey,
     name: String,
-    /// How many processes [`Self::target`] reaches: 1 for a sheep, the
-    /// group's own size for a [`RowKey::Group`]. Captured at arm time, the
-    /// same reason [`Self::name`] is: the confirm prompt states the blast
-    /// radius before the operator commits, and the group could gain or lose
-    /// an instance between arming and the Enter.
+    /// How many processes [`Self::target`] reaches, captured at arm time: 1 for
+    /// a sheep, the group's own size for a [`RowKey::Group`].
     count: usize,
     /// When it was armed. Only an armed action expires.
     at: Instant,
@@ -1409,53 +1133,36 @@ pub struct ActionState<'a> {
 
 /// How long an armed confirm waits for its Enter.
 ///
-/// Ten seconds. A prompt left armed while the operator walks away, followed by
-/// an Enter typed at what they think is a shell, is the same fat finger
-/// arriving by a slower route. It rides `Msg::Tick`, so it costs one `Instant`
-/// comparison and no timer (A11).
+/// Ten seconds: a prompt left armed while the operator walks away is the same
+/// fat finger by a slower route. Rides `Msg::Tick`, so it needs no timer.
 pub const CONFIRM_EXPIRY: Duration = Duration::from_secs(10);
 
-/// The sentence `r` gives when the link is gone. The action keys refuse with
-/// the same one, so the two cannot drift apart.
+/// The sentence `r` and the action keys both give when the link is gone.
 const LINK_GONE: &str = "the shepherd is gone — nothing left to ask";
 
-/// The sentence every closed-gate refusal gives, on the dashboard and on
-/// the settings screen alike. One string, so an operator who has met it
-/// once on `x` recognises it on `space` -- and so the two cannot drift
-/// apart the way the checks behind them once did.
+/// The sentence every closed-gate refusal gives, dashboard and settings alike.
 const READ_ONLY_REFUSAL: &str = "read-only: actions need --allow-control";
 
 /// The whole dashboard's state.
 #[derive(Debug)]
 pub struct App {
     flock: BTreeMap<u32, Row>,
-    /// Which row the detail pane and the bleats feed describe.
+    /// Which row the detail pane and the bleats feed describe. `None` only for
+    /// an empty flock.
     ///
-    /// A [`RowKey`], not an index. The flock map is replaced wholesale every
-    /// two seconds, so an index survives a `shep delete` of an earlier row by
-    /// silently pointing at a different sheep — and every pane below the table
-    /// would then describe that different sheep with nothing on screen
-    /// changing. `None` only for an empty flock.
-    ///
-    /// The viewport offset is derived from this rather than stored beside it
-    /// ([`super::view::flock::scroll_offset`]), which is what makes a
-    /// disagreement between a stored offset and a stored cursor impossible
-    /// rather than merely unlikely.
+    /// A [`RowKey`], not an index: the flock map is replaced wholesale every
+    /// two seconds, and an index would silently start pointing at a different
+    /// sheep. The viewport offset is derived from this
+    /// ([`super::view::flock::scroll_offset`]).
     selected: Option<RowKey>,
-    /// The live substring filter over sheep NAMES, empty when there is none.
+    /// The live substring filter over sheep names, empty when there is none.
     ///
-    /// Case-insensitive `contains`, and nothing else: not the CLI's selector
-    /// grammar, not a regex, no understanding of `fold:`, `all` or ids. The
-    /// grammar is exact-match on both the variants an operator would type
-    /// while narrowing, so it cannot narrow as you type, and a half-typed
-    /// `/re` parses as a search for a sheep literally named `/re` rather than
-    /// refusing. See the design's feature 1 and assumption A1.
-    ///
-    /// Taken literally, spaces included, with no trimming (A6): this repo does
-    /// not widen an accepted input format without a basis in the spec.
+    /// Case-insensitive `contains`, taken literally with no trimming. Not the
+    /// CLI's selector grammar, which is exact-match and so cannot narrow as you
+    /// type.
     filter: String,
-    /// Which keymap [`super::input::map_key`] is called with. Normal until
-    /// `/` opens the box; the reducer, not the keymap, owns this state.
+    /// Which keymap [`super::input::map_key`] is called with. Normal until `/`
+    /// opens the box; the reducer, not the keymap, owns this state.
     mode: InputMode,
     /// The next config-write ticket. Monotonic and never reused, so a reply
     /// can only settle the write it belongs to -- see [`PanePending::Sent`].
@@ -1464,59 +1171,43 @@ pub struct App {
     notice: Option<Notice>,
     palette: Palette,
     control: Control,
-    /// The `$SHEP_HOME` this lookout watches, for the title line. Held here
-    /// rather than threaded through [`super::view::draw`]: it never changes for
-    /// the life of the process, and a render function taking it as an argument
-    /// would make every call site — including eight scene fixtures — carry it.
+    /// The `$SHEP_HOME` this lookout watches, for the title line.
     home: String,
-    /// The clock the view reads. Advanced by [`Msg::Tick`] — and deliberately
-    /// NOT advanced once the link is [`Link::Lost`], which is what stops a
-    /// frozen dashboard's uptime column from counting up for a sheep nothing
-    /// can see.
+    /// The clock the view reads. Advanced by [`Msg::Tick`], and never once the
+    /// link is [`Link::Lost`], so a frozen dashboard's uptime column stops.
     now: Instant,
     /// The last host reading, or `None` before the first heartbeat and on a
     /// platform `sysinfo` does not support. [`Self::host_unsupported`] tells
     /// the strip which of the two it is looking at.
     host: Option<super::source::HostSample>,
-    /// True once a sample has come back `None` — the two `None`s mean
-    /// different things and the strip says different sentences for them.
+    /// True once a sample has come back `None`, which the strip says a
+    /// different sentence for than a heartbeat that has not fired yet.
     host_unsupported: bool,
-    /// The selected sheep's most recent output, as of the last refresh.
-    /// [`Tail::default`](super::tail::Tail::default) before the first one —
-    /// an empty, unlabelled tail, which
-    /// [`super::view::bleats::feed_lines`] reads the same way it reads a
-    /// sheep that has genuinely written nothing.
+    /// The selected sheep's most recent output, as of the last refresh. An
+    /// empty, unlabelled tail before the first one, which the feed reads the
+    /// same way as a sheep that has written nothing.
     feed: super::tail::Tail,
-    /// The last lamb reading, or `None` before there has been one.
-    ///
-    /// Keyed by the id it was taken for, so a reading for a sheep that is no
-    /// longer selected, and a request a full channel dropped, both read as
-    /// "not read yet" without a second field tracking them.
+    /// The last lamb reading, or `None` before there has been one. Keyed by the
+    /// id it was taken for, so a stale reading and a dropped request both read
+    /// as "not read yet".
     lambs: Option<LambReading>,
     /// The one action this dashboard is in the middle of, or `None`.
     action: Option<Action>,
-    /// The settings screen's own state. `None` is the dashboard; `Some` is
-    /// the screen, open over it.
+    /// The settings screen's own state. `None` is the dashboard.
     settings: Option<Settings>,
     /// Which sheep a config pane is open for, or wanted for.
     ///
-    /// Set by `e` when the read goes out, cleared the moment the pane
-    /// closes, and checked when a reply lands. Without it, two `e` presses
-    /// against a slow shepherd followed by an `Esc` re-opened the pane on
-    /// the second reply, over a dashboard the operator had already gone
-    /// back to. [`Self::config_pane`] alone cannot answer that: it is
-    /// `None` both while a first read is in flight and after a close, and
-    /// those two want opposite things done with a reply.
+    /// Set when the read goes out, cleared when the pane closes, checked
+    /// when a reply lands. Without it, two `e` presses and an `Esc` could
+    /// reopen a closed pane on the late reply. [`Self::config_pane`] alone
+    /// cannot tell those two `None` states apart.
     config_target: Option<String>,
     /// The dog a config pane is open for, or wanted for, and the schema its
     /// binary answered with.
     ///
-    /// [`Self::config_target`]'s twin, and it carries a schema because a
-    /// dog's is probed once at open and then reused: `r`, and the re-read a
-    /// landed write raises, ask the shepherd for the SECTION again and never
-    /// respawn the dog's binary. Cleared with `config_target`, on exactly
-    /// the same keystrokes, so a reply nobody is waiting for is dropped in
-    /// silence rather than re-opening a pane the operator has left.
+    /// [`Self::config_target`]'s twin. Carries a schema because it is
+    /// probed once at open and reused on every re-read, so `r` never
+    /// respawns the dog's binary. Cleared alongside `config_target`.
     dog_target: Option<DogProbe>,
     /// The open config pane, or `None`. Opened by `e` on a selected sheep,
     /// and closed by `e` or `Escape` from inside it.
@@ -1526,13 +1217,9 @@ pub struct App {
     /// other. `on_key` checks this one first, so a pane opened over the
     /// dashboard owns the keyboard for as long as it is up.
     config_pane: Option<ConfigPane>,
-    /// The resolved style level and which layer chose it, from
-    /// `run_argv`'s own `resolve_style`. `App::new` defaults it to
-    /// `(StyleLevel::Full, StyleSource::Default)`; `run_argv`'s `lookout`
-    /// dispatch immediately overrides it with the real resolution through
-    /// `Self::set_style`, so the settings screen's own STYLE LEVEL row
-    /// reads the same answer the rest of the CLI does rather than a second,
-    /// independently derived one.
+    /// The resolved style level and which layer chose it. Defaulted here and
+    /// overridden through [`Self::set_style`], so the STYLE LEVEL row reads the
+    /// same answer the rest of the CLI does.
     style: (StyleLevel, StyleSource),
 }
 
@@ -1569,11 +1256,8 @@ impl App {
     pub fn update(&mut self, msg: Msg) -> Effect {
         match msg {
             Msg::Snapshot { rows, at } => {
-                // A snapshot cannot arrive after a freeze — the link task has
-                // ended by then, so there is nothing left to produce one. If
-                // one does, it is a message from a task that should not exist,
-                // and accepting it would silently un-freeze a dashboard whose
-                // banner says otherwise.
+                // The link task has ended, so nothing is left to produce a
+                // snapshot. Accepting one would un-freeze the dashboard.
                 if matches!(self.link, Link::Lost { .. }) {
                     return Effect::None;
                 }
@@ -1584,10 +1268,8 @@ impl App {
                     .collect();
                 self.reseat(previous);
                 self.forget_missing_target();
-                // Unconditional, and NOT `if reseat(..)`: the paths on the
-                // selected row may have changed even when the selection did
-                // not, and this is the whole of the feed's cadence. See design
-                // decision 2.
+                // Unconditional: the selected row's log paths can change even
+                // when the selection does not, and this is the feed's cadence.
                 Effect::RefreshFeed
             }
             Msg::Event(event) => self.on_event(event),
@@ -1619,7 +1301,6 @@ impl App {
                 Effect::None
             }
             Msg::Tick { now } => {
-                // The one line that keeps a frozen dashboard honest.
                 if !matches!(self.link, Link::Lost { .. }) {
                     self.now = now;
                     let expired = self.action.as_ref().is_some_and(|action| {
@@ -1630,15 +1311,9 @@ impl App {
                         self.action = None;
                     }
                 }
-                // The settings screen's own expiry sits OUTSIDE the guard
-                // above, and compares against `now` -- the tick's own
-                // instant -- rather than `self.now`, which that guard stops
-                // advancing once the link is lost. The sheep confirm freezes
-                // with everything else on a dead link because every word of
-                // it describes the shepherd, which the dashboard can no
-                // longer see; a settings edit describes a local file that is
-                // not stale just because the shepherd stopped answering, so
-                // it keeps its own clock running.
+                // Against the tick's own `now`, not `self.now`, which stops on
+                // a dead link: a settings edit describes a local file that is
+                // no staler for the shepherd being gone.
                 if let Some(settings) = self.settings.as_mut() {
                     let expired = matches!(
                         settings.pending,
@@ -1667,11 +1342,8 @@ impl App {
             Msg::Resize => Effect::None,
             Msg::Key(key) => self.on_key(key),
             Msg::Host { sample } => {
-                // The one line that keeps a frozen dashboard honest, for the
-                // second time. `Msg::Tick` stops advancing `now` once the link
-                // is lost; this stops the strip for the same reason. A single
-                // line ticking over on a screen whose banner says the values
-                // are frozen is a contradiction on one frame.
+                // A strip ticking over under a banner saying the values are
+                // frozen contradicts it on one frame.
                 if matches!(self.link, Link::Lost { .. }) {
                     return Effect::None;
                 }
@@ -1679,19 +1351,9 @@ impl App {
                 self.host = sample;
                 Effect::None
             }
-            // Always `Effect::None`. A reducer that answered its own feed
-            // update with another refresh request would spin the UI task at
-            // full tilt; the `let _ =` at the call site in `run_ui` is
-            // deliberate rather than lazy.
-            //
-            // The `Link::Lost` guard is load-bearing, not decorative: `run_ui`
-            // arms its coalesced read from a `feed_dirty` flag set BEFORE a
-            // freeze can land, so a read requested a moment earlier can still
-            // be in flight when `Msg::Frozen` arrives and this arm sees the
-            // stale read after it. Without the guard that read reaches the
-            // rendered frame under a banner saying the values are frozen —
-            // the same contradiction-on-one-frame design decision 7 already
-            // refuses for the host strip and the uptime clock.
+            // Always `Effect::None`: answering a feed update with another
+            // refresh would spin the UI task. The guard catches a read `run_ui`
+            // armed before the freeze landed.
             Msg::Bleats { tail } => {
                 if matches!(self.link, Link::Lost { .. }) {
                     return Effect::None;
@@ -1725,28 +1387,18 @@ impl App {
                 Sent::Action { verb, target, name } => {
                     self.action = None;
                     self.notice = Some(Notice {
-                        // "it was not sent", and no cause. The reducer does
-                        // not know one: the channel holds 2, it is shared with
-                        // lamb fetches, and `run_connected` awaits each
-                        // request inline, so `Full` is reachable while the
-                        // shepherd is perfectly reachable and merely slow.
-                        // Naming a cause nothing observed is the failure the
-                        // `-` CPU cell exists to prevent.
+                        // No cause: `Full` is reachable while the shepherd is
+                        // merely slow, so naming one would invent it.
                         text: format!("{}: it was not sent", target_prefix(verb, &target, &name)),
                         grave: true,
                     });
                     Effect::None
                 }
-                // A dropped lamb fetch already reads as "not read yet", which
-                // is what the pane says. Nothing to report and nothing to
-                // clear.
+                // A dropped lamb fetch already reads as "not read yet".
                 Sent::Lambs { .. } => Effect::None,
-                // A config read nobody took. Same shape as `Sent::Lambs`
-                // above rather than as `Sent::Action`: nothing was armed and
-                // nothing is in flight to clear, so the notice is the whole
-                // report. Said out loud rather than swallowed, because `e`
-                // dropped in silence looks exactly like a key that is not
-                // bound.
+                // A config read nobody took, reported rather than
+                // swallowed: silence here looks like a key that is not
+                // bound. Nothing was armed, so this is the whole report.
                 Sent::SheepConfig { name } => {
                     self.notice = Some(Notice {
                         text: format!("{name}: its config was not asked for"),
@@ -1782,12 +1434,9 @@ impl App {
                     });
                     Effect::None
                 }
-                // The dog twins of the two arms above, and they say the
-                // same two things for the same two reasons: a read nobody
-                // took is reported rather than swallowed, because `e`
-                // dropped in silence looks exactly like a key that is not
-                // bound, and a write nobody took has to clear the pane's
-                // own "sent, waiting" line.
+                // The dog twins of the two arms above: a read nobody took
+                // is reported, and a write nobody took clears the pane's
+                // "sent, waiting" line.
                 Sent::DogSection { name } => {
                     self.notice = Some(Notice {
                         text: format!("{name}: its config was not asked for"),
@@ -1805,9 +1454,7 @@ impl App {
                     });
                     Effect::None
                 }
-                // Same shape as `Sent::Action`'s own arm above, aimed at the
-                // settings screen's own pending line instead of the sheep
-                // confirm.
+                // The arm above, against the settings screen's pending line.
                 Sent::Dog { name, enable, .. } => {
                     if let Some(settings) = self.settings.as_mut() {
                         settings.pending = None;
@@ -1820,67 +1467,26 @@ impl App {
                     Effect::None
                 }
             },
-            // The file can have changed since `s` asked for it, and the
-            // screen opens on whatever this read found -- never on stale or
-            // empty state, which is exactly why `s` asks first rather than
-            // opening immediately. A failed read leaves the dashboard up: an
-            // empty settings screen would say nothing about why it has
-            // nothing to show.
-            //
-            // This is also where a landed write's own re-read lands
-            // (`Msg::SettingWritten`'s `Ok` arm raises `Effect::LoadSettings`
-            // rather than hand-updating one row) and where `r` lands. Both
-            // arrive with `self.settings` already `Some`, and the cursor is
-            // preserved across them rather than reset: `opening` below is
-            // true only the first time, when `s` itself is what raised the
-            // read.
+            // The screen opens on what this read found; a failed read leaves
+            // the dashboard up. A landed write's re-read and `r` land here too,
+            // with `self.settings` already `Some`, so `opening` is false and
+            // the cursor survives.
             Msg::Settings { result } => {
                 let opening = self.settings.is_none();
                 match result {
                     Ok(snapshot) => {
-                        // Clears an action that armed while the read was in
-                        // flight (`s`, then `x`, then this landing): once
-                        // this branch runs, `on_key`'s settings short
-                        // circuit intercepts every key ahead of the
-                        // armed-confirm cancel block, and `on_settings_key`
-                        // no-ops `Confirm`. Without this, the prompt would
-                        // sit on screen, unreachable by Enter or by any
-                        // other key, until `CONFIRM_EXPIRY`. This is the
-                        // same closing-by-construction `on_key`'s own
-                        // comment already argues for `/` and the filter
-                        // box: a sheep confirm and the settings screen can
-                        // never coexist, and this is the one place
-                        // `self.settings` becomes `Some`, so clearing here
-                        // covers both the keypress and the race.
+                        // An action armed while the read was in flight: once
+                        // the screen is up, `on_settings_key` no-ops `Confirm`
+                        // and the prompt would be unreachable.
                         self.action = None;
-                        // The sibling race: `s`, then `/`, then a snapshot
-                        // landing while the box is still open. `on_key`
-                        // checks `self.mode == InputMode::Text` ahead of the
-                        // settings check, and `on_text_key` never consults
-                        // `self.settings`, so an open box would survive the
-                        // screen opening and keep eating every keystroke the
-                        // settings keymap was meant to own. Leaving text
-                        // mode here makes that state unrepresentable, the
-                        // same way clearing `self.action` above does for a
-                        // confirm.
-                        //
-                        // The query itself is kept, not cleared: this is
-                        // `TextApply`'s reading (Enter), not
-                        // `TextAbandon`'s (Esc). The operator was watching
-                        // the dashboard filter live while `/` was open --
-                        // the read had not landed yet -- so the characters
-                        // they typed are a real query they chose to build,
-                        // not a stray keystroke. Discarding it on the way
-                        // out would be the one filter edit in this whole
-                        // screen that vanishes without an Esc.
+                        // A filter box left open would keep eating every
+                        // keystroke the settings keymap owns: `on_key` checks
+                        // the mode first. The query itself is kept.
                         self.mode = InputMode::Normal;
-                        // The viewport: reset to the top only while
-                        // `opening`. `Settings::cursor` clamps on every
-                        // read, so a preserved cursor sitting past a
-                        // shorter dogs list still lands somewhere real
-                        // rather than out of bounds -- and the same clamp
-                        // now covers the offset a preserved `Viewport`
-                        // carries.
+                        // Reset to the top only while `opening`.
+                        // `Settings::cursor` clamps on every read, so a
+                        // preserved `Viewport` past a shorter dogs list
+                        // still lands somewhere real.
                         let view = self.settings.as_ref().map(|settings| settings.view.clone());
                         let mut settings = Settings::new(snapshot);
                         if !opening {
@@ -1901,27 +1507,9 @@ impl App {
                 }
                 Effect::None
             }
-            // An [`Effect::WriteSetting`] landed. `Ok` clears the prompt and
-            // raises a fresh [`Effect::LoadSettings`] rather than folding
-            // the write into the row by hand: that covers `Set` and
-            // `Unset` uniformly (an `Unset` has no local value to fold in,
-            // only the document does), picks up anything else that changed
-            // on disk in the meantime, and is the same read `r` and the
-            // initial `s` already go through -- see [`Msg::Settings`]'s own
-            // doc for how the cursor survives it. `Err` leaves the row
-            // exactly as it read before the write, and raises a grave
-            // notice with the refusal's own words rather than a generic
-            // one -- the same "say why" rule `arm`'s refusal ladder follows.
-            //
-            // For the two free-text fields, `Err` also reopens
-            // [`Pending::Typing`] with the text the operator typed
-            // ([`typed_text_of`]) and switches [`InputMode::Text`] back on:
-            // the refusal is discovered under `apply_setting`'s own lock,
-            // after the confirm, so it has to land as a re-opened editor
-            // rather than a blank row -- an operator who typed a long path
-            // must not have to retype it to fix one character. The four
-            // cycled fields have nothing to reopen; their `Err` matches the
-            // behaviour this arm already had.
+            // `Ok` re-reads rather than folding the write into the row, which
+            // covers `Unset` too. `Err` reopens the editor for the two
+            // free-text fields, so a long path need not be retyped.
             Msg::SettingWritten { edit, result } => match result {
                 Ok(()) => {
                     if let Some(settings) = self.settings.as_mut() {
@@ -1930,10 +1518,8 @@ impl App {
                     Effect::LoadSettings
                 }
                 Err(message) => {
-                    // `typed_text_of` names the field, so the two branches
-                    // below never share a borrow of `self.settings` that
-                    // would fight the `self.notice` assignment beneath
-                    // them.
+                    // Split so no borrow of `self.settings` is held across the
+                    // `self.notice` assignment below.
                     if let Some((field, buffer)) = typed_text_of(&edit) {
                         if let Some(settings) = self.settings.as_mut() {
                             settings.pending = Some(Pending::Typing { field, buffer });
@@ -1950,17 +1536,9 @@ impl App {
                 }
             },
             // A dog's schema probe answered. `Ok` parks the schema and asks
-            // the shepherd for the section, which is the half this binary
-            // cannot answer for itself; the pane is built when that lands
-            // (`Self::on_dog_section`). `Err` is decision 10 -- a dog with
-            // no schema gets no pane, and the refusal names the file and the
-            // tool that does edit it.
-            //
-            // The settings screen is deliberately LEFT OPEN here. It closes
-            // only once the pane really exists, the same rule `e` on the
-            // dashboard already follows: a screen that vanished on the
-            // keypress and then refused would leave the operator staring at
-            // a dashboard wondering which of the two things happened.
+            // the shepherd for the section; the pane is built once that
+            // lands. `Err` gets no pane, and the refusal names the file to
+            // edit instead. The settings screen stays open until then.
             Msg::DogPane {
                 name,
                 adopted_path,
@@ -1982,14 +1560,9 @@ impl App {
                     Effect::None
                 }
             },
-            // An [`Effect::WriteDog`] landed. `Ok` clears the prompt and
-            // raises the daemon half -- one message still yields one
-            // effect, so the chain is `Cycle` arms, `Confirm` writes the
-            // file, this arm asks the shepherd. `Err` raises a grave notice
-            // with the refusal's own words, the same "say why" rule
-            // `Msg::SettingWritten`'s own `Err` arm follows, and never
-            // reaches the shepherd: the file half failed, so there is
-            // nothing yet for the daemon half to agree or disagree with.
+            // `Ok` raises the daemon half: `Cycle` arms, `Confirm` writes the
+            // file, this arm asks the shepherd. `Err` never reaches it, since
+            // there is nothing for the daemon half to agree with.
             Msg::DogWritten { edit, result } => match result {
                 Ok(source) => Effect::Send(Sent::Dog {
                     name: edit.name,
@@ -2013,10 +1586,8 @@ impl App {
     /// Records one lamb reading. Always [`Effect::None`]: a reducer that
     /// answered a reading with another request would spin the UI task.
     fn on_lambs(&mut self, id: u32, result: Result<Response, RequestError>) -> Effect {
-        // The same guard `Msg::Bleats` carries, for the same reason: this
-        // fetch is armed before a freeze can land, and a reading that reached
-        // the frame afterwards would be newer than the banner saying the
-        // values are frozen.
+        // Armed before the freeze could land: a reading reaching the frame now
+        // would be newer than the banner over it.
         if matches!(self.link, Link::Lost { .. }) {
             return Effect::None;
         }
@@ -2027,9 +1598,8 @@ impl App {
                 .map_or(LambWalk::Failed, |info| {
                     info.lambs.map_or(LambWalk::NotWalked, LambWalk::Walked)
                 }),
-            // An `Err`, or a reply this binary does not recognise. Neither is
-            // an empty walk, and reporting either as one would say "none
-            // found" about a process table nobody read.
+            // Neither an `Err` nor an unrecognised reply is an empty walk:
+            // reporting one would say "none found" about nothing read.
             _ => LambWalk::Failed,
         };
         self.lambs = Some(LambReading {
@@ -2041,13 +1611,7 @@ impl App {
     }
 
     /// One action's answer: the shepherd's rows upserted, and one sentence.
-    ///
-    /// No provisional row state is invented anywhere on this path. The three
-    /// replies carry `Vec<ProcessInfo>`, so the table updates from the
-    /// shepherd's own words; an `online, restart sent...` in the STATUS column
-    /// would be a guess printed in the one column whose whole job is to be
-    /// true, and it would have to negotiate with the narrow-terminal column
-    /// drop order for the privilege.
+    /// Nothing provisional is invented; all three replies carry the rows.
     fn on_action_reply(
         &mut self,
         verb: ActionVerb,
@@ -2057,10 +1621,8 @@ impl App {
     ) -> Effect {
         self.action = None;
         let prefix = target_prefix(verb, &target, name);
-        // Each verb accepts its own reply and no other. A `Stopped` answering
-        // a `Restart` carries rows and would upsert perfectly happily, which
-        // is why the guards are on the arms rather than a single
-        // rows-carrying match.
+        // Each verb accepts its own reply and no other: a `Stopped` answering
+        // a `Restart` carries rows and would upsert happily.
         let rows = match result {
             Ok(Response::Stopped(rows)) if verb == ActionVerb::Stop => rows,
             Ok(Response::Restarted(rows)) if verb == ActionVerb::Restart => rows,
@@ -2074,11 +1636,8 @@ impl App {
                 });
                 return Effect::None;
             }
-            // The daemon's own message, not `RequestError`'s full `Display`:
-            // the latter interpolates the code with `{:?}` and produces
-            // "the daemon reported NotFound: ...", which puts a Rust
-            // identifier on an operator's screen. The message alone is
-            // already a sentence a human wrote.
+            // The daemon's own message: `RequestError`'s `Display` would put a
+            // Rust identifier on an operator's screen.
             Err(RequestError::Rpc(err)) => {
                 self.notice = Some(Notice {
                     text: format!("{prefix}: {}", err.message),
@@ -2109,25 +1668,12 @@ impl App {
         Effect::None
     }
 
-    /// One dog toggle's answer: the settings screen's `Pending::Sent` line
-    /// clears, one sentence lands in the status bar, and the screen
-    /// re-reads `shep.toml`.
+    /// One dog toggle's answer: the `Pending::Sent` line clears, one sentence
+    /// lands in the status bar, and the screen re-reads `shep.toml`.
     ///
-    /// No row is upserted here from `Response::DogStarted`'s own
-    /// `ProcessInfo`, unlike [`Self::on_action_reply`]: the RUNNING column
-    /// this reply would feed repairs itself off the next `ListFlock`, two
-    /// seconds later, the same as every other flock fact this screen shows.
-    ///
-    /// [`Effect::LoadSettings`] on every arm, `Err` included, for the same
-    /// reason `Msg::SettingWritten`'s own `Ok` arm raises it: the FILE half
-    /// has already landed by the time this reply arrives (that is what
-    /// `Msg::DogWritten`'s `Ok` sent the request on), so `DogView.enabled`
-    /// is stale here whatever the shepherd went on to say. Without the
-    /// re-read the IN FILE cell kept its pre-write value while RUNNING
-    /// updated off the two-second poll, so a landed `enable metrics` read
-    /// `metrics | no | online` -- the dogs table manufacturing the exact
-    /// drift it exists to reveal, and reading as the one row the docs page
-    /// teaches an operator to treat as "running with nothing enabling it".
+    /// [`Effect::LoadSettings`] on every arm, `Err` included: the file half has
+    /// already landed, so `DogView.enabled` is stale whatever the shepherd
+    /// said. No row is upserted; the next `ListFlock` repairs RUNNING.
     fn on_dog_reply(
         &mut self,
         name: String,
@@ -2140,9 +1686,7 @@ impl App {
         let verb = if enable { "enable" } else { "disable" };
         let prefix = format!("{verb} {name}");
         // `EnableDog` answers `Response::DogStarted`; `DisableDog` answers
-        // `Response::Deleted`, the same reply `Delete` gives -- see that
-        // variant's own doc in shep-core for why it carries no dedicated
-        // shape.
+        // `Response::Deleted`, the same reply `Delete` gives.
         match result {
             Ok(Response::DogStarted(_)) if enable => {
                 self.notice = Some(Notice {
@@ -2156,13 +1700,8 @@ impl App {
                     grave: false,
                 });
             }
-            // Also reached by a mismatched guard above -- an `EnableDog`
-            // that somehow answered `Response::Deleted`, or a `DisableDog`
-            // that somehow answered `Response::DogStarted`. Neither reply
-            // agrees with the request this reducer sent, so this is the
-            // right arm for both: "something this lookout does not
-            // understand" is true of an answer to the wrong verb too, not
-            // only of a variant this binary has never heard of.
+            // Also a mismatched guard above: an `EnableDog` answered by
+            // `Response::Deleted`, or the reverse.
             Ok(_unrecognised) => {
                 self.notice = Some(Notice {
                     text: format!(
@@ -2304,22 +1843,10 @@ impl App {
                         Effect::None
                     };
                 }
-                // An upsert cannot orphan the selection from `self.flock` —
-                // the row it names either already existed (so the id is
-                // still in the map) or is new (so it cannot be the one the
-                // selection pointed at) — but it CAN orphan it from the
-                // VISIBLE sequence `reseat` and `j`/`k` actually walk: a
-                // rename that moves the selected row out of the current
-                // filter leaves its id in `self.flock` while dropping it out
-                // of `visible_ids()`. A `was_empty`-only guard misses that
-                // case: the cursor stays pinned to an id the table has
-                // stopped drawing, and `j`/`k` do nothing until the next
-                // snapshot repairs it. Reading
-                // `previous` before the insert and always reseating covers
-                // both that case and the empty-to-non-empty one below with
-                // the same call — `reseat` itself is a no-op read when the
-                // selection is still seated, so the common case costs one
-                // cheap check.
+                // An upsert can orphan the selection from `visible_rows()`
+                // without touching `self.flock`: a rename can move the selected
+                // row out of the filter. `reseat` is a no-op read while the
+                // selection is still seated.
                 let previous = self.selected_index();
                 let anchor = self.now;
                 self.flock.insert(info.id, Row { info, anchor });
@@ -2328,12 +1855,9 @@ impl App {
                 }
                 Effect::None
             }
-            // The shepherd's own outbound queue overflowed for this
-            // subscriber. Deliberately worded differently from
-            // `Msg::BusLagged` above: the two failures live on opposite ends of
-            // the connection, and an operator cannot tell which end to
-            // investigate if they read the same. `bleats` pins the identical
-            // distinction.
+            // The shepherd's own outbound queue overflowed. Worded differently
+            // from `Msg::BusLagged`: an operator cannot tell which end of the
+            // connection to investigate if the two read the same.
             BusEvent::Dropped { count } => {
                 self.notice = Some(Notice {
                     text: format!("the shepherd dropped {count} events; re-reading the flock"),
@@ -2341,11 +1865,8 @@ impl App {
                 });
                 Effect::PollNow
             }
-            // A notice, not an exit. `bleats` prints this and then leaves,
-            // which is right for a follow; a standing dashboard that vanished
-            // when the shepherd went down would take the last known state with
-            // it. The link task will find the socket gone, climb the reconnect
-            // ladder, and freeze if it runs out.
+            // A notice, not an exit: a dashboard that vanished would take the
+            // last known state with it.
             BusEvent::DaemonShutdown => {
                 self.notice = Some(Notice {
                     text: "the shepherd is shutting down".to_string(),
@@ -2353,10 +1874,8 @@ impl App {
                 });
                 Effect::None
             }
-            // `BusEvent` is `#[non_exhaustive]`: a variant a newer shepherd
-            // added must not take the dashboard down, and must not be reported
-            // as anything. `Dropped` and `DaemonShutdown` are NOT in this arm
-            // — both are named variants this binary understands.
+            // `BusEvent` is `#[non_exhaustive]`: a newer shepherd's variant
+            // must not take the dashboard down.
             _ => Effect::None,
         }
     }
@@ -2604,42 +2123,24 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyPress) -> Effect {
-        // While the box is open every KEY is text. That is not the same as
-        // nothing being able to raise a notice: three of them arrive on
-        // messages that are not keys at all, and the status bar rather than
-        // this branch is what keeps them off the query. See `on_text_key`.
+        // While the box is open every key is text.
         if self.mode == InputMode::Text {
             return self.on_text_key(key);
         }
         // The config pane owns the keyboard while it is open, ahead of the
-        // settings screen and ahead of the armed-confirm check below. The
-        // two screens cannot coexist -- `e` reaches the dashboard only from
-        // the dashboard, and `s` only from there too -- so the ordering
-        // between these first two branches is a documentation choice rather
-        // than a correctness one, the same as the next one down.
+        // settings screen and the armed-confirm check below. The two
+        // screens cannot coexist, so this ordering is a documentation
+        // choice, not a correctness one.
         if self.config_pane.is_some() {
             return self.on_pane_key(key);
         }
-        // The settings screen owns its own keymap while it is open, ahead of
-        // the armed-confirm check below: no sheep action can be armed from
-        // in here (`s` reaches the dashboard only after the screen closes),
-        // so the ordering is a documentation choice, not a correctness one.
+        // The settings screen owns its own keymap while it is open.
         if self.settings.is_some() {
             return self.on_settings_key(key);
         }
-        // Checked BEFORE the ordinary dispatch, and a cancelling keypress is
-        // CONSUMED. A stray `j` during a pending confirm cancels it and does
-        // not also move the selection: if it did both, the operator would see
-        // the prompt vanish and the cursor move, and the next reflexive Enter
-        // would act on a target they had already lost track of.
-        //
-        // Cancelling is silent. Nothing happened, and reporting nothing as if
-        // it were something trains an operator to ignore the status bar.
-        //
-        // One consequence worth naming: `/` cancels before it opens the filter
-        // box, so a confirm and a filter edit can never coexist. That closes
-        // the whole interaction between the two features by construction
-        // rather than by rule.
+        // A cancelling keypress is consumed: a stray `j` cancels the confirm
+        // and does not also move the selection, or the next reflexive Enter
+        // acts on a target the operator lost track of. Cancelling is silent.
         if self
             .action
             .as_ref()
@@ -2648,16 +2149,9 @@ impl App {
             if key == KeyPress::Confirm {
                 return self.confirm();
             }
-            // The one key the cancel does not consume. `input.rs`'s own doc
-            // says why: dropping Ctrl-C would leave the most reflexive way out
-            // of a terminal program doing nothing, and the operator's next
-            // move is `kill -9` from another window, past every restore path
-            // `super::term` has. Quitting DISCARDS the confirm rather than
-            // acting on it, so the property this rule exists for is untouched;
-            // that property is about a cancelling key also doing its ordinary
-            // job on a target the operator has lost track of. Text mode makes
-            // the same carve-out. See the phase plan's "Shapes the design
-            // named" #4.
+            // The one key the cancel does not consume: an operator whose
+            // Ctrl-C does nothing reaches for `kill -9`, past every restore
+            // path `super::term` has. Quitting discards the confirm.
             if key == KeyPress::Quit {
                 return Effect::Quit;
             }
@@ -2667,9 +2161,8 @@ impl App {
         self.notice = None;
         match key {
             KeyPress::Quit => Effect::Quit,
-            // The one key whose meaning depends on state, and the screen says
-            // which meaning is in force: the bar reads `esc clear` for
-            // exactly as long as clearing is what it does.
+            // The one key whose meaning depends on state, and the bar reads
+            // `esc clear` for exactly as long as clearing is what it does.
             KeyPress::Escape => {
                 if self.filter.is_empty() {
                     Effect::Quit
@@ -2677,10 +2170,8 @@ impl App {
                     self.set_filter(String::new())
                 }
             }
-            // The one key that does I/O, and it refuses honestly once the
-            // link task has ended: its poll receiver is gone by then, so an
-            // `Effect::PollNow` would be a `try_send` into a closed channel
-            // and the operator would get silence with no reason for it.
+            // Once the link task has ended its poll receiver is gone, so an
+            // `Effect::PollNow` would be silence with no reason for it.
             KeyPress::Refresh => {
                 if matches!(self.link, Link::Lost { .. }) {
                     self.notice = Some(Notice {
@@ -2696,64 +2187,41 @@ impl App {
             KeyPress::SelectFirst => self.select_at(0),
             KeyPress::SelectLast => self.select_at(self.visible_len().saturating_sub(1)),
             KeyPress::Action(verb) => self.arm(verb),
-            // Enter means nothing outside an armed confirm. It reaches this
-            // match whenever nothing is armed, which includes while an action
-            // is IN FLIGHT, because the routing rule above only fires on
-            // `Stage::Armed`. Named rather than swept into a wildcard: on the
-            // one key whose job is to confirm a stop, an unspecified arm is
-            // one edit away from being the wrong arm.
+            // Enter means nothing outside an armed confirm, including while one
+            // is in flight: the routing rule above fires only on `Stage::Armed`.
             KeyPress::Confirm => Effect::None,
             KeyPress::FilterStart => {
                 self.mode = InputMode::Text;
                 Effect::None
             }
             // `map_key` produces these only in text mode, which the branch at
-            // the top of this function has already taken. Named rather than
-            // wildcarded so a future variant does not fall silently into an
-            // arm that ignores it.
+            // the top of this function has already taken.
             KeyPress::TextChar(_)
             | KeyPress::TextBackspace
             | KeyPress::TextApply
             | KeyPress::TextAbandon => Effect::None,
             // The read, not the open: the screen opens only once
-            // `Msg::Settings` lands. See that arm's own doc for why.
+            // `Msg::Settings` lands.
             KeyPress::Settings => Effect::LoadSettings,
-            // Also the read, not the open, and for the same reason: the
-            // pane shows the shepherd's answer or it shows nothing.
-            //
-            // `selected_row` is `None` for a group row as well as for an
-            // empty flock. A group has no single sheep, but every instance
-            // behind it shares one stored spec, so the group's own name is
-            // exactly what `Request::SheepConfig` wants -- and refusing
-            // there would make `e` do nothing on the one row a
-            // multi-instance app shows by default.
+            // Also the read, not the open: the pane shows the shepherd's
+            // answer or nothing. `selected_row` is `None` for a group too,
+            // but a group's name is what `Request::SheepConfig` wants, so
+            // `e` still works on a multi-instance app's default row.
             KeyPress::Edit => self.ask_for_config(),
-            // Meaningless from the dashboard; the settings screen is the
-            // only thing `space` does anything for, and this branch is only
-            // reached when that screen is not open.
+            // `space` acts only on the settings screen.
             KeyPress::Cycle => Effect::None,
         }
     }
 
-    /// The settings screen's own keymap, in force for as long as
-    /// [`Self::settings`] is `Some`. Everything not named here is ignored,
-    /// in particular an action key: no sheep action can arm while this
-    /// screen owns the keyboard.
+    /// The settings screen's own keymap, in force while [`Self::settings`] is
+    /// `Some`. Everything not named here is ignored, an action key included.
     fn on_settings_key(&mut self, key: KeyPress) -> Effect {
         self.notice = None;
         match key {
             KeyPress::Quit => return Effect::Quit,
-            // Both close -- but an armed confirm eats the FIRST one instead,
-            // the same cancel-before-act rule `on_key`'s own dashboard
-            // branch already follows for `x`/`R`/`L`. Without this, `space`
-            // then a reflexive `Escape` would close the whole screen on top
-            // of a question the operator only meant to back out of.
-            //
-            // `s` toggling shut is the dashboard's own `s` meaning something
-            // different once the screen is open, the same division
-            // `Escape`'s doc argues for; `Escape` closing rather than
-            // quitting is the one place this screen swaps the dashboard's
-            // own cascade.
+            // Both close, but an armed confirm eats the first one, the
+            // cancel-before-act rule the dashboard follows. `Escape` closing
+            // rather than quitting is where this screen swaps that cascade.
             KeyPress::Settings | KeyPress::Escape => {
                 let armed = self.settings.as_ref().is_some_and(Settings::is_armed);
                 if armed {
@@ -2764,16 +2232,9 @@ impl App {
                     self.settings = None;
                 }
             }
-            // An armed candidate eats the FIRST movement key rather than
-            // also moving the cursor -- the same cancel-before-act rule
-            // `on_key`'s own dashboard branch already follows for
-            // `x`/`R`/`L` (see its "A stray `j` during a pending confirm"
-            // comment): without it, the operator would see the prompt
-            // vanish and the cursor move on the same keypress, and the
-            // next reflexive Enter would apply an edit to a row they had
-            // already lost track of. `Sent` is untouched, same as the
-            // dashboard's own guard, which only fires on `Stage::Armed`:
-            // a request already in flight is not cancellable by a keypress.
+            // An armed candidate eats the first movement key rather than also
+            // moving: the next reflexive Enter would otherwise apply an edit to
+            // a row the operator lost track of. `Sent` is untouched.
             KeyPress::SelectUp
             | KeyPress::SelectDown
             | KeyPress::SelectFirst
@@ -2794,16 +2255,8 @@ impl App {
             }
             KeyPress::Cycle => return self.cycle_setting(),
             KeyPress::Confirm => return self.confirm_setting(),
-            // Re-reads `shep.toml`, so another process's write shows up --
-            // the design spec's own table entry for `r`. `Msg::Settings`'s
-            // own doc is what keeps the cursor from resetting to the first
-            // row on the way back, the same as a landed write's reload.
-            //
-            // An armed candidate eats this one too, the same cancel-before-act
-            // rule the movement keys and `Escape`/`Settings` already follow
-            // above: without the guard, `space` then a reflexive `r` would
-            // silently drop the question and never send the edit, with
-            // nothing on screen to say so.
+            // Re-reads `shep.toml`, so another process's write shows up, and
+            // the cursor survives. An armed candidate eats this key too.
             KeyPress::Refresh => {
                 if let Some(settings) = self.settings.as_mut()
                     && settings.is_armed()
@@ -2813,12 +2266,9 @@ impl App {
                 }
                 return Effect::LoadSettings;
             }
-            // The probe, not the open, and for the reason
-            // `on_key`'s own `e` gives about a sheep: the pane shows the
-            // dog's real schema and the shepherd's real section, or it
-            // shows nothing. An armed candidate eats it first, the same
-            // cancel-before-act rule every other key on this screen
-            // follows.
+            // The probe, not the open, same reasoning as `on_key`'s `e`:
+            // the pane shows the dog's real schema and section or nothing.
+            // An armed candidate eats it first, like every other key here.
             KeyPress::Edit => {
                 if let Some(settings) = self.settings.as_mut()
                     && settings.is_armed()
@@ -2828,10 +2278,8 @@ impl App {
                 }
                 return self.probe_dog_schema();
             }
-            // Unreachable from here, and named rather than wildcarded so a
-            // future variant does not fall silently into an arm that
-            // ignores it: an action key in particular must never be
-            // mistaken for one this screen answers.
+            // Unreachable from here, named so a new variant cannot fall
+            // silently into an arm that ignores it.
             KeyPress::Action(_)
             | KeyPress::FilterStart
             | KeyPress::TextChar(_)
@@ -3432,14 +2880,8 @@ impl App {
     /// The [`WriteAuthority`] every settings write path has to hold, or
     /// [`None`] with the refusal already raised.
     ///
-    /// The one place [`Control`] is read on this screen. Every door that
-    /// can end in a changed `shep.toml` -- `space` on a scalar, `space` on
-    /// a dog, `Enter` opening the free-text editor, `Enter` applying an
-    /// armed candidate -- comes through here, and it is not a convention
-    /// they are trusted to follow: [`Effect::WriteSetting`] and
-    /// [`Effect::WriteDog`] cannot be built without the token this returns.
-    /// See [`WriteAuthority`]'s own doc for why the gate is shaped this way
-    /// rather than as a check per key.
+    /// The one place [`Control`] is read on this screen: `space` on a scalar or
+    /// a dog, and `Enter` opening or applying an edit, all come through here.
     fn authorize_write(&mut self) -> Option<WriteAuthority> {
         let authority = WriteAuthority::granted(self);
         if authority.is_none() {
@@ -3451,13 +2893,8 @@ impl App {
         authority
     }
 
-    /// `space` on the settings screen. Arms a candidate for the cursor's
-    /// row, or refuses and says why the same way an action key does; the
-    /// gate is [`Self::authorize_write`], the same one every other door on
-    /// this screen passes, because a keystroke that mutates `shep.toml`
-    /// needs the same fat-finger catch a keystroke that stops a sheep does.
-    /// Dispatches by row kind: [`Self::cycle_scalar`] for one of the six
-    /// fields, [`Self::cycle_dog`] for a [`SettingsRow::Dog`] row.
+    /// `space` on the settings screen: arms a candidate for the cursor's row,
+    /// or refuses through [`Self::authorize_write`].
     fn cycle_setting(&mut self) -> Effect {
         if self.authorize_write().is_none() {
             return Effect::None;
@@ -3471,15 +2908,9 @@ impl App {
         }
     }
 
-    /// `space` on one of the six scalar rows. Re-arms rather than no-opping
-    /// when a candidate is already armed for this field, so a second
-    /// `space` walks one step further along the cycle -- see
-    /// [`Settings::next_candidate`]'s own doc.
-    ///
-    /// Silently does nothing on [`SettingField::Socket`] and
-    /// [`SettingField::MaxCronSleep`]: free text is not this function's job,
-    /// and a screen the operator can already read gives no sign that
-    /// `space` was ever going to do anything there.
+    /// `space` on one of the six scalar rows. Re-arms when a candidate is
+    /// already armed, so a second `space` walks one step further along the
+    /// cycle. Does nothing on the two free-text fields.
     fn cycle_scalar(&mut self, field: SettingField) -> Effect {
         let Some(settings) = self.settings.as_mut() else {
             return Effect::None;
@@ -3497,16 +2928,11 @@ impl App {
         Effect::None
     }
 
-    /// `space` on a [`SettingsRow::Dog`] row: refuses while the link is
-    /// gone, with [`LINK_GONE`]'s own sentence rather than a second one for
-    /// the same fact, then arms the opposite of the file's own `enabled`
-    /// bit -- one `space` always proposes a toggle, never a cycle, because
-    /// there are only two states.
+    /// `space` on a [`SettingsRow::Dog`] row: arms the opposite of the file's
+    /// `enabled` bit, refusing in [`LINK_GONE`]'s words while the link is gone.
     ///
-    /// The link check is this row's own, unlike [`Self::cycle_scalar`]: an
-    /// enable/disable is a request to the shepherd once confirmed, and a
-    /// scalar edit is local file I/O the shepherd never sees, so only the
-    /// dog row needs the shepherd reachable to be worth arming at all.
+    /// The link check is this row's own, unlike [`Self::cycle_scalar`]: a
+    /// confirmed toggle ends in a request to the shepherd.
     fn cycle_dog(&mut self, index: usize) -> Effect {
         if matches!(self.link, Link::Lost { .. }) {
             self.notice = Some(Notice {
@@ -3536,27 +2962,14 @@ impl App {
         Effect::None
     }
 
-    /// The operator's `Enter` on the settings screen. Three meanings,
-    /// picked in this order:
+    /// The operator's `Enter` on the settings screen. On a free-text row with
+    /// nothing pending it opens [`Pending::Typing`] and switches
+    /// [`InputMode::Text`] on; on an armed candidate it sends and moves to
+    /// [`Pending::Sent`]; anything else is untouched.
     ///
-    /// - Nothing is pending and the cursor sits on [`SettingField::Socket`]
-    ///   or [`SettingField::MaxCronSleep`]: opens [`Pending::Typing`],
-    ///   seeded with that field's own on-disk value, and switches
-    ///   [`InputMode::Text`] on -- [`Self::on_settings_text_key`] is what
-    ///   answers every key from here on, not this function again.
-    /// - Something is [`Pending::Armed`] or [`Pending::DogArmed`]: sends it
-    ///   and moves it to [`Pending::Sent`] -- [`Effect::WriteSetting`] for
-    ///   the former, [`Effect::WriteDog`] for the latter, per each one's own
-    ///   doc for why they are not the same effect.
-    /// - Anything else (nothing pending on a cycled row, or already
-    ///   `Sent`): untouched.
-    ///
-    /// The first two both go through [`Self::authorize_write`] and refuse
-    /// under [`Control::ReadOnly`]; the third does nothing, so it raises no
-    /// refusal for a key that was never going to act. Opening the editor is
-    /// gated as well as applying it, because an editor a read-only operator
-    /// can type a whole socket path into before being told no is a worse
-    /// refusal than one that arrives on the keypress that asked.
+    /// Both acting cases go through [`Self::authorize_write`]. Opening the
+    /// editor is gated as well as applying it, so the refusal arrives before a
+    /// whole socket path is typed.
     fn confirm_setting(&mut self) -> Effect {
         let Some(settings) = self.settings.as_ref() else {
             return Effect::None;
@@ -3604,33 +3017,20 @@ impl App {
 
     /// Arms a confirm, or refuses and says why.
     ///
-    /// Every refusal happens HERE rather than at confirm time, so an operator
-    /// never answers a question that was never going to be honoured. Every
-    /// sentence is literal: the standing rule is that nothing about damage
-    /// gets charming, and a stop is damage.
-    ///
-    /// The ladder's order is the design's error table, read top to bottom:
-    /// gate, link, nothing selected, one already in flight. It only shows when
-    /// two conditions hold at once, and there is no reason to reorder an
-    /// approved table.
+    /// Every refusal happens here rather than at confirm time, so an operator
+    /// never answers a question that was never going to be honoured. The ladder
+    /// is gate, link, nothing selected, one already in flight.
     fn arm(&mut self, verb: ActionVerb) -> Effect {
         let refusal = if self.control == Control::ReadOnly {
             Some(READ_ONLY_REFUSAL.to_string())
         } else if let Link::Retrying { attempt } = self.link {
-            // NOT `LINK_GONE` here: that sentence says the shepherd is gone,
-            // which is false while it is still being redialled, and a
-            // refusal saying so under a banner that says "reconnecting"
-            // would be two contradictory claims on one frame. This is the
-            // status bar's own sentence for the state (`view/status.rs`),
-            // so the refusal agrees with the banner above it instead of
-            // overriding it.
+            // Not `LINK_GONE`, which says the shepherd is gone: this is the
+            // status bar's own sentence for a redial (`view/status.rs`).
             Some(format!(
                 "the shepherd stopped answering — reconnecting (attempt {attempt})"
             ))
         } else if matches!(self.link, Link::Lost { .. }) {
-            // The same sentence `r` gives once the ladder is exhausted: at
-            // that point the shepherd really is gone, so `LINK_GONE` is
-            // literally true rather than merely reused for convenience.
+            // The ladder is exhausted, so the shepherd really is gone.
             Some(LINK_GONE.to_string())
         } else if self.selected.is_none() {
             Some("no sheep is selected".to_string())
@@ -3712,8 +3112,8 @@ impl App {
     }
 
     /// Takes an armed prompt off the screen once its target is gone, rather
-    /// than leaving a question about nothing. Called from the `Snapshot` arm
-    /// and from the `Delete` arm; an action already in flight keeps its line.
+    /// than leaving a question about nothing. An action already in flight
+    /// keeps its line.
     fn forget_missing_target(&mut self) {
         let gone = self.action.as_ref().is_some_and(|action| {
             action.stage == Stage::Armed && !self.target_present(&action.target)
@@ -3725,17 +3125,9 @@ impl App {
 
     /// Takes an armed prompt off the screen when the link stops being live.
     ///
-    /// Called from the `Msg::Retrying` and `Msg::Frozen` arms. A9 refuses to
-    /// ARM unless the link is `Live`; without this, a prompt armed a moment
-    /// earlier would outlive the connection it was going to be sent over, and
-    /// on a frozen dashboard it would never expire either, because `now` stops
-    /// advancing and the expiry check rides it. Silent, like every other
-    /// cancel: nothing happened, and the banner appearing on the same frame
-    /// already says why.
-    ///
-    /// An action already SENT keeps its line. It is a real request, and
-    /// `run_connected` answers it with an `Err` before its loop ends, so the
-    /// in-flight line always resolves rather than hanging.
+    /// On a frozen dashboard it would never expire either, since `now` stops
+    /// advancing and the expiry check rides it. An action already sent keeps
+    /// its line: `run_connected` answers it with an `Err` before its loop ends.
     fn disarm_on_link_change(&mut self) {
         if self
             .action
@@ -3746,12 +3138,9 @@ impl App {
         }
     }
 
-    /// The one text keymap's own router: the filter box while the
-    /// settings screen is closed, [`Self::on_settings_text_key`]'s editor
-    /// while it is open. A previous task closed the window where the two
-    /// could both own [`InputMode::Text`] at once -- see `Msg::Settings`'s
-    /// own arm -- so this split is total: exactly one of the two ever
-    /// answers a given keypress.
+    /// The text keymap's router: the filter box while the settings screen is
+    /// closed, [`Self::on_settings_text_key`]'s editor while it is open. The
+    /// two never both own [`InputMode::Text`].
     fn on_text_key(&mut self, key: KeyPress) -> Effect {
         // Three now, and the split is still total: the config pane and the
         // settings screen cannot both be open (`e` reaches the dashboard
@@ -3769,18 +3158,10 @@ impl App {
 
     /// The filter box's keymap.
     ///
-    /// Ctrl-C still quits: in raw mode it is a key event and not a signal,
-    /// and a text box that swallowed it would leave the operator reaching for
-    /// `kill -9` from another window, past every restore path
-    /// [`super::term`] has.
-    ///
-    /// Deliberately does NOT clear [`Self::notice`], unlike the normal-mode
-    /// branch above it. A notice can be raised while this box is open, by
-    /// `Msg::BusLagged`, `BusEvent::Dropped` or `BusEvent::DaemonShutdown`,
-    /// none of which is a keypress; clearing here would destroy it because
-    /// somebody was mid-word. The status bar hides it under the box instead
-    /// and shows it when the box closes. See the phase plan's "Shapes the
-    /// design named" #2.
+    /// Ctrl-C still quits: in raw mode it is a key event, not a signal. Does
+    /// not clear [`Self::notice`], unlike normal mode, since a notice can be
+    /// raised with no keypress involved; the status bar hides it under the box
+    /// and shows it again when the box closes.
     fn on_filter_text_key(&mut self, key: KeyPress) -> Effect {
         match key {
             KeyPress::Quit => Effect::Quit,
@@ -3806,24 +3187,13 @@ impl App {
         }
     }
 
-    /// The settings editor's own text keymap, in force for as long as a
-    /// [`Pending::Typing`] owns [`InputMode::Text`].
-    ///
-    /// Does not trim the buffer, on `TextChar` or on `TextBackspace`
-    /// alike: this repository does not widen an accepted input grammar
-    /// without a basis in the spec, the same rule
-    /// [`Self::on_filter_text_key`]'s own filter buffer carries.
+    /// The settings editor's own text keymap, in force while a
+    /// [`Pending::Typing`] owns [`InputMode::Text`]. The buffer is never
+    /// trimmed.
     ///
     /// `TextApply` arms rather than writes: an empty buffer becomes
-    /// [`SettingEdit::Unset`], anything else becomes [`SettingEdit::Set`],
-    /// and either way the edit moves to [`Pending::Armed`] rather than
-    /// going out -- the operator's next `Enter`, on the now-closed editor,
-    /// is what sends it, the same second-`Enter` shape every other confirm
-    /// on this screen already uses.
-    ///
-    /// `TextAbandon` drops [`Pending::Typing`] back to `None` and leaves
-    /// the screen open, matching [`KeyPress::Escape`]'s own doc: the
-    /// cascade backs out of the innermost thing first.
+    /// [`SettingEdit::Unset`], anything else [`SettingEdit::Set`], and the next
+    /// `Enter` sends it. `TextAbandon` leaves the screen open.
     fn on_settings_text_key(&mut self, key: KeyPress) -> Effect {
         let now = self.now;
         let Some(settings) = self.settings.as_mut() else {
@@ -3870,35 +3240,15 @@ impl App {
     }
 
     /// The rows the table draws, in `(name, instance, id)` order: the whole
-    /// flock, or whatever the filter leaves of it, as [`RowKey`]s rather than
-    /// as a flat list of ids.
+    /// flock, or whatever the filter leaves of it.
     ///
-    /// An app earns a [`RowKey::Group`] header, immediately before its own
-    /// [`RowKey::Sheep`] entries, under the same condition
-    /// `output::rows::FlockRows`'s own `name_groups`/`slotted` rule uses
-    /// (task 9): more than one instance of the name, every one of them
-    /// reporting a slot. The listing is sorted by `(name, instance, id)`
-    /// here for exactly that reason -- `sort_flock`'s own doc is why an
-    /// app's instances arrive adjacent and in slot order upstream, and this
-    /// sequence keeps that ordering rather than the plainer `(name, id)`
-    /// this function used before grouping existed.
+    /// A [`RowKey::Group`] header comes immediately before its own
+    /// [`RowKey::Sheep`] entries, on [`Self::is_grouped`]'s rule. The sort key
+    /// is total on purpose: the table repolls every two seconds, and a partial
+    /// one would let two instances swap places under the cursor.
     ///
-    /// The order is otherwise the one every operator-facing shep listing
-    /// takes. `flock` is a `BTreeMap<u32, Row>`, so iterating it is id
-    /// order, which is why the sequence is materialised and re-keyed here
-    /// rather than taken from the map. That matters more in this pane than
-    /// anywhere else: the table repolls every two seconds, so a key that is
-    /// not total would let two instances of one app swap places under the
-    /// operator's cursor between refreshes.
-    ///
-    /// [`Self::select_at`], [`Self::select_by`], [`Self::reseat`] and
-    /// [`Self::selected_index`] all read this sequence and nothing else.
-    /// That is the whole point of it: a filter that hid rows `j` and `k`
-    /// still stepped over would move the cursor onto a sheep nobody can see,
-    /// and every pane below the table would then describe that sheep with
-    /// nothing on screen saying so. A query narrows by NAME, so it can never
-    /// split one app's instances across the filter boundary, which is what
-    /// keeps a [`RowKey::Group`] and its own slots always adjacent here too.
+    /// Every cursor move reads this sequence and nothing else, so `j` and `k`
+    /// cannot step onto a filtered-out row.
     #[must_use]
     pub fn visible_rows(&self) -> Vec<RowKey> {
         let needle = self.filter.to_lowercase();
@@ -3928,35 +3278,22 @@ impl App {
         out
     }
 
-    /// How many rows the table draws.
     fn visible_len(&self) -> usize {
         self.visible_rows().len()
     }
 
-    /// Puts the selection back on a real row after the flock changed.
+    /// Puts the selection back on a real row after the flock changed, and
+    /// reports whether it moved.
     ///
-    /// `previous_index` is where the selection sat **before** the change, read
-    /// while the old map was still in place. A selection whose key survived is
-    /// left alone, whatever row it now occupies. One that did not falls to
-    /// whatever occupies the same position, clamped to the last row — not to
-    /// row 0, which would throw an operator back to the top of a
-    /// two-hundred-sheep flock every time an unrelated sheep was deleted.
-    ///
-    /// Returns whether the selection changed, which is what decides between
-    /// [`Effect::RefreshSelected`] and [`Effect::None`].
+    /// `previous_index` is where the selection sat before the change, read
+    /// while the old map was still in place. A surviving key is left alone; a
+    /// lost one falls to whatever now occupies that position, clamped to the
+    /// last row rather than to row 0.
     fn reseat(&mut self, previous_index: Option<usize>) -> bool {
-        // `selected_index`, NOT `flock.contains_key`: a selection the filter
-        // is hiding is not seated, however present its id still is in the map.
-        // This one line is the difference between a cursor that follows the
-        // filter and one that wanders behind it.
-        //
-        // It must come BEFORE the `flock.is_empty()` check below: with the
-        // emptiness test above it instead, reverting this line changes
-        // nothing when the query matches no sheep, because the early
-        // return has already fired -- so this order is what makes the
-        // nothing-matches case reachable at all. The order is otherwise
-        // behaviour-preserving (a seated selection implies at least one
-        // visible row).
+        // `selected_index`, not `flock.contains_key`: a selection the filter
+        // hides is not seated, however present its id is. Must come before the
+        // emptiness check below, which would otherwise return early for a query
+        // that matches no sheep.
         if self.selected_index().is_some() {
             return false;
         }
@@ -3972,10 +3309,7 @@ impl App {
     }
 
     /// Moves the selection by `delta` rows and reports whether it moved.
-    ///
-    /// Clamped rather than wrapping: wrapping a two-hundred-sheep flock from
-    /// the last row to the first on one keypress loses the operator's place
-    /// with nothing to undo it.
+    /// Clamped rather than wrapping.
     fn select_by(&mut self, delta: isize) -> Effect {
         let Some(index) = self.selected_index() else {
             return Effect::None;
@@ -3988,8 +3322,8 @@ impl App {
     /// that changed anything.
     ///
     /// `Effect::None` when it did not: [`Effect::RefreshSelected`] reads two
-    /// files off disk and asks the shepherd for lambs, and a held `k` at the
-    /// top of the flock must not do that once per keypress.
+    /// files and asks the shepherd for lambs, and a held `k` at the top of the
+    /// flock must not do that once per keypress.
     fn select_at(&mut self, index: usize) -> Effect {
         let visible = self.visible_rows();
         if visible.is_empty() {
@@ -4000,26 +3334,20 @@ impl App {
             return Effect::None;
         }
         self.selected = Some(next);
-        // The cursor moved; whether anything is READ is a separate question.
         // A frozen dashboard re-reading live log files would put content on
-        // screen newer than the banner saying the values are frozen, which is
-        // the contradiction design decision 7 refuses for the host strip. The
-        // detail pane still re-renders, from the frozen listing — that is data
-        // already on the frame.
+        // screen newer than the banner over it. The cursor still moves, and the
+        // detail pane re-renders from the frozen listing.
         if matches!(self.link, Link::Lost { .. }) {
             return Effect::None;
         }
         Effect::RefreshSelected
     }
 
-    /// Every sheep the table's rows are drawn from, in name-then-id order:
-    /// the whole flock, or whatever the filter leaves of it. See
-    /// [`Self::all_rows`] for the unfiltered sequence a pane describing the
-    /// machine as a whole, not the table's current view, needs instead.
+    /// Every sheep the table's rows are drawn from, in name-then-id order: the
+    /// whole flock, or whatever the filter leaves of it.
     ///
-    /// A flat sheep list, not [`Self::visible_rows`]'s own [`RowKey`]
-    /// sequence: this is what the title bar and the host-strip tests count,
-    /// and a group header is not a sheep to count twice against.
+    /// A flat sheep list, not [`Self::visible_rows`]'s [`RowKey`] sequence: the
+    /// title bar counts this, and a group header is not a sheep.
     #[must_use]
     pub fn rows(&self) -> Vec<&Row> {
         let needle = self.filter.to_lowercase();
@@ -4034,31 +3362,19 @@ impl App {
         visible
     }
 
-    /// Every sheep the shepherd last reported, in id order, whatever the
-    /// filter hides.
+    /// Every sheep the shepherd last reported, in id order, whatever the filter
+    /// hides.
     ///
-    /// Id order, unlike [`Self::rows`]: nothing renders this sequence as a
-    /// list. The host strip sums it, and a sum does not care what order it
-    /// arrives in.
-    ///
-    /// The host strip reads this rather than [`Self::rows`] so a name filter
-    /// cannot narrow what `flock cpu`/`flock mem` sum while the strip stays
-    /// labelled `flock` -- see `view::host`'s own module doc for why. The
-    /// title bar already carries the filtered-vs-total distinction
-    /// (`2 of 6 in the flock`) so the strip does not have to.
+    /// The host strip sums this rather than [`Self::rows`], so a name filter
+    /// cannot narrow what `flock cpu`/`flock mem` add up to while the label
+    /// still says `flock`.
     #[must_use]
     pub fn all_rows(&self) -> Vec<&Row> {
         self.flock.values().collect()
     }
 
-    /// Replaces the filter and puts the selection back on a visible sheep.
-    ///
-    /// Private, and its only production caller is [`Self::on_key`]'s text-mode
-    /// arm (Task 2). The reseat is the whole reason this is not a plain field
-    /// assignment: a keystroke that narrows the query can hide the selected
-    /// sheep, and the selection then falls to whatever occupies the same
-    /// position, clamped to the last visible row, which is `reseat`'s shipped
-    /// rule applied to a new cause.
+    /// Replaces the filter and puts the selection back on a visible sheep: a
+    /// keystroke that narrows the query can hide the selected one.
     fn set_filter(&mut self, query: String) -> Effect {
         if self.filter == query {
             return Effect::None;
@@ -4066,9 +3382,8 @@ impl App {
         let previous = self.selected_index();
         self.filter = query;
         if self.reseat(previous) && !matches!(self.link, Link::Lost { .. }) {
-            // The cursor moved, so the feed and the lambs are about to
-            // describe a different sheep. A frozen dashboard reads nothing,
-            // for the reason `select_at` already states.
+            // The cursor moved, so the feed and the lambs are about to describe
+            // a different sheep.
             return Effect::RefreshSelected;
         }
         Effect::None
@@ -4080,19 +3395,13 @@ impl App {
         &self.filter
     }
 
-    /// Which keymap is currently in force, for `super::run_ui`'s call to
-    /// [`super::input::map_key`].
+    /// Which keymap is currently in force.
     #[must_use]
     pub fn mode(&self) -> InputMode {
         self.mode
     }
 
     /// How many sheep the shepherd last reported, whatever the filter hides.
-    ///
-    /// The title reads this beside `rows().len()`. A title that could only
-    /// read the narrowed count would understate the flock while a filter is
-    /// on, which is the confident wrong number this dashboard's `-` cells and
-    /// its frozen uptime clock both exist to avoid.
     #[must_use]
     pub fn flock_len(&self) -> usize {
         self.flock.len()
@@ -4104,9 +3413,8 @@ impl App {
         self.selected.clone()
     }
 
-    /// Which row of [`Self::visible_rows`] the selection sits on.
-    ///
-    /// Derived every call rather than stored: see [`Self::selected`].
+    /// Which row of [`Self::visible_rows`] the selection sits on, derived every
+    /// call rather than stored.
     #[must_use]
     pub fn selected_index(&self) -> Option<usize> {
         let key = self.selected.clone()?;
@@ -4114,10 +3422,8 @@ impl App {
     }
 
     /// The selected sheep's row, which the detail pane and the feed read.
-    ///
-    /// `None` for a [`RowKey::Group`] selection as well as for no selection
-    /// at all: a group has no single sheep to describe, and the panes that
-    /// call this read the `None` case as their own "nothing to show" state.
+    /// `None` for a [`RowKey::Group`] selection as well as for none at all: a
+    /// group has no single sheep to describe.
     #[must_use]
     pub fn selected_row(&self) -> Option<&Row> {
         match &self.selected {
@@ -4128,11 +3434,10 @@ impl App {
 
     /// The selected row's app name: a sheep's own, or a group row's.
     ///
-    /// Unlike [`Self::selected_row`] this answers for a group too. The two
-    /// callers differ in what they need: the detail pane and the feed
-    /// describe ONE process and have nothing to show for a group, while a
-    /// config pane is about the stored spec every instance of an app
-    /// shares, which a group row names exactly.
+    /// Unlike [`Self::selected_row`] this answers for a group too: a config
+    /// pane is about the stored spec every instance of an app shares, which
+    /// a group row names exactly, while the detail pane and feed describe
+    /// one process and have nothing to show for a group.
     #[must_use]
     pub fn selected_name(&self) -> Option<String> {
         match &self.selected {
@@ -4142,14 +3447,14 @@ impl App {
         }
     }
 
-    /// One sheep by id, whatever the filter hides -- the lookup a
-    /// [`RowKey::Sheep`] row's own rendering needs.
+    /// One sheep by id, whatever the filter hides: the lookup a
+    /// [`RowKey::Sheep`] row's rendering needs.
     #[must_use]
     pub fn row(&self, id: u32) -> Option<&Row> {
         self.flock.get(&id)
     }
 
-    /// Every instance of `name`, sorted by slot -- the members a
+    /// Every instance of `name`, sorted by slot: the members a
     /// [`RowKey::Group`] row summarises.
     #[must_use]
     pub fn group_members(&self, name: &str) -> Vec<&Row> {
@@ -4162,25 +3467,19 @@ impl App {
         members
     }
 
-    /// Whether `name`'s instances draw under a [`RowKey::Group`] header.
+    /// Whether `name`'s instances draw under a [`RowKey::Group`] header: more
+    /// than one instance of the name, every one of them reporting a slot.
     ///
-    /// The one condition, stated once: more than one instance of the name,
-    /// every one of them reporting a slot. [`Self::visible_rows`] decides
-    /// whether to emit the header from it and the table decides how to render
-    /// a slot row underneath from the same call, so the header and its rows
-    /// cannot disagree about which shape they are in.
-    ///
-    /// Read over the whole flock rather than over the filtered sequence, and
-    /// that is not a discrepancy: a query narrows by NAME, so it either keeps
-    /// every instance of an app or none of them.
+    /// Read over the whole flock rather than the filtered sequence, which a
+    /// name query keeps whole either way.
     #[must_use]
     pub fn is_grouped(&self, name: &str) -> bool {
         let members = self.group_members(name);
         members.len() > 1 && members.iter().all(|row| row.info.instance.is_some())
     }
 
-    /// `name`'s rolled-up numbers. See [`GroupTotals`]'s own doc for the
-    /// rule each field follows.
+    /// `name`'s rolled-up numbers. [`GroupTotals`] gives the rule each field
+    /// follows.
     #[must_use]
     pub fn group_totals(&self, name: &str) -> GroupTotals {
         let members = self.group_members(name);
@@ -4202,17 +3501,12 @@ impl App {
         }
     }
 
-    /// `name`'s STATUS cell: the shared status word when every instance
-    /// agrees, else a count per state -- the same rule
-    /// `output::rows::group_status` applies for `shep flock` (task 9), kept
-    /// here so the two surfaces read a mixed group the same way.
+    /// `name`'s STATUS cell: the shared status word when every instance agrees,
+    /// else a count per state, as `output::rows::group_status` does for
+    /// `shep flock`.
     ///
-    /// Reads `ProcStatus` directly, never [`Row::reported`]: `is_grouped`
-    /// requires every member's `instance` to be `Some`, and a dog is never
-    /// stocked to several instances, so no group this method can see has a
-    /// handshake to report. Same argument `output::rows::group_paint`
-    /// already makes for the table's own group row (task 5's own plan entry
-    /// spells this out rather than leaving it to be re-derived).
+    /// Reads `ProcStatus` directly, never [`Row::reported`]: a dog is never
+    /// stocked to several instances, so a group has no handshake to report.
     #[must_use]
     pub fn group_status_text(&self, name: &str) -> String {
         let members = self.group_members(name);
@@ -4233,16 +3527,9 @@ impl App {
             .join(", ")
     }
 
-    /// `name`'s status, when every instance agrees on one -- what
-    /// [`view::flock`](super::view::flock)'s STATUS colouring and
-    /// [`view::detail`](super::view::detail)'s own status word key off,
-    /// mirroring `output::rows::group_paint`'s "a mixed group's plain count
-    /// text wears no colour" rule.
-    ///
-    /// `Option<ProcStatus>`, not `Option<Reported>`, for the same reason
-    /// [`Self::group_status_text`] reads `ProcStatus` directly above: a dog
-    /// is never stocked to several instances, so a group row has no
-    /// handshake to report and nothing here is ever silent.
+    /// `name`'s status when every instance agrees on one, which the STATUS
+    /// colouring and the detail pane's status word key off. A mixed group's
+    /// plain count text wears no colour.
     #[must_use]
     pub fn group_uniform_status(&self, name: &str) -> Option<ProcStatus> {
         let members = self.group_members(name);
@@ -4290,11 +3577,9 @@ impl App {
     }
 
     /// Whether [`Self::host`] is `None` because the platform cannot be read,
-    /// rather than because no heartbeat has fired yet.
-    ///
-    /// The strip says `usage is not available on this platform` for the first
-    /// and `not read yet` for the second. They are different facts and an
-    /// operator seeing the wrong one waits for numbers that are never coming.
+    /// rather than because no heartbeat has fired yet. The strip says a
+    /// different sentence for each: an operator shown the wrong one waits for
+    /// numbers that are never coming.
     #[must_use]
     pub fn host_unsupported(&self) -> bool {
         self.host_unsupported
@@ -4308,14 +3593,9 @@ impl App {
 
     /// One sheep's uptime as of this dashboard's own clock, in milliseconds.
     ///
-    /// A **running** sheep's uptime advances between polls, from the anchor its
-    /// row carries — the alternative, showing a number that only moves every
-    /// two seconds, reads as a frozen dashboard when it is not. A sheep that is
-    /// not running does not advance: its `uptime_ms` is a historical fact about
-    /// how long it ran, and animating it would invent one.
-    ///
-    /// While the link is [`Link::Lost`], nothing advances at all, because
-    /// `self.now` stops.
+    /// A running sheep's uptime advances between polls, from the anchor its row
+    /// carries. One that is not running does not: its `uptime_ms` is a fact
+    /// about how long it ran. Nothing advances once the link is [`Link::Lost`].
     #[must_use]
     pub fn uptime_ms(&self, id: u32) -> Option<u64> {
         let row = self.flock.get(&id)?;
@@ -4326,13 +3606,10 @@ impl App {
         Some(row.info.uptime_ms.saturating_add(millis(elapsed)))
     }
 
-    /// The lamb reading for sheep `id`, with its age in milliseconds as of
-    /// this dashboard's own clock.
+    /// The lamb reading for sheep `id`, with its age in milliseconds.
     ///
     /// `None` when there is no reading, or when the one there is was taken for
-    /// a different sheep. The age comes from [`Self::now`], the same clock the
-    /// uptime column reads, which means it stops when the dashboard freezes,
-    /// for the same reason.
+    /// a different sheep. The age stops when the dashboard freezes.
     #[must_use]
     pub fn lambs_for(&self, id: u32) -> Option<(&LambWalk, u64)> {
         let reading = self.lambs.as_ref().filter(|reading| reading.id == id)?;
@@ -4389,59 +3666,41 @@ impl App {
         self.config_pane.as_ref()
     }
 
-    /// The resolved style level and which layer chose it. What
-    /// `Effect::LoadSettings` hands `commands::settings::load_settings`
-    /// for the STYLE LEVEL row, so the screen never re-resolves on its own.
+    /// The resolved style level and which layer chose it, which the STYLE LEVEL
+    /// row reads rather than re-resolving.
     #[must_use]
     pub fn style(&self) -> (StyleLevel, StyleSource) {
         self.style
     }
 
-    /// Sets the resolved style level and its source. Called exactly once,
-    /// by `run_argv`'s `lookout` dispatch, right after construction: `App`
-    /// has no way to resolve this itself (it holds no `GlobalArgs` and
-    /// reads no files), so the caller that already computed it hands it
-    /// over rather than this type inventing a second, divergent way to get
-    /// one.
+    /// Sets the resolved style level and its source. `App` reads no files, so
+    /// it cannot resolve this itself.
     pub(crate) fn set_style(&mut self, style: (StyleLevel, StyleSource)) {
         self.style = style;
     }
 
-    /// Overrides the control gate a fixture built with. `App::new` takes
-    /// [`Control`] and every shipped fixture hard-codes [`Control::ReadOnly`];
-    /// this is the one line that lets the action-key tests build a dashboard
-    /// with the gate open without a second copy of `app_with`.
+    /// Overrides the control gate a fixture built with. Every shipped fixture
+    /// hard-codes [`Control::ReadOnly`].
     #[cfg(test)]
     pub(crate) fn set_control_for_tests(&mut self, control: Control) {
         self.control = control;
     }
 
-    /// Sets the filter directly, bypassing the reseat [`Self::set_filter`]
-    /// does. `set_filter` is private to this module; this is the one line
-    /// that lets `view::host`'s tests (a sibling module, not a descendant)
-    /// build a dashboard with a filter already applied, the same shape
-    /// [`Self::set_control_for_tests`] takes for the control gate.
+    /// Sets the filter directly, bypassing [`Self::set_filter`]'s reseat.
     #[cfg(test)]
     pub(crate) fn set_filter_for_tests(&mut self, query: &str) {
         self.filter = query.to_string();
     }
 
-    /// Selects `key` directly, without walking the cursor. No production
-    /// caller needs this: every real selection change arrives by walking
-    /// (`select_by`/`select_at`) or by a snapshot's own [`Self::reseat`].
-    /// This exists only so a test can point the cursor at a specific group
-    /// or sheep without simulating keypresses.
+    /// Points the cursor at `key` without simulating keypresses.
     #[cfg(test)]
     fn select(&mut self, key: RowKey) {
         self.selected = Some(key);
     }
 }
 
-/// The prefix every action's notice shares: which verb, and which target.
-///
-/// A single sheep keeps the `(id N)` form unchanged from before this feature;
-/// a group names the app instead of an id, since there is no one id for the
-/// notice to name.
+/// The prefix every action's notice shares: the verb, and the target. A single
+/// sheep takes the `(id N)` form; a group names the app, having no one id.
 fn target_prefix(verb: ActionVerb, target: &RowKey, name: &str) -> String {
     match target {
         RowKey::Sheep(id) => format!("{} {name} (id {id})", verb.label()),
@@ -4449,18 +3708,14 @@ fn target_prefix(verb: ActionVerb, target: &RowKey, name: &str) -> String {
     }
 }
 
-/// Saturating `Duration` -> milliseconds. A lookout left open for 580 million
-/// years is not the failure this guards; the cast is what clippy's
-/// `cast_possible_truncation` would otherwise deny.
+/// Saturating `Duration` to milliseconds. Saturates for clippy's
+/// `cast_possible_truncation`, not for a lookout left open 580 million years.
 fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// What the bar says once the shepherd has answered.
-///
-/// Reload's wording is not decoration. `Response::Reloading` is an acceptance
-/// and not a result, and the swaps arrive afterwards on the bus, which the
-/// table already consumes.
+/// What the bar says once the shepherd has answered. `Response::Reloading` is
+/// an acceptance, not a result: the swaps arrive later on the bus.
 const fn outcome(verb: ActionVerb) -> &'static str {
     match verb {
         ActionVerb::Stop => "the shepherd stopped it",
@@ -4503,17 +3758,12 @@ mod tests {
         (app, t0)
     }
 
-    /// `started()`'s three sheep with the gate open and the cursor parked in
-    /// the middle, on `web` at id 1.
+    /// `started()`'s three sheep with the gate open and the cursor mid-list, on
+    /// `web` at id 1.
     ///
-    /// The table reads by name (`App::visible_ids`), so the middle row is the
-    /// middle NAME: `api` 2, `web` 1, `worker` 3. The ids are deliberately
-    /// left disagreeing with the display order, so a test that walks the
-    /// cursor and then asserts an id cannot pass by reading the map.
-    ///
-    /// Mid-list on purpose. Half the tests below assert that a stray `j` did
-    /// NOT move the cursor, and a cursor already clamped at either end would
-    /// pass those tests whether the routing rule consumed the key or not.
+    /// The table reads by name, so the ids disagree with the display order:
+    /// `api` 2, `web` 1, `worker` 3. Mid-list, because a cursor clamped at
+    /// either end would pass the tests that assert a stray `j` did not move it.
     fn allowed() -> App {
         let t0 = Instant::now();
         let mut app = App::new(
@@ -4535,11 +3785,8 @@ mod tests {
         app
     }
 
-    /// `allowed()`'s shape, but with three instances of one app instead of
-    /// three distinct ones: `web` at slots 0, 1 and 2, ids 1 through 3.
-    /// Nothing is selected here -- which row a `RowKey::Group` occupies is
-    /// exactly what the group tests are checking, so each one calls
-    /// `App::select` itself rather than trusting a walk to land there.
+    /// `allowed()`'s shape with three instances of one app: `web` at slots 0, 1
+    /// and 2, ids 1 through 3. Nothing is selected; each test selects itself.
     fn allowed_with_instances() -> App {
         let t0 = Instant::now();
         let mut app = App::new(
@@ -4556,9 +3803,6 @@ mod tests {
     }
 
     /// `web`'s three instances, at slots 0, 1 and 2 and ids 1 through 3.
-    /// Shared by [`allowed_with_instances`] and the reseat test's own second
-    /// `Msg::Snapshot`, so a poll that repeats the same listing is the one
-    /// under test rather than the flock actually changing shape.
     fn instanced_rows() -> Vec<ProcessInfo> {
         (0..3)
             .map(|slot| {
@@ -4569,14 +3813,11 @@ mod tests {
             .collect()
     }
 
-    /// The status bar's own rendered text, for the tests that assert on the
-    /// confirm prompt's wording rather than on the reducer's internal state.
+    /// The status bar's own rendered text.
     fn status_line_text(app: &App) -> String {
         super::super::view::fixtures::rendered(&super::super::view::status::status_line(app, 200))
     }
 
-    /// fails if an app with more than one instance does not get a group
-    /// header above its own slots.
     #[test]
     fn a_multi_instance_app_shows_a_group_row_above_its_slots() {
         let app = allowed_with_instances();
@@ -4588,11 +3829,6 @@ mod tests {
         assert!(matches!(app.visible_rows()[0], RowKey::Group(ref n) if n == "web"));
     }
 
-    /// fails if an action armed on a group row sends against one instance
-    /// instead of the whole app. This is the test that would redden if
-    /// targeting regressed to `SelectorSpec::Id` for a group: the request
-    /// this asserts on can only be built from `RowKey::Group`, never from a
-    /// single pinned id.
     #[test]
     fn an_action_on_a_group_row_targets_the_whole_app_by_name() {
         let mut app = allowed_with_instances();
@@ -4609,9 +3845,6 @@ mod tests {
         );
     }
 
-    /// fails if the confirm prompt does not say how many processes a group
-    /// action reaches before the operator commits. The one place a keypress
-    /// reaches several processes is the one place the prompt has to say so.
     #[test]
     fn a_group_confirm_states_how_many_processes_it_reaches() {
         let mut app = allowed_with_instances();
@@ -4621,9 +3854,6 @@ mod tests {
         assert!(prompt.contains('3'), "names the blast radius: {prompt}");
     }
 
-    /// fails if a group selection does not survive the two-second poll. The
-    /// cursor has to reseat onto the SAME group, not fall back to whatever
-    /// row now occupies its old position.
     #[test]
     fn selection_survives_a_poll_on_both_row_kinds() {
         let mut app = allowed_with_instances();
@@ -4635,10 +3865,6 @@ mod tests {
         assert_eq!(app.selected(), Some(RowKey::Group("web".to_string())));
     }
 
-    /// fails if `arm`'s read-only refusal stops firing for a group row. The
-    /// gate exists so a keystroke in a dashboard somebody is reading does
-    /// not become an action, and that has to hold for a keypress that would
-    /// reach three processes exactly as much as for one that reaches one.
     #[test]
     fn arming_a_group_action_refuses_when_read_only() {
         let mut app = allowed_with_instances();
@@ -4652,12 +3878,6 @@ mod tests {
         );
     }
 
-    /// fails if a group action can be armed while the link is not live. The
-    /// mirror of `every_action_key_refuses_while_the_link_is_not_live`, for
-    /// a `RowKey::Group` selection: A9's reasoning (an action typed during
-    /// the reconnect ladder would queue and land on a connection the
-    /// operator has stopped watching) does not know or care which kind of
-    /// row is selected.
     #[test]
     fn arming_a_group_action_refuses_while_the_link_is_not_live() {
         for link in [
@@ -4675,11 +3895,6 @@ mod tests {
         }
     }
 
-    /// fails if a second action can be armed on a group row while one is
-    /// already in flight. The mirror of
-    /// `a_second_action_refuses_while_one_is_in_flight` for a
-    /// `RowKey::Group` target: the in-flight line names one action, and a
-    /// second one racing it would make it ambiguous which (A12).
     #[test]
     fn arming_a_group_action_refuses_while_one_is_already_in_flight() {
         let mut app = allowed_with_instances();
@@ -4697,9 +3912,6 @@ mod tests {
         assert!(action.sent);
     }
 
-    /// fails if an action key acts. It arms, and nothing has been sent: the
-    /// whole point of the gate is that one keystroke in a dashboard somebody
-    /// is reading does not become an action.
     #[test]
     fn an_action_key_arms_a_confirm_and_sends_nothing() {
         let mut app = allowed();
@@ -4714,9 +3926,6 @@ mod tests {
         assert!(!armed.sent, "nothing has gone out");
     }
 
-    /// fails if the action key itself confirms, or if only `Esc` cancels. A
-    /// confirm the action key could complete is the double-tap the gate exists
-    /// to catch, on a keyboard that may be repeating.
     #[test]
     fn only_enter_confirms_and_every_other_key_cancels() {
         for key in [
@@ -4748,15 +3957,8 @@ mod tests {
         );
     }
 
-    /// fails if a cancelling keypress ALSO does its ordinary job. This is the
-    /// failure mode the whole feature is about: the operator would see the
-    /// prompt vanish and the cursor move, and the next reflexive Enter would
-    /// act on a target they had already lost track of.
-    ///
-    /// Three assertions, because each catches a different half of the bug: the
-    /// prompt is gone, the cursor did NOT move, and no effect leaked out. The
-    /// selection is parked mid-list by `allowed()` so a `j` genuinely could
-    /// move it.
+    /// `allowed()` parks the selection mid-list, so a `j` genuinely could move
+    /// it.
     #[test]
     fn a_cancelling_key_is_consumed_and_does_not_also_move_the_selection() {
         let mut app = allowed();
@@ -4768,28 +3970,10 @@ mod tests {
         assert_eq!(effect, Effect::None, "nor ask for a feed read or a walk");
     }
 
-    /// fails if the confirm re-reads the cursor at Enter time. A snapshot can
-    /// land between the arming keypress and the Enter, and a confirmation
-    /// built from `self.selected` would then act on a sheep the operator never
-    /// pointed at.
-    ///
-    /// Arming on id 2 and having a snapshot delete id 2's NEIGHBOUR does
-    /// NOT exercise this: `reseat`'s own rule is "an id that survived is
-    /// left alone, whatever row it now occupies" — id 2 survives every
-    /// such snapshot, so `self.selected` stays 2 right alongside
-    /// `action.id`, and the mutation this test exists to catch (reading
-    /// `self.selected` instead of the pinned `action.id`) could not redden
-    /// it.
-    ///
-    /// This version applies a filter before arming, then has the snapshot
-    /// RENAME the armed sheep out of that filter while a second sheep enters
-    /// it. The armed id (2) still survives in `self.flock` — a rename is not
-    /// a delete, so `confirm`'s "did the target leave" check must not fire —
-    /// but it drops out of `visible_ids()`, so `reseat` moves the cursor to
-    /// the other match. That genuinely separates `self.selected` (9) from
-    /// `action.id` (2), which is what makes the pin observable: the fixed
-    /// code sends id 2 under its arm-time name "api", and the mutation Task 7
-    /// tried would instead send id 9 under whatever the snapshot named it.
+    /// The snapshot renames the armed sheep out of the filter while another
+    /// enters it, so id 2 stays in `self.flock` while leaving `visible_rows()`
+    /// and the cursor moves to id 9. Deleting a neighbour would not separate
+    /// the two: `reseat` leaves a surviving id alone.
     #[test]
     fn the_confirm_is_pinned_to_the_id_it_was_armed_on() {
         let mut app = allowed();
@@ -4820,8 +4004,6 @@ mod tests {
         );
     }
 
-    /// fails if a confirm whose sheep left the flock sends anyway. The one
-    /// refusal that has to happen at confirm time rather than at arm time.
     #[test]
     fn a_confirm_whose_sheep_left_the_flock_refuses_instead_of_sending() {
         let mut app = allowed();
@@ -4832,15 +4014,11 @@ mod tests {
             manually: true,
             at_ms: 0,
         }));
-        // The prompt came off the screen as soon as the reducer learned the
-        // sheep was gone, rather than sitting there as a question about
-        // nothing.
         assert!(app.action().is_none());
         assert_eq!(app.update(Msg::Key(KeyPress::Confirm)), Effect::None);
     }
 
-    /// fails if a prompt left armed while the operator walks away never
-    /// expires. Driven by `Msg::Tick`, so there is no sleep here (IR-33).
+    /// Driven by `Msg::Tick`, so there is no sleep here.
     #[test]
     fn a_confirm_expires_after_ten_seconds_of_ticks() {
         let mut app = allowed();
@@ -4857,9 +4035,6 @@ mod tests {
         assert!(app.action().is_none(), "ten is not");
     }
 
-    /// fails if arming is allowed while the link is not live. An action typed
-    /// during the eight second reconnect ladder would otherwise queue and land
-    /// seconds later, on a connection the operator has stopped watching (A9).
     #[test]
     fn every_action_key_refuses_while_the_link_is_not_live() {
         for link in [
@@ -4876,9 +4051,6 @@ mod tests {
         }
     }
 
-    /// fails if a second action can be armed while one is in flight. The
-    /// in-flight line names one action; a second one would make it ambiguous
-    /// which (A12).
     #[test]
     fn a_second_action_refuses_while_one_is_in_flight() {
         let mut app = allowed();
@@ -4895,9 +4067,6 @@ mod tests {
         assert!(action.sent);
     }
 
-    /// fails if the in-flight line is stored as a notice. A notice is cleared
-    /// by the next keypress, and an in-flight action whose only sign on screen
-    /// could be wiped by a stray `j` is a dashboard hiding something it knows.
     #[test]
     fn an_in_flight_line_survives_a_keypress() {
         let mut app = allowed();
@@ -4910,13 +4079,6 @@ mod tests {
         );
     }
 
-    /// fails if `q` or Ctrl-C stops quitting while a prompt is up. The routing
-    /// rule consumes every other key; this is the one carve-out, and
-    /// `input.rs`'s own doc says why: an operator whose most reflexive way out
-    /// of a terminal program stops working reaches for `kill -9` from another
-    /// window, past every restore path `term` has. Quitting discards the
-    /// confirm rather than acting on it, so nothing this rule protects is
-    /// weakened. See the phase plan's "Shapes the design named" #4.
     #[test]
     fn quit_still_quits_while_a_confirm_is_armed() {
         let mut app = allowed();
@@ -4924,9 +4086,6 @@ mod tests {
         assert_eq!(app.update(Msg::Key(KeyPress::Quit)), Effect::Quit);
     }
 
-    /// fails if Enter does something when nothing is armed. It reaches the
-    /// ordinary match in two states an operator can be in: nothing armed at
-    /// all, and one action already in flight. Neither may send.
     #[test]
     fn enter_outside_an_armed_confirm_does_nothing() {
         let mut app = allowed();
@@ -4943,9 +4102,6 @@ mod tests {
         );
     }
 
-    /// fails if a request the channel could not take leaves the dashboard
-    /// claiming an action is in flight forever, which would also refuse every
-    /// later action for the life of the process.
     #[test]
     fn a_request_that_could_not_be_sent_says_so_and_clears_the_state() {
         let mut app = allowed();
@@ -4958,11 +4114,6 @@ mod tests {
         assert!(app.notice().is_some_and(Notice::is_grave));
     }
 
-    /// fails if an armed prompt outlives the connection it was going to be
-    /// sent over. Both halves matter: `Retrying` because A9 says an action
-    /// typed during the reconnect ladder is refused rather than queued, and
-    /// `Frozen` because a frozen dashboard's `now` stops advancing, so an
-    /// armed prompt there would never expire either.
     #[test]
     fn a_link_that_stops_being_live_takes_an_armed_prompt_down() {
         for link in [
@@ -4984,11 +4135,6 @@ mod tests {
         }
     }
 
-    /// fails if the poll stops being the truth. A bus event upserts, but a
-    /// snapshot REPLACES: the bus is lossy by construction, so a sheep the
-    /// events invented — or one they never learned had been deleted — must not
-    /// survive the next listing. Event-sourcing a lossy bus is the exact drift
-    /// this reducer exists to prevent.
     #[test]
     fn a_snapshot_replaces_the_flock_wholesale() {
         let (mut app, t0) = started();
@@ -5008,10 +4154,6 @@ mod tests {
         assert!(app.rows().iter().all(|row| row.info.id == 1));
     }
 
-    /// fails if a snapshot that shrinks the flock leaves the selection pointing
-    /// at a row that no longer exists. The map is REPLACED wholesale every two
-    /// seconds, so a selection that was valid for six sheep can outlive four of
-    /// them — and this is the reseat rule, not the clamp `last_row` used to be.
     #[test]
     fn a_snapshot_that_shrinks_the_flock_pulls_the_selection_back() {
         let (mut app, t0) = started();
@@ -5035,12 +4177,6 @@ mod tests {
         assert_eq!(app.selected_index(), None, "an empty flock selects nothing");
     }
 
-    /// fails if the selection stops being stored as an ID. The flock map is
-    /// replaced wholesale every two seconds, so an INDEX cursor silently
-    /// points at a different sheep the moment an earlier row is deleted —
-    /// and the detail pane and the feed would then describe that different
-    /// sheep with nothing on screen changing. This is the whole reason
-    /// `selected` is a `u32` and not a `usize`.
     #[test]
     fn the_selection_follows_the_sheep_and_not_the_row_number() {
         let (mut app, t0) = started();
@@ -5052,8 +4188,8 @@ mod tests {
             "the third row, worker"
         );
 
-        // Sheep 1 goes away. `worker` is now row 1 rather than row 2 — an
-        // index cursor would now be pointing at `api`.
+        // Sheep 1 goes away. `worker` is now row 1 rather than row 2, where
+        // an index cursor would be pointing at `api`.
         app.update(Msg::Snapshot {
             rows: vec![
                 sheep(2, "api", ProcStatus::Errored),
@@ -5065,10 +4201,6 @@ mod tests {
         assert_eq!(app.selected_index(), Some(1), "which is now row 1");
     }
 
-    /// fails if a selection whose sheep was deleted jumps to the top of the
-    /// flock. It falls to whatever now occupies the same POSITION, clamped —
-    /// throwing an operator back to row 0 of a two-hundred-sheep flock every
-    /// time an unrelated sheep is deleted is the behaviour this rejects.
     #[test]
     fn a_deleted_selection_falls_to_the_row_that_took_its_place() {
         let (mut app, t0) = started();
@@ -5093,7 +4225,7 @@ mod tests {
             "the row that took index 1"
         );
 
-        // The LAST row dying clamps rather than leaving the cursor past the end.
+        // The last row dying clamps rather than leaving the cursor past the end.
         app.update(Msg::Key(KeyPress::SelectLast));
         assert_eq!(app.selected(), Some(RowKey::Sheep(3)));
         app.update(Msg::Snapshot {
@@ -5102,7 +4234,6 @@ mod tests {
         });
         assert_eq!(app.selected(), Some(RowKey::Sheep(2)));
 
-        // An empty flock selects nothing at all, rather than an id that is gone.
         app.update(Msg::Snapshot {
             rows: vec![],
             at: t0,
@@ -5111,11 +4242,6 @@ mod tests {
         assert_eq!(app.selected_index(), None);
     }
 
-    /// fails if moving the selection stops asking for a feed refresh, or
-    /// starts asking for one when the selection did not move. The second half
-    /// is the one that matters: `RefreshSelected` reads two files off disk
-    /// and asks the shepherd for lambs, and a held `k` at the top of the
-    /// flock must not do that once per keypress.
     #[test]
     fn a_selection_that_moves_refreshes_the_feed_and_one_that_cannot_does_not() {
         let (mut app, _) = started();
@@ -5143,9 +4269,6 @@ mod tests {
         );
     }
 
-    /// fails if a moved selection stops asking for lambs. The pane describes
-    /// the selected sheep, so the trigger is the selection changing and
-    /// nothing else.
     #[test]
     fn moving_the_selection_asks_for_lambs() {
         let (mut app, _t0) = started();
@@ -5155,12 +4278,8 @@ mod tests {
         );
     }
 
-    /// fails if the two-second listing starts asking for lambs, which is the
-    /// whole cost decision inverted. `with_lambs`'s own doc says `ListFlock`
-    /// declines the walk because a flock listing is what an operator leaves
-    /// running in a loop; a dashboard putting a full machine enumeration on a
-    /// fixed 2s clock, times however many lookout windows are open, is the
-    /// daemon paying exactly the cost its own code was written to avoid.
+    /// `ListFlock` declines the lamb walk: a full machine enumeration every two
+    /// seconds, times every open lookout.
     #[test]
     fn a_snapshot_refreshes_the_feed_and_does_not_ask_for_lambs() {
         let (mut app, t0) = started();
@@ -5173,9 +4292,6 @@ mod tests {
         );
     }
 
-    /// fails if a frozen dashboard asks the shepherd for anything. Inherited
-    /// from `select_at`'s shipped rule rather than restated: the link is gone,
-    /// so there is nothing to ask.
     #[test]
     fn nothing_is_requested_while_the_link_is_lost() {
         let (mut app, _t0) = started();
@@ -5185,11 +4301,6 @@ mod tests {
         assert_eq!(app.update(Msg::Key(KeyPress::SelectDown)), Effect::None);
     }
 
-    /// fails if a snapshot stops refreshing the feed. This is the whole
-    /// cadence: the feed has no timer of its own, and inherits the two-second
-    /// listing, the drop repair, the lag repair and `r` from this one line.
-    /// It must NOT fire once the link is lost — a frozen dashboard re-reading
-    /// log files would be the one thing on screen still moving.
     #[test]
     fn a_snapshot_refreshes_the_feed_unless_the_link_is_frozen() {
         let (mut app, t0) = started();
@@ -5213,18 +4324,8 @@ mod tests {
         );
     }
 
-    /// fails if a frozen dashboard reads a log file. The snapshot path
-    /// freezes for free — no snapshots arrive after `Msg::Frozen` — but the
-    /// KEY path does not, and `j` on a frozen screen would repaint the feed
-    /// with content newer than the banner saying the values are frozen as of
-    /// 14:32:07. That is the contradiction on one frame that design decision 7
-    /// refuses for the host strip, and 12a's
-    /// `the_frozen_frame_does_not_move_however_long_the_link_stays_gone`
-    /// cannot catch it, because it presses no keys.
-    ///
-    /// The cursor still MOVES: the detail pane re-rendering from the frozen
-    /// listing is the operator reading data already on the frame, which is
-    /// allowed. It is touching the disk that is not.
+    /// The cursor still moves: re-rendering the detail pane from the frozen
+    /// listing is data already on the frame. Touching the disk is not.
     #[test]
     fn a_frozen_dashboard_moves_the_cursor_without_touching_a_file() {
         let (mut app, _) = started();
@@ -5246,10 +4347,6 @@ mod tests {
         assert_eq!(app.selected(), Some(RowKey::Sheep(3)));
     }
 
-    /// fails if a dropped or lagged frame stops triggering an immediate poll.
-    /// The drop carries no information about what was lost; the only repair
-    /// is to ask the shepherd what things look like now — bark's own reason,
-    /// and the reason this dashboard does not go silently wrong under load.
     #[test]
     fn a_drop_and_a_lag_both_ask_for_an_immediate_poll() {
         let (mut app, _) = started();
@@ -5270,11 +4367,6 @@ mod tests {
         );
     }
 
-    /// fails if the two drop conditions stop being told apart. `Dropped` is the
-    /// SHEPHERD's outbound queue overflowing; `Lagged` is this process failing
-    /// to read its own socket fast enough. They live on opposite ends of the
-    /// connection, and an operator cannot tell which end to investigate if the
-    /// notice reads the same. `bleats` pins the same distinction.
     #[test]
     fn a_shepherd_side_drop_and_a_local_lag_read_differently() {
         let (mut app, _) = started();
@@ -5288,8 +4380,6 @@ mod tests {
         assert_ne!(shepherd_side, local);
     }
 
-    /// fails if the uptime column stops advancing between polls. A dashboard
-    /// whose uptime only moves on the 2s poll reads as frozen when it is not.
     #[test]
     fn a_running_sheeps_uptime_advances_with_the_heartbeat() {
         let (mut app, t0) = started();
@@ -5300,11 +4390,6 @@ mod tests {
         assert_eq!(app.uptime_ms(1), Some(65_000));
     }
 
-    /// fails if a FROZEN dashboard keeps counting. This is the specific lie
-    /// this whole state exists to avoid: the shepherd is gone, so nothing on
-    /// screen is known to still be true, and an UPTIME column that keeps
-    /// ticking asserts second by second that a process is still running when
-    /// nothing can see it.
     #[test]
     fn a_frozen_dashboard_stops_the_uptime_clock() {
         let (mut app, t0) = started();
@@ -5326,9 +4411,6 @@ mod tests {
         assert_eq!(at_freeze, Some(65_000));
     }
 
-    /// fails if a sheep that is not running has its uptime animated. A stopped
-    /// sheep's `uptime_ms` is a historical fact — how long it ran — and
-    /// advancing it invents one.
     #[test]
     fn a_stopped_sheeps_uptime_does_not_advance() {
         let t0 = Instant::now();
@@ -5348,13 +4430,6 @@ mod tests {
         assert_eq!(app.uptime_ms(1), Some(60_000));
     }
 
-    /// fails if the gate is checked for one key and not the others. Replaces
-    /// `the_stop_key_refuses_in_both_control_states`: that test's whole
-    /// subject was that `x` refuses in BOTH gate states, and half of that
-    /// stopped being true this task — behind an open gate `x` now arms. Its
-    /// read-only half is strictly subsumed here, which covers all three
-    /// verbs; its control-enabled half moved out and became
-    /// `an_action_key_arms_a_confirm_and_sends_nothing` below.
     #[test]
     fn every_action_key_refuses_while_the_gate_is_closed() {
         for verb in [ActionVerb::Stop, ActionVerb::Restart, ActionVerb::Reload] {
@@ -5372,10 +4447,8 @@ mod tests {
         }
     }
 
-    /// fails if lookout learns to exit on its own. A `DaemonShutdown` is a
-    /// notice here, where in `bleats` it precedes a clean exit — the whole
-    /// point of the maintainer's ruling is that a standing dashboard admits it is stale
-    /// rather than vanishing. Only `q` quits.
+    /// A `DaemonShutdown` is a notice here, where in `bleats` it precedes a
+    /// clean exit.
     #[test]
     fn nothing_but_a_keypress_quits() {
         let (mut app, _) = started();
@@ -5393,23 +4466,8 @@ mod tests {
         assert_eq!(app.update(Msg::Key(KeyPress::Quit)), Effect::Quit);
     }
 
-    /// fails if `Esc` starts quitting out from under a filter. It is the one
-    /// key whose meaning depends on state, which is acceptable only because
-    /// the status bar reads `esc clear` for as long as that is in force and
-    /// the title keeps `2 of 4 in the flock` on screen.
-    ///
-    /// **Deviation from the plan's literal (Task 2, Step 2.2):** the plan
-    /// asserts `Effect::RefreshFeed` here. Traced against `reseat`/
-    /// `set_filter` (both shipped, unchanged, in Task 1): clearing a filter
-    /// only WIDENS the visible set, so a selection valid under the narrower
-    /// filter is — by construction — still valid under the wider one.
-    /// `reseat`'s very first line (`if self.selected_index().is_some() {
-    /// return false; }`) therefore always takes the no-reseat path on any
-    /// widening change, for every fixture, not just this one — there is no
-    /// selected sheep for which clearing a filter could report a move. Empty
-    /// filter's own doc says `RefreshFeed` rides "a selection that actually
-    /// moved"; here it correctly did not, so `Effect::None` is the honest
-    /// answer, not a bug this task should paper over by nudging `reseat`.
+    /// `Effect::None`, not `RefreshFeed`: clearing a filter only widens the
+    /// visible set, so the selection stays seated and `reseat` is a no-op.
     #[test]
     fn esc_clears_the_filter_instead_of_quitting_while_one_is_set() {
         let mut app = filtered("web");
@@ -5418,19 +4476,12 @@ mod tests {
         assert_eq!(app.rows().len(), 4);
     }
 
-    /// fails if the clear becomes unconditional, which is the mirror bug: `q`
-    /// and Ctrl-C quit from every non-editing state, and so does `Esc` when
-    /// there is no filter to take away first.
     #[test]
     fn esc_still_quits_with_no_filter_set() {
         let (mut app, _t0) = started();
         assert_eq!(app.update(Msg::Key(KeyPress::Escape)), Effect::Quit);
     }
 
-    /// fails if typing into the box stops narrowing the table live, or if
-    /// `Enter` narrows it a second time. The design's `filter_editing` frame
-    /// is mid-type with the table already narrowed; applying only changes
-    /// which keys mean what.
     #[test]
     fn the_table_narrows_while_the_query_is_still_being_typed() {
         let (mut app, _t0) = started();
@@ -5449,7 +4500,6 @@ mod tests {
         );
     }
 
-    /// fails if backspace stops widening the table again.
     #[test]
     fn backspace_widens_the_table_back_out() {
         let (mut app, _t0) = started();
@@ -5465,8 +4515,6 @@ mod tests {
         );
     }
 
-    /// fails if abandoning the box leaves the filter behind. `Esc` while
-    /// editing clears and leaves; the two halves are one action.
     #[test]
     fn esc_while_editing_clears_the_filter_and_leaves_the_box() {
         let (mut app, _t0) = started();
@@ -5478,17 +4526,6 @@ mod tests {
         assert_eq!(app.rows().len(), 3);
     }
 
-    /// fails if a notice survives into the filter box. Two things keep the
-    /// query visible and this is one of them: opening the box takes any
-    /// standing notice down (the `self.notice = None` at the top of
-    /// `on_key`'s normal branch, which `FilterStart` goes through), and slot
-    /// 2 of the bar keeps a notice raised LATER, while the box is open, from
-    /// covering it. The second is what actually matters, because
-    /// `Msg::BusLagged`, `BusEvent::Dropped` and `BusEvent::DaemonShutdown`
-    /// all raise notices with no keypress involved and keep arriving while
-    /// somebody types; see the phase plan's "Shapes the design named" #2.
-    /// This test pins the first, which is what stops a stale notice
-    /// reappearing the instant the box closes.
     #[test]
     fn opening_the_filter_takes_a_notice_off_the_bar() {
         let (mut app, _t0) = started();
@@ -5498,12 +4535,6 @@ mod tests {
         assert!(app.notice().is_none(), "the box is what the bar shows now");
     }
 
-    /// fails if a notice raised WHILE the box is open is destroyed rather
-    /// than deferred. The rejected fix for the same problem was to clear
-    /// `self.notice` at the top of `on_text_key`; it would lose a
-    /// `DaemonShutdown` because the operator happened to be mid-word. The bar
-    /// hides the notice under the box (slot 2) and this pins that the notice
-    /// itself is still there to be shown when the box closes.
     #[test]
     fn a_notice_raised_while_typing_is_deferred_and_not_destroyed() {
         let (mut app, _t0) = started();
@@ -5518,9 +4549,6 @@ mod tests {
         assert_eq!(app.filter(), "we", "and the box kept the query");
     }
 
-    /// fails if a reconnect leaves the dashboard in a state that says nothing.
-    /// `Retrying` has to be visible while it is happening — an operator
-    /// watching a shepherd restart should see it, and should see it clear.
     #[test]
     fn the_link_state_walks_live_to_retrying_to_lost_and_back() {
         let (mut app, t0) = started();
@@ -5543,9 +4571,7 @@ mod tests {
             }
         );
 
-        // A late snapshot after the freeze must not silently unfreeze it: the
-        // link task has ended, so there is nothing left to produce one, and
-        // accepting it would be accepting a message that cannot exist.
+        // A late snapshot must not unfreeze it.
         app.update(Msg::Snapshot {
             rows: vec![],
             at: t0,
@@ -5553,10 +4579,6 @@ mod tests {
         assert!(matches!(app.link(), Link::Lost { .. }));
     }
 
-    /// fails if selecting up at the first row or down at the last one wraps or
-    /// panics. Clamping is the choice: wrapping a two-hundred-sheep flock from
-    /// the last row to the first on one keypress loses the operator's place
-    /// with nothing to undo it.
     #[test]
     fn the_selection_clamps_at_both_ends() {
         let (mut app, _) = started();
@@ -5582,13 +4604,6 @@ mod tests {
         assert_eq!(app.selected_index(), Some(2));
     }
 
-    /// fails if `r` stops asking for a poll while the link is live, or starts
-    /// pretending to ask once it is frozen. It is the one key that does I/O,
-    /// and it is what an operator presses when they do not believe the screen
-    /// — so it has to be honest in both directions. The link task ENDS at the
-    /// freeze (design decision 8), which drops its poll receiver, so an
-    /// `Effect::PollNow` after that is a `try_send` into a closed channel:
-    /// the operator presses the key and gets silence with no reason given.
     #[test]
     fn refresh_polls_while_live_and_says_why_it_cannot_once_frozen() {
         let (mut app, _) = started();
@@ -5607,8 +4622,6 @@ mod tests {
         assert!(notice.contains("nothing left to ask"));
     }
 
-    /// fails if a notice outlives the keypress after it. A stale refusal still
-    /// on screen a minute later is read as a live one.
     #[test]
     fn the_next_keypress_clears_the_notice() {
         let (mut app, _) = started();
@@ -5618,16 +4631,9 @@ mod tests {
         assert!(app.notice().is_none());
     }
 
-    /// fails if a frozen dashboard accepts a host reading. The strip reads
-    /// THIS machine, which lookout can still see after the shepherd dies — so
-    /// this is the one pane that could keep ticking, and one line ticking over
-    /// on a screen whose banner says the values are frozen as of 14:32:07 is a
-    /// contradiction on the same frame.
-    ///
-    /// Asserted in the reducer, which is the single place the rule lives:
-    /// `run_ui`'s heartbeat samples unconditionally and this arm decides
-    /// whether the dashboard is allowed to believe it, exactly as
-    /// `Msg::Tick` and the uptime clock already work.
+    /// The strip reads this machine, which lookout can still see after the
+    /// shepherd dies, so it is the one pane that could keep ticking under a
+    /// banner saying the values are frozen.
     #[test]
     fn a_frozen_dashboard_ignores_a_host_sample() {
         let (mut app, _) = started();
@@ -5654,10 +4660,6 @@ mod tests {
         );
     }
 
-    /// fails if `Msg::Bleats` starts asking for another refresh. A reducer
-    /// that answered its own feed update with `Effect::RefreshFeed` would
-    /// spin the UI task at full tilt, re-reading two files as fast as the
-    /// loop can go — the one recursion this design can have.
     #[test]
     fn applying_a_tail_does_not_ask_for_another_one() {
         let (mut app, _) = started();
@@ -5669,16 +4671,8 @@ mod tests {
         );
     }
 
-    /// fails if a frozen dashboard applies a coalesced feed read that landed
-    /// after the freeze. `refresh_feed` already refuses to ISSUE a read once
-    /// the link is `Link::Lost`, but `run_ui`'s coalesced read is armed by a
-    /// `feed_dirty` flag set BEFORE the freeze — a read requested a moment
-    /// before `Msg::Frozen` can still be in flight when it lands, and without
-    /// a guard here the `Msg::Bleats` arm would apply it anyway. That is the
-    /// same contradiction-on-one-frame design decision 7 already refuses for
-    /// the host strip and the uptime clock; the single enforcement point for
-    /// the feed has to live in this arm; nothing upstream can catch a read
-    /// that was already in flight when the freeze landed.
+    /// `run_ui`'s coalesced read is armed before the freeze, so a read can
+    /// still be in flight when `Msg::Frozen` lands.
     #[test]
     fn a_frozen_dashboard_ignores_a_bleats_tail_in_flight_at_the_freeze() {
         let (mut app, _) = started();
@@ -5718,22 +4712,12 @@ mod tests {
         );
     }
 
-    /// A dashboard whose filter is set without any keymap involved. Task 2
-    /// wires `/` to this; this task proves the sequence underneath it.
+    /// A dashboard whose filter is set without any keymap involved.
     ///
     /// Four sheep, two of which contain `web`: `api-web` at id 1 and
-    /// `web-worker` at id 4, with `cron` and `queue` sitting BETWEEN them. The
-    /// gap is deliberate. It is what makes `j` stepping over a hidden row a
-    /// falsifiable claim rather than one a contiguous fixture would pass by
-    /// accident.
-    ///
-    /// The names are what they are because the table reads by NAME. The old
-    /// fixture was `web` 1, `api` 2, `web-worker` 3, `cron` 4, which put the
-    /// gap in the id order alone: sorted by name, `web` and `web-worker` are
-    /// adjacent and nothing can ever sit between them that the query `web`
-    /// does not also match. Every "stepped over a hidden row" test here would
-    /// have gone on passing over a contiguous pair. `api-web` sorts before
-    /// `cron`, which is what puts two hidden rows back in the middle.
+    /// `web-worker` at id 4, with `cron` and `queue` between them. The table
+    /// sorts by name, so the gap is what makes `j` stepping over a hidden row
+    /// falsifiable.
     fn filtered(query: &str) -> App {
         let t0 = Instant::now();
         let mut app = App::new(
@@ -5755,33 +4739,10 @@ mod tests {
         app
     }
 
-    /// fails if the table draws in id order, or if two instances of one app
-    /// are left in an order the map decides.
-    ///
-    /// `flock` is a `BTreeMap<u32, Row>`, so a build that simply iterates it
-    /// draws by id. The fixture makes those two answers impossible to
-    /// confuse: by id it is `web` 0, `api` 1, `web` 2; by name and then id it
-    /// is `api` 1, `web` 0, `web` 2.
-    ///
-    /// The two `web` rows carry the clustered-app case, but be clear about
-    /// what they can and cannot catch here, because it is not what the
-    /// equivalent test in `shep-core` catches. Measured with the tiebreak
-    /// removed (`sort_by(|a, b| a.0.cmp(b.0))`, a STABLE name-only key): this
-    /// test still passed. `flock` is a `BTreeMap<u32, Row>`, so the rows
-    /// arrive in id order already and a stable name sort leaves them in it.
-    /// The tiebreak is unfalsifiable from this pane, and pretending otherwise
-    /// is how a test comes to assert something nothing could break. What this
-    /// DOES catch, measured with the sort deleted outright, is the whole
-    /// defect: the rows came back `web` 0, `api` 1, `web` 2, straight off the
-    /// map.
-    ///
-    /// The key this test exercises is `rows()`'s own `(name, id)`, not
-    /// `visible_rows`'s `(name, instance, id)` -- `rows()` is the flat sheep
-    /// list, with no group headers and no slots in it, and nothing here
-    /// calls the sequence the table draws. Both keys are TOTAL, which is the
-    /// property that matters either way: this pane repolls every two
-    /// seconds, and a key that is not total is what would let two rows swap
-    /// places under the operator's cursor between refreshes.
+    /// The fixture separates the two answers: by id it is `web` 0, `api` 1,
+    /// `web` 2; by name then id it is `api` 1, `web` 0, `web` 2. The `(name,
+    /// id)` tiebreak itself is not falsifiable here, since the rows arrive in
+    /// id order; what this catches is the sort going missing entirely.
     #[test]
     fn the_table_draws_by_name_then_by_id() {
         let t0 = Instant::now();
@@ -5808,11 +4769,6 @@ mod tests {
         assert_eq!(drawn, vec![("api", 1), ("web", 0), ("web", 2)]);
     }
 
-    /// fails if the table stops narrowing, or if the flock's real size stops
-    /// being available beside the narrowed one. The title reads both numbers
-    /// and a title that could only read the narrowed one would understate the
-    /// flock, which is the same confident wrong number the `-` CPU cell and
-    /// the frozen uptime rule exist to prevent.
     #[test]
     fn a_filter_narrows_the_rows_and_leaves_the_real_size_readable() {
         let app = filtered("web");
@@ -5820,18 +4776,14 @@ mod tests {
         assert_eq!(app.flock_len(), 4, "the flock did not get smaller");
     }
 
-    /// fails if the filter matches whole names instead of substrings, which is
-    /// precisely the failure the CLI's selector grammar would have had:
-    /// `ProcessSelector`'s `Name` compares with `==`, so typing `w`, `we`,
-    /// `web` toward `web-worker` matches nothing at every step.
+    /// `ProcessSelector`'s `Name` compares with `==`, so borrowing the CLI's
+    /// selector grammar would match nothing while `web-worker` is being typed.
     #[test]
     fn the_filter_matches_a_substring_and_not_a_whole_name() {
         assert_eq!(filtered("wor").rows().len(), 1, "web-worker, by its middle");
         assert_eq!(filtered("w").rows().len(), 2, "api-web, by its own middle");
     }
 
-    /// fails if either `to_lowercase` is dropped. Both directions, because
-    /// dropping one of the two leaves the other test passing.
     #[test]
     fn the_filter_ignores_case_in_both_directions() {
         let t0 = Instant::now();
@@ -5855,9 +4807,6 @@ mod tests {
         assert_eq!(app.rows().len(), 1, "and an uppercase one");
     }
 
-    /// fails if `select_by` walks the whole flock again. This is the whole
-    /// point of the task: `j` from the first visible row must land on the
-    /// second VISIBLE row, not on whatever id happens to sit next in the map.
     #[test]
     fn j_and_k_step_only_over_visible_rows() {
         let mut app = filtered("web");
@@ -5882,7 +4831,6 @@ mod tests {
         assert_eq!(app.selected(), Some(RowKey::Sheep(1)));
     }
 
-    /// fails if `SelectLast` measures the flock rather than the visible set.
     #[test]
     fn select_last_lands_on_the_last_visible_row() {
         let mut app = filtered("web");
@@ -5894,11 +4842,6 @@ mod tests {
         );
     }
 
-    /// fails if a filter that hides the selection snaps to row 0, or drops the
-    /// selection entirely while rows are still visible. `reseat`'s shipped
-    /// rule is that a lost selection falls to whatever now occupies the same
-    /// POSITION, clamped: snapping to the top would throw an operator to the
-    /// start of a two hundred sheep flock for typing one more character.
     #[test]
     fn a_filter_that_hides_the_selection_clamps_to_the_nearest_visible_row() {
         let mut app = filtered("");
@@ -5916,10 +4859,6 @@ mod tests {
         );
     }
 
-    /// fails if nothing-matches leaves the selection pointing at a hidden
-    /// sheep. Every pane below the table describes the selection, so a
-    /// selection nobody can see is four panes describing a sheep that is not
-    /// on screen.
     #[test]
     fn nothing_visible_means_nothing_selected() {
         let app = filtered("zzz");
@@ -5929,13 +4868,6 @@ mod tests {
         assert_eq!(app.flock_len(), 4, "the flock is still four sheep");
     }
 
-    /// fails if a snapshot clears the filter, or rebuilds the table from the
-    /// unfiltered map. The two-second `ListFlock` reply REPLACES `self.flock`
-    /// wholesale and is by far the most frequent message this reducer sees, so
-    /// a regression here would make the filter appear to work for two seconds
-    /// and then silently widen the table under an operator who is still
-    /// reading it, with the title's `2 of 4` the only thing left saying a
-    /// filter is on.
     #[test]
     fn a_filter_survives_the_two_second_snapshot() {
         let mut app = filtered("web");
@@ -5954,9 +4886,6 @@ mod tests {
         assert_eq!(app.flock_len(), 4);
     }
 
-    /// fails if clearing the filter does not bring the whole flock back, or
-    /// leaves the selection unseated. An empty query is the same as no filter,
-    /// which is also what `Enter` on an empty box has to mean.
     #[test]
     fn an_empty_query_is_the_same_as_no_filter() {
         let mut app = filtered("zzz");
@@ -5965,11 +4894,8 @@ mod tests {
         assert_eq!(app.selected(), Some(RowKey::Sheep(1)), "seated again");
     }
 
-    /// fails if the three states `ProcessInfo::lambs` distinguishes get
-    /// collapsed. The wire type keeps them apart on purpose: `None` means this
-    /// reply did not walk, `Some(vec![])` means it walked and found nothing,
-    /// and the pane says different sentences for each because they are
-    /// different facts about the machine.
+    /// `None` means the reply did not walk, `Some(vec![])` means it walked and
+    /// found nothing.
     #[test]
     fn a_lamb_reply_records_which_of_the_three_states_it_saw() {
         let (mut app, t0) = started();
@@ -6000,11 +4926,6 @@ mod tests {
         let _ = t0;
     }
 
-    /// fails if a reading taken for one sheep is shown against another. The
-    /// reading carries the id it was taken for and the pane asks by id, so a
-    /// request dropped by a full channel and a reply for the previous
-    /// selection both read as "not read yet" with no second field to track
-    /// them.
     #[test]
     fn a_reading_for_another_sheep_reads_as_not_read_yet() {
         let (mut app, _t0) = started();
@@ -6020,9 +4941,6 @@ mod tests {
         assert!(app.lambs_for(2).is_none(), "not this sheep's reading");
     }
 
-    /// fails if a failed lamb fetch steals the status bar. It is a decoration
-    /// on a pane, not an operator's action, and the pane already says what it
-    /// does not know (A17).
     #[test]
     fn a_failed_lamb_fetch_says_so_in_the_pane_and_raises_no_notice() {
         let (mut app, _t0) = started();
@@ -6034,10 +4952,6 @@ mod tests {
         assert!(app.notice().is_none(), "no notice for a decoration");
     }
 
-    /// fails if an unrecognised reply is recorded as a successful walk.
-    /// `Response` is `#[non_exhaustive]`; a variant this binary predates is
-    /// not a lamb list and must not read as an empty one, which would say
-    /// "none found" about a machine nobody looked at.
     #[test]
     fn an_unrecognised_lamb_reply_is_a_failure_and_not_an_empty_walk() {
         let (mut app, _t0) = started();
@@ -6048,11 +4962,8 @@ mod tests {
         assert!(matches!(app.lambs_for(1), Some((LambWalk::Failed, _))));
     }
 
-    /// fails if a reading landing after a freeze reaches the frame. Same guard
-    /// and same reason as `Msg::Bleats`: the fetch is armed before the freeze
-    /// can land, so a reply can still be in flight when `Msg::Frozen` arrives,
-    /// and content newer than a banner saying the values are frozen is the
-    /// contradiction-on-one-frame this dashboard refuses everywhere else.
+    /// The fetch is armed before the freeze can land, so a reply can still be
+    /// in flight when `Msg::Frozen` arrives.
     #[test]
     fn a_lamb_reply_after_a_freeze_is_refused() {
         let (mut app, _t0) = started();
@@ -6073,8 +4984,6 @@ mod tests {
         );
     }
 
-    /// fails if the reply's rows are thrown away and the table left to wait
-    /// for the next poll. The shepherd's own rows are right there.
     #[test]
     fn an_accepted_stop_upserts_the_rows_the_shepherd_returned() {
         let mut app = allowed();
@@ -6107,12 +5016,8 @@ mod tests {
         assert!(app.action().is_none(), "the in-flight state cleared");
     }
 
-    /// fails if a reload reply claims the swap finished. `Response::Reloading`
-    /// is an ACCEPTANCE, its own doc says so, and the swaps arrive afterwards
-    /// on the bus as `process.reload` / `process.reloaded` /
-    /// `process.reload_abandoned`, which the table already consumes. A
-    /// sentence saying "reloaded" would be the one lie this reply makes easy
-    /// to tell.
+    /// `Response::Reloading` is an acceptance; the swaps arrive afterwards on
+    /// the bus, which the table consumes.
     #[test]
     fn a_reload_reply_does_not_claim_the_swap_finished() {
         let mut app = allowed();
@@ -6138,10 +5043,7 @@ mod tests {
         assert!(!said.contains("reloaded"), "got {said:?}");
     }
 
-    /// fails if the daemon's own words are replaced with a canned string. The
-    /// message is a sentence a human wrote; `RequestError`'s full `Display`
-    /// interpolates the code with `{:?}` and would put a Rust identifier on an
-    /// operator's screen.
+    /// `RequestError`'s full `Display` would put a Rust identifier on screen.
     #[test]
     fn a_daemon_refusal_reaches_the_bar_in_the_daemons_own_words() {
         let mut app = allowed();
@@ -6168,7 +5070,6 @@ mod tests {
         assert!(app.notice().is_some_and(Notice::is_grave));
     }
 
-    /// fails if a connection that died mid-request reports as anything else.
     #[test]
     fn a_connection_that_died_mid_request_says_so_under_the_same_prefix() {
         let mut app = allowed();
@@ -6187,15 +5088,8 @@ mod tests {
         assert!(said.contains(&RequestError::Closed.to_string()));
     }
 
-    /// fails if a reply this binary does not understand reads as success.
-    /// `Response` is `#[non_exhaustive]`, and swallowing an unrecognised
-    /// variant into `Ok` is what `flock()` does and what this must not: a
-    /// stop that silently reported success while the sheep kept running is the
-    /// worst outcome this feature has.
-    ///
-    /// The second half is the sharper case: the RIGHT SHAPE for the wrong
-    /// verb. A `Stopped` answering a `Restart` carries rows and would upsert
-    /// happily.
+    /// The second case is the sharper one: the right shape for the wrong verb.
+    /// A `Stopped` answering a `Restart` carries rows and would upsert happily.
     #[test]
     fn an_unrecognised_reply_says_so_rather_than_reading_as_success() {
         for reply in [
@@ -6223,9 +5117,6 @@ mod tests {
         }
     }
 
-    /// `s` asks for the read rather than opening on stale or empty state: the
-    /// file can have changed since the last look, and an empty screen while the
-    /// read is in flight is a screen that lies for one frame.
     #[test]
     fn s_asks_for_the_file_before_the_screen_opens() {
         let mut app = fixtures::full_app();
@@ -6269,8 +5160,7 @@ mod tests {
         assert!(app.settings().is_none());
     }
 
-    /// The one arm of the `Escape` cascade this screen swaps. From the dashboard
-    /// with no filter, `Esc` quits; from here it must not.
+    /// From the dashboard with no filter `Esc` quits; from here it must not.
     #[test]
     fn escape_closes_the_screen_and_never_quits() {
         let mut app = fixtures::app_in_settings();
@@ -6286,8 +5176,6 @@ mod tests {
             let _ = app.update(Msg::Key(KeyPress::TextChar(c)));
         }
         let _ = app.update(Msg::Key(KeyPress::TextApply));
-        // `selected()` hands back an owned `Option<RowKey>` (app.rs:1436), so
-        // there is nothing to clone.
         let selected = app.selected();
         let filter = app.filter().to_string();
 
@@ -6327,7 +5215,7 @@ mod tests {
             app.settings().unwrap().cursor(),
             Some(*rows.last().unwrap())
         );
-        // and it stops rather than wrapping, the way the flock table does
+        // and it stops rather than wrapping
         let _ = app.update(Msg::Key(KeyPress::SelectDown));
         assert_eq!(
             app.settings().unwrap().cursor(),
@@ -6338,38 +5226,23 @@ mod tests {
     #[test]
     fn an_action_key_from_the_dashboard_is_unreachable_while_the_screen_is_up() {
         let mut app = fixtures::app_in_settings_with_control();
-        // `x` is the stop key on the dashboard. In here it is not an action at all.
+        // `x` is the stop key on the dashboard. In here it is not an action.
         let _ = app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
-        // The accessor is `App::action()` (app.rs:1662).
         assert!(app.action().is_none(), "no sheep confirm can arm from here");
     }
 
-    /// fails if ANY key route on the settings screen reaches a write while
-    /// the gate is closed.
+    /// Every key sequence that ends in a write, not one key: a gate guarding
+    /// `space` alone leaves the free-text editor's route reaching
+    /// `WriteSetting` on a read-only lookout.
     ///
-    /// Not "the cycle key refuses", which is all
-    /// `a_read_only_lookout_opens_the_screen_and_refuses_the_edit_key`
-    /// below ever checked. `space` was the only door the first version of
-    /// this gate guarded, and the free-text editor added a task later
-    /// walked straight around it: `SelectDown, SelectDown, Confirm,
-    /// TextChar, TextChar, TextApply, Confirm` on a `Control::ReadOnly`
-    /// lookout came back `WriteSetting(Set { field: Socket, .. })`. So this
-    /// walks every sequence that ends in a write instead of naming one key,
-    /// and asserts the two write effects never come back.
-    ///
-    /// The refusal is checked per keypress rather than at the end because
-    /// `on_settings_key` clears `self.notice` on every key: a route whose
-    /// last press is a no-op `Enter` has already had the sentence wiped by
-    /// the time the walk finishes.
+    /// The refusal is checked per keypress rather than at the end, because
+    /// `on_settings_key` clears `self.notice` on every key.
     #[test]
     fn no_key_route_writes_the_config_while_the_gate_is_closed() {
         use KeyPress::{Confirm, Cycle, SelectDown, TextApply, TextChar};
 
-        // The six scalars come first in `Settings::rows`, in the order
-        // `log_level, log_json, socket, max_cron_sleep, allow_control,
-        // level`, and `fixtures::settings_snapshot` carries two dogs after
-        // them -- so two `SelectDown`s reach `socket` and six reach the
-        // first dog row.
+        // `Settings::rows` puts the six scalars first, then the fixture's two
+        // dogs: two `SelectDown`s reach `socket`, six the first dog row.
         let routes: &[(&str, &[KeyPress])] = &[
             ("space on a cycled scalar", &[Cycle, Confirm]),
             (
@@ -6435,11 +5308,8 @@ mod tests {
         }
     }
 
-    /// fails if the same five routes stop reaching a write once the gate is
-    /// open. The twin of
-    /// `no_key_route_writes_the_config_while_the_gate_is_closed`, and the
-    /// half that keeps it honest: a gate that refused everything would pass
-    /// that test and be useless.
+    /// The half that keeps the closed-gate test honest: a gate that refused
+    /// everything would pass it and be useless.
     #[test]
     fn every_one_of_those_routes_writes_once_the_gate_is_open() {
         use KeyPress::{Confirm, Cycle, SelectDown, TextApply, TextChar};
@@ -6502,8 +5372,8 @@ mod tests {
         assert!(app.settings().unwrap().pending().is_some());
     }
 
-    /// Six log levels and one cycle key. Without re-arming, the fourth is
-    /// unreachable without cancelling in between.
+    /// Six log levels and one cycle key: without re-arming, the fourth needs a
+    /// cancel in between.
     #[test]
     fn space_advances_the_candidate_rather_than_needing_a_cancel() {
         let mut app = fixtures::app_in_settings_with_control();
@@ -6544,15 +5414,8 @@ mod tests {
         assert!(text.contains("the next command reads it"), "got: {text}");
     }
 
-    /// fails if the style confirm keeps promising "the next command reads
-    /// it" while a layer above the file is set.
-    ///
-    /// `style::resolve` is flag over env over config, so with `$SHEP_STYLE`
-    /// or `--style` in play the write lands and nothing changes. This is
-    /// the one field where lookout KNOWS -- the SOURCE cell on the same row
-    /// already reads `$SHEP_STYLE` or `--style` -- and it was the one field
-    /// whose confirm said nothing about it, while the other three carry a
-    /// caveat about layers lookout cannot see at all.
+    /// `style::resolve` is flag over env over config, so with `$SHEP_STYLE` or
+    /// `--style` in play the write lands and nothing changes.
     #[test]
     fn a_shadowed_style_confirm_names_the_layer_that_keeps_winning() {
         for (source, layer) in [
@@ -6574,13 +5437,8 @@ mod tests {
         }
     }
 
-    /// fails if `space` on the style row cycles from the level in FORCE
-    /// rather than the level on DISK.
-    ///
-    /// With `$SHEP_STYLE=bare` over a file saying `full`, cycling the
-    /// resolved value walks `bare -> full` and proposes `full`, which is
-    /// what the file already holds: a no-op write, reported to the operator
-    /// as a change. From the file it walks `full -> plain`.
+    /// With `$SHEP_STYLE=bare` over a file saying `full`, cycling the resolved
+    /// value would propose `full`: a no-op write, reported as a change.
     #[test]
     fn the_style_cycle_starts_from_the_file_and_not_the_level_in_force() {
         let mut app = fixtures::app_in_settings_with_shadowed_style(StyleSource::Env);
@@ -6635,10 +5493,7 @@ mod tests {
         );
         assert!(app.settings().unwrap().pending().is_none());
 
-        // The re-read itself: `run_ui` drives this through `spawn_blocking`
-        // and `load_settings`; this test drives the landing message
-        // directly, the same way the fixtures that open the screen already
-        // do for the initial `s`.
+        // The re-read, which `run_ui` drives through `load_settings`.
         let mut updated = fixtures::settings_snapshot();
         updated.log_level = ScalarView {
             value: candidate,
@@ -6651,10 +5506,6 @@ mod tests {
         assert_eq!(app.settings().unwrap().snapshot(), &updated);
     }
 
-    /// The other half of the row-update story: an `Unset` has no local
-    /// value to fold in (only the document does), which is exactly why the
-    /// fix routes both through the same re-read rather than growing a
-    /// second, `Unset`-shaped folding path.
     #[test]
     fn an_unset_write_returns_the_row_to_the_default() {
         let mut app = fixtures::app_in_settings_on(SettingField::MaxCronSleep);
@@ -6691,8 +5542,7 @@ mod tests {
         assert_eq!(app.settings().unwrap().snapshot(), &updated);
     }
 
-    /// fails if a landed write's own reload throws the cursor back to the
-    /// first row -- `Msg::Settings`'s `opening` check is what this pins.
+    /// Pins `Msg::Settings`'s `opening` check.
     #[test]
     fn the_cursor_survives_a_landed_writes_reload() {
         let mut app = fixtures::app_in_settings_on(SettingField::MaxCronSleep);
@@ -6712,8 +5562,6 @@ mod tests {
         assert_eq!(app.settings().unwrap().cursor(), before);
     }
 
-    /// fails if `r` throws the cursor back to the first row the same way a
-    /// landed write's own reload almost did.
     #[test]
     fn the_cursor_survives_a_refresh() {
         let mut app = fixtures::app_in_settings_on(SettingField::MaxCronSleep);
@@ -6748,8 +5596,7 @@ mod tests {
     }
 
     /// The divergence from the sheep confirm, which `disarm_on_link_change`
-    /// clears. A settings edit is local file I/O over a file that is not
-    /// stale.
+    /// clears: a settings edit is local file I/O.
     #[test]
     fn a_lost_link_leaves_a_scalar_confirm_armed() {
         let mut app = fixtures::app_in_settings_with_control();
@@ -6763,8 +5610,8 @@ mod tests {
         );
     }
 
-    /// And it still expires, off the raw tick rather than `self.now`, which
-    /// stops advancing once the link is lost.
+    /// Off the raw tick rather than `self.now`, which stops advancing once the
+    /// link is lost.
     #[test]
     fn a_settings_confirm_expires_on_a_frozen_dashboard() {
         let (mut app, start) = fixtures::app_in_settings_at();
@@ -6792,14 +5639,9 @@ mod tests {
         assert!(app.settings().is_none());
     }
 
-    /// fails if an action armed while the read is still in flight survives
-    /// the screen opening. `s` raises `Effect::LoadSettings` while
-    /// `self.settings` is still `None`, so `x` reaches `arm()` normally and
-    /// succeeds; once the read lands, `on_key`'s settings branch runs ahead
-    /// of the armed-confirm cancel block and `on_settings_key` no-ops
-    /// `Confirm`, so nothing would ever reach the code that resolves an
-    /// armed action. The fix is the same closing-by-construction `on_key`'s
-    /// own comment already argues for `/` and the filter box.
+    /// `s` raises `Effect::LoadSettings` while `self.settings` is still `None`,
+    /// so `x` reaches `arm()`. Once the read lands, `on_settings_key` no-ops
+    /// `Confirm`, so nothing could resolve the armed action.
     #[test]
     fn opening_the_screen_clears_an_action_armed_while_the_read_was_in_flight() {
         let mut app = fixtures::allowed_app();
@@ -6818,15 +5660,9 @@ mod tests {
         );
     }
 
-    /// fails if the filter box survives the screen opening the same way an
-    /// armed action almost did. `s` raises `Effect::LoadSettings` while
-    /// `self.settings` is still `None`, so `/` reaches `on_key`'s ordinary
-    /// dispatch and opens the box; once the read lands, `on_key`'s
-    /// `self.mode == InputMode::Text` check runs ahead of the settings
-    /// branch, so every key after this would keep landing in
-    /// `on_text_key` and never reach `on_settings_key` at all. The query
-    /// is kept rather than cleared -- `TextApply`'s reading, argued at the
-    /// fix's own call site.
+    /// `on_key` checks the text mode ahead of its settings branch, so a box
+    /// left open would eat every key the settings keymap owns. The query itself
+    /// is kept.
     #[test]
     fn opening_the_screen_closes_a_filter_box_left_open_while_the_read_was_in_flight() {
         let mut app = fixtures::allowed_app();
@@ -6851,10 +5687,6 @@ mod tests {
         assert_eq!(app.filter(), "we", "the typed query is kept, not discarded");
     }
 
-    /// fails if `App::set_style` does not round trip exactly: the flag
-    /// source in particular, since that is the layer the settings screen's
-    /// own STYLE LEVEL row was silently dropping before this was wired
-    /// through `App` at all.
     #[test]
     fn set_style_round_trips_exactly() {
         let mut app = fixtures::full_app();
@@ -6867,14 +5699,9 @@ mod tests {
         assert_eq!(app.style(), (StyleLevel::Bare, StyleSource::Flag));
     }
 
-    /// fails if the settings screen's own STYLE LEVEL row can disagree with
-    /// the style `App` was told to carry. Drives the exact call
-    /// `Effect::LoadSettings` makes (`load_settings(path, socket_default,
-    /// app.style())`) against a real file on disk whose own `[style]
-    /// level` names a THIRD, different level -- proving the row reports
-    /// the value threaded onto `App`, not one re-derived from the file,
-    /// which is what a flag "reaching the row" rather than being dropped
-    /// actually means.
+    /// Against a real file whose `[style] level` names a third, different
+    /// level: the row reports the value threaded onto `App`, not one re-derived
+    /// from the file.
     #[test]
     fn the_style_set_on_the_app_reaches_the_settings_row_undropped() {
         let dir = tempfile::tempdir().unwrap();
@@ -6953,9 +5780,8 @@ mod tests {
         assert!(text.contains("a reload will not move it"), "got: {text}");
     }
 
-    /// A refusal is discovered under the lock, so it lands after the confirm.
-    /// The typed text has to survive it, or the operator retypes a path to fix
-    /// one character.
+    /// A refusal is discovered under the lock, so it lands after the confirm,
+    /// and the typed text has to survive it.
     #[test]
     fn a_refused_write_reopens_the_editor_with_the_text_intact() {
         let mut app = fixtures::app_in_settings_on(SettingField::MaxCronSleep);
@@ -7008,11 +5834,6 @@ mod tests {
         );
     }
 
-    /// fails if an armed candidate survives a movement key. `space` on
-    /// `log_level` arms it; `j` must cancel that arm instead of also
-    /// moving the cursor to `log_json` -- the same cancel-before-act rule
-    /// the dashboard's `x`/`R`/`L` already follow (task 7 review finding
-    /// A).
     #[test]
     fn movement_cancels_an_armed_candidate_rather_than_also_moving() {
         let mut app = fixtures::app_in_settings_with_control(); // cursor on log_level
@@ -7034,10 +5855,6 @@ mod tests {
         );
     }
 
-    /// fails if an armed candidate survives `r`. `space` arms; `r` must
-    /// cancel that arm instead of silently dropping it while reloading the
-    /// screen underneath it -- the same cancel-before-act rule every other
-    /// key on this screen already follows.
     #[test]
     fn refresh_cancels_an_armed_candidate_rather_than_silently_dropping_it() {
         let mut app = fixtures::app_in_settings_with_control(); // cursor on log_level
@@ -7074,7 +5891,6 @@ mod tests {
         assert!(text.contains("deregistered"), "got: {text}");
     }
 
-    /// The chain: the write lands, and the reducer raises the daemon half.
     /// One message still yields one effect.
     #[test]
     fn a_written_dog_toggle_raises_the_daemon_half() {
@@ -7138,11 +5954,8 @@ mod tests {
         );
     }
 
-    /// Drives a dog toggle all the way to `Effect::Send`, the setup every
-    /// `on_dog_reply` test below shares: arm, confirm (the file half),
-    /// `Msg::DogWritten` landing `Ok` (the daemon half goes out). Panics
-    /// with a message naming which step failed, rather than an unwrap,
-    /// since every caller is a test asserting on what happens next.
+    /// Drives a dog toggle to `Effect::Send`: arm, confirm the file half, then
+    /// land `Msg::DogWritten` so the daemon half goes out.
     fn armed_and_sent_dog(name: &str) -> (App, Sent) {
         let mut app = fixtures::app_in_settings_on_dog(name);
         let _ = app.update(Msg::Key(KeyPress::Cycle));
@@ -7158,10 +5971,8 @@ mod tests {
         (app, sent)
     }
 
-    /// `EnableDog` answers `Response::DogStarted`, and the reply's own
-    /// sentence names what the shepherd did rather than a bare "done" --
-    /// the same convention `on_action_reply`'s own `outcome()` sets for a
-    /// sheep action.
+    /// `EnableDog` answers `Response::DogStarted`. The sentence names what the
+    /// shepherd did rather than a bare "done".
     #[test]
     fn a_landed_enable_names_what_the_shepherd_did() {
         let (mut app, sent) = armed_and_sent_dog("metrics");
@@ -7188,10 +5999,8 @@ mod tests {
         );
     }
 
-    /// `DisableDog` answers `Response::Deleted`, the same reply `Delete`
-    /// gives -- and disable's own reply names the deregistration, the
-    /// sharpest fact on this screen, since the confirm that said so is
-    /// gone by the time this lands.
+    /// `DisableDog` answers `Response::Deleted`, the reply `Delete` gives. The
+    /// sentence names the deregistration, since the confirm is gone by now.
     #[test]
     fn a_landed_disable_names_the_deregistration() {
         let (mut app, sent) = armed_and_sent_dog("otel");
@@ -7207,8 +6016,7 @@ mod tests {
     }
 
     /// Whether the settings screen's own dogs list still says `name` is
-    /// enabled. Reads the snapshot the screen is rendering from, not the
-    /// file, which is the whole point: the two can disagree.
+    /// enabled. Reads the snapshot, not the file: the two can disagree.
     #[track_caller]
     fn dog_enabled_in_view(app: &App, name: &str) -> bool {
         app.settings()
@@ -7221,22 +6029,9 @@ mod tests {
             .enabled
     }
 
-    /// fails if a landed dog toggle leaves the dogs table showing what the
-    /// file said BEFORE the write.
-    ///
-    /// The file half lands first and the daemon half second, so by the time
-    /// this reply arrives `DogView.enabled` is already stale while RUNNING
-    /// keeps updating off the two-second poll. Nothing raised a re-read, so
-    /// a landed `enable metrics` sat there reading `metrics | no | online`
-    /// -- the dogs table manufacturing the one drift row the docs page
-    /// teaches an operator to read as "running with nothing enabling it".
-    /// The scalar path already solved this: `Msg::SettingWritten`'s `Ok`
-    /// arm raises `Effect::LoadSettings` rather than folding the write into
-    /// the row by hand, and this inherits it.
-    ///
-    /// Both directions, because an enable and a disable answer with
-    /// different replies (`DogStarted` and `Deleted`) down two different
-    /// arms of `on_dog_reply`'s own match.
+    /// The file half lands first, so `DogView.enabled` is stale by the time
+    /// this reply arrives while RUNNING keeps updating off the poll. Without
+    /// the re-read a landed `enable metrics` reads `metrics | no | online`.
     #[test]
     fn a_landed_toggle_re_reads_the_file_in_both_directions() {
         for (name, enable) in [("metrics", true), ("otel", false)] {
@@ -7273,8 +6068,7 @@ mod tests {
                 "{name}: nothing is folded into the row by hand -- the re-read is the repair"
             );
 
-            // The re-read landing, with the bit the write actually put in
-            // the file.
+            // The re-read landing, with the bit the write put in the file.
             let mut fresh = app.settings().unwrap().snapshot().clone();
             for dog in &mut fresh.dogs {
                 if dog.name == name {
@@ -7291,14 +6085,9 @@ mod tests {
         }
     }
 
-    /// fails if a reply this binary does not understand -- or the RIGHT
-    /// SHAPE for the WRONG verb -- reads as success. `metrics` is armed as
-    /// an `enable`, so `Response::Deleted` (the shape a `DisableDog` gets)
-    /// is a mismatched guard rather than a recognised reply, and
-    /// `Response::Pong` is a reply this binary has genuinely never heard of
-    /// -- both must land in the same refusal, the same pairing
-    /// `an_unrecognised_reply_says_so_rather_than_reading_as_success` makes
-    /// for a sheep action.
+    /// `metrics` is armed as an `enable`, so `Response::Deleted` is the right
+    /// shape for the wrong verb and `Response::Pong` is a reply this binary has
+    /// never heard of.
     #[test]
     fn an_unrecognised_dog_reply_says_so_rather_than_reading_as_success() {
         for reply in [Response::Pong, Response::Deleted(vec![1])] {
@@ -7317,10 +6106,6 @@ mod tests {
         }
     }
 
-    /// fails if a connection that died mid-request reports as anything
-    /// else, the same claim
-    /// `a_connection_that_died_mid_request_says_so_under_the_same_prefix`
-    /// makes for a sheep action.
     #[test]
     fn a_dog_reply_that_failed_to_send_says_so_under_the_same_prefix() {
         let (mut app, sent) = armed_and_sent_dog("metrics");

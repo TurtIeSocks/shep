@@ -2,14 +2,8 @@
 //! debounces a run of empty samples before `runtime`'s foreground engine
 //! decides the flock is gone rather than mid-recovery.
 //!
-//! Read decision 13 in this phase's plan before touching this file — the
-//! debounce and the clean/failed split here are what decide between
-//! [`crate::exit::ExitCode::Success`] and [`crate::exit::ExitCode::FlockEmpty`],
-//! which is a resolution of a collision spec §9 named and left open.
-//!
-//! `commands::foreground::run` is the one caller: it races
-//! [`watch_until_empty`] against the supervisor's own task, so the engine
-//! stops as soon as either has something to say.
+//! The clean/failed split decides between [`crate::exit::ExitCode::Success`]
+//! and [`crate::exit::ExitCode::FlockEmpty`].
 
 use std::future::Future;
 use std::time::Duration;
@@ -32,17 +26,9 @@ pub enum Sample {
 
 /// Reads one `ListFlock` answer into a [`Sample`].
 ///
-/// **Dogs do not count.** A `ProcessInfo` with `dog: Some(_)` is a metrics or
-/// bark process the shepherd started for itself; a flock whose only remaining
-/// entry is the metrics dog is an empty flock, and counting the dog would keep
-/// a container alive forever after its app died. This is the one line of this
-/// function that is easy to leave out and impossible to notice without a test.
-///
-/// `Stopping` counts as busy alongside `Starting`/`Online`/`WaitingRestart`:
-/// it is reachable from exactly one path — a reload's outgoing instance,
-/// see `ProcStatus::Stopping`'s own doc — but that instance is still alive on
-/// the OS until it exits, and a reload in progress must not read as the
-/// flock having gone away.
+/// Dogs do not count: counting one would keep a container alive forever after
+/// its app died. `Stopping` counts as busy, so a reload in progress does not
+/// read as the flock having gone away.
 #[must_use]
 pub fn sample(flock: &[ProcessInfo]) -> Sample {
     let mut any_errored = false;
@@ -66,10 +52,8 @@ pub fn sample(flock: &[ProcessInfo]) -> Sample {
     }
 }
 
-/// Three consecutive empty samples, two seconds apart, before the engine
-/// gives up — map.md's recorded contract, and not ceremony: a single sample
-/// catches the gap between a sheep exiting and its backoff restart, and a
-/// container torn down in that gap is a container torn down mid-recovery.
+/// Consecutive empty samples before the engine gives up: a single sample
+/// catches the gap between a sheep exiting and its backoff restart.
 pub const STRIKES: u8 = 3;
 
 /// The interval between polls while debouncing an emptying flock.
@@ -78,18 +62,10 @@ pub const INTERVAL: Duration = Duration::from_secs(2);
 /// Polls `source` until [`STRIKES`] consecutive non-[`Sample::Busy`] readings
 /// have been seen in a row, then returns the last of them.
 ///
-/// `source` is polled immediately on entry, and then once per [`INTERVAL`]
-/// after every reading that did not just complete the run — so a caller
-/// scripting exactly `STRIKES` empty readings with no interleaved
-/// [`Sample::Busy`] measures `STRIKES - 1` intervals of wait, not `STRIKES`.
-/// A [`Sample::Busy`] reading resets the count to zero at any point in the
-/// run; that reset is the entire reason this debounces rather than trusting
-/// one sample, per [`STRIKES`]'s own doc.
-///
-/// The loop takes its readings through a generic `source` rather than a
-/// concrete `Client` so this stays testable against a scripted sequence with
-/// no socket involved; `commands::foreground::run` polls a live `Client`
-/// behind the same closure shape.
+/// `source` is polled immediately on entry, then once per [`INTERVAL`] after
+/// every reading that did not complete the run, so `STRIKES` uninterrupted
+/// empty readings measure `STRIKES - 1` intervals of wait. A [`Sample::Busy`]
+/// reading resets the count to zero.
 pub async fn watch_until_empty<F, Fut>(mut source: F) -> Sample
 where
     F: FnMut() -> Fut,
@@ -117,28 +93,22 @@ mod tests {
 
     use super::*;
 
-    /// A sheep row named `name` in `status`, otherwise empty.
     fn sheep_info(name: &str, status: ProcStatus) -> ProcessInfo {
         ProcessInfo::builder(1, name, status).build()
     }
 
-    /// A dog row named `name` in `status` — `dog` set so [`sample`]'s filter
-    /// skips it.
     fn dog_info(name: &str, status: ProcStatus) -> ProcessInfo {
         ProcessInfo::builder(1, name, status)
             .dog(Some(DogSource::BuiltIn))
             .build()
     }
 
-    /// fails if a dog keeps a dead flock alive. `shep enable metrics` inside
-    /// a container would otherwise mean the container never exits.
     #[test]
     fn a_flock_of_nothing_but_dogs_is_empty() {
         let flock = vec![dog_info("metrics", ProcStatus::Online)];
         assert_eq!(sample(&flock), Sample::EmptyClean);
     }
 
-    /// fails if a sheep between backoff attempts reads as gone.
     #[test]
     fn a_sheep_waiting_to_restart_is_busy() {
         assert_eq!(
@@ -147,8 +117,6 @@ mod tests {
         );
     }
 
-    /// fails if a clean stop and a failure report the same thing — the whole
-    /// of decision 13's exit-code split.
     #[test]
     fn an_errored_sheep_makes_an_empty_flock_a_failed_one() {
         assert_eq!(
@@ -168,17 +136,9 @@ mod tests {
         );
     }
 
-    /// fails if the debounce is dropped or miscounted, and fails differently
-    /// if a busy reading does not reset the strike count. On a paused clock
-    /// (IR-46: the forcing mechanism is the test's own virtual-time advance
-    /// via `tokio::time::sleep` inside `watch_until_empty` itself), so this
-    /// measures the interval rather than waiting six real seconds.
-    ///
-    /// Script: clean, busy (resets), clean, clean, failed. Without the reset,
-    /// three strikes land on the third reading (`clean`) and this returns
-    /// `EmptyClean`; with it, three strikes land on the fifth (`failed`).
-    /// Elapsed virtual time pins the interval count directly: four sleeps of
-    /// `INTERVAL` between five readings, none after the last.
+    /// Without the reset, three strikes land on the third reading and this
+    /// returns `EmptyClean`. The paused clock lets `start.elapsed()` pin four
+    /// sleeps of `INTERVAL` between five readings, none after the last.
     #[tokio::test(start_paused = true)]
     async fn three_consecutive_empty_samples_are_needed_and_one_busy_one_resets_them() {
         let mut script = vec![

@@ -11,15 +11,14 @@ use crate::output::{OutputEnvelope, SCHEMA_VERSION, Streams};
 
 /// The art, with `{version}` and `{home}` substituted at render time.
 ///
-/// Original work, not taken from the ASCII-art corpus. Deliberately about a
-/// third the height of pm2's banner: the point is to be seen once and not
-/// resented.
+/// About a third the height of pm2's banner: the point is to be seen
+/// once and not resented.
 ///
-/// No `\` line-continuation before the first line, deliberately: `\` followed
-/// by a newline strips the newline *and the next line's leading whitespace*,
-/// which silently unindented the leftmost sheep by six columns. An
-/// exact-string test cannot catch that on its own, because the expected value
-/// is written the same way and loses the same six columns.
+/// No `\` line-continuation before the first line: `\` followed by a
+/// newline strips the newline and the next line's leading whitespace,
+/// which would unindent the leftmost sheep by six columns. A pinning
+/// test cannot catch that on its own: the expected string is written the
+/// same way and loses the same six columns.
 const ART: &str = "      ,-~-.     ,-~-.     ,-~-.
      ( o.o )   ( o.o )   ( o.o )       shep {version}
       `-^-'     `-^-'     `-^-'        flock at {home}

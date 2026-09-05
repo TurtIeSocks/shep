@@ -1,27 +1,16 @@
 //! Proves [`ProcessInfo::builder`] reaches every field from outside
-//! shep-core, and that field assignment still works across the boundary.
+//! shep-core, and that field assignment works across the boundary.
 //!
-//! It does **not** prove `ProcessInfo` is `#[non_exhaustive]`, and the
-//! filename deliberately does not claim otherwise. That attribute is
-//! invisible inside the defining crate and this file's `assert`s run in a
-//! separate crate but still only observe what compiles here — nothing in the
-//! repository guards the attribute itself. The only thing that would is a
-//! `trybuild` compile-fail pair asserting E0639, declined as a whole new
-//! test tier for one attribute.
+//! Does not prove `ProcessInfo` is `#[non_exhaustive]`. Nothing in the
+//! repository guards that attribute; this file only observes what
+//! compiles here.
 //!
-//! This file is a deliberate **exception** to IR-38, not an application of
-//! it. IR-38 reads: "`tests/` dir = at most one compile-only file per crate
-//! proving an external crate can implement the public trait (`todo!()`
-//! bodies fine). Everything behavioral is co-located `#[cfg(test)]`." This
-//! file has assertions and is therefore behavioral, so IR-38 does not permit
-//! it. It earns the exception on the same grounds IR-38's own carve-out
-//! rests on — the property needs a real crate boundary to observe, and
-//! shep-core's `#[cfg(test)]` modules are inside the boundary. It is
-//! shep-core's one `tests/` file and must stay the only one.
+//! shep-core's one `tests/` file, and it must stay the only one. The
+//! property needs a real crate boundary, which `#[cfg(test)]` modules
+//! inside the crate cannot provide.
 
-// `ProcStatus` lives at `shep_core::status` and is re-exported through the
-// prelude, NOT through `protocol` — `protocol/mod.rs`'s `pub use` list does
-// not name it. Two imports, deliberately, rather than one wrong one.
+// `ProcStatus` is re-exported through the prelude, not through
+// `protocol`; `protocol/mod.rs`'s `pub use` list does not name it.
 use shep_core::prelude::ProcStatus;
 use shep_core::protocol::{DogSource, ExitInfo, Lamb, ProcessInfo};
 
@@ -44,9 +33,8 @@ fn the_builder_reaches_every_field_from_outside_the_crate() {
         }))
         .build();
 
-    // Every field, read back across the boundary. `dog` is set to a real
-    // variant rather than `None`: `None` is the default, so it proves
-    // nothing.
+    // `dog` is set to a real variant rather than `None`, which is the
+    // default and would prove nothing.
     assert_eq!(info.id, 1);
     assert_eq!(info.name, "web");
     assert_eq!(info.status, ProcStatus::Online);
@@ -68,9 +56,9 @@ fn the_builder_reaches_every_field_from_outside_the_crate() {
         })
     );
 
-    // Field ASSIGNMENT is still legal across the boundary — the attribute
-    // blocks construction, not mutation, and several call sites in shep-cli
-    // and shep-daemon depend on that.
+    // Field assignment is still legal across the boundary: the
+    // attribute blocks construction, not mutation, and call sites in
+    // shep-cli and shep-daemon depend on that.
     let mut adjusted = info.clone();
     adjusted.pid = None;
     assert_eq!(adjusted.name, info.name);

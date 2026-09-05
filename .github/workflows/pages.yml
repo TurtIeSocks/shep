@@ -1,53 +1,16 @@
 name: pages
-# Builds `web/` and publishes it to GitHub Pages, served at
-# https://shep-pm.com. The Pages source is set to "GitHub Actions"
-# in the repository settings, and the custom domain lives there too — with
-# an Actions-based deploy there is no `CNAME` file in the artifact.
+# Builds `web/` and publishes it to GitHub Pages at https://shep-pm.com.
+# Pages source and custom domain are both set in the repo settings; an
+# Actions-based deploy ignores any `web/public/CNAME` file, and moving to a
+# new owner still needs the domain re-set there by hand.
 #
-# A transfer to another owner CARRIES that setting verbatim, which is worse
-# than dropping it. Moving to the shep-pm org kept `shep.turtlesocks.dev`,
-# a domain whose DNS still aimed at the previous owner's Pages host, so the
-# site was unreachable while every setting looked populated and every
-# workflow ran green. Changing the owner means re-setting the domain by
-# hand, and a `CNAME` file committed under `web/public` does NOT do it: it
-# reaches `web/dist` exactly as you would expect and GitHub then ignores it,
-# which is a convincing way to believe the problem is solved.
+# Runs on every push rather than by dispatch only: one ubuntu job of a couple
+# of minutes at 1x, unlike test.yml's macOS/Windows-heavy matrix.
 #
-# Unlike test.yml, this one runs on every push rather than by dispatch only.
-# test.yml is gated because one run is 19 jobs, five of them on the macOS
-# and Windows runners that bill at 10x and 2x on a private repo. This is a
-# single ubuntu job of a couple of minutes at 1x, so the arithmetic that
-# keeps the Rust CI manual does not reach it.
-#
-# The paths filter names three files outside `web/` on purpose: the site parses
-# them at build time (see `web/src/data/*.ts`) rather than restating them, so
-# that a stale claim fails the build instead of shipping. docs/specs/deferred.md
-# feeds the "not built yet" chalkboard through web/src/data/chalkboard.ts, and
-# docs/terminology.md feeds TWO consumers: the landing page's lexicon through
-# web/src/data/lexicon.ts, and the terminology page's usage rules through
-# web/src/data/docsRules.ts. Editing either file without redeploying would leave
-# the site asserting something the repo no longer says.
-#
-# Cargo.toml is the newest of the three and is here for a sharper reason than
-# the other two: it is the ONLY build input that a release changes. The CLI
-# reference page prints the workspace version through
-# web/src/data/workspaceVersion.ts, and a release commit touches nothing under
-# `web/` -- so without this entry the release that bumps the version deploys
-# nothing, and the published page goes on naming the version before it. That is
-# the exact staleness the version was moved out of cli-reference.generated.txt
-# to end, so leaving it out here would rebuild the defect one level up. The
-# cost is that a dependency edit redeploys too: one ubuntu job, a couple of
-# minutes, 1x.
-#
-# The terminology page's TABLE is a different thing and is not in this filter,
-# because it comes from web/src/data/lexiconTable.md through
-# web/src/data/docsLexicon.ts, and `web/**` already covers it.
-#
-# README.md was in this list too, until the lexicon table moved to
-# web/src/data/lexiconTable.md, which happened because the README was rewritten
-# as a landing page and the parser was left reading a heading that had gone.
-# Nothing imports README.md now -- grep web/src for `?raw` for the real list --
-# so it is no longer a build input and no longer belongs here.
+# The paths filter also covers docs/specs/deferred.md, docs/terminology.md
+# and Cargo.toml: the site parses each at build time (`web/src/data/*.ts`),
+# and Cargo.toml is the only one of the three a release commit touches, for
+# the workspace version the CLI reference page prints.
 on:
   push:
     branches: [main]
@@ -73,13 +36,15 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # `npm ci` plus `astro build` is a couple of minutes. 15 is a ceiling
-    # against a hang, not a budget. Both jobs here went without one while
-    # every job in test.yml and release-artifacts.yml had one.
+    # `npm ci` plus `astro build` takes a couple of minutes; 15 is a ceiling
+    # against a hang, not a budget.
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      # Pinned by commit like every other workflow here, and moved by
+      # .github/dependabot.yml. This job holds `pages: write` and
+      # `id-token: write`, which is more than test.yml ever holds.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           # Reads web/.nvmrc, so the pinned version has exactly one home.
           node-version-file: web/.nvmrc
@@ -89,7 +54,7 @@ jobs:
         working-directory: web
       - run: npm run build
         working-directory: web
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: web/dist
 
@@ -104,4 +69,4 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

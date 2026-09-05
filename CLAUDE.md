@@ -61,6 +61,25 @@ races two threads and needs the machine quiet. Add a timing- or
 contention-sensitive test and it needs the same treatment; the workflow's
 skip list names both groups explicitly.
 
+**The skip list is not the first answer to a CI-only failure, and twice on
+2026-09-04 it was the wrong one.**
+`a_reopen_that_cannot_open_a_path_again_exits_internal` renamed a log file
+after `poll_flock` said `online`, which means the daemon spawned the child
+and NOT that the pump has opened the file, so the rename failed `ENOENT`;
+the sibling ninety lines above it
+already waits for the first line through `bleats` and calls that wait a
+precondition. `a_flock_of_every_carried_kind_survives_a_daemon_reload` was
+not a test problem at all: the log pump dropped a line the child wrote just
+before its sheep task let go, 39 times in 64 at the seam, and quarantining
+it would have hidden that. Both stay in the ordinary tier. Before reaching
+for the skip list, check the failure against the `slow` tier's own
+criterion, which the workflow states: a test belongs there when it asserts a
+duration, a batch or a count that a contended runner cannot hold still.
+"Waits twenty seconds for something that should take milliseconds" is not
+that, and an EMPTY artifact where a partial one was expected is a defect
+rather than a slow machine. See `docs/decisions.md`, "CI flakes, and the log
+line a stop could lose".
+
 From Phase 15 on, `shep` is a library with three thin `[[bin]]` targets
 over it (`shep`, `shep-runtime`, `shep-dev`) rather than one bare binary — the
 two container-entrypoint aliases spec §3 asks for cannot share a module tree
@@ -177,6 +196,46 @@ on a project where doctests dominated. It does not transfer: this workspace's
 cost is the integration tier (`cli_e2e` ~47s, `daemon_e2e` ~22s), which
 `--lib --bins` would skip entirely rather than speed up. Keep the bare form.
 
+**This holds for the LOCAL gate. CI splits them, because nextest cannot run
+them at all.** As of 2026-09-04 every CI leg that used to run `cargo test`
+runs `cargo nextest run` plus a separate `cargo test --doc`, so a flaky
+integration test can be retried without retrying anything else. That split is
+forced by the tool rather than chosen, and it is cheap: measured the same day
+on this machine, warm, doctests alone are **6.8s**, not the 30.9s above, which
+was a colder tree. `cargo nextest run` over the same skip set is **26.1s**
+against `cargo test`'s **45.2s**, so a leg is faster even paying for the
+second command.
+
+Two numbers to keep straight when a count looks wrong. `cargo test --workspace
+--all-features` over the skip set reports **2525**; nextest reports **2511**,
+and the missing **14** are exactly the doctests it does not run. The two
+filtersets in the workflow partition the suite with nothing dropped: 2511 in
+the ordinary legs plus 30 in `slow` is 2541, which is every non-doctest test.
+Nothing here changes the local gate: keep running bare `cargo test`.
+
+**A test that passed only on retry is a warning on the run, not a green
+leg.** Every CI profile in `.config/nextest.toml` writes junit, and
+`.github/actions/nextest-report` runs after every nextest leg: each test
+carrying a `flakyFailure` becomes a `::warning` annotation and a row in the
+job summary, and the file is kept as an artifact for 14 days. Read the
+annotation before merging. The retry exists so a contended runner does not
+block a merge, not so a defect can hide behind one; `nextest.toml`'s own
+comment records two 2026-09-04 failures a retry would have hidden.
+
+### cargo-deny runs in CI; run it when a dependency changes
+
+```bash
+cargo deny check
+```
+
+The `deny` job runs it against `deny.toml` on every pull request that
+touches Rust, either lockfile or the file itself: RustSec advisories, the
+licence allowlist, duplicate versions (warned, not refused) and sources
+(crates.io only). A licence not on the list fails the job until somebody
+reads it and adds it, which is the point. `brew install cargo-deny` on the
+host; it is not in the task gate because the advisory half needs the
+network, and the gate is meant to run offline.
+
 ### The phase gate — run at a merge, not per task
 
 The four above, plus `cargo test --workspace --all-features -- --test-threads=1`
@@ -222,10 +281,21 @@ re-running that suite in isolation with the mutation still applied.
   Nine types are accepted, and they are what `release-plz-changelog.toml`
   handles rather than the conventional-commits list. `feat`, `fix`, `perf`
   and `refactor` produce entries; `docs`, `test`, `ci`, `chore` and `style`
-  are `skip = true` and drop on purpose. `revert` and `build` are refused,
-  because they match no parser there and `filter_commits = true` discards
-  them as silently as it discards a sentence. Measured with git-cliff 2.14.1
-  against the real config.
+  are `skip = true` and drop when not breaking, except
+  `chore: update Cargo.{toml,lock} dependencies`, which has its own parser
+  ahead of that skip. `revert` and `build` are refused, because they match no
+  parser and `filter_commits = true` discards them as silently as it discards
+  a sentence.
+
+  **A `!` is the second half of the rule, never a shortcut past the first.**
+  `protect_breaking_commits = true` outranks a `skip = true`, so `docs!:` and
+  `chore!:` are kept and arrive marked BREAKING. It does not outrank a miss,
+  so `revert!:` and `build!:` vanish, and neither does it rescue a subject
+  that never parsed: `Tell a running dog its config changed!` produces
+  nothing, measured. The commit that changed `BusEvent::topic` needed to be
+  `refactor(core)!:`, and no shorter fix would have saved 0.2.1. A conventional
+  type gets the commit seen; the `!` then decides the bump. All measured with
+  git-cliff 2.14.1 against the real config.
 
   `.github/workflows/commits.yml` gates it now and `.githooks/commit-msg`
   catches it earlier, so this bullet is the explanation rather than the
@@ -235,9 +305,11 @@ re-running that suite in isolation with the mutation still applied.
 
 ## Architecture
 
-Five workspace members, one distributed binary (`shep`): shep-core,
-shep-daemon, shep-client, shep-cli (published as `shep`), and
-shep-cli-redirect, a placeholder holding the `shep-cli` name on crates.io.
+Six crates plus `examples` in the workspace, one distributed binary
+(`shep`): shep-core, shep-daemon, shep-client, shep-macros (the `DogConfig`
+derive, reached through shep-client's re-export), shep-cli (published as
+`shep`), and shep-cli-redirect, a placeholder holding the `shep-cli` name on
+crates.io. This line said "five" for the whole time shep-macros existed.
 Each crate's Cargo.toml `description` states its role.
 
 **The docs site is `web/`** -- an Astro site, published, and part of the
@@ -302,7 +374,7 @@ anywhere in this file until now.
 
 **Invoke the `shep-idiomatic-rust` skill before writing or reviewing ANY Rust
 in this repo.** It fronts [docs/idiomatic-rust.md](docs/idiomatic-rust.md) —
-46 numbered rules (IR-1..IR-46) distilled from rand 0.10.2. Cite rules as
+47 numbered rules (IR-1..IR-47) distilled from rand 0.10.2. Cite rules as
 `IR-<n>` in reviews. Evidence with file:line citations:
 [docs/idiomatic-rust/lenses/](docs/idiomatic-rust/lenses/).
 
@@ -336,6 +408,21 @@ never costs clarity.
 - Open design decisions live at the bottom of map.md and in goals.md's open
   questions — check them before making architectural calls; if a decision is
   listed there, it is the maintainer's, not yours.
+- **A dev-dependency on another workspace crate names only a path**, never
+  `workspace = true` and never a version. `cargo publish` strips a path-only
+  dev-dependency and keeps a versioned one, and a versioned one has to
+  resolve on crates.io while the crate is being packaged. shep-macros'
+  dev-dependency on shep-client carried the workspace version, shep-client
+  depends on shep-macros so shep-macros publishes first, and every release
+  from 2026-09-04 18:24 stopped there with `failed to select a version for
+  the requirement shep-client = "^0.2.1"`: shep-core and shep-daemon reached
+  crates.io at 0.2.1 and 0.2.2 while shep-macros, shep-client and shep
+  stayed at 0.2.0 until #131 broke the cycle on 2026-09-05.
+  `scripts/check-dev-deps.py` now refuses a versioned one on every pull
+  request (`.github/workflows/manifests.yml`, no toolchain needed);
+  `cargo publish --dry-run -p <crate>` reproduces the failure in a second;
+  and `deny.toml` allows a path-only wildcard for exactly this shape. See
+  `docs/decisions.md`, "CI and releases".
 
 ## Status / workflow
 

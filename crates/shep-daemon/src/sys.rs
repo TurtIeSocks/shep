@@ -1,131 +1,31 @@
-//! Adopting an inherited descriptor — this crate's only `unsafe`
+//! Adopting an inherited descriptor: this crate's only `unsafe` on unix
 //!
-//! **Why unsafe here, and nowhere else.** The daemonization contract (spec
-//! §3) is that the CLI re-execs itself detached and the child reports
-//! `{pid, version}` on an inherited pipe once the socket is bound. Adopting
-//! an inherited descriptor is the one operation std offers no safe path
-//! for: `OwnedFd`/`File` can only be built from a raw number through
-//! `from_raw_fd`, which is unsafe because nothing in the type system proves
-//! the number names a descriptor this process owns.
+//! Daemonization re-execs the CLI detached, and the child reports
+//! `{pid, version}` on an inherited pipe. Building an owning [`File`] from a
+//! raw number is the one step std offers no safe path for.
 //!
-//! **All of it, confined to this file (IR-22).** [`adopt_fd`] is `unsafe
-//! fn`, not a safe fn hiding an internal unsafe block: the ordering
-//! precondition that makes adoption sound (call this before the process
-//! opens anything of its own — see scenario (c) below) is a CALLER
-//! obligation this function cannot verify from inside itself, so the type
-//! system pushes it out to whoever calls it. [`crate::boot::BootOptions::ready_fd`]
-//! is `Option<`[`std::fs::File`]`>`, an already-owned handle — `boot`
-//! itself never calls this function and contains no unsafe of its own (see
-//! that field's own doc). The crate's actual unsafe surface today, counted
-//! honestly: [`adopt_fd`]'s own definition here, plus this file's own
-//! test-only call sites exercising it directly against synthetic fds (see
-//! below) — every syntactic site lives in this one file. The intended
-//! PRODUCTION caller is the CLI's `main` (Phase 3), a different crate, as
-//! its literal first fd-touching statement, before a tokio runtime even
-//! exists — not written yet, so it adds no site here today. What actually
-//! matters for soundness is unaffected by exactly how many test sites this
-//! file accumulates: only a real production call's ordering claim has to
-//! hold against a genuinely inherited descriptor; every test site adopts a
-//! fd it created itself moments earlier in the same test, which is a
-//! narrower, locally-checkable obligation, not a widening of the
-//! exception.
-//!
-//! **The second entry point, [`adopt_handover_fd`], is safe on purpose.**
-//! It is [`adopt_fd`] for a handover's successor, and its whole doc is the
-//! argument for why the ordering obligation is discharged by the situation
-//! rather than by the call site: a descriptor inherited across `execve` is
-//! open before the new image runs at all, so the kernel can never hand its
-//! number to anything this process opens later. That argument holds for
-//! handover descriptors and for nothing else, which is why it is a second,
-//! narrowly documented function rather than a relaxation of [`adopt_fd`].
-//!
-//! **Rejected alternative:** have the parent pass a socket path
-//! (`SHEP_READY_SOCK`) and let the child connect and write. It is entirely
-//! safe and was the first design. Its cost is a second socket in the boot
-//! path — one more thing to place inside 0700, unlink, and recover when
-//! stale — to replace a five-line adoption, and it puts the readiness
-//! handshake on a different mechanism from the one the spec, systemd
-//! `Type=notify` integration, and every comparable supervisor use. Not
-//! worth it.
-//!
-//! **Invariant:** the descriptor was inherited across `exec` from our own
-//! parent and is not otherwise owned in this process. **Checked, not
-//! assumed:** [`adopt_fd`] refuses anything below fd 3 (stdio is owned
-//! elsewhere) and calls `fcntl(fd, F_GETFD)` first, so a closed or
-//! never-opened number returns [`SysError::BadFd`] instead of being
-//! adopted. **Failure scenarios considered:**
-//! (a) a hostile `SHEP_READY_FD=1` — refused by the fd-3 floor, so stdout
-//!     is never closed underneath the logger;
-//! (b) a stale number for a descriptor closed since exec — refused by the
-//!     `fcntl` probe;
-//! (c) a number that has been *recycled* into another live descriptor
-//!     since exec — this is a REAL hazard, not a theoretical one:
-//!     `F_GETFD` only proves a number is open RIGHT NOW, never who opened
-//!     it, so it cannot distinguish a genuinely inherited descriptor from a
-//!     number the daemon's OWN later steps happened to reuse. Concretely:
-//!     if adoption ran *after* `bind_socket`/`write_pidfile` had already
-//!     opened (and, for the pidfile's temp file, closed) descriptors of
-//!     their own, a stale `SHEP_READY_FD` could land on the freshly-bound
-//!     listener's own fd, and dropping the wrongly-adopted `File` would
-//!     close that listener out from under `tokio`. This is exactly why
-//!     [`adopt_fd`] is `unsafe fn`: the precondition that actually closes
-//!     this hole — call it before this process has opened any descriptor
-//!     of its own — is a CALLER obligation no amount of internal checking
-//!     can verify from inside `adopt_fd` itself, so the type system forces
-//!     every call site to write down its own justification instead of
-//!     letting the invariant erode silently on a future reorder. `boot`
-//!     never calls [`adopt_fd`] at all, so it is not possible for anything
-//!     `boot` itself does — bind a socket, open a tempfile, install signal
-//!     handlers — to land between adoption and use. The intended
-//!     PRODUCTION caller is the CLI's `main` (Phase 3), which discharges
-//!     the ordering precondition by being the literal first fd-touching
-//!     statement of the whole process, before a tokio runtime — the thing
-//!     that would make `boot`'s own attempt at this structurally
-//!     impossible to guarantee, since `boot` is `async` and a runtime with
-//!     its own live poller fds necessarily exists before `boot` is ever
-//!     called — even exists. See [`crate::boot::BootOptions::ready_fd`]'s
-//!     own doc;
-//!
-//! (d) double adoption — a future production caller (the CLI's `main`,
-//!     Phase 3) is expected to call [`adopt_fd`] at most once, consuming
-//!     the number into an owning [`std::fs::File`] that closes it on drop,
-//!     so a second production adoption of the same fd should not occur; if
-//!     it somehow did, scenario (b)'s `BadFd` refusal catches it, since the
-//!     first adoption already closed the number. (This crate's *tests*
-//!     call `adopt_fd` directly, and more than once across the suite, each
-//!     time against a fd the test itself just created — a different,
-//!     lower-stakes situation than production double-adoption, and not
-//!     what this scenario is about.)
-#![allow(unsafe_code)] // IR-24 exception: eight sites total, all in this file (`adopt_fd`'s own definition, `adopt_handover_fd`'s block, and 6 test call sites). `boot.rs` has none; see the essay above and `crate::boot::BootOptions::ready_fd`'s doc.
+//! [`adopt_fd`] is `unsafe fn` rather than a safe wrapper: its ordering
+//! precondition is a caller obligation it cannot check from inside.
+//! [`adopt_handover_fd`] is safe because inheritance across `execve`
+//! discharges that obligation. [`crate::boot`] calls neither and holds an
+//! already-owned [`std::fs::File`].
+#![allow(unsafe_code)] // every unsafe site in this crate's unix build is in this file
 
 use core::fmt;
 
 use std::fs::File;
 use std::os::unix::io::{FromRawFd, RawFd};
 
-/// Lowest fd number this daemon will ever adopt. 0/1/2 are stdio, owned by
-/// the logger and inherited-terminal plumbing elsewhere in the process —
-/// adopting one of those into an owning [`File`] would silently steal it out
-/// from under whatever already holds it.
+/// Lowest fd number this daemon will ever adopt. 0/1/2 are stdio; adopting
+/// one into an owning [`File`] would steal it from whatever already holds it.
 pub(crate) const RESERVED_FD_FLOOR: RawFd = 3;
 
 /// Whether `fd` is a number this process could adopt at all: not stdio, and
 /// open right now.
 ///
-/// [`adopt_fd`]'s two checks and nothing else, split out for the one caller
-/// that has to ask the question WITHOUT taking ownership. The predecessor in
-/// a handover rehearses its successor's adoption before the `execve` — see
-/// `handover::adopt::dry_run` — and a rehearsal that closed the descriptors
-/// it was checking would be worse than no rehearsal at all. It asks this
-/// rather than keeping a second copy of the same two checks: a copy that
-/// drifted lax would pass a blob the successor still refuses, and by then
-/// there is no image left to refuse back to.
-///
-/// Safe, unlike [`adopt_fd`], and the reason is that it takes nothing. That
-/// function's `# Safety` section is entirely about who owns the number
-/// afterwards, and afterwards this owns nothing, so the recycling hazard has
-/// nowhere to land. It asks a question about a number rather than making a
-/// claim on one.
+/// [`adopt_fd`]'s two checks without taking ownership, for the predecessor's
+/// pre-exec rehearsal in `handover::adopt::dry_run`. Safe because it owns
+/// nothing afterwards, so the recycling hazard has nowhere to land.
 ///
 /// # Errors
 /// - [`SysError::ReservedFd`]: `fd` is below 3 (stdio is owned elsewhere).
@@ -136,12 +36,8 @@ pub fn adoptable_fd(fd: RawFd) -> Result<(), SysError> {
     if fd < RESERVED_FD_FLOOR {
         return Err(SysError::ReservedFd(fd));
     }
-    // `F_GETFD` only succeeds on a descriptor this process actually has open
-    // right now, so a stale or never-opened number is rejected here instead
-    // of being handed to `from_raw_fd`. (This does NOT prove the number is
-    // the caller's intended inherited pipe rather than something recycled —
-    // that half of the contract is [`adopt_fd`]'s caller's, per that fn's
-    // own `# Safety` section.)
+    // `F_GETFD` proves only that the number is open right now, never who
+    // opened it; that half of the contract is `adopt_fd`'s caller's.
     nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD).map_err(|errno| SysError::BadFd {
         fd,
         errno: errno.to_string(),
@@ -152,113 +48,48 @@ pub fn adoptable_fd(fd: RawFd) -> Result<(), SysError> {
 /// Takes ownership of a descriptor inherited across `exec`.
 ///
 /// # Errors
-/// - [`SysError::ReservedFd`] — `fd` is below 3 (stdio is owned elsewhere).
-/// - [`SysError::BadFd`] — `fd` names no open descriptor in this process.
+/// - [`SysError::ReservedFd`]: `fd` is below 3 (stdio is owned elsewhere).
+/// - [`SysError::BadFd`]: `fd` names no open descriptor in this process.
 ///
 /// # Safety
 ///
-/// The caller must call this before this process opens (or closes) any
-/// descriptor of its own — before binding a socket, opening a file,
-/// spawning anything that inherits fds. `F_GETFD` (used internally) only
-/// proves a number is CURRENTLY open, never who opened it or what it now
-/// names, so calling this after the process has touched its own descriptors
-/// risks adopting a number the kernel has since recycled into something the
-/// process already owns; dropping the returned [`File`] would then close
-/// that resource out from under its real owner instead of the intended
-/// inherited pipe. See this module's rationale essay, scenario (c), for a
-/// worked example of exactly this happening.
-///
-/// The intended caller is the CLI's `main` (Phase 3, a different crate —
-/// not written yet): its literal first fd-touching statement, before a
-/// tokio runtime (or anything else) exists. Nothing in `shep-daemon` calls
-/// this function in production today; [`crate::boot::boot`] receives an
-/// already-adopted [`std::fs::File`] via
-/// [`crate::boot::BootOptions::ready_fd`] and never touches a raw fd
-/// itself — see that field's own doc for why adoption moved out of `boot`.
+/// Call this before this process opens or closes any descriptor of its own.
+/// `F_GETFD` proves only that a number is open now, never what it names, so
+/// a later call can adopt a number the kernel recycled into something this
+/// process already owns, and the returned [`File`] closes that on drop.
 pub unsafe fn adopt_fd(fd: RawFd) -> Result<File, SysError> {
     adoptable_fd(fd)?;
-    // SAFETY: `adoptable_fd` returned `Ok`, so `fd` is >= RESERVED_FD_FLOOR
-    // and cannot alias stdio, and the `fcntl` probe inside it proved the
-    // number names a descriptor genuinely open in this process. That check
-    // is shared with the predecessor's pre-exec rehearsal rather than
-    // inlined here, and sharing it costs this block nothing: the two
-    // conditions the `unsafe` below rests on are the two that function
-    // returns `Ok` for. The caller's own contract
-    // (this fn's `# Safety` section) is what proves that open descriptor is
-    // the intended inherited pipe rather than something this process opened
-    // itself in the meantime. `adopt_fd` is the only place in this crate
-    // that constructs a `File` from a bare fd. `boot` never calls it — see
-    // this fn's own doc above — and its only in-crate caller outside this
-    // file's own tests is `adopt_handover_fd` below, which discharges the
-    // ordering contract from the situation rather than from where it sits.
-    // The `File` returned here becomes that number's sole owner; nothing
-    // else will read, write, or close it again.
+    // SAFETY: `adoptable_fd` returned `Ok`, so `fd` is at or above
+    // `RESERVED_FD_FLOOR` and names a descriptor open in this process. The
+    // caller's `# Safety` contract is what proves it is the intended
+    // inherited pipe; the returned `File` becomes that number's sole owner.
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-/// Takes ownership of a descriptor a handover blob names, without the
-/// caller having to discharge [`adopt_fd`]'s ordering precondition itself.
+/// Takes ownership of a descriptor a handover blob names.
 ///
-/// This is [`adopt_fd`] for exactly one situation: the process is a
-/// handover's successor, and `fd` is a number its own predecessor wrote
-/// into the blob at `$SHEP_HOME/run/handover.json` moments before it
-/// `execve`d this image. It is safe to call, and the argument for that is
-/// specific to that situation rather than general.
-///
-/// **Why the recycling hazard cannot arise here.** [`adopt_fd`]'s `#
-/// Safety` section exists because `F_GETFD` proves only that a number is
-/// open right now, never who opened it, so a stale number could name
-/// something this process opened for itself. A descriptor genuinely
-/// inherited across `execve` is never in that position: it is already open
-/// the instant the new image starts, and the kernel allocates the lowest
-/// FREE number, so nothing this process opens afterwards can ever be handed
-/// one of them. The ordering obligation `adopt_fd` pushes onto its caller is
-/// discharged by the inheritance itself, not by where the call sits.
-///
-/// **What that leaves.** A blob naming a number that was NOT inherited,
-/// one left over from a handover that never completed or one an operator
-/// edited, could name a descriptor this process opened. The blob is
-/// written mode `0600` inside `$SHEP_HOME/run`, which is `0700`, and it is
-/// removed both when an exec fails and once a successor has read it, so it
-/// is trusted exactly as far as everything else the daemon reads out of its
-/// own home. Do not call this on a descriptor number from anywhere else.
-///
-/// **One number, one owner.** The argument above is about a number naming
-/// the wrong object; a blob naming the SAME number twice would instead build
-/// two owners of the right one, and the second drop would close a descriptor
-/// the first owner, or a later open, is still using.
-/// `handover::adopt::adopt` refuses a repeated number before it adopts
-/// anything, so every call that reaches here is the only call for its
-/// number.
+/// [`adopt_fd`] for one situation: this process is a handover's successor and
+/// `fd` was named in the blob at `$SHEP_HOME/run/handover.json` before the
+/// `execve`. Safe because an inherited descriptor is open before the new
+/// image runs, so no number this process opens later can collide with it; do
+/// not call it on a descriptor number from anywhere else.
+/// `handover::adopt::adopt` refuses a repeated number.
 ///
 /// # Errors
 /// - [`SysError::ReservedFd`]: `fd` is below 3 (stdio is owned elsewhere).
-/// - [`SysError::BadFd`]: `fd` names no open descriptor in this process,
-///   which is what a blob naming a descriptor that did not survive the exec
-///   looks like. Refusing is the whole point: a sheep whose stdout read end
-///   is missing does not lose its output, it blocks on `write()` once the
-///   pipe buffer fills.
+/// - [`SysError::BadFd`]: `fd` names no open descriptor in this process.
 pub fn adopt_handover_fd(fd: RawFd) -> Result<File, SysError> {
     // SAFETY: `fd` was inherited across `execve` from this process's own
     // predecessor, which cleared `FD_CLOEXEC` on it and named it in the
-    // handover blob. An inherited descriptor is open before this image runs
-    // its first instruction, so its number is never free for anything this
-    // process opens to be given, which is precisely the recycling scenario
-    // (c) that makes `adopt_fd` unsafe. See this function's own doc for the
-    // one residual case (a blob naming a number that was not inherited) and
-    // why the blob is trusted that far.
+    // handover blob. It was open before this image ran, so no number this
+    // process opens can share it.
     unsafe { adopt_fd(fd) }
 }
 
 /// Errors adopting an inherited descriptor.
 ///
-/// `#[non_exhaustive]`: today's two variants cover a disqualified fd number
-/// and one the OS says is not open, and a future adoption check — rejecting
-/// an fd that is open but of the wrong kind, not a socket where one is
-/// required — would need its own variant rather than stretching
-/// [`Self::BadFd`] past what `fcntl` actually told the caller, and
-/// shep-daemon is a published library an out-of-tree matcher should not
-/// break for (IR-20).
+/// `#[non_exhaustive]`: a future adoption check would need its own variant
+/// rather than stretching [`Self::BadFd`] past what `fcntl` reported.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SysError {
@@ -303,14 +134,8 @@ mod tests {
 
     #[test]
     fn a_real_inherited_descriptor_is_adopted_and_owned() {
-        // No fd-reuse hazard here, and so no lock: this adopts a descriptor
-        // it just created and still holds open. Nothing is closed and then
-        // re-probed by number, which is the only shape that can race another
-        // test over fd reuse (see
-        // `a_closed_descriptor_is_refused_instead_of_adopted`).
-        //
-        // into_raw_fd gives up std's ownership, which is exactly the state
-        // an exec-inherited descriptor is in: live, and owned by nobody yet.
+        // `into_raw_fd` leaves the descriptor in the state an exec-inherited
+        // one is in: live, and owned by nobody.
         let (parent, child) = std::os::unix::net::UnixStream::pair().unwrap();
         let fd = child.into_raw_fd();
         {
@@ -331,8 +156,8 @@ mod tests {
     #[test]
     fn stdio_numbers_are_refused() {
         for fd in 0..3 {
-            // SAFETY: adopt_fd refuses fd < 3 before touching anything —
-            // no precondition to uphold for a call that never adopts.
+            // SAFETY: adopt_fd refuses fd < 3 before touching anything, so
+            // there is no precondition to uphold for a call that never adopts.
             let result = unsafe { adopt_fd(fd) };
             assert_eq!(result.unwrap_err(), SysError::ReservedFd(fd));
         }
@@ -340,7 +165,7 @@ mod tests {
 
     #[test]
     fn a_negative_fd_is_refused_with_an_accurate_message() {
-        // SAFETY: same as above — refused before any adoption is attempted.
+        // SAFETY: `adopt_fd` refuses fd < 3 before touching anything.
         let err = unsafe { adopt_fd(-1) }.unwrap_err();
         assert_eq!(err, SysError::ReservedFd(-1));
         assert!(
@@ -351,27 +176,10 @@ mod tests {
 
     #[test]
     fn a_closed_descriptor_is_refused_instead_of_adopted() {
-        // Park the probe on a HIGH descriptor number instead of whatever the
-        // kernel handed the pair. Unix allocates the LOWEST free fd, so once
-        // this one is closed below, no other concurrently-running test in
-        // this binary can be handed the number back ahead of the ~2048 lower
-        // free ones — which is what makes the second adoption a genuine
-        // BadFd probe rather than a race.
-        //
-        // Re-probing the pair's own LOW fd under a lock cannot work: the
-        // lock only excludes tests that take it, while every OTHER test in
-        // the binary remains free to open a file and be handed the
-        // just-closed number. `adopt_fd`'s `F_GETFD` probe would then
-        // succeed (the number IS open — it belongs to someone else now),
-        // the adoption would go through, and dropping the returned `File`
-        // would double-close another test's descriptor. The high number
-        // keeps this closed only as long as this process has fewer than
-        // ~2048 descriptors open at once; it is not a structural
-        // guarantee, just a floor no test in this suite comes close to. If
-        // parallel tests ever pushed descriptor use past it, `parked`
-        // could be reused before the second `adopt_fd` below runs. No lock
-        // is needed for the concurrency this suite actually reaches, not
-        // because the race is impossible at any concurrency.
+        // A high number, not the pair's own: unix hands out the lowest free
+        // fd, so once this one is closed no concurrent test in this binary is
+        // handed it back ahead of the ~2048 lower free ones. That floor is
+        // what makes the second adoption a real `BadFd` probe, not a race.
         const PROBE_FD: RawFd = 2048;
         let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
         let parked = nix::fcntl::fcntl(a.as_raw_fd(), nix::fcntl::FcntlArg::F_DUPFD(PROBE_FD))
@@ -381,7 +189,7 @@ mod tests {
             "F_DUPFD must return a number at or above its floor, got {parked}"
         );
         // SAFETY: `parked` is a descriptor this test just created and owns
-        // outright — `a` keeps its own separate descriptor and its own Drop.
+        // outright; `a` keeps its own separate descriptor and its own Drop.
         drop(unsafe { adopt_fd(parked) }.unwrap()); // adopt once, closing it
         // SAFETY: `parked` is closed now, and being >= PROBE_FD it cannot be
         // reallocated while lower numbers remain free, so this second
@@ -393,21 +201,9 @@ mod tests {
 
     #[test]
     fn a_fd_this_process_never_owned_is_refused() {
-        // `BootOptions::ready_fd` is `Option<std::fs::File>`, so there is no
-        // way to drive a bad fd NUMBER through `boot`'s public API at all —
-        // the type itself proves the handle was valid at construction. The
-        // BadFd-refusal behavior this test pins belongs here, testing
-        // `adopt_fd` directly, which is where the refusal actually happens.
-        //
-        // fd 4096 is a number this process will NEVER own: default
-        // fd-table limits sit far below it, and nothing in this crate's
-        // test suite opens anywhere near that many concurrent descriptors,
-        // so `F_GETFD` fails on it deterministically, every time, regardless
-        // of what else is running concurrently — zero collision risk. Same
-        // reasoning as the high `PROBE_FD` in
-        // `a_closed_descriptor_is_refused_instead_of_adopted` above: staying
-        // clear of the numbers the kernel actually hands out is what makes
-        // an fd-refusal test deterministic under a parallel harness.
+        // fd 4096 is a number this process never owns: fd-table limits sit
+        // far below it, so `F_GETFD` fails deterministically even under a
+        // parallel harness.
         // SAFETY: fd 4096 is never open in this process; adopt_fd's
         // F_GETFD probe rejects it before from_raw_fd ever runs, so there
         // is no ordering precondition to uphold for a call that never

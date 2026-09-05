@@ -17,14 +17,13 @@ pub enum ProcStatus {
     Online,
     /// This instance is going away and is not a restart target
     ///
-    /// Reachable from exactly one path: a reload's `SpawnNew` step, which
-    /// marks the instance being replaced before its replacement is spawned,
-    /// so the two never both count as running. Nothing else sets it — an
-    /// operator's `stop` leaves a sheep `Online` for its whole kill ladder
-    /// instead, so this status names reload's transient specifically, never
-    /// "any kill ladder in progress". A scheduled restart or an out-of-band
-    /// liveness/memory-limit restart must both reject a sheep in this status
-    /// rather than race the fresh replacement coming to take over its slot.
+    /// Set by whichever step marks the drainee before its replacement takes
+    /// the slot: `SpawnNew` for an overlap reload, `DrainOld` for a serial
+    /// one. Either way, the old and new instance never both count as
+    /// running. An operator's `stop` leaves a sheep `Online` through its
+    /// whole kill ladder instead; a scheduled or out-of-band restart must
+    /// reject a sheep in this status rather than race the replacement
+    /// taking over its slot.
     Stopping,
     /// Cleanly stopped; not scheduled to run
     Stopped,

@@ -1,57 +1,15 @@
 //! Reaping the sheep a successor adopted, one pid at a time and never
 //! wildcard.
 //!
-//! An adopted sheep has no `tokio::process::Child` and there is no way to
-//! build one: tokio produces a `Child` only from `Command::spawn`, and its
-//! public API has no constructor from a bare pid. A successor therefore
-//! cannot await an adopted sheep through tokio at all, so this is a second
-//! reaping mechanism that runs permanently alongside tokio's own, in the
-//! same process.
-//!
-//! # Why every wait here names a pid
-//!
-//! **`waitpid(-1, ..)` is forbidden in this process, and this repository
-//! has already paid to learn it.** tokio reaps its own children by calling
-//! `waitpid` on their exact pids when `SIGCHLD` fires. A blind wildcard
-//! loop in the same process races that and sometimes wins, taking the
-//! status tokio needed; tokio's own wait then answers `ECHILD` and a clean
-//! exit reaches the supervisor as an `io::Error`. The record is in three
-//! places: `crates/shep-cli/src/commands/reap.rs`, which is `shep runtime`'s
-//! PID-1 init and says so in its own module doc; decision 14 in
-//! `docs/decisions.md`; and `crates/shep-cli/tests/init.rs`, where CI
-//! actually hit it. `crates/shep-daemon/src/tokio_runner.rs` is already
-//! written to expect the loss and degrades to `{code: None, signal: None}`,
-//! which means a stolen status is not merely an error, it is an exit code
-//! and a signal number gone for good.
-//!
-//! That init loop's own wildcard wait is correct where it lives, because it
-//! lives in a *separate process* from tokio's reaper. A successor cannot do
-//! that: it is the same process. So the vocabulary here is borrowed from it
-//! and the architecture deliberately is not.
-//!
-//! A targeted wait is safe for exactly the opposite reason. Nothing else in
-//! this process holds a `Child` for an adopted pid, so nothing else will
-//! ever wait on it, and taking its status steals nothing. The pid is still
-//! a child of this process after the `execve`: an exec replaces the image,
-//! not the process, so the parent/child relationships the predecessor had
-//! are the ones the successor has.
-//!
-//! **Zero and negative pids are refused rather than passed through.**
-//! `waitpid(0, ..)` waits on any child in this process group and
-//! `waitpid(-n, ..)` on any child in group `n`. Both are the wildcard this
-//! module exists to refuse, wearing a different number, and a pid that
-//! arrived as a zero would otherwise turn a targeted wait into one silently.
-//!
-//! # How a wakeup arrives
-//!
-//! Each wait arms its own `SIGCHLD` stream through
-//! `tokio::signal::unix::signal`, which multiplexes: every stream
-//! registered for a kind is notified, so arming one here takes nothing away
-//! from the stream tokio's own process driver arms for itself. The stream
-//! is armed BEFORE the first look, so an exit that lands between the look
-//! and the registration still wakes the loop instead of being lost. A pid
-//! that had already exited needs no wakeup at all: the kernel holds the
-//! zombie until somebody waits, so the first look reports the real status.
+//! An adopted sheep has no `tokio::process::Child` and none can be built
+//! from a bare pid, so this reaper runs alongside tokio's own in the same
+//! process. `waitpid(-1, ..)` here would race tokio's reaper for a status
+//! tokio needed, losing an exit code and a signal for good; zero and
+//! negative pids are that wildcard wearing a different number, so they are
+//! refused. A targeted wait steals nothing: nothing else in this process
+//! holds a `Child` for an adopted pid, and an exec replaces the image rather
+//! than the process, so those pids are still its children. Each wait arms
+//! its own multiplexed `SIGCHLD` stream before its first look.
 
 use std::collections::HashMap;
 use std::io;
@@ -67,20 +25,16 @@ use crate::runner::ExitOutcome;
 /// Waits on the pids a successor adopted, targeted and never wildcard.
 ///
 /// One reaper serves a whole adopted flock; [`AdoptedReaper::wait`] takes
-/// `&self` so several waits can be in flight at once, one per sheep.
+/// `&self`, so several waits can be in flight at once, one per sheep.
 ///
-/// `Debug` is derived: this holds pids and exit statuses, both of which an
-/// operator already reads out of `shep flock`, and no environment value
-/// ever reaches it.
+/// `Debug` is derived: pids and exit statuses only, no environment value.
 #[derive(Debug, Default)]
 pub struct AdoptedReaper {
     /// Statuses already taken from the kernel, by pid.
     ///
-    /// A status can be collected exactly once, so a second wait on a pid
-    /// already reaped would meet `ECHILD` and lose it. Remembering makes a
-    /// repeated or concurrent wait replay the first answer instead, which
-    /// is the contract `crate::runner::RunningProcess::wait` already states
-    /// for tokio-supervised sheep.
+    /// A status can be collected once, so a second wait would meet `ECHILD`
+    /// and lose it. Remembering replays the first answer instead, which is
+    /// what `crate::runner::RunningProcess::wait` already promises.
     observed: Mutex<HashMap<i32, ExitOutcome>>,
 }
 
@@ -93,26 +47,17 @@ impl AdoptedReaper {
 
     /// Waits for one adopted pid and reports how it exited.
     ///
-    /// Returns as soon as the pid has a status, whether it exited before
-    /// this call or long after it. Cancel-safe in the way that matters: a
-    /// dropped wait loses no status, because a status this reaper has taken
-    /// is remembered and replayed to the next caller.
+    /// A dropped wait loses no status: one already taken is replayed.
     ///
     /// # Errors
     ///
-    /// - [`io::ErrorKind::InvalidInput`] if `pid` is zero or does not fit
-    ///   in an `i32`. Zero is refused because `waitpid(0, ..)` is a
-    ///   group-wide wait, not a targeted one.
+    /// - [`io::ErrorKind::InvalidInput`] if `pid` is zero, which `waitpid`
+    ///   reads as a group-wide wait, or does not fit in an `i32`.
     /// - [`io::ErrorKind::NotFound`] if the kernel has no such child and
-    ///   this reaper never took its status, which means something else in
-    ///   this process reaped it and the exit is gone.
-    /// - Any other `waitpid` errno, and a failure to arm a `SIGCHLD`
-    ///   stream, reported as-is.
+    ///   this reaper never took its status, so the exit is gone.
+    /// - Any other `waitpid` errno, or a failure to arm `SIGCHLD`, as-is.
     pub async fn wait(&self, pid: u32) -> io::Result<ExitOutcome> {
         let pid = targeted(pid)?;
-        // Armed before the first look: an exit that lands in between still
-        // wakes this loop, where one armed afterwards would sleep through
-        // the only notification it was ever going to get.
         let mut sigchld = signal(SignalKind::child())?;
         loop {
             if let Some(outcome) = self.look(pid)? {
@@ -129,10 +74,10 @@ impl AdoptedReaper {
 
     /// One non-blocking look at `pid`, replaying a status already taken.
     ///
-    /// The lock spans the `waitpid` call deliberately, so two concurrent
-    /// waits on the same pid cannot have one take the status while the
-    /// other is between its own `ECHILD` and this map. Nothing awaits while
-    /// it is held and `WNOHANG` never blocks.
+    /// The lock spans the `waitpid` call, so two concurrent waits on one pid
+    /// cannot have one take the status while the other sits between its own
+    /// `ECHILD` and this map. Nothing awaits while it is held, and `WNOHANG`
+    /// never blocks.
     fn look(&self, pid: i32) -> io::Result<Option<ExitOutcome>> {
         let mut observed = self.observed.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(outcome) = observed.get(&pid) {
@@ -179,10 +124,9 @@ fn targeted(pid: u32) -> io::Result<i32> {
 
 /// One `waitpid(pid, WNOHANG)`, retried past `EINTR`.
 ///
-/// `Ok(None)` means the pid is still running. `EINTR` is retried rather
-/// than reported, because reporting it as "still running" would send the
-/// caller back to sleep on a `SIGCHLD` that may already have been the last
-/// one it was going to get.
+/// `Ok(None)` means the pid is still running. Reporting `EINTR` as that
+/// would send the caller back to sleep on a `SIGCHLD` that may already have
+/// been the last one.
 fn wait_once(pid: i32) -> Result<Option<ExitOutcome>, Errno> {
     loop {
         match waitpid(Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG)) {
@@ -195,15 +139,10 @@ fn wait_once(pid: i32) -> Result<Option<ExitOutcome>, Errno> {
 
 /// Maps one `waitpid` return into the daemon's own [`ExitOutcome`].
 ///
-/// Pure and `cfg`-free, so the one thing that must never blur can be
-/// asserted without a child: a code and a signal are different fields and
-/// stay that way. `crates/shep-cli/src/output/rows.rs`'s `exit_cell`
-/// renders one or the other, so collapsing them makes the EXIT column lie.
-///
-/// `Stopped` and `Continued` need `WUNTRACED`/`WCONTINUED`, which nothing
-/// here passes, so they cannot arrive in practice. They map to "not an
-/// exit" rather than to a panic, so a future flag addition keeps a
-/// supervising daemon alive.
+/// A code and a signal are different fields and stay that way:
+/// `crates/shep-cli/src/output/rows.rs`'s `exit_cell` renders one or the
+/// other. `Stopped` and `Continued` need `WUNTRACED`/`WCONTINUED`, which
+/// nothing here passes; they map to "not an exit" rather than to a panic.
 fn outcome_of(status: WaitStatus) -> Option<ExitOutcome> {
     match status {
         WaitStatus::Exited(_, code) => Some(ExitOutcome {
@@ -220,11 +159,8 @@ fn outcome_of(status: WaitStatus) -> Option<ExitOutcome> {
 
 #[cfg(test)]
 mod tests {
-    // Every child here is deliberately never `Child::wait()`ed on: that is
-    // the whole shape under test. An adopted sheep reaches a successor as a
-    // bare pid with no handle to wait through, so the reaper is what
-    // collects its status, and a `wait()` added to satisfy this lint would
-    // take the status the assertions are about.
+    // An adopted sheep reaches a successor as a bare pid with no handle, so
+    // the reaper collects the status a `Child::wait()` would take first.
     #![expect(
         clippy::zombie_processes,
         reason = "the reaper collects these statuses; a Child::wait would take them first"
@@ -240,9 +176,8 @@ mod tests {
     use super::{AdoptedReaper, outcome_of};
     use crate::runner::ExitOutcome;
 
-    /// A child spawned the way an adopted sheep reaches a successor: by
-    /// `std::process::Command`, so tokio holds no `Child` for it and
-    /// nothing but this module will ever wait on it.
+    /// A child spawned the way an adopted sheep reaches a successor: through
+    /// `std::process::Command`, so tokio holds no `Child` for it.
     fn adopted(script: &str) -> std::process::Child {
         Command::new("/bin/sh")
             .args(["-c", script])
@@ -252,7 +187,6 @@ mod tests {
             .expect("spawn a shell")
     }
 
-    /// fails if an adopted pid's real exit code does not reach the caller.
     #[tokio::test]
     async fn an_adopted_pid_yields_its_real_exit_code() {
         let child = adopted("exit 7");
@@ -270,7 +204,6 @@ mod tests {
         );
     }
 
-    /// fails if a signalled adopted pid reports a code instead of a signal.
     #[tokio::test]
     async fn an_adopted_pid_killed_by_a_signal_reports_the_signal() {
         let child = adopted("sleep 30");
@@ -294,11 +227,9 @@ mod tests {
         );
     }
 
-    /// fails if the reaper waits for a `SIGCHLD` that already came and
-    /// went. The kernel holds the zombie until somebody waits, so a pid
-    /// that exited before the reaper's first look still has a real status
-    /// to report; an implementation that awaits the signal before looking
-    /// hangs here forever and the timeout turns that into a failure.
+    /// The kernel holds the zombie until somebody waits, so an
+    /// implementation that awaits the signal before looking hangs here and
+    /// the timeout turns that into a failure.
     #[tokio::test]
     async fn a_pid_that_exited_before_the_first_look_still_yields_its_status() {
         let mut child = adopted("echo bye; exit 5");
@@ -312,8 +243,7 @@ mod tests {
             .expect("read to EOF, which the child's own exit closes");
         assert_eq!(said.trim(), "bye");
         // EOF means the child is in its exit path; this gives the kernel
-        // time to finish making it a zombie, so the reaper's first look is
-        // genuinely after the exit rather than racing it.
+        // time to finish making it a zombie.
         std::thread::sleep(Duration::from_millis(50));
 
         let reaper = AdoptedReaper::new();
@@ -330,19 +260,11 @@ mod tests {
         );
     }
 
-    /// fails if the reaper ever waits wildcard. The regression this file
-    /// exists to prevent: a tokio-spawned child's status is pending at the
-    /// moment the reaper looks, and both processes must still report their
-    /// own real exit rather than one of them meeting an `io::Error`.
-    ///
-    /// The steal is made deterministic rather than left to a race. tokio
-    /// does not call `waitpid` for a live `Child` until its `wait()` is
-    /// polled, so a child that exits while nothing is awaiting it leaves
-    /// its status sitting in the kernel; the adopted sheep is meanwhile
-    /// still running, so the `SIGCHLD` that wakes the reaper is that other
-    /// child's. A `waitpid(-1, ..)` in this position takes the pending
-    /// status every time. Confirmed by implementing the wildcard and
-    /// watching this test redden on its own.
+    /// The steal is deterministic rather than raced: tokio calls `waitpid`
+    /// for a live `Child` only once its `wait()` is polled, so the
+    /// supervised child's status sits pending in the kernel while the
+    /// adopted sheep is still running. A `waitpid(-1, ..)` in this position
+    /// takes that pending status every time.
     #[tokio::test]
     async fn reaping_an_adopted_pid_does_not_disturb_a_tokio_spawned_child() {
         let reaper = std::sync::Arc::new(AdoptedReaper::new());
@@ -355,8 +277,8 @@ mod tests {
                 let reaper = std::sync::Arc::clone(&reaper);
                 tokio::spawn(async move { reaper.wait(carried_pid).await })
             };
-            // Long enough for that wait to arm its SIGCHLD stream and take
-            // its first look before anything else exits.
+            // Long enough to arm the SIGCHLD stream and take a first look
+            // before anything else exits.
             tokio::time::sleep(Duration::from_millis(50)).await;
 
             let mut supervised = tokio::process::Command::new("/bin/sh")
@@ -364,8 +286,8 @@ mod tests {
                 .stdout(Stdio::null())
                 .spawn()
                 .expect("spawn a tokio-supervised child");
-            // It exits here, with nothing polling its `wait()`, so its
-            // status is pending when the reaper's wakeup arrives.
+            // Nothing polls its `wait()`, so its status is pending when the
+            // reaper's wakeup arrives.
             tokio::time::sleep(Duration::from_millis(200)).await;
 
             drop(carried.stdin.take());
@@ -397,9 +319,6 @@ mod tests {
         }
     }
 
-    /// fails if a second wait on an already-reaped pid answers `ECHILD`
-    /// instead of replaying what the first one saw. A supervisor may ask
-    /// twice, and the second answer must not be an error.
     #[tokio::test]
     async fn a_second_wait_replays_the_status_the_first_one_saw() {
         let child = adopted("exit 6");
@@ -415,10 +334,6 @@ mod tests {
         assert_eq!(first, second);
     }
 
-    /// fails if pid 0 ever reaches `waitpid`. `waitpid(0, ..)` is not a
-    /// targeted wait at all: it waits on any child in this process group,
-    /// which is the wildcard this module exists to refuse, wearing a
-    /// different number.
     #[tokio::test]
     async fn pid_zero_is_refused_rather_than_becoming_a_group_wide_wait() {
         let reaper = AdoptedReaper::new();
@@ -426,10 +341,6 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
-    /// fails if an exit code and a signal are ever collapsed into one
-    /// another. `crates/shep-cli/src/output/rows.rs`'s `exit_cell` renders
-    /// one or the other, so a reaper that mixed them up would make the
-    /// EXIT column lie.
     #[test]
     fn a_code_and_a_signal_are_never_collapsed_into_one_another() {
         assert_eq!(

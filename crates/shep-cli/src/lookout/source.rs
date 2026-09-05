@@ -1,28 +1,14 @@
 //! What the link task reads the shepherd through, and the real implementation
 //! over `shep-client`.
 //!
-//! Three traits rather than one concrete type, so [`super::link::run_link`] is
-//! drivable with no socket at all: the tests that matter here are about a bus
-//! that genuinely drops frames and a shepherd that genuinely will not answer,
-//! and neither is reachable through a real connection on demand.
+//! Traits rather than one concrete type, so [`super::link::run_link`] is
+//! drivable with no socket: a bus that genuinely drops frames and a shepherd
+//! that will not answer are not reachable through a real connection on
+//! demand.
 //!
-//! **Why two source traits and not one object.** Reading the bus needs `&mut`
-//! and issuing a `ListFlock` needs a shared reference, and `tokio::select!`
-//! cannot hold both against one value. `crate::dog::bark` split its own pair
-//! for exactly this reason and this follows it.
-//!
-//! **Why they are declared here and not shared with bark.** The shapes look
-//! alike; the meanings differ. Bark's `EventSource::next` yields
-//! `Result<BusEvent, u64>` because a dog only needs the count; this one yields
-//! `Result<BusEvent, `[`Lagged`]`>` because the status bar prints the notice
-//! and has to distinguish it from the shepherd's own `BusEvent::Dropped`. A
-//! shared home for two six-line traits, one of which would then be generic
-//! over its error type to serve both callers, is a worse trade than the
-//! duplication — the repetition here is of shape, not of meaning.
-//!
-//! Every public item below is wired together by `super::mod`'s `lookout` — the
-//! opening dial — and by `super::link::run_link`, which drives both traits
-//! through the rest of a connection's life.
+//! Reading the bus needs `&mut` and issuing a `ListFlock` needs a shared
+//! reference, and `tokio::select!` cannot hold both against one value, so
+//! the two halves are separate traits.
 
 use core::fmt;
 use core::future::Future;
@@ -38,17 +24,13 @@ use crate::exit::ExitCode;
 /// The topics lookout subscribes to.
 ///
 /// `process.*` is what the flock table is made of; `daemon.*` carries
-/// `BusEvent::Dropped` and `BusEvent::DaemonShutdown`, both of which this
-/// dashboard reports rather than ignores.
+/// `BusEvent::Dropped` and `BusEvent::DaemonShutdown`.
 ///
-/// **Not `log.*`, and that is now a shipped decision rather than a deferral.**
-/// The bleats feed reads the selected sheep's log files from disk
-/// ([`super::tail`]) rather than subscribing. Subscribing would make lookout
-/// the highest-volume subscriber on the bus, and `super::link::run_connected`
-/// answers a lag or a drop with an immediate `ListFlock` — so log traffic
-/// would convert into request load on the shepherd at exactly the moment the
-/// shepherd is busiest. The phase plan for 12b has the full accounting,
-/// including what reading files costs instead.
+/// Not `log.*`: the bleats feed reads log files from disk
+/// ([`super::tail`]). Subscribing would make lookout the bus's
+/// highest-volume subscriber, and `super::link::run_connected` answers a
+/// lag with an immediate `ListFlock`, so log traffic would turn into
+/// shepherd request load exactly when the shepherd is busiest.
 pub const TOPICS: &[&str] = &["process.*", "daemon.*"];
 
 /// Reading the flock. `&self`, so [`super::link::run_connected`] can hold it
@@ -57,19 +39,14 @@ pub trait FlockSource: Send + Sync {
     /// The flock as it stands.
     ///
     /// # Errors
-    /// Whatever the underlying source could not answer with — for the real
-    /// implementation, whatever `Request::ListFlock` failed with.
+    /// Whatever `Request::ListFlock` failed with.
     fn flock(&self) -> impl Future<Output = Result<Vec<ProcessInfo>, RequestError>> + Send;
 
     /// Sends one request over this connection and returns the shepherd's
     /// answer, whatever it is.
     ///
-    /// Unlike [`Self::flock`], this does NOT swallow an unrecognised
-    /// [`Response`] into an empty success. `Response` is `#[non_exhaustive]`,
-    /// and a reply this binary does not understand is a fact the operator has
-    /// to be told about: `flock()` can afford to shrug one off because the
-    /// next poll asks again two seconds later, and an action or a lamb fetch
-    /// has no next poll.
+    /// Unlike [`Self::flock`], an unrecognised [`Response`] is not swallowed
+    /// into an empty success: an action or a lamb fetch has no next poll.
     ///
     /// # Errors
     ///
@@ -88,10 +65,8 @@ pub trait EventSource: Send {
 
 /// Opens a connection and hands back both halves of it together.
 ///
-/// One factory rather than two independently-refreshable parameters: a
-/// reconnect rebuilds the request path and the subscription at the same
-/// moment, and a signature that let a caller replace one without the other
-/// would admit a state the real connection cannot be in.
+/// One factory rather than two parameters: a reconnect rebuilds the request
+/// path and the subscription at the same moment.
 pub trait Shepherd: Send {
     /// This connection's request half.
     type Flock: FlockSource;
@@ -111,37 +86,27 @@ pub trait Shepherd: Send {
 
 /// Why opening a connection failed.
 ///
-/// No `#[non_exhaustive]`, and that is a decision rather than an oversight:
-/// IR-20's obligation is on `pub` error enums in LIBRARY crates, and shep-cli
-/// is `[[bin]]`-only — there is no downstream to break, and every match on this
-/// type is in this crate. Stated here rather than left silent, which is the
-/// half of IR-20 that applies either way.
+/// No `#[non_exhaustive]`: shep-cli is `[[bin]]`-only and every match on
+/// this type is in this crate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkError {
     /// Nothing answered at the socket, or the handshake did not complete.
     Unreachable(String),
     /// The shepherd answered and speaks a different wire version.
     ///
-    /// Held apart from [`Self::Unreachable`] for one reason: it is the single
-    /// connect failure with its own exit code, and `main.rs`'s
-    /// `connect_client` — the path every other client verb takes — already
-    /// makes that distinction. A lookout that reported a version skew as
-    /// "the shepherd did not answer" would send the operator to check whether
-    /// the daemon is running, which it is.
+    /// Its own exit code, as in `main.rs`'s `connect_client`: reporting a
+    /// skew as "the shepherd did not answer" would send the operator to
+    /// check a daemon that is running.
     Protocol(String),
     /// The shepherd answered but refused the subscription.
     Refused(String),
 }
 
 impl LinkError {
-    /// The exit code this reports when it happens on the FIRST dial, before
-    /// the dashboard exists.
-    ///
-    /// Only the first dial reaches this: once a link has been established, a
-    /// failure is a rung on [`super::link::run_link`]'s ladder and never an
-    /// exit. Derived from `ExitCode::from(&ConnectError)` at conversion time
-    /// rather than re-decided here, so this and every other verb's mapping
-    /// cannot drift apart.
+    /// The exit code for a failure on the first dial, before the dashboard
+    /// exists. A later failure is a rung on [`super::link::run_link`]'s
+    /// ladder, never an exit. Derived from `ExitCode::from(&ConnectError)`
+    /// at conversion time, so verbs cannot drift apart.
     #[must_use]
     pub fn exit_code(&self) -> ExitCode {
         match self {
@@ -165,8 +130,6 @@ impl core::error::Error for LinkError {}
 
 impl From<ConnectError> for LinkError {
     fn from(err: ConnectError) -> Self {
-        // `ExitCode::from(&ConnectError)` is the existing taxonomy — reused
-        // rather than re-derived, so the two cannot skew.
         if ExitCode::from(&err) == ExitCode::ProtocolMismatch {
             return Self::Protocol(err.to_string());
         }
@@ -181,15 +144,10 @@ pub struct ClientFlock(Client);
 impl ClientFlock {
     /// The wrapped connection, for [`super::lookout`]'s version guard.
     ///
-    /// The guard is applied there, right after the first
-    /// [`Shepherd::link`] succeeds, rather than inside [`UnixShepherd::link`]
-    /// itself: `link`'s Future carries a `+ Send` bound that a `Streams`
-    /// (which holds `&mut dyn io::Write`, not `Send`) cannot cross, and
-    /// [`super::link::run_link`] holds this same `Shepherd` for the whole
-    /// reconnect ladder, spawned with `tokio::spawn` and so `'static` —
-    /// a borrowed `Streams` could not live in it. This accessor is what
-    /// lets the one call site that DOES have a `Streams`, the first dial,
-    /// reach the client the guard compares against.
+    /// The guard cannot live inside [`UnixShepherd::link`]: that Future is
+    /// `+ Send`, and [`super::link::run_link`] holds the `Shepherd` for the
+    /// whole reconnect ladder as `'static`. A borrowed `Streams` crosses
+    /// neither bound.
     pub(crate) fn client(&self) -> &Client {
         &self.0
     }
@@ -199,19 +157,14 @@ impl FlockSource for ClientFlock {
     async fn flock(&self) -> Result<Vec<ProcessInfo>, RequestError> {
         match self.0.request(Request::ListFlock).await? {
             Response::Flock(flock) => Ok(flock),
-            // `Response` is `#[non_exhaustive]`; a reply this binary does not
-            // recognise is not a reason to tear the dashboard down, and the
-            // next poll asks again.
+            // `Response` is `#[non_exhaustive]`; the next poll asks again.
             _unrecognised => Ok(Vec::new()),
         }
     }
 
     async fn send(&self, request: Request) -> Result<Response, RequestError> {
-        // The client's own default deadline, which is what every one of these
-        // verbs already gets from the CLI: `commands::lifecycle` passes
-        // `deadline: None` for stop, restart and reload, and `Reloading` is an
-        // acceptance rather than a completed swap, so a longer budget would
-        // buy nothing.
+        // The client's own default deadline, the same one `commands::lifecycle`
+        // passes for stop, restart and reload.
         self.0.request(request).await
     }
 }
@@ -243,12 +196,9 @@ impl Shepherd for UnixShepherd {
     type Events = EventStream;
 
     async fn link(&mut self) -> Result<(Self::Flock, Self::Events), LinkError> {
-        // `Client::connect`, never `connect_or_spawn`: opening a dashboard
-        // must not start a shepherd, and a RECONNECT starting one would be
-        // worse still — it would resurrect a supervisor the operator may have
-        // just killed on purpose, from a process whose whole job is to watch.
-        // `main.rs`'s own dispatch draws the same line for every verb but
-        // `start` and `muster`.
+        // `Client::connect`, never `connect_or_spawn`: opening a dashboard, or
+        // reconnecting one, must not start a shepherd, and a reconnect that
+        // did would resurrect one the operator may have just killed.
         let client = Client::connect(&self.socket).await?;
         let topics = TOPICS.iter().map(|topic| (*topic).to_string()).collect();
         let stream = client
@@ -261,20 +211,15 @@ impl Shepherd for UnixShepherd {
 
 /// One reading of the machine this lookout is running on.
 ///
-/// Deliberately NOT `dog::metrics::HostReading`, whose shape this overlaps.
-/// That one carries a host **process count** — which costs a process-table
-/// walk — and no load average; this one is the other way round, because it is
-/// read on a one-second heartbeat rather than once per Prometheus scrape.
-/// `source`'s own doc already records making this call for `EventSource`, in
-/// these words: the repetition here is of shape, not of meaning.
+/// Not `dog::metrics::HostReading`: that one walks the process table for a
+/// process count and carries no load average. This is read every second.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HostSample {
     /// One-, five- and fifteen-minute load averages.
     pub load: (f64, f64, f64),
     /// How many cores that load is spread across, from
     /// `std::thread::available_parallelism`. `None` when the platform would
-    /// not say — a load average with no denominator is a number nobody can
-    /// read, so the strip drops the whole segment rather than guessing 1.
+    /// not say; the strip drops the segment rather than guessing 1.
     pub cores: Option<usize>,
     /// Total physical memory in bytes.
     pub memory_total_bytes: u64,
@@ -286,16 +231,8 @@ pub struct HostSample {
 
 /// Everything lookout reads that does not come off the socket.
 ///
-/// One trait rather than two, because both methods answer the same question —
-/// what can this process see without asking the shepherd — and because
-/// `super::run_ui` already carries two generic parameters.
-///
-/// `&mut self` rather than `&self`: the tail reader remembers each file's
-/// length at the previous read, which is what makes the gap notice exact, and
-/// `run_ui` owns this outright. That is the opposite call from
-/// [`FlockSource::flock`], which is `&self` precisely because
-/// [`super::link::run_connected`] holds it across a `select!` with an
-/// [`EventSource`] borrowed mutably.
+/// `&mut self`: the tail reader remembers each file's length at the previous
+/// read, and `super::run_ui` owns this outright.
 pub trait Local {
     /// This machine's load, memory and uptime, or `None` on a platform
     /// `sysinfo` does not support.
@@ -314,8 +251,7 @@ pub struct LocalReader {
 }
 
 impl LocalReader {
-    /// Reads the core count once — it does not change for the life of a
-    /// process — and starts with no memory of any log file.
+    /// Reads the core count once and starts with no memory of any log file.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -329,10 +265,8 @@ impl LocalReader {
 
 /// Same as [`LocalReader::new`].
 ///
-/// `clippy::new_without_default` is on by default and the gate denies
-/// warnings: an argument-less `new` with no `Default` fails it.
-/// [`super::term::RestoreGuard`] carries this impl and this sentence for the
-/// same reason — the repetition is the lint's, not this module's.
+/// `clippy::new_without_default` denies an argument-less `new` with no
+/// `Default`.
 impl Default for LocalReader {
     fn default() -> Self {
         Self::new()
@@ -368,27 +302,14 @@ impl Local for LocalReader {
 mod tests {
     use super::*;
 
-    /// fails if the host sampler starts walking the process table. That walk
-    /// is what makes `dog::metrics`' own `sample_host` expensive enough that
-    /// shep-daemon's memory sampler runs at fifteen seconds; this one runs on
-    /// a one-second heartbeat and must stay a memory read and a load average.
-    ///
-    /// Asserted through the wall clock rather than by inspecting the
-    /// `RefreshKind`, because the `RefreshKind` is exactly what a regression
-    /// would change and asserting on it would be asserting the code says what
-    /// it says.
-    ///
-    /// **Bound lowered from the plan's 50 ms to 2 ms** (Step 3.5's report):
-    /// on this machine a memory-only sample runs ~8 µs and the mutated
-    /// process-table walk ~8 ms, so 50 ms sits below neither and the
-    /// mutation could not redden it. 2 ms clears the real reading by two
-    /// orders of magnitude and stays four times under the walk.
+    /// 2 ms: a memory-only sample runs ~8 µs on this machine and a
+    /// process-table walk ~8 ms. Timed rather than asserted on the
+    /// `RefreshKind`, which is what a regression would change.
     #[test]
     fn a_host_sample_is_cheap_enough_for_a_one_second_heartbeat() {
         let mut local = LocalReader::new();
-        // One warm sample first: the first `System` construction pays for
-        // whatever the platform caches, and this test is about the steady
-        // state the heartbeat actually runs in.
+        // One warm sample first: the heartbeat runs in the steady state, not
+        // in the first `System` construction.
         let _ = local.host();
 
         let started = std::time::Instant::now();
@@ -396,16 +317,9 @@ mod tests {
             let _ = local.host();
         }
         let each = started.elapsed() / 10;
-        // Per-platform, because the cost genuinely differs and the bound is
-        // meant to catch a REGRESSION rather than to describe one machine.
-        // `sysinfo`'s Windows backend is heavier than its unix one: measured
-        // 2.8ms here against a unix budget of 2ms. That is still 0.3% of the
-        // one-second heartbeat this test is named for, so the behaviour is
-        // fine and only the number was wrong.
-        //
-        // 15ms keeps real headroom over the measurement while still failing
-        // loudly on the thing worth catching — a sample that has become tens
-        // or hundreds of milliseconds and would make the dashboard stutter.
+        // Windows' `sysinfo` backend is heavier: 2.8ms there against 2ms
+        // on unix. 15ms still fails loudly on a sample that would make
+        // the dashboard stutter.
         #[cfg(unix)]
         let budget = std::time::Duration::from_millis(2);
         #[cfg(windows)]
@@ -417,26 +331,14 @@ mod tests {
         );
     }
 
-    /// fails if the sampler starts inventing numbers on a platform sysinfo
-    /// does not support. `None` is a real, expected case — `dog::metrics`'
-    /// `Reading::host` says so in its own doc — and a strip rendering an
-    /// unsupported platform as `0.00 load, 0 bytes` would be a lie the
-    /// operator has no way to detect.
-    ///
-    /// Branched on `IS_SUPPORTED_SYSTEM` rather than asserting it.
-    /// `sysinfo::IS_SUPPORTED_SYSTEM` is a `const bool`, and both
-    /// `assert!(IS_SUPPORTED_SYSTEM)` and its negation trip
-    /// `clippy::assertions_on_constants`, which is on by default and denied by
-    /// the gate's `-D warnings`. The workspace carries no `allow` for it.
+    /// Branched on `IS_SUPPORTED_SYSTEM` rather than asserted:
+    /// `clippy::assertions_on_constants` denies both forms.
     #[test]
     fn an_unsupported_platform_reports_nothing_rather_than_zero() {
         let mut local = LocalReader::new();
         if sysinfo::IS_SUPPORTED_SYSTEM {
             let sample = local.host().expect("a supported platform samples");
             assert!(sample.memory_total_bytes > 0, "a supported host has memory");
-            // `<`, not `<=`: see Step 3.6 — the weaker form survives a
-            // mutation that reports used == total, which is the whole point of
-            // running the mutation.
             assert!(sample.memory_used_bytes < sample.memory_total_bytes);
             assert!(sample.cores.is_some_and(|cores| cores >= 1));
         } else {
@@ -447,12 +349,8 @@ mod tests {
         }
     }
 
-    /// fails if the load average's denominator stops coming from std.
-    ///
-    /// `sysinfo` can also report a CPU count, from its own cpu list, and it is
-    /// the obvious thing to reach for while writing a `sysinfo` sampler — but
-    /// the two can disagree (an affinity mask, a cgroup quota), and the number
-    /// this strip needs is the one the load average is actually spread across.
+    /// `sysinfo`'s own cpu count can disagree with std's under an affinity
+    /// mask or a cgroup quota; the load average is spread across std's.
     #[test]
     fn the_core_count_comes_from_std_and_not_from_sysinfo() {
         let mut local = LocalReader::new();
@@ -464,10 +362,6 @@ mod tests {
         );
     }
 
-    /// fails if `mod.rs`'s guard, applied right after the first
-    /// [`Shepherd::link`] succeeds, loses the client it needs to compare
-    /// versions on. `ClientFlock::client` is what makes that reachable —
-    /// see its own doc for why the guard cannot live inside `link` itself.
     #[tokio::test]
     async fn a_version_skewed_shepherd_is_refused_through_client_flock() {
         let dir = tempfile::tempdir().unwrap();
@@ -494,7 +388,6 @@ mod tests {
         assert_eq!(code, crate::exit::ExitCode::VersionSkew);
     }
 
-    /// A shepherd of this binary's own version is not a skew.
     #[tokio::test]
     async fn a_matching_version_proceeds_through_client_flock() {
         let dir = tempfile::tempdir().unwrap();
