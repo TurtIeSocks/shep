@@ -1439,6 +1439,13 @@ pub struct LineReply {
 /// derived `Debug` on [`Response`] would undo that the moment something
 /// logs a reply — see the manual `Debug` below, which prints only a length.
 ///
+/// [`Self::as_str`] is the only way out, deliberately. A `Deref<Target =
+/// str>` reads as a convenience and is not one here: it hands the type
+/// every `str` method, `ToString` among them, so `.to_string()` returned
+/// the section in the clear and defeated the redacted `Debug` above it.
+/// lookout's own `FieldValue` has no `Deref` for the same reason and is the
+/// shape both of these follow.
+///
 /// `#[serde(transparent)]` makes the wire representation identical to a
 /// bare `String`: this newtype changes nothing about
 /// [`crate::protocol::PROTOCOL_VERSION`] or the pinned snapshot fixtures.
@@ -1457,14 +1464,6 @@ impl DogSectionToml {
 impl From<String> for DogSectionToml {
     fn from(toml: String) -> Self {
         Self(toml)
-    }
-}
-
-impl core::ops::Deref for DogSectionToml {
-    type Target = str;
-
-    fn deref(&self) -> &str {
-        &self.0
     }
 }
 
@@ -1493,6 +1492,11 @@ impl fmt::Debug for DogSectionToml {
 /// answers with the env KEYS and no values at all, which is decision 12 of
 /// the overrides design.
 ///
+/// [`Self::as_str`] is the only way out, for the reason
+/// [`DogSectionToml`] gives: a `Deref<Target = str>` brought `ToString`
+/// with it, so `.to_string()` returned the value in the clear and defeated
+/// the redacted `Debug` below.
+///
 /// `#[serde(transparent)]` makes the wire representation identical to a
 /// bare `String`, so this newtype changes nothing about
 /// [`crate::protocol::PROTOCOL_VERSION`] or the pinned snapshot fixtures.
@@ -1511,14 +1515,6 @@ impl EnvValue {
 impl From<String> for EnvValue {
     fn from(value: String) -> Self {
         Self(value)
-    }
-}
-
-impl core::ops::Deref for EnvValue {
-    type Target = str;
-
-    fn deref(&self) -> &str {
-        &self.0
     }
 }
 

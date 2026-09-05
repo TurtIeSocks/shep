@@ -3553,7 +3553,11 @@ impl<R: ProcessRunner> Actor<R> {
                 value,
                 reply,
             } => {
-                let _ = reply.send(self.handle_set_sheep_env(&name, &key, value.as_deref()));
+                let _ = reply.send(self.handle_set_sheep_env(
+                    &name,
+                    &key,
+                    value.as_ref().map(EnvValue::as_str),
+                ));
                 false
             }
             Command::SetSheepField {

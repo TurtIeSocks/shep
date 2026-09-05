@@ -3839,7 +3839,7 @@ mod tests {
         let Ok(Response::DogSection { toml }) = reply.result else {
             panic!("expected DogSection, got {:?}", reply.result)
         };
-        assert!(toml.contains("30s"));
+        assert!(toml.as_str().contains("30s"));
     }
 
     /// fails if the section is written without the topic going out, which
