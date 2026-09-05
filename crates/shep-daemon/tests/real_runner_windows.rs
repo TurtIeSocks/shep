@@ -132,20 +132,40 @@ fn pid_is_alive(pid: u32) -> bool {
     system.process(Pid::from_u32(pid)).is_some()
 }
 
-/// The pid of a live child of `parent`, or `None`.
+/// Every live `ping` the sheep has spawned.
 ///
 /// Replaces having the sheep print its own child's pid, which needed a
 /// shell that could ask Windows for it, which meant PowerShell, which is
 /// what hung this suite for four CI runs. This asks the same question from
-/// the test process, where an answer of `None` is a visible failure rather
+/// the test process, where an empty answer is a visible failure rather
 /// than a wait that never ends.
 ///
 /// The concern that led to the sheep naming its own child was that
 /// `sysinfo` might not SEE a grandchild that `Win32_Process` showed, which
 /// would make a containment test pass while finding nothing. That is why
-/// the caller `expect`s this: a grandchild it cannot find fails the test
-/// rather than skipping the assertion.
-fn child_of(parent: u32) -> Option<u32> {
+/// the caller asserts this is non-empty: a grandchild it cannot find fails
+/// the test rather than skipping the assertion.
+///
+/// # Why this filters on the image name
+///
+/// It asked for "a child of the sheep" until 2026-09-04, and that is not
+/// the same question. `cmd` running the fixture has THREE children: the
+/// `ping` it backgrounds with `start /b`, the `ping` it then waits on, and
+/// a `conhost.exe` that Windows creates on its behalf to host the console
+/// (`CREATE_NO_WINDOW` suppresses the window, not the console). The old
+/// form returned whichever the process table happened to yield first, and
+/// a process table is a map whose iteration order is nobody's contract:
+/// measured over 30 runs on a real Windows box, `conhost.exe` came first in
+/// 12 of them.
+///
+/// So roughly a third of runs asserted job containment against console
+/// infrastructure, which is a process the fixture never spawned and which
+/// Windows tears down on its own schedule once the console has no clients
+/// left. Over those same 30 runs it was reliably the slowest of the three
+/// to go after `kill_tree`: 140ms at worst against the two pings' 65ms. A
+/// case whose subject changes from run to run is one that can go red
+/// without anything having regressed, and this one did, on 2026-08-31.
+fn pings_under(parent: u32) -> Vec<u32> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate};
     let mut system = sysinfo::System::new();
     system.refresh_processes_specifics(
@@ -156,8 +176,16 @@ fn child_of(parent: u32) -> Option<u32> {
     system
         .processes()
         .values()
-        .find(|process| process.parent() == Some(Pid::from_u32(parent)))
+        .filter(|process| process.parent() == Some(Pid::from_u32(parent)))
+        .filter(|process| {
+            // `PING.EXE` on some Windows builds, `ping.exe` on others.
+            process
+                .name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case("ping.exe")
+        })
         .map(|process| process.pid().as_u32())
+        .collect()
 }
 
 /// fails if a real child's stdout never reaches its log file. The most basic
@@ -213,12 +241,18 @@ async fn kill_tree_stops_a_long_running_sheep_and_reports_a_recognisable_code() 
 /// `start /b` and then waits, so there is a grandchild to contain and a
 /// parent for `kill_tree` to address.
 ///
-/// The grandchild is found by walking the process table
+/// The grandchildren are found by walking the process table
 /// (`sysinfo`'s `parent()` reports the relationship reliably; `Win32_Process`
 /// would too, but reaching it needs a shell able to ask Windows for a pid,
 /// which means PowerShell — and PowerShell is what hangs this suite, see
-/// below). `child_of` is `expect`ed, so a grandchild the test cannot see
-/// fails it rather than skipping the assertion and looking green.
+/// below). An empty answer from `pings_under` fails the case, so a
+/// grandchild the test cannot see fails it rather than skipping the
+/// assertion and looking green.
+///
+/// EVERY `ping` the sheep spawned has to die, not an arbitrary one of them:
+/// see `pings_under` for why asking for "a child" was picking console
+/// infrastructure a third of the time, and reporting a containment failure
+/// when it did.
 ///
 /// This is the assertion that would go red if `spawn` ever stopped assigning
 /// the child to its job — a change that breaks nothing else, and that every
@@ -233,15 +267,25 @@ async fn kill_tree_reaches_a_grandchild_and_not_just_the_sheep() {
     // `start /b` is the grandchild: a process the sheep spawns that
     // outlives it, which is the whole point of the case. The sheep then
     // waits, so `kill_tree` has something to kill.
+    //
+    // Both pings count to 600, not 60, for the reason [`LONG_RUNNING`]
+    // gives: a fixture child has to outlive the test by a margin nobody has
+    // to think about. At 60 it did not. The background ping starts ticking
+    // before the sheep has even logged, and the steps between that and the
+    // kill are two full process-table walks, so a loaded machine can spend
+    // longer here than the child was given: measured on a real Windows box
+    // under 32 spinning loads, 5 runs in 30 died of old age before the kill
+    // and the slowest single run took 154s. Ten minutes is the same number
+    // every other case in this file already uses.
     const CRLF: &str = "\r\n";
     let script = dir.path().join("lamb.cmd");
     std::fs::write(
         &script,
         [
             "@echo off",
-            "start /b ping -n 60 127.0.0.1 >nul",
+            "start /b ping -n 600 127.0.0.1 >nul",
             "echo LAMB-STARTED",
-            "ping -n 60 127.0.0.1 >nul",
+            "ping -n 600 127.0.0.1 >nul",
             "",
         ]
         .join(CRLF),
@@ -256,26 +300,32 @@ async fn kill_tree_reaches_a_grandchild_and_not_just_the_sheep() {
     // comes from the process table, since `cmd` cannot report one.
     wait_for_log(&spec.out_file, "LAMB-STARTED").await;
     let sheep = proc.pid();
-    let lamb = child_of(sheep).expect(
-        "the sheep's grandchild must be visible in the process table, or this \
-         case proves nothing about containment",
+    let lambs = pings_under(sheep);
+    assert!(
+        !lambs.is_empty(),
+        "the sheep's grandchildren must be visible in the process table, or \
+         this case proves nothing about containment"
     );
 
-    assert!(
-        pid_is_alive(lamb),
-        "grandchild {lamb} must be live before the kill, or this proves nothing"
-    );
+    for lamb in &lambs {
+        assert!(
+            pid_is_alive(*lamb),
+            "grandchild {lamb} must be live before the kill, or this proves nothing"
+        );
+    }
 
     proc.kill_tree().unwrap();
     let _ = tokio::time::timeout(SETTLE, proc.wait()).await;
 
     let deadline = tokio::time::Instant::now() + SETTLE;
-    while pid_is_alive(lamb) {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "grandchild {lamb} outlived kill_tree: the job object is not containing the tree"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    for lamb in lambs {
+        while pid_is_alive(lamb) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "grandchild {lamb} outlived kill_tree: the job object is not containing the tree"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 }
 
