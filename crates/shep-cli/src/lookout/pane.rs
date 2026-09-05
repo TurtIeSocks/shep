@@ -1008,9 +1008,15 @@ impl ConfigPane {
     /// the durable answer, read off the shepherd's parked-field list on
     /// every refresh.
     ///
-    /// `NeedsRespawn` is the one arm that still promises an outcome,
-    /// because for that group the prediction cannot be wrong: nothing
-    /// carries a respawn-only field to a child that is already running.
+    /// `NeedsRespawn` used to be exempted, on the argument that for that
+    /// group the prediction cannot be wrong, since nothing carries a
+    /// respawn-only field to a child that is already running. That argument
+    /// is about the CHILD and the sentence was about the FLOCK, and the two
+    /// are not the same claim: `web is respawned to pick it up` was read as
+    /// a promise that shep restarts something, and shep restarts nothing.
+    /// The daemon parks the field and waits. So this arm names the reload
+    /// it waits for, in the words the reply's own status line uses, and no
+    /// arm predicts an outcome now.
     ///
     /// An env sentence names its key and NEVER its value, unlike a field
     /// sentence, which quotes what it is setting. The value has just been
@@ -1031,12 +1037,12 @@ impl ConfigPane {
                 key,
                 value: Some(_),
             } => {
-                return format!("set env {key}? {name} is respawned to pick it up");
+                return format!("set env {key}? {key} waits for `shep reload {name}`");
             }
             PaneEdit::SetEnv { key, value: None } => {
                 return format!(
-                    "remove env {key}? {name} is respawned, and lookout cannot read the value \
-                     back to put it there again"
+                    "remove env {key}? it waits for `shep reload {name}`, and lookout cannot \
+                     read the value back to put it there again"
                 );
             }
             PaneEdit::Set { key, value } => (key, value),
@@ -1060,7 +1066,7 @@ impl ConfigPane {
             Some(ApplyGroup::NextSpawn) => {
                 format!("set {key} = {shown}? {key} is read when {name} spawns")
             }
-            Some(_) => format!("set {key} = {shown}? {name} is respawned to pick it up"),
+            Some(_) => format!("set {key} = {shown}? {key} waits for `shep reload {name}`"),
             None => format!("set {key} = {shown}? {name} is told, and decides what to reload"),
         }
     }
@@ -1405,18 +1411,44 @@ mod tests {
         assert!(!text.contains("respawn"), "{text}");
     }
 
-    /// fails if a field that costs a respawn stops saying so, or stops
-    /// naming the sheep that pays for it.
+    /// fails if a respawn-class confirm goes back to promising a respawn
+    /// nothing performs. The daemon PARKS such a field and waits, which is
+    /// what the status line one keystroke later already said, so the
+    /// confirm said the flock would restart and the reply said it had not.
     #[test]
-    fn a_respawn_field_arms_a_confirm_that_names_the_death() {
-        let mut pane = ConfigPane::sheep(web());
-        pane.move_to_key("merge_logs");
-        pane.cycle(Instant::now());
-        let Some(PanePending::Armed { text, .. }) = pane.pending_edit() else {
-            panic!("{:?}", pane.pending_edit());
-        };
-        assert!(text.contains("respawn"), "{text}");
-        assert!(text.contains("web"), "{text}");
+    fn a_respawn_field_arms_a_confirm_that_names_the_reload_it_waits_for() {
+        for key in ["merge_logs", "shutdown_with_message"] {
+            let mut pane = ConfigPane::sheep(web());
+            pane.move_to_key(key);
+            pane.cycle(Instant::now());
+            let Some(PanePending::Armed { text, .. }) = pane.pending_edit() else {
+                panic!("{:?}", pane.pending_edit());
+            };
+            assert_eq!(
+                pane.cost(key),
+                Some(ApplyGroup::NeedsRespawn),
+                "the fixture must keep {key} NeedsRespawn or the test means nothing"
+            );
+            assert!(text.contains("waits for `shep reload web`"), "{text}");
+            assert!(!text.contains("is respawned"), "{text}");
+        }
+    }
+
+    /// fails if either env sentence promises a respawn. Env is
+    /// `NeedsRespawn` in every case, so both arms carried the same wrong
+    /// promise the field arm did, and against the same status line.
+    #[test]
+    fn an_env_confirm_names_the_reload_it_waits_for_and_never_the_value() {
+        for value in [Some("hunter2".to_owned().into()), None] {
+            let pane = ConfigPane::sheep(web());
+            let text = pane.confirm_text(&PaneEdit::SetEnv {
+                key: "DB_PASSWORD".into(),
+                value,
+            });
+            assert!(text.contains("waits for `shep reload web`"), "{text}");
+            assert!(!text.contains("respawn"), "{text}");
+            assert!(!text.contains("hunter2"), "{text}");
+        }
     }
 
     /// fails if a field shep refuses a config write for starts arming one.
