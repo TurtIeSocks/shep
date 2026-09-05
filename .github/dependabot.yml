@@ -1,0 +1,56 @@
+# Moves the commit pins in .github/workflows weekly, and the lockfiles
+# monthly. Subjects carry `ci(deps):` / `chore(deps):` so commits.yml
+# accepts them; release-plz skips both, so a bump alone makes no changelog
+# entry and release-plz-pr.yml's no-op guard holds that release open.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
+      include: scope
+    labels: [dependencies]
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      cargo:
+        patterns: ["*"]
+    commit-message:
+      prefix: chore
+      include: scope
+    labels: [dependencies]
+
+  # benches/ is its own workspace with its own lockfile, excluded from the
+  # root one so a bench-only dependency can never reach a shipped binary,
+  # which also means the entry above never sees it.
+  - package-ecosystem: cargo
+    directory: /benches
+    schedule:
+      interval: monthly
+    groups:
+      cargo-benches:
+        patterns: ["*"]
+    commit-message:
+      prefix: chore
+      include: scope
+    labels: [dependencies]
+
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: monthly
+    groups:
+      npm:
+        patterns: ["*"]
+    commit-message:
+      prefix: chore
+      include: scope
+    labels: [dependencies]
