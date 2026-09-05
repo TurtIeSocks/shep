@@ -4713,10 +4713,14 @@ fn available_dogs_reports_a_server_error_naming_the_url() {
 /// covers it.
 #[test]
 fn available_dogs_names_no_url_that_carries_credentials() {
+    // A sentinel per component, none of them a substring of anything the
+    // message says on its own. A password redacted while the username or
+    // the host it was paired with still prints is a narrower leak, not a
+    // closed one.
     for url in [
-        "ftp://user:hunter2@example.com/dogs.json",
+        "ftp://sentineluser:hunter2@sentinelhost.invalid/dogs.json",
         // Scheme-relative, so there is no `://` to split the authority on.
-        "//user:hunter2@example.com/dogs.json",
+        "//sentineluser:hunter2@sentinelhost.invalid/dogs.json",
     ] {
         let home = TempDir::new().unwrap();
 
@@ -4731,10 +4735,12 @@ fn available_dogs_names_no_url_that_carries_credentials() {
             "{url}: an unfetchable url must not exit success: {output:?}"
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            !stderr.contains("hunter2"),
-            "{url}: stderr printed the password: {stderr}"
-        );
+        for secret in ["hunter2", "sentineluser", "sentinelhost.invalid"] {
+            assert!(
+                !stderr.contains(secret),
+                "{url}: stderr printed {secret}: {stderr}"
+            );
+        }
         assert!(
             stderr.contains("a url carrying credentials"),
             "{url}: stderr must say why it withheld the url: {stderr}"
