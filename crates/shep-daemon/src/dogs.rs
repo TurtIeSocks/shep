@@ -194,15 +194,17 @@ pub async fn spawn_enabled_dogs(
 }
 
 /// The `[<name>]` section of `path`, a `dogs.toml`, as the operator wrote
-/// it: the table's own text, without its header.
+/// it, as a document in its own right: headers rebased off `name`, and no
+/// header of its own.
 ///
 /// Reads the file on every call, so one reader can never be stale and
 /// `shep disable X && shep enable X` re-reads an edited section. A missing
 /// file, or one with no such section, is `Ok(String::new())`.
 ///
-/// The span, not a re-render: rendering a parsed table drops the comments
-/// inside a section and sorts its keys. [`set_dog_section`] writes back the
-/// text its caller hands it.
+/// The operator's own bytes, not a re-render: rendering a parsed table drops
+/// the comments inside a section and sorts its keys. [`set_dog_section`]
+/// takes the same shape back, parsing what it is handed as a document and
+/// rebasing it under `name` again.
 ///
 /// # Errors
 /// - [`DogError::Config`] if the file exists and is not valid `dogs.toml`, or
@@ -226,7 +228,26 @@ pub fn dog_section(path: &Path, name: &str) -> Result<String, DogError> {
         .parse()
         .map_err(|err: toml_edit::TomlError| DogError::Config(err.to_string()))?;
     match doc.get(name) {
-        Some(toml_edit::Item::Table(spanned)) => Ok(spanned.to_string()),
+        Some(toml_edit::Item::Table(spanned)) => {
+            // Re-rooted, not `to_string`ed in place. A table renders its own
+            // key-values and leaves its child tables to the document, which
+            // writes their headers by their path from the root: a section
+            // read out of `[bark]` would arrive at the dog either missing
+            // `[bark.sinks.local]` entirely or naming it `bark.sinks`, and
+            // the dog parses what it gets as its own root. Cloning the table
+            // in as a document's root keeps every byte the operator wrote,
+            // comments between keys included, and rebases the headers.
+            let mut section = spanned.clone();
+            // The root of a document takes no header, and the decor here is
+            // the `[bark]` line's own: a comment above it belongs to the
+            // table rather than to the body, and `set_dog_section` carries
+            // it across on the write instead.
+            section.set_implicit(true);
+            *section.decor_mut() = toml_edit::Decor::default();
+            let mut out = toml_edit::DocumentMut::new();
+            *out.as_table_mut() = section;
+            Ok(out.to_string())
+        }
         // An inline table, `bark = { poll = "60s" }`, is a valid entry
         // whose span is `{ ... }`, which is not a section body and is not
         // something the pane could write back. Rendered, as every section
@@ -1274,6 +1295,63 @@ fn record_dog_errored(barks_path: &Path, name: &str, restarts: u32) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_section_written_with_sub_tables_reaches_the_dog_as_its_own_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dogs.toml");
+        let source = "# above the header\n[bark]\n# above poll\npoll = \"5s\"\n\n[bark.sinks.local]\nkind = \"json\"\nurl = \"https://example.invalid/h\"\n\n[[bark.rules]]\non = \"event\"\nkinds = [\"exit\"]\nsinks = [\"local\"]\n\n[otel]\nendpoint = \"https://collector.invalid\"\n";
+        std::fs::write(&path, source).unwrap();
+
+        let section = dog_section(&path, "bark").unwrap();
+        let parsed: toml::Table = section.parse().unwrap();
+
+        // The dog parses the section as its own root, so every sub-table has
+        // to arrive rebased off the section name.
+        assert!(parsed.contains_key("sinks"), "{section}");
+        assert!(parsed.contains_key("rules"), "{section}");
+        assert_eq!(
+            parsed["sinks"]["local"]["kind"].as_str(),
+            Some("json"),
+            "{section}"
+        );
+        assert_eq!(
+            parsed["rules"].as_array().map(Vec::len),
+            Some(1),
+            "{section}"
+        );
+        // The operator's own comment between keys survives the re-rooting,
+        // which is the reason this reads a span rather than re-rendering.
+        assert!(section.contains("# above poll"), "{section}");
+        // The header's own decor is `set_dog_section`'s to carry, not this.
+        assert!(!section.contains("# above the header"), "{section}");
+        // A second dog is nobody else's business.
+        assert!(!section.contains("otel"), "{section}");
+    }
+
+    #[test]
+    fn a_sub_table_section_survives_a_read_and_a_write_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dogs.toml");
+        std::fs::write(
+            &path,
+            "# keep me\n[bark]\npoll = \"5s\"\n\n[bark.sinks.local]\nkind = \"json\"\nurl = \"https://example.invalid/h\"\n",
+        )
+        .unwrap();
+
+        let section = dog_section(&path, "bark").unwrap();
+        set_dog_section(&path, "bark", &section).unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        let reloaded: toml::Table = after.parse().unwrap();
+        assert_eq!(
+            reloaded["bark"]["sinks"]["local"]["url"].as_str(),
+            Some("https://example.invalid/h"),
+            "{after}"
+        );
+        assert!(after.contains("# keep me"), "{after}");
+        assert_eq!(dog_section(&path, "bark").unwrap(), section, "{after}");
+    }
+
     use super::*;
     use crate::fake::ProcScript;
     use crate::testing::test_paths;
