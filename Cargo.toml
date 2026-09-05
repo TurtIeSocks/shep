@@ -33,7 +33,7 @@ shep-client = { path = "crates/shep-client", version = "0.3.0" }
 shep-macros = { path = "crates/shep-macros", version = "0.3.0" }
 serde = { version = "1", default-features = false, features = ["derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
-toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
+toml = { version = "1.1", default-features = false, features = ["parse", "display"] }
 # The read-modify-write behind `shep.toml` and `dogs.toml`: `shep-cli`'s
 # `ShepToml` and `shep-daemon`'s `dogs::set_dog_section` both edit the
 # document they parsed rather than rendering a map back out, so a comment or
@@ -41,7 +41,7 @@ toml = { version = "0.8", default-features = false, features = ["parse", "displa
 # already pulls `toml_edit` in as its own backing implementation.
 #
 # Floor 0.22.7: `DocumentMut` is that release's rename of the older `Document`.
-toml_edit = { version = "0.22.7", default-features = false, features = ["display", "parse"] }
+toml_edit = { version = "0.25.13", default-features = false, features = ["display", "parse"] }
 serde-saphyr = { version = "1", default-features = false, features = ["deserialize"] }
 # Transitive floor pins: -Z minimal-versions picks a version below what a
 # dependency's own code actually needs.
@@ -65,8 +65,8 @@ syn-floor = { package = "syn", version = "1.0.1", default-features = false }
 # return.
 proc-macro2 = { version = "1.0", default-features = false, features = ["proc-macro"] }
 quote = { version = "1.0", default-features = false, features = ["proc-macro"] }
-syn = { version = "2.0", default-features = false }
-json5 = { version = "0.4", default-features = false }
+syn = { version = "3.0", default-features = false }
+json5 = { version = "1.3", default-features = false }
 # Floor 1.9: regex 1.8's compiled-size accounting lets
 # `selector_spec_oversized_regex_is_rejected`'s huge pattern slip under the
 # 1 MiB size_limit; 1.9 rejects it.
@@ -86,7 +86,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 # Only shep-daemon: process-group signal delivery and process-related syscalls for the
 # real ProcessRunner (kill ladder, SIGKILL tree); `user` adds geteuid for the same-uid
 # peer-cred check and passwd/group lookups for `user`/`group` spawn.
-nix = { version = "0.29", default-features = false, features = ["signal", "process", "user"] }
+nix = { version = "0.31", default-features = false, features = ["signal", "process", "user"] }
 # Only shep-daemon: passes the shepherd-channel socketpair as fd 3 into the spawned child.
 command-fds = { version = "0.3", default-features = false }
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
@@ -135,7 +135,7 @@ assert_cmd = { version = "2", default-features = false }
 predicates = { version = "3", default-features = false }
 # The cron_restart dialect (spec §4). `serde` is croner's only feature; we do
 # not serialize a parsed Cron, the Flockfile carries the pattern string.
-croner = { version = "3.0.1", default-features = false }
+croner = { version = "4.0.0", default-features = false }
 # croner is generic over chrono::TimeZone; `clock` provides Utc::now(), which
 # the daemon's cron worker reads to derive the next occurrence.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
@@ -162,7 +162,7 @@ notify-debouncer-full = { version = "0.7.0", default-features = false }
 # needs FSEventsGetCurrentEventId, FSEventStreamGetDeviceBeingWatched and
 # FSEventsPurgeEventsForDeviceUpToEventId, all added in 4.1.0. macOS only,
 # but unconditional since Cargo resolves one version workspace-wide.
-fsevent-sys = "4.1.0"
+fsevent-sys = "5.2.0"
 # Bark's sinks are Discord and Slack webhooks (HTTPS), the one thing here
 # needing TLS. tokio-rustls + webpki-roots, not reqwest: reqwest's default
 # rustls pulls in aws-lc-sys, needing both a C compiler and cmake; this
@@ -177,7 +177,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 # Mozilla's compiled-in root store. rustls itself is reached through
 # tokio-rustls's `pub use rustls;`; not named directly in
 # crates/shep-cli/Cargo.toml since only the re-exported types are needed.
-webpki-roots = "0.26"
+webpki-roots = "1.0"
 # The lookout TUI (spec §9): cell diffing, resize handling and cursor
 # arithmetic are the whole cost of a terminal UI, already solved by an
 # established crate.
