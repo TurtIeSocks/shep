@@ -1017,6 +1017,13 @@ impl ConfigPane {
     /// typed, so echoing it tells the operator nothing they cannot see, and
     /// it would put a secret into a string that outlives the editor, sits
     /// on the status bar, and rides inside [`PanePending`].
+    ///
+    /// A field the schema marks `x-shep-secret` gets that same protection,
+    /// rendered as the `<set>` its own cell reads rather than as a quoted
+    /// credential. Nothing above this reaches it: `begin_typing` seeds the
+    /// editor empty for a secret and the cell never holds the value, so
+    /// this sentence was the one place a credential got into a string that
+    /// outlives the keystroke.
     fn confirm_text(&self, edit: &PaneEdit) -> String {
         let name = self.target.name();
         let (key, value) = match edit {
@@ -1034,8 +1041,10 @@ impl ConfigPane {
             }
             PaneEdit::Set { key, value } => (key, value),
         };
+        let secret = self.fields.by_key(key).is_some_and(|field| field.secret);
         let shown = match value.as_value() {
             Value::Null => "(unset)".to_owned(),
+            _ if secret => "<set>".to_owned(),
             Value::String(text) => text.clone(),
             other => other.to_string(),
         };
@@ -1551,6 +1560,44 @@ mod tests {
         assert_eq!(pane.lock("sinks"), Some(Lock::NoWidget));
         assert_eq!(pane.lock("rules"), Some(Lock::NoWidget));
         assert_eq!(pane.lock("poll"), None);
+    }
+
+    /// A dog whose schema declares one secret STRING. No built-in has one:
+    /// bark's only secret is a map, and a map has no editor to type a
+    /// secret into, so the leak the confirm sentence could carry was not
+    /// reachable from any fixture the pane already had.
+    fn secret_dog_pane() -> ConfigPane {
+        let schema = serde_json::json!({
+            "properties": {
+                "webhook": { "type": "string", "x-shep-secret": true },
+            }
+        });
+        ConfigPane::dog(
+            "pydog".into(),
+            None,
+            schema,
+            "webhook = \"https://hook/OLD\"\n".to_owned(),
+        )
+    }
+
+    /// fails if the confirm sentence quotes a credential. The pane renders
+    /// `<set>` for a secret and seeds its editor empty, and the sentence
+    /// outlives both: it sits in `PanePending`, prints on the status bar,
+    /// and survives `take_armed` for the whole round trip.
+    #[test]
+    fn a_secret_fields_confirm_never_quotes_what_was_typed() {
+        let mut pane = secret_dog_pane();
+        pane.move_to_key("webhook");
+        pane.begin_typing();
+        for typed in "https://hook/T0PS3CRET".chars() {
+            pane.type_char(typed);
+        }
+        pane.apply_typing(Instant::now());
+        let Some(PanePending::Armed { text, .. }) = pane.pending_edit() else {
+            panic!("{:?}", pane.pending_edit());
+        };
+        assert!(!text.contains("T0PS3CRET"), "{text}");
+        assert!(text.contains("set webhook = <set>?"), "{text}");
     }
 
     /// fails if a write starts re-rendering the section from the parsed
