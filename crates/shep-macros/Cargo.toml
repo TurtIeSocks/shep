@@ -20,14 +20,18 @@ quote.workspace = true
 proc-macro2.workspace = true
 
 # A dependency cycle on paper and none in the build graph: `shep-client`
-# depends on this crate normally, and dev-dependencies sit outside the library
-# build, so cargo allows it. What it buys is the doctest on the derive, which
-# has to name `shep_client::dogs::DogConfig` because that is what the
-# expansion names. The alternative was leaving the example `ignore`d, which
-# means publishing a snippet nothing compiles for the one crate whose whole
-# job is to turn a typo into a compile error.
+# depends on this crate normally, and dev-dependencies sit outside the
+# library build, so cargo allows it. Lets the derive's doctest name
+# `shep_client::dogs::DogConfig`, what the expansion actually produces.
 [dev-dependencies]
-shep-client.workspace = true
+# Path-only, with no `version`, DELIBERATELY. `cargo publish` strips `path`
+# and keeps whatever `version` a dependency carries, so the workspace entry's
+# `version = "0.2.x"` would make packaging this crate require a shep-client
+# release that cannot exist yet: shep-client depends on this crate normally, so
+# it publishes AFTER it. A dev-dependency with no version is dropped from the
+# published manifest outright, which is what breaks the cycle. Keep it inline —
+# `workspace = true` pulls the version back in.
+shep-client = { path = "../shep-client" }
 schemars.workspace = true
 serde.workspace = true
 

@@ -11,47 +11,31 @@ documentation = "https://docs.rs/shep-client"
 keywords = ["shep", "process-manager", "client", "ipc", "async"]
 categories = ["asynchronous", "network-programming", "api-bindings"]
 
-# No `[package.metadata.docs.rs]` here, deliberately. There are two features
-# and neither wants unlocking on docs.rs: `schema` is on by default, so the
-# default build already documents `dogs::config_schema` and everything it
-# gates, and `test-support` is test scaffolding rather than public API (its
-# own comment below says so). Unlike shep-core, whose `schema` is OFF by
-# default and whose docs would otherwise render as though half the crate did
-# not exist.
+# No `[package.metadata.docs.rs]`: `schema` is on by default, so the
+# default build already documents `dogs::config_schema`; `test-support` is
+# test scaffolding, not public API worth unlocking.
 [features]
 default = ["schema"]
 
-# Option: build a dog's config schema, `dogs::config_schema` and the
-# `dogs::probe` arm that prints it. ON by default, so following the dog docs
-# works with no feature line; off is for a dog that would rather not compile
-# schemars for an answer it does not want to give. Not answering is legal
-# rather than broken (see `dogs`'s module docs), so this stays additive: with
-# it off, `probe` still answers the version flag and exits silently on the
-# schema flag. The name matches the feature shep-core already uses for the
-# same dependency.
+# Option: `dogs::config_schema` and the `dogs::probe` arm that prints it. On
+# by default, so following the dog docs works with no feature line. Off is
+# additive, not broken: `probe` still answers the version flag and exits
+# silently on the schema flag.
 schema = ["dep:schemars", "dep:serde_json"]
 
 # Option: expose `testing` (the hand-rolled daemon fakes) to other crates'
-# tests. Off by default — it is test scaffolding, not public API. Mirrors
-# shep-daemon's `test-fakes` (`crates/shep-daemon/Cargo.toml:12`), which does
-# the same job for the scripted runner.
+# tests. Off by default, since it is test scaffolding, not public API.
 test-support = []
 
-# This crate's own fake-driven tests are integration tests, so they link the
-# ordinary (not `--cfg test`) library and need the feature switched on —
-# `cfg(test)` alone does not reach them. Declared per target rather than left
-# to fail: a bare `cargo test -p shep-client` skips all four below instead of
-# failing to compile. `cargo test --workspace` runs them, because shep-cli's
-# dev-dependency turns the feature on for the whole workspace build; so does
-# any `--all-features` leg.
+# These integration tests link the ordinary library, so `cfg(test)` alone
+# does not reach them: declared per target so a bare
+# `cargo test -p shep-client` skips them instead of failing to compile.
+# `cargo test --workspace` runs them, since shep-cli's dev-dependency turns
+# the feature on for the whole build.
 #
-# Cargo skips a target whose required features are off in SILENCE — no line,
-# no count, no warning — so a bare per-crate run reports a fraction of this
-# crate's cases and reads as the whole. Nobody measuring coverage or a blast
-# radius opens this file first, so the warning also lives where the
-# measurement is taken: `lib.rs`'s
+# Cargo skips a target with an off required feature in silence, so `lib.rs`'s
 # `heads_up_four_integration_binaries_need_test_support_and_are_not_running`
-# compiles only when the feature is off, and says so in the test output.
+# compiles only when the feature is off, and names the gap in its own output.
 [[test]]
 name = "request_reply"
 required-features = ["test-support"]

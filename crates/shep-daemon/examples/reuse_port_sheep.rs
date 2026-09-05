@@ -1,67 +1,17 @@
-//! A sheep that serves one TCP port with `SO_REUSEPORT`, and that can be told
-//! to ignore its stop signal.
+//! A sheep serving one TCP port with `SO_REUSEPORT`, and able to
+//! ignore its stop signal. Used by `daemon_e2e.rs`'s reload
+//! measurement, since `/bin/sh` cannot set a socket option.
 //!
-//! `tests/daemon_e2e.rs`'s reload measurement starts this program under a real
-//! daemon, connects to it continuously, and reloads it — so that what a reload
-//! costs a live connection is measured against an application that cooperates
-//! and against one that does not. Nothing else in the suite can stand in for
-//! it: every other real child here is `/bin/sh` running an inline script, and
-//! `/bin/sh` cannot set a socket option.
+//! Env, read once at startup: `SHEEP_PORT_BASE` + `SHEP_INSTANCE`
+//! (required, bind port); `SHEEP_HOLD_MS` (default 40, reply delay);
+//! `SHEEP_DEFIANT=1` (ignore `SIGTERM`); `SHEEP_MUTE_FILE` (if it
+//! exists at startup, bind nothing and answer nothing).
 //!
-//! # Why this is an `examples/` target
-//!
-//! Cargo has no "helper program a test executes" target kind, and each of the
-//! three that exist costs something different:
-//!
-//! - `src/bin/` would be built for every consumer, installed by `cargo install`
-//!   and — the deciding one — could not use a dev-dependency, so `nix`'s
-//!   `socket` feature would have to join the SHIPPED daemon's dependency graph
-//!   to serve a fixture.
-//! - A `[[test]]` target is RUN by `cargo test`; a server that never returns is
-//!   not a test.
-//! - A separate workspace member is not built by `cargo test -p shep-daemon`,
-//!   which is a leg of this repo's CI.
-//!
-//! An example is built by a plain `cargo test`, may use dev-dependencies, and
-//! is never installed. It reaches for none of `shep-daemon`'s own API, which is
-//! unusual for the target kind and is the price of the other three being worse.
-//!
-//! # Contract
-//!
-//! Environment, all read once at startup:
-//!
-//! - `SHEEP_PORT_BASE` (required) — the sheep binds `127.0.0.1` on
-//!   `SHEEP_PORT_BASE + SHEP_INSTANCE`. Derived from the instance slot rather
-//!   than taken whole so that a reload replacing an instance in a DIFFERENT
-//!   slot would bind a different port, and a caller that keeps connecting to
-//!   the old one would see it.
-//! - `SHEP_INSTANCE` (required) — the slot, which the daemon sets for every
-//!   sheep it spawns.
-//! - `SHEEP_HOLD_MS` (optional, default 40) — how long a connection is held
-//!   before its reply. A reply is not instant because a handover's cost is
-//!   mostly what happens to work already in hand.
-//! - `SHEEP_DEFIANT` (optional, `1` to enable) — never act on `SIGTERM`. The
-//!   uncooperative half of the measurement.
-//! - `SHEEP_MUTE_FILE` (optional) — a path. If it EXISTS when this program
-//!   starts, the sheep runs without ever binding its port: it comes up, stays
-//!   up, answers nothing. That is a release that starts and does not serve,
-//!   which is the failure a readiness probe exists to catch and the one a
-//!   reload used to miss — the instance being replaced was still bound to the
-//!   probe's address and answered on the newcomer's behalf. The test creates
-//!   the file between the first instance's start and the reload, so the two
-//!   instances of one app differ without the app's config differing.
-//!
-//! Protocol: the server speaks first, writing `<pid>\n` and closing. The pid
-//! is what lets a caller attribute every answered connection to a process,
-//! which is how the test tells its own setup races apart from the thing it is
-//! measuring.
-//!
-//! Startup is announced on stdout, so a failing run leaves the port, the pid
-//! and the role in the sheep's log.
+//! Protocol: the server writes `<pid>\n` and closes. Startup is
+//! announced on stdout.
 
-// nix is unix-only and so is everything below; the Windows CI leg builds this
-// file and gets the stub at the bottom. The test that drives it is
-// `#![cfg(unix)]` for the same reason.
+// nix is unix-only, and so is everything below. The Windows CI leg
+// builds this file and gets the stub at the bottom.
 #[cfg(unix)]
 fn main() {
     unix::serve();
@@ -83,21 +33,20 @@ mod unix {
         sockopt,
     };
 
-    /// How long the accept loop sleeps between polls of a listener that has
-    /// nothing queued. A drain has to notice its stop signal without an
-    /// `accept` blocking through it, and a poll this short is invisible next
-    /// to the connection rate the test drives.
+    /// How long the accept loop sleeps between polls of an empty
+    /// listener. Short enough to notice a stop signal promptly, and
+    /// invisible next to the test's connection rate.
     const ACCEPT_POLL: Duration = Duration::from_millis(1);
 
-    /// Reads `key`, or dies saying which variable was missing — a fixture that
-    /// silently defaulted a port would be measured against the wrong thing.
+    /// Reads `key`, or dies saying which variable was missing. A
+    /// silently defaulted port would measure the wrong thing.
     fn required(key: &str) -> u16 {
         let raw = std::env::var(key).unwrap_or_else(|_| panic!("{key} must be set"));
         raw.parse()
             .unwrap_or_else(|error| panic!("{key}={raw} is not a port number: {error}"))
     }
 
-    /// Binds, serves, and — unless told to be defiant — drains on `SIGTERM`.
+    /// Binds, serves, and drains on `SIGTERM` unless told to be defiant.
     pub fn serve() {
         let port = required("SHEEP_PORT_BASE") + required("SHEP_INSTANCE");
         let hold = Duration::from_millis(
@@ -110,12 +59,10 @@ mod unix {
         let mute =
             std::env::var("SHEEP_MUTE_FILE").is_ok_and(|path| std::path::Path::new(&path).exists());
 
-        // Blocked before any thread exists, so every thread spawned below
-        // inherits the mask and none of them can take the signal instead.
-        // Blocking rather than installing SIG_IGN is what keeps this file free
-        // of `unsafe`: `sigaction`/`signal` are unsafe in nix, `pthread_sigmask`
-        // and `sigwait` are not. A blocked SIGTERM is delivered to nobody and
-        // stays pending, which is exactly "ignores its stop signal".
+        // Blocked before any thread exists, so every spawned thread
+        // inherits the mask. Blocking, not `SIG_IGN`, needs no
+        // `unsafe`. A blocked SIGTERM stays pending: this is what
+        // "ignores its stop signal" means.
         let mut term = SigSet::empty();
         term.add(Signal::SIGTERM);
         term.thread_block().expect("SIGTERM must be blockable");
@@ -130,10 +77,9 @@ mod unix {
         }
 
         if mute {
-            // Up and useless, on purpose. Nothing is bound, so a probe against
-            // this port can only be answered by some OTHER process — which is
-            // the whole point: if a reload calls this instance ready, it did so
-            // on the strength of an answer that was not this instance's.
+            // Nothing is bound, so only some other process can answer
+            // a probe against this port. A reload that calls this
+            // instance ready did so on another instance's answer.
             println!(
                 "reuse_port_sheep pid={} port={port} MUTE (bound nothing)",
                 std::process::id()
@@ -161,11 +107,10 @@ mod unix {
             match listener.accept() {
                 Ok((conn, _)) => in_flight.push(thread::spawn(move || answer(conn, hold))),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    // The queue is empty. That is the only moment at which
-                    // closing the listener costs nothing: a connection already
-                    // queued and not yet accepted is RESET when its listener
-                    // closes, which is the loss this whole fixture exists to
-                    // measure.
+                    // The queue is empty: the only moment closing the
+                    // listener costs nothing. A connection queued but
+                    // not yet accepted resets when its listener
+                    // closes.
                     if stopping.load(Ordering::Relaxed) {
                         break;
                     }
@@ -175,28 +120,27 @@ mod unix {
             }
         }
 
-        // Stop accepting first, then finish what was already accepted: that
-        // order is what "drain" means, and reversing it would hand the
-        // measurement a window in which this process is neither taking new
-        // work nor done with the old.
+        // Stop accepting first, then finish what was already
+        // accepted: that order is what "drain" means. Reversing it
+        // leaves a window: no new work taken, none of the old
+        // finished.
         drop(listener);
         for handle in in_flight {
             let _ = handle.join();
         }
     }
 
-    /// A listening socket on `127.0.0.1:port` with `SO_REUSEPORT` set before
-    /// the bind — the option a reload's overlap depends on, and the one shep
-    /// cannot set on an app's behalf (`AppConfig::reuse_port` documents that
-    /// division).
+    /// A listening socket on `127.0.0.1:port` with `SO_REUSEPORT` set
+    /// before the bind. Shep cannot set this on an app's behalf
+    /// (`AppConfig::reuse_port` documents that division).
     ///
-    /// `SO_REUSEADDR` rides along for the ordinary reason every server sets it:
-    /// this port carries hundreds of short connections per run, and their
-    /// `TIME_WAIT` remains would otherwise refuse the next bind.
+    /// `SO_REUSEADDR` rides along too: this port carries hundreds of
+    /// short connections per run. Their `TIME_WAIT` remains would
+    /// otherwise refuse the next bind.
     ///
-    /// Hand-built rather than `TcpListener::bind` because `std` has no way to
-    /// set a socket option before binding. Every call here is safe: `socket`
-    /// hands back an `OwnedFd`, and `TcpListener: From<OwnedFd>` takes it.
+    /// Hand-built rather than `TcpListener::bind`, since `std` has no
+    /// way to set a socket option before binding. `socket` hands back
+    /// an `OwnedFd`, and `TcpListener: From<OwnedFd>` takes it safely.
     fn bind_reuse_port(port: u16) -> TcpListener {
         let sock = socket(
             AddressFamily::Inet,
@@ -218,9 +162,9 @@ mod unix {
 
     /// Holds one connection for `hold`, then answers with this process's pid.
     ///
-    /// Write errors are ignored: a caller that walked away mid-hold is the
-    /// caller's business, and this program's exit status belongs to the daemon
-    /// supervising it.
+    /// Write errors are ignored: a caller that walked away mid-hold is
+    /// the caller's business. This program's exit status belongs to
+    /// the daemon supervising it.
     fn answer(mut conn: TcpStream, hold: Duration) {
         thread::sleep(hold);
         let _ = writeln!(conn, "{}", std::process::id());

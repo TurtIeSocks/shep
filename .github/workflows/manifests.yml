@@ -1,0 +1,26 @@
+name: manifests
+# Rejects a pull request whose intra-workspace dev-dependency carries a
+# version. `cargo publish` keeps a versioned dev-dependency and has to resolve
+# it, so shep-macros dev-depending on shep-client with a version while
+# shep-client depends on shep-macros normally means neither can publish first.
+# `workspace = true` inherits a version without looking like it does. Runs
+# locally in about a second: `python3 scripts/check-dev-deps.py`.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  dev-dependencies:
+    name: intra-workspace dev-dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      # No toolchain and no cargo. The check reads the manifests with tomllib
+      # and never resolves anything, so it wants a Python and nothing else.
+      # ubuntu-latest ships 3.12; tomllib landed in 3.11.
+      - name: Check every intra-workspace dev-dependency is path-only
+        run: python3 scripts/check-dev-deps.py

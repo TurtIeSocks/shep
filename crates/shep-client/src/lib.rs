@@ -17,35 +17,25 @@
 #![doc(test(attr(deny(warnings))))]
 #![forbid(unsafe_code)]
 
-// The `DogConfig` derive expands to `impl ::shep_client::dogs::DogConfig`,
-// which is a path this crate does not otherwise have for itself. `dogs`'s own
-// tests derive it, so the name has to resolve from inside. Same reason serde
-// does this.
+// the `DogConfig` derive expands to `impl ::shep_client::dogs::DogConfig`,
+// a path this crate has no other way to name for its own tests
 extern crate self as shep_client;
 
-// Portable on both tiers: `connection` names `shep_core::transport::ClientStream`
-// rather than `tokio::net::UnixStream` directly, so the OS choice is made one
-// crate down and nothing here has a platform arm at all. `spawn`'s exit-code
-// contract for a `shep daemon` child reads `ExitStatus::code()`, which every
-// platform has.
+// portable: `connection` names `shep_core::transport::ClientStream`, not
+// `tokio::net::UnixStream`, so the OS choice is made one crate down.
+// `spawn`'s exit-code contract reads `ExitStatus::code()`, portable already.
 mod actor;
 mod client;
 mod connection;
-// The dog side of the probe contract: one call a dog makes as its first line.
-// Public because a dog is a third-party binary, so this module IS the API it
-// is written against, and it stays a module rather than a flattened re-export
-// for the same reason `spawn` does: `dogs::probe` reads as an agreement
-// between two processes, which `probe` alone would not.
+// public: a dog is a third-party binary, so this module is the API it's
+// written against; kept as a module rather than flattened, like `spawn`
 pub mod dogs;
 mod events;
 mod reconnect;
-// `spawn` stays a public module rather than a flattened re-export: the
-// exit-code contract (`spawn::DAEMON_ALREADY_RUNNING`) reads better
-// qualified, a cross-crate agreement rather than a convenience import.
-// Deliberately a plain `//` comment, not `///` — an outer doc comment on a
-// `mod` declaration merges with the module file's own `//!` docs and
-// resolves in crate-root scope, breaking that module's intra-doc links to
-// its own siblings.
+// public module, not a flattened re-export, so `spawn::DAEMON_ALREADY_RUNNING`
+// reads as a qualified cross-crate contract. Plain `//`, not `///`: an outer
+// doc on a `mod` item merges into the crate root and breaks this module's
+// own intra-doc links.
 pub mod spawn;
 pub use client::{
     Client, DEADLINE_GRACE, DEFAULT_DEADLINE, LOG_PLANE_DEADLINE, RequestError, START_DEADLINE,
@@ -55,19 +45,15 @@ pub use connection::{ConnectError, HANDSHAKE_TIMEOUT};
 pub use events::{EventStream, Lagged};
 /// The trait [`EventStream`] implements.
 ///
-/// Re-exported (IR-32: third-party re-exports normalized under our
-/// namespace) because there is no stable `core::stream::Stream` — this
+/// Re-exported because there is no stable `core::stream::Stream`, and this
 /// trait is otherwise unnameable in a caller's own bound without a direct
-/// `futures-util` dependency. Pulling one event at a time needs no import
-/// at all: [`EventStream::next`] is an inherent method. Only the trait
-/// itself is re-exported, not `StreamExt`'s combinators — the inherent
-/// `next` covers the common case, and a narrower surface is easier to widen
-/// later than to walk back.
+/// `futures-util` dependency. Pulling one event at a time needs no import:
+/// [`EventStream::next`] is an inherent method. Only the trait itself is
+/// re-exported, not `StreamExt`'s combinators.
 ///
 /// # Example
 ///
-/// The one thing this re-export is for — writing the bound — with no
-/// `futures-util` in the caller's own manifest:
+/// Writing the bound with no `futures-util` in the caller's own manifest:
 ///
 /// ```
 /// use shep_client::{EventStream, Stream};
@@ -96,36 +82,24 @@ pub use shep_core;
 /// The wire protocol this client speaks, re-exported from
 /// [`shep_core::protocol::PROTOCOL_VERSION`].
 ///
-/// Here because `docs/dogs.md` asks every dog to print it, and the path
-/// through the crate re-export above reads as though a dog is reaching
-/// somewhere it should not: `shep_client::shep_core::protocol::PROTOCOL_VERSION`
-/// is four segments of plumbing for a number that is part of the dog
-/// contract. A dog depends on this crate and on nothing else, so the number
-/// it has to publish should be reachable from this crate's own root.
+/// Reachable from this crate's own root because a dog depends on this
+/// crate and nothing else, and `docs/dogs.md` asks every dog to print it.
 ///
-/// It is a re-export rather than a copy for the reason the protocol has bitten
-/// twice already: the value lives in shep-core, this crate's dependency on it
-/// floats within 0.1.x, and a second definition here could disagree with the
-/// one the handshake actually compares.
+/// A re-export rather than a copy: a second definition here could
+/// disagree with the value the handshake actually compares.
 pub use shep_core::protocol::PROTOCOL_VERSION;
 
 #[cfg(test)]
 mod tests {
-    /// Not an assertion about behaviour — a line of output where a wrong
-    /// number is otherwise read in silence.
+    /// Not an assertion, just a line of output where a wrong number would
+    /// otherwise pass in silence.
     ///
-    /// A bare `cargo test -p shep-client` runs this crate's lib tests and
-    /// nothing else. All four integration binaries carry
-    /// `required-features = ["test-support"]` (see `Cargo.toml`), and cargo
-    /// skips a target whose required features are off without a line, a
-    /// count, or a warning — so a per-crate run reports a fraction of this
-    /// crate's cases and presents it as the whole. That is exactly how a
-    /// coverage or blast-radius measurement of this crate goes wrong.
-    ///
-    /// This case is compiled only when the feature is off, so it appears in
-    /// precisely the runs that are missing those binaries and in none of the
-    /// runs that include them (`--all-features`, `--workspace`, or anything
-    /// pulling shep-cli's dev-dependency).
+    /// The four integration binaries require `test-support` (`Cargo.toml`),
+    /// and cargo skips a target whose required features are off without a
+    /// line or a warning, so a bare `cargo test -p shep-client` silently
+    /// reports a fraction of this crate's tests as the whole. This case
+    /// compiles only when the feature is off, so it appears in exactly
+    /// the runs missing those binaries.
     #[cfg(not(feature = "test-support"))]
     #[test]
     fn heads_up_four_integration_binaries_need_test_support_and_are_not_running() {

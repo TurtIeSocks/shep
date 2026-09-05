@@ -1,17 +1,12 @@
 //! The sheep detail pane: four lines about the selected sheep.
 //!
-//! Three of the four come from the `ProcessInfo` the flock table's own rows
-//! are built from. The lamb line alone is different: it comes from a
+//! Three of the four come from the same `ProcessInfo` the flock table's rows
+//! are built from. The lamb line is different: it comes from a
 //! `Request::Describe` fetched on selection change and on `r`, never on the
-//! two-second poll — `ListFlock` never populates `ProcessInfo::lambs`, and its
-//! own doc says why, so this pane asks separately for the one thing the table
-//! cannot answer.
+//! poll, since `ListFlock` never populates `ProcessInfo::lambs`.
 //!
-//! What it adds over the row above it: the UNTRUNCATED name (the NAME column
-//! ends in `…`, and a truncated name is one an operator types into
-//! `shep stop`), both log paths (the first thing anyone wants once the feed
-//! shows them a crash), the lamb line, and whichever fields the current width
-//! tier has dropped.
+//! Adds over the row above it: the untruncated name, both log paths, the
+//! lamb line, and whichever fields the current width tier dropped.
 
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -33,9 +28,8 @@ pub fn detail_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     }
 }
 
-/// The pane's four lines when nothing is selected. Names the CAUSE, not the
-/// fact: an operator can see the pane is empty; what they cannot see is
-/// whether that is a broken dashboard or a shepherd with nothing registered.
+/// The pane's four lines when nothing is selected. Names the cause, not the
+/// fact: whether the flock is empty or the filter matched nothing.
 fn empty_lines(app: &App, width: u16, palette: Palette) -> Vec<Line<'static>> {
     let why = if app.flock_len() == 0 {
         "no sheep selected: the flock is empty".to_string()
@@ -52,9 +46,8 @@ fn empty_lines(app: &App, width: u16, palette: Palette) -> Vec<Line<'static>> {
 
 /// An app's four lines when a [`RowKey::Group`] is selected: the rollup
 /// [`App::group_totals`] computes, in place of one sheep's own fields. No
-/// lamb line and no log paths -- a group has no single process to walk or
-/// tail, and reading either for one arbitrarily chosen instance would
-/// describe a sheep the operator did not select.
+/// lamb line and no log paths, since a group has no single process to walk
+/// or tail.
 fn group_lines(app: &App, name: &str, width: u16, palette: Palette) -> Vec<Line<'static>> {
     let totals = app.group_totals(name);
     let head = format!("app {name} \u{d7}{}  ", totals.count);
@@ -72,8 +65,7 @@ fn group_lines(app: &App, name: &str, width: u16, palette: Palette) -> Vec<Line<
     );
     let used = head.chars().count() + status.chars().count();
     // `palette.status`, not `palette.reported`: a selected group is always
-    // an app's own instances, never a dog -- see
-    // `App::group_uniform_status`'s own doc.
+    // an app's own instances, never a dog.
     let status_style = app
         .group_uniform_status(name)
         .map_or(Style::default(), |status| palette.status(status));
@@ -105,8 +97,8 @@ fn sheep_lines(app: &App, width: u16, palette: Palette) -> Vec<Line<'static>> {
     };
     let info = &row.info;
 
-    // Everything except the status word, which is the one coloured cell —
-    // exactly the table's rule, for exactly the table's reason.
+    // Everything except the status word, which is the one coloured cell,
+    // same as the table.
     let head = format!("sheep {}  {}   ", info.id, info.name);
     // `Row::reported`, not `info.status.to_string()`: this pane must agree
     // with the flock table's own STATUS cell for the same row, and a dog
@@ -155,14 +147,11 @@ fn sheep_lines(app: &App, width: u16, palette: Palette) -> Vec<Line<'static>> {
 
 /// The lamb line: what the last walk found, and how old it is.
 ///
-/// The age comes first. This file's own rule is that the rarest field goes
-/// last so a narrow terminal truncates it first, and here that rule inverts:
-/// a truncated list is still honest, while a list whose stamp was truncated
-/// away is a stale reading presented as current.
+/// The age comes first: a truncated list is still honest, but a list whose
+/// stamp truncated away is a stale reading presented as current.
 ///
-/// It does not repeat the CLI's "not exactly the set a stop kills" clause.
-/// "parent-pid descendants" is already precisely true, and forty characters of
-/// warning on every frame trains an operator to stop reading the pane (A16).
+/// Omits the CLI's "not exactly the set a stop kills" caveat, since
+/// "parent-pid descendants" is already precise.
 fn lamb_line(
     app: &App,
     id: u32,
@@ -203,10 +192,9 @@ fn lamb_line(
 
 /// One log-path line, or a sentence saying why there is none.
 ///
-/// `None` means the shepherd predates the field — `ProcessInfo::out_file`'s own
-/// doc — which is a fact about the peer, not about this sheep, and the
-/// sentence says so rather than leaving a bare `-` that reads like a missing
-/// file.
+/// `None` means the shepherd predates the field, a fact about the peer, not
+/// about this sheep. The sentence says so rather than leaving a bare `-`
+/// that reads like a missing file.
 fn path_line(
     label: &str,
     path: Option<&str>,
@@ -236,11 +224,8 @@ mod tests {
     use crate::lookout::app::{App, Control, LambWalk, Msg, RowKey};
     use crate::lookout::theme::Palette;
 
-    /// fails if the pane collapses any two of the five states it can be in.
-    /// Three of them are distinctions `ProcessInfo::lambs` was built to keep
-    /// (walked and non-empty, walked and empty, not walked at all) and the CLI
-    /// has wording for only the first, so the other four sentences are this
-    /// pane's own.
+    /// Five states, and the CLI's own wording covers only one of them: the
+    /// other four sentences belong to this pane.
     #[test]
     fn the_pane_says_which_lamb_state_it_is_in() {
         let cases: [(LambWalk, &str); 3] = [
@@ -273,7 +258,6 @@ mod tests {
         assert!(render_all(&detail_lines(&unread, 200)).contains("lambs  not read yet"));
     }
 
-    /// fails if a single lamb reads as "1 parent-pid descendants".
     #[test]
     fn one_lamb_is_a_descendant_and_not_descendants() {
         let app = with_lamb_reading(LambWalk::Walked(vec![Lamb::new(48_220, "node")]));
@@ -284,11 +268,6 @@ mod tests {
         );
     }
 
-    /// fails if the staleness stamp moves after the list, or goes away.
-    /// `detail.rs`'s standing rule is that the rarest field goes last so a
-    /// narrow terminal truncates it first; here that rule inverts, because a
-    /// truncated list is still honest and a list whose "read 4m ago" was
-    /// truncated away is a stale reading presented as current.
     #[test]
     fn the_lamb_line_carries_its_age_before_its_list() {
         let app = with_lamb_reading(LambWalk::Walked(vec![Lamb::new(48_220, "node")]));
@@ -298,7 +277,6 @@ mod tests {
         assert!(stamp < list, "the caveat must survive truncation: {line:?}");
     }
 
-    /// fails if the pane starts showing a reading taken for another sheep.
     #[test]
     fn a_reading_for_another_sheep_is_not_drawn_here() {
         // with_lamb_reading pins its reading to the selected sheep's id;
@@ -307,17 +285,9 @@ mod tests {
         assert!(render_all(&detail_lines(&app, 200)).contains("lambs  not read yet"));
     }
 
-    /// fails if the stamp reads a live clock instead of `App::now`, and fails
-    /// again if a frozen dashboard's stamp creeps. Two halves, and BOTH are
-    /// needed: the first proves the stamp moves at all, the second proves it
-    /// stops when the banner says the values did.
-    ///
-    /// This is a unit test rather than a two-age frame comparison, and that is
-    /// the point. Rendering the frozen scene at two ages cannot fail for this
-    /// mutation: both renders happen at the same wall-clock instant, so a live
-    /// clock produces the same string in both and the frames stay identical.
-    /// Here the two ages differ by construction, because they are `Msg::Tick`
-    /// arithmetic rather than elapsed time. No sleep (IR-33).
+    /// A two-age frame comparison can't fail here, since both renders share
+    /// one wall-clock instant. Ages come from `Msg::Tick` arithmetic
+    /// instead.
     #[test]
     fn the_stamp_ages_on_a_live_dashboard_and_stops_on_a_frozen_one() {
         let (mut app, t0) =
@@ -341,11 +311,8 @@ mod tests {
         );
     }
 
-    /// fails if the pane stops showing what the ROW above it cannot. Three
-    /// things justify four rows of screen: the untruncated name (the NAME
-    /// column ends in `…`, and a truncated name is one an operator types into
-    /// `shep stop`), and both log paths (the first thing anyone wants after
-    /// the feed shows them a crash).
+    /// The untruncated name matters: an operator types it into `shep stop`,
+    /// and the name column truncates.
     #[test]
     fn the_pane_adds_the_full_name_and_both_log_paths() {
         let app = with_selection(
@@ -363,9 +330,8 @@ mod tests {
         assert!(rendered.contains("err  /home/ada/.shep/logs/payments-err.log"));
     }
 
-    /// fails if the STATUS word stops carrying its own colour, or if anything
-    /// else on the pane starts carrying one. Same rule as the table's: the
-    /// coloured cell is the cell whose text already says the same thing.
+    /// Same rule as the table's: the coloured cell is the cell whose text
+    /// already says the same thing.
     #[test]
     fn only_the_status_word_is_coloured() {
         let palette = coloured();
@@ -383,11 +349,6 @@ mod tests {
         assert_eq!(coloured, vec!["errored"], "got {coloured:?}");
     }
 
-    /// fails if an unselectable pane stops saying WHY it is empty. "no sheep
-    /// selected" alone restates what the operator can already see; the cause
-    /// is that the flock is empty, and that is what the sentence has to carry.
-    /// 12a shipped a caption claiming a sentence said why when it only stated
-    /// the fact — this is the same mistake, refused one layer down.
     #[test]
     fn an_empty_flock_says_why_the_pane_has_nothing_to_describe() {
         let app = App::new(
@@ -403,12 +364,9 @@ mod tests {
         );
     }
 
-    /// fails if a selected group row falls back to the empty-pane sentence,
-    /// stops showing the app's own rollup, or starts fetching lambs / a log
-    /// path for one arbitrarily chosen instance. Drives `detail_lines`
-    /// through a real `App` built from a real `Msg::Snapshot` (via
-    /// `fixtures::app_with`), the same door the production render loop
-    /// walks through -- not through `group_lines` directly.
+    /// Drives `detail_lines` through a real `App` built from a real
+    /// `Msg::Snapshot`, the same door the production render loop walks
+    /// through, rather than calling `group_lines` directly.
     #[test]
     fn a_selected_group_row_shows_the_apps_rollup_and_no_lambs_or_paths() {
         let app = app_with(
@@ -427,10 +385,8 @@ mod tests {
             ],
             plain(),
         );
-        // Sanity: the group is the whole flock here, so `App::reseat`'s own
-        // rule (first visible row, unseated) lands the default selection on
-        // it with no keypress -- confirming this is what makes the rest of
-        // the assertion mean anything.
+        // Sanity: the group is the whole flock here, so the default
+        // selection lands on it with no keypress.
         assert!(
             matches!(app.selected(), Some(RowKey::Group(ref name)) if name == "web"),
             "sanity: the group is selected by default, got {:?}",
@@ -457,11 +413,8 @@ mod tests {
         );
     }
 
-    /// fails if this pane and the flock table disagree about the same dog --
-    /// which is exactly what happened before this task: the table said
-    /// `silent` (task 4) and this pane still said `online`. Drives both
-    /// panes off the same [`App`] built from the same row, the way an
-    /// operator with both open sees them.
+    /// Drives both panes off the same [`App`] built from the same row, the
+    /// way an operator with both open sees them.
     #[test]
     fn a_silent_dogs_status_word_and_colour_agree_with_the_flock_pane() {
         use shep_core::protocol::DogSource;
@@ -495,8 +448,8 @@ mod tests {
             .collect();
         assert!(flock_rendered.contains("silent"), "{flock_rendered:?}");
 
-        // Both panes colour the word `--butter`, the "gap the operator can
-        // close" role -- see `Reported::role`'s own doc for why not `--bark`.
+        // Both panes colour the word `--butter`: a gap the operator can
+        // close, not `--bark`.
         let detail_colour = detail_lines(&app, 200)[0]
             .spans
             .iter()

@@ -349,7 +349,7 @@ anywhere in this file until now.
 
 **Invoke the `shep-idiomatic-rust` skill before writing or reviewing ANY Rust
 in this repo.** It fronts [docs/idiomatic-rust.md](docs/idiomatic-rust.md) —
-46 numbered rules (IR-1..IR-46) distilled from rand 0.10.2. Cite rules as
+47 numbered rules (IR-1..IR-47) distilled from rand 0.10.2. Cite rules as
 `IR-<n>` in reviews. Evidence with file:line citations:
 [docs/idiomatic-rust/lenses/](docs/idiomatic-rust/lenses/).
 

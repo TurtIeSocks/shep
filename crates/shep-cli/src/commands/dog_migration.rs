@@ -2,24 +2,12 @@
 //! and the one write path `dogs.toml` has.
 //!
 //! [`migrate_dog_sections`] runs at the top of every daemon boot and does
-//! nothing on all but the first. [`forget_dog_section`] is the other
-//! writer, `shep rehome`'s half of forgetting a dog, and it lives here
-//! rather than beside that verb because both go through
-//! [`write_dogs_config`]: that file holds webhook credentials at `0600`,
-//! and one staged-temp-`fsync`-`rename` helper with the reasoning attached
-//! is what keeps a second writer from reaching for `std::fs::write`.
-//!
-//! **Both hold `dogs.toml`'s own [`ConfigLock`] across the whole
-//! read-modify-write**, the same discipline [`ShepToml::edit`] applies to
-//! `shep.toml` and for the same reason: each rewrites the entire file, so
-//! two unserialised writers lose one of each other's edits rather than
-//! colliding visibly. Two `shep rehome` calls for two different dogs, out
-//! of the sort of provisioning script `docs/dogs.md` tells operators is
-//! safe, is the ordinary way to reach that. When both locks are held,
-//! `shep.toml`'s is always the outer one. `RawDaemonConfig` keeps its `dog` field so an un-migrated file
-//! still parses: deleting it would turn `deny_unknown_fields` into a
-//! refused boot for every operator carrying a dog section, with the flock
-//! left unsupervised at exactly the moment nobody is watching.
+//! nothing on all but the first. [`forget_dog_section`] is `shep rehome`'s
+//! half. Both hold `dogs.toml`'s own [`ConfigLock`] across the whole
+//! read-modify-write, since each rewrites the entire file; when both locks
+//! are held, `shep.toml`'s is the outer one. `RawDaemonConfig` keeps its
+//! `dog` field so an un-migrated file still parses under
+//! `deny_unknown_fields`.
 
 use core::fmt;
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,114 +20,52 @@ use toml_edit::{DocumentMut, Item, TableLike};
 
 use super::shep_toml::{ConfigLock, ShepToml, ShepTomlError, create_config_file};
 
-/// Moves every `[dog.<name>]` section into `dogs.toml`, returning the names
-/// moved
-///
-/// Empty when there was nothing to move, which is every boot after the
-/// first. Writes `dogs.toml` before striking `shep.toml`, so a crash
-/// between the two leaves the sections readable from the old file rather
-/// than from neither. On unix both writes flush the directory holding
-/// them, which is what makes that an order at all rather than two renames
-/// a power cut can lose independently; on Windows `sync_dir` does nothing
-/// and the order holds only against an ordinary crash.
+/// Moves every `[dog.<name>]` section into `dogs.toml`, naming those moved
 ///
 /// # Errors
-///
-/// - [`DogMigrationError::WouldOverwrite`] when a name holds VALUES in
-///   BOTH files. Two values for one key is a question shep cannot answer,
-///   so it refuses and changes nothing. An empty section is not one of the
-///   two on either side: an empty `[dog.<name>]` in the source is skipped
-///   (see [`declared_dog_names`]) and an empty `[<name>]` in the
-///   destination is written over.
-/// - [`DogMigrationError::SectionsUnreadable`] when `shep.toml` declares a
-///   name under `[dog]` that did not come back as a section to move.
-///   Refused rather than skipped: `take_dog_sections` has already struck
-///   the whole `[dog]` table by then, so moving what came back would drop
-///   what did not.
-/// - [`DogMigrationError::Parse`] when `dogs.toml` is not valid TOML, and
-///   [`DogMigrationError::Read`], [`DogMigrationError::ReadDogs`],
+/// - [`DogMigrationError::WouldOverwrite`] when a name holds values in both
+///   files; an empty section is not a value on either side.
+/// - [`DogMigrationError::SectionsUnreadable`] when a name declared under
+///   `[dog]` did not come back as a section to move.
+/// - [`DogMigrationError::Parse`] when `dogs.toml` is not valid TOML.
+/// - [`DogMigrationError::Read`], [`DogMigrationError::ReadDogs`],
 ///   [`DogMigrationError::Lock`], [`DogMigrationError::Write`] and
-///   [`DogMigrationError::Toml`] for the underlying I/O. There is no
-///   rendering failure to report: a [`DocumentMut`] always renders.
+///   [`DogMigrationError::Toml`] for the underlying I/O.
 pub(crate) fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, DogMigrationError> {
     let existing_source = match std::fs::read_to_string(&paths.daemon_config) {
         Ok(source) => source,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(DogMigrationError::Read(err)),
     };
-    // One parse of the string already in memory, answering both questions
-    // this function has to ask before it may open the document: is there
-    // anything to move, and which names. A read-only `toml::Table` parse
-    // opens no file and costs nothing next to the boot around it.
-    //
-    // Not a substring test, which is what this was. `[dog.` and `[dog]`
-    // are two of the spellings a `[dog]` header has and TOML allows the
-    // others: `[ dog.metrics ]` and `[dog . metrics]` are the same section
-    // and matched neither, so the migration reported nothing to do, the
-    // section stayed in a file nothing reads any more, and the dog came up
-    // on compiled defaults with no warning on any surface. For bark that
-    // is every sink gone. A parse knows the spellings; a substring cannot.
-    //
-    // Skipping the open when there is nothing to move is load-bearing
-    // rather than an optimisation. `ShepToml::edit` and `try_edit` both
-    // stage a temp file and rename it over the original whenever `save`
-    // runs, so opening the document at all would give an untouched
-    // `shep.toml` a fresh inode, force `OWNER_ONLY_FILE_MODE` on it, and
-    // replace a symlinked path with a plain file. Every boot after the
-    // first reaches this line, so that cost would land on everyone.
-    //
-    // `[dog]` on its own is a header with nothing under it: a section
-    // neither to move nor to lose, and refusing on it would leave an
-    // operator with a stray `[dog]` line unable to boot at all. A
-    // `[dog.metrics]` holding no values is the same shape one level down
-    // and is skipped for the same reason -- see [`declared_dog_names`].
-    //
-    // `None` means this parser could not read the source at all. That is
-    // not decided here: the document is opened and it falls through to
-    // `ShepToml`, whose own parse error names the file and the line, and
-    // the guard inside the closure falls back to the only question it can
-    // still answer.
+    // Not a substring test: `[ dog.metrics ]` is the same section spelled
+    // differently. `None` means this parser could not read the source, which
+    // `ShepToml` below reports with file and line.
     let declared = existing_source
         .parse::<toml::Table>()
         .ok()
         .map(|table| declared_dog_names(&table));
+    // Skipping the open is load-bearing: `ShepToml::save` renames a staged
+    // temp file over the original, so opening an untouched `shep.toml` would
+    // give it a fresh inode and mode on every boot after the first.
     if declared.as_ref().is_some_and(BTreeSet::is_empty) {
         return Ok(Vec::new());
     }
 
-    // `try_edit`, never `edit`. `edit` calls `save` unconditionally
-    // (shep_toml.rs:173), so refusing from inside it would strike the
-    // sections from `shep.toml` and only then fail, leaving them in
-    // neither file. `try_edit`'s own `Err` skips `save` entirely and
-    // leaves `path` exactly as it was found.
+    // `try_edit`, never `edit`: `edit` calls `save` unconditionally, so
+    // refusing from inside it would strike the sections from `shep.toml` and
+    // only then fail, leaving them in neither file.
     ShepToml::try_edit(&paths.daemon_config, |doc| {
-        // Empty sections dropped here, matching what [`declared_dog_names`]
-        // already left out of `declared`, so the two agree on what there
-        // was to move. An empty one is not moved and not counted as
-        // missing: there is nothing in it to arrive at the other end. It
-        // does still go, because `take_dog_sections` removes the whole
-        // `[dog]` table, and striking an empty header an older `shep
-        // enable` scaffolded is the right outcome anyway. Only the sections
-        // beside it are what made this boot open the file at all.
+        // Empty sections dropped here, matching what `declared_dog_names`
+        // left out, so the two agree on what there was to move. They still
+        // leave `shep.toml`: `take_dog_sections` removes the whole `[dog]`.
         let incoming: BTreeMap<String, Item> = doc
             .take_dog_sections()
             .into_iter()
             .filter(|(_, section)| !section.as_table_like().is_some_and(TableLike::is_empty))
             .collect();
-        // `take_dog_sections` removes the WHOLE `[dog]` table and then
-        // decides what to hand back, so anything it drops on the way is
-        // gone from the document with nothing written in its place: a
-        // failed internal reparse hands back nothing at all, and its filter
-        // drops a non-table entry while keeping the tables beside it. That
-        // second shape is the one a count cannot see, since `[dog] stray =
-        // 5` next to `[dog.metrics]` comes back one entry long and not
-        // empty. So the guard is over NAMES, comparing what the source
-        // declared against what came back, and it refuses before anything
-        // is written: `try_edit`'s own `Err` is what makes that a `save`
-        // that never happens.
-        //
-        // With no readable source there are no names to compare, and the
-        // fallback is the weaker question: did anything come back at all.
+        // `take_dog_sections` removes the whole `[dog]` table before deciding
+        // what to hand back, so a count cannot see what it dropped: compare
+        // names. With no readable source, fall back to whether any came back.
         let missing: Vec<String> = match &declared {
             Some(names) => names
                 .iter()
@@ -151,36 +77,18 @@ pub(crate) fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, Dog
         if !missing.is_empty() || incoming.is_empty() {
             return Err(DogMigrationError::SectionsUnreadable { names: missing });
         }
-        // `dogs.toml`'s own lock, taken here rather than at the top of the
-        // function so that this whole read-and-merge is one transaction
-        // against the other writer of that file,
-        // [`forget_dog_section`]. Nested INSIDE `shep.toml`'s lock, which
-        // `try_edit` already holds: that is the ordering both call sites
-        // keep, and the reason a deadlock is not reachable. This is the
-        // only place either lock is nested in the other at all, and it
-        // never takes them the other way round.
+        // `dogs.toml`'s lock, so the read and merge below are one transaction
+        // against `forget_dog_section`. Nested inside `shep.toml`'s lock,
+        // which `try_edit` holds; that order is the only one taken anywhere.
         let _dogs_lock =
             ConfigLock::acquire(&paths.dogs_config).map_err(DogMigrationError::Lock)?;
-        // The destination as a live document, not a `toml::Table`: a
-        // second migration writes into a `dogs.toml` an operator has been
-        // hand-editing since the first one, and a `toml::to_string` of a
-        // parsed map hands that file back with every comment gone (spec
-        // decision 1 calls this file hand-editable, and decision 9 promises
-        // `toml_edit` for exactly this reason).
+        // A live document, not a `toml::Table`: a second migration writes into
+        // a `dogs.toml` an operator has been hand-editing, and a
+        // `toml::to_string` of a parsed map drops every comment in it.
         let mut merged = read_dogs_document(&paths.dogs_config)?;
-        // Over VALUES on both sides, the same rule `incoming`'s own filter
-        // and [`declared_dog_names`] apply to the source. `WouldOverwrite`
-        // exists because two values for one key is a question shep cannot
-        // answer, and a bare `[metrics]` in `dogs.toml` is not one of the
-        // two: there is no second value to guess between, so the section
-        // carrying values wins and the header it lands on held nothing to
-        // lose. Refusing on it took a boot down over an empty header, the
-        // same way the source side did before
-        // `an_empty_section_colliding_with_a_configured_one_is_not_a_refusal`.
-        //
-        // Table-like only, deliberately. A destination `[[metrics]]` is an
-        // array of tables and not a section this migration could merge
-        // into, so it still refuses rather than being quietly replaced.
+        // Over values on both sides: a bare `[metrics]` in `dogs.toml` is not
+        // a second value, so the section carrying values wins. A destination
+        // `[[metrics]]` is not table-like, so it refuses.
         let collides = |name: &String| {
             merged
                 .get(name)
@@ -192,24 +100,9 @@ pub(crate) fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, Dog
         let mut moved: Vec<String> = incoming.keys().cloned().collect();
         moved.sort();
 
-        // Appended, never wedged into the middle. A table taken out of
-        // `shep.toml` still carries the position it held THERE, and
-        // `toml_edit` renders tables in position order, so a
-        // `[dog.metrics]` that was the first table in `shep.toml` lands
-        // between the first and second tables of an operator's `dogs.toml`
-        // -- inside the blank line that separated them. Renumbering from
-        // one past the destination's own last table is what makes a
-        // migration read like an append.
-        //
-        // Over EVERY positioned table in the destination, not the
-        // top-level `Item::Table`s alone, which is what this counted. A
-        // `dogs.toml` whose own sections are `[bark.sinks]` (nested under
-        // an implicit `bark` that holds no position of its own) and
-        // `[[bark.rules]]` (an array of tables, never an `Item::Table`)
-        // answered "no positions at all", so the scan said 0, the moved
-        // section took 0, and it rendered FIRST and jammed against the
-        // section it was supposed to follow. That is the shape a real
-        // `dogs.toml` has as soon as bark is configured.
+        // Appended: a table taken out of `shep.toml` still carries the
+        // position it held there. The scan covers every positioned table, not
+        // top-level `Item::Table`s alone, since `[bark.sinks]` is neither.
         let mut next = merged
             .iter()
             .filter_map(|(_, item)| last_position(item))
@@ -220,24 +113,8 @@ pub(crate) fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, Dog
             merged.insert(&name, section);
         }
         // Written before this closure returns, so `save` strikes the old
-        // sections only once the new file already holds them. A crash
-        // between the two leaves them readable from `shep.toml`, which is
-        // the direction that loses nothing.
-        //
-        // "Before" is a claim about durability, not about statement order,
-        // and on unix it holds only because `write_dogs_config` flushes the
-        // directory it renamed into. Without that the two renames are
-        // independent under a power cut, and the interleaving that loses
-        // this one while landing the strike leaves the sections in NEITHER
-        // file: an operator's webhook URLs gone, from a path whose whole
-        // argument was that it could not happen.
-        //
-        // What the surviving interleaving costs is a refusal, not data.
-        // Landing here and losing the strike leaves values under both
-        // `[dog.<name>]` and `[<name>]`, which is what `collides` above
-        // answers `WouldOverwrite` to, so the next boot stops and says so
-        // rather than guessing between two values. Recoverable by hand and
-        // loud, which is the trade this order is choosing.
+        // sections only once the new file holds them, durable on unix but not
+        // against a Windows power cut (`sync_dir` no-ops there).
         write_dogs_config(&paths.dogs_config, &merged.to_string())
             .map_err(DogMigrationError::Write)?;
         Ok(moved)
@@ -245,51 +122,21 @@ pub(crate) fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, Dog
 }
 
 /// Removes `name`'s section from `dogs.toml`, answering whether there was
-/// one to remove.
+/// one to remove. A missing file, or no section under `name`, is `Ok(false)`.
 ///
-/// `shep rehome <name>`'s half of the cross-file forget: [`ShepToml`] owns
-/// `shep.toml` alone, so `rehome_dog` strikes the registration and this
-/// strikes the configuration. A missing `dogs.toml`, or one with no
-/// section under `name`, is `Ok(false)` and writes nothing: rehoming a dog
-/// that was never configured is an ordinary thing to do, not a fault.
-///
-/// Called after `shep.toml` has already been rewritten, deliberately. The
-/// two writes are not one transaction, and of the two ways a crash between
-/// them can land, this is the harmless one: a section nothing reads, since
-/// the name is out of `enabled_dogs` and `adopted_dogs` by then. The other
-/// order loses an operator's webhook URLs while the dog is still enabled
-/// and still running, and says nothing about it.
-///
-/// Which of the two lands is only decided by the order once each rename is
-/// durable by itself. On unix both writers flush the directory they
-/// renamed into for that reason: a power cut between them can otherwise
-/// lose the `shep.toml` rewrite while keeping this removal, which is the
-/// bad order reached by accident. `sync_dir` does nothing on Windows, so
-/// there the order survives a crash but not a power cut.
+/// Call only after `shep.toml` is rewritten: the two writes are not one
+/// transaction, and the other order can drop a section while the dog stays
+/// enabled, guaranteed on unix only since `sync_dir` no-ops on Windows.
 ///
 /// # Errors
-///
-/// - [`DogMigrationError::ReadDogs`] when `dogs.toml` exists and cannot be
-///   read, and [`DogMigrationError::Parse`] when it is not valid TOML.
-///   Refused rather than replaced: a file this verb cannot understand is
-///   not one it may overwrite.
-/// - [`DogMigrationError::Lock`] when this file's sibling lock could not be
-///   taken, and [`DogMigrationError::Write`] when the staged replacement
-///   fails.
-///
-/// The error type is shared with [`migrate_dog_sections`] rather than
-/// split: every variant either half can produce says which of the two
-/// files failed and how, which is what an operator needs from both.
+/// - [`DogMigrationError::ReadDogs`], [`DogMigrationError::Parse`]:
+///   `dogs.toml` cannot be read, or is not valid TOML.
+/// - [`DogMigrationError::Lock`], [`DogMigrationError::Write`]: the lock
+///   could not be taken, or the staged write failed.
 pub(crate) fn forget_dog_section(path: &Path, name: &str) -> Result<bool, DogMigrationError> {
-    // Held across the read, the removal and the rename, and dropped on the
-    // way out of this function. Without it, two `shep rehome` calls for two
-    // different dogs, backgrounded together out of a provisioning script,
-    // both read the file before either writes and the second rename puts
-    // one of the two removals back: a whole-file read-modify-write with
-    // nothing serialising it. `docs/dogs.md` promises a provisioning script
-    // exactly this guarantee. This function takes no other lock, so it can
-    // never be the half of a deadlock that holds `dogs.toml` and waits on
-    // `shep.toml`.
+    // Held across the read, the removal and the rename: this is a whole-file
+    // read-modify-write, so two unserialised `shep rehome` calls lose one of
+    // the two removals. No other lock is taken here, so it cannot deadlock.
     let _lock = ConfigLock::acquire(path).map_err(DogMigrationError::Lock)?;
     let mut doc = read_dogs_document(path)?;
     if doc.remove(name).is_none() {
@@ -299,29 +146,16 @@ pub(crate) fn forget_dog_section(path: &Path, name: &str) -> Result<bool, DogMig
     Ok(true)
 }
 
-/// Reads `path` as an editable document, treating a missing file as an
-/// empty one.
+/// Reads `path` as an editable document, treating a missing file as an empty
+/// one. Callers hold `path`'s [`ConfigLock`]: a read outside it is the first
+/// half of a lost update.
 ///
-/// Both writers of `dogs.toml` read it this way, and both call this with
-/// that file's [`ConfigLock`] already held: a read outside the lock is the
-/// first half of a lost update, not a cheap shortcut.
-///
-/// A [`DocumentMut`] rather than a [`DogsConfig`], because both writers
-/// rewrite the whole file and an operator is invited to hand-edit it. Every
-/// comment, key order and inline table survives a `toml_edit` round trip
-/// and none of them survives a `toml::to_string` of a parsed map, which is
-/// what one `shep rehome` used to do to a commented file.
-///
-/// [`DogsConfig::load`] stays as the gate in front of that, unconditional
-/// and first. It is strictly the stricter of the two parses -- a stray
-/// top-level scalar is a valid document and not a valid `DogsConfig` -- and
-/// it is the same call `shep_daemon::dogs` reads this file with, so a file
-/// this gate refuses is one the daemon could not have served either.
-/// Refusing it here is the rule both writers already followed: a file this
-/// verb cannot understand is not one it may overwrite.
+/// A [`DocumentMut`] rather than a [`DogsConfig`], since both writers rewrite
+/// the whole file and an operator hand-edits it: comments and inline tables
+/// survive a `toml_edit` round trip and not a `toml::to_string` of a parsed
+/// map. [`DogsConfig::load`] still gates it, being the stricter parse.
 ///
 /// # Errors
-///
 /// - [`DogMigrationError::ReadDogs`] when the file exists and could not be
 ///   read, and [`DogMigrationError::Parse`] when it is not valid TOML.
 fn read_dogs_document(path: &Path) -> Result<DocumentMut, DogMigrationError> {
@@ -334,35 +168,25 @@ fn read_dogs_document(path: &Path) -> Result<DocumentMut, DogMigrationError> {
     };
     DogsConfig::load(Some(&source)).map_err(DogMigrationError::Parse)?;
     source.parse::<DocumentMut>().map_err(|_| {
-        // No input reaches this. `toml` 0.8 is a thin layer over
-        // `toml_edit`, so a source the gate above accepted parses here as
-        // well. Reported rather than `expect`ed all the same: this runs at
-        // the top of every daemon boot, and a boot is not a place to
-        // panic on a disagreement between two parsers.
+        // Unreachable: `toml` is a thin layer over `toml_edit`, so a source
+        // the gate accepted parses here too. Reported rather than panicked
+        // on, since this runs at the top of every daemon boot.
         DogMigrationError::ReadDogs(std::io::Error::other(
             "dogs.toml parses as TOML values and not as an editable document",
         ))
     })
 }
 
-/// Every name `table` declares a VALUE for under `[dog]`.
+/// Every name `table` declares a value for under `[dog]`.
 ///
-/// Read from a second parse of a file [`ShepToml`] is about to parse
-/// again, and deliberately so: it is the only record of what was there
-/// BEFORE [`ShepToml::take_dog_sections`] struck the table, which is what
-/// the guard inside [`migrate_dog_sections`] compares against. Read-only,
-/// over a string already in memory, and it never opens the file. Empty
-/// also means "do not open the file at all", so this is the whole of that
-/// caller's gate as well as its record.
+/// The only record of what was there before
+/// [`ShepToml::take_dog_sections`] struck the table, which is what the guard
+/// inside [`migrate_dog_sections`] compares against. Read-only, over a string
+/// already in memory; empty also means do not open the file at all.
 ///
-/// A name holding nothing is left out, and that is the whole of
-/// [`declares_nothing`]'s reason to exist. `shep enable metrics` on any
-/// binary older than this branch scaffolds an EMPTY `[dog.metrics]`, and
-/// this branch's own `enable` no longer does -- but a mixed-version host is
-/// ordinary, so the shape keeps arriving. Counting it as a declared name
-/// made the new binary refuse to boot against a `dogs.toml` that already
-/// held `metrics`, on a `WouldOverwrite` whose own doc says "two values for
-/// one key". An empty table is not a value.
+/// A name holding nothing is left out. An empty `[dog.metrics]` is what
+/// `shep enable` scaffolds on older binaries, and counting it as declared
+/// refuses a boot against a `dogs.toml` that already holds `metrics`.
 fn declared_dog_names(table: &toml::Table) -> BTreeSet<String> {
     match table.get("dog") {
         Some(toml::Value::Table(dog)) => dog
@@ -370,26 +194,21 @@ fn declared_dog_names(table: &toml::Table) -> BTreeSet<String> {
             .filter(|(_, value)| !declares_nothing(value))
             .map(|(name, _)| name.clone())
             .collect(),
-        // No `[dog]` at all, or a `dog` that is not a table: either way it
-        // declares no dog and there is nothing here to open the document
-        // for.
+        // No `[dog]` at all, or a `dog` that is not a table: either way
+        // nothing is declared and there is no reason to open the document.
         _ => BTreeSet::new(),
     }
 }
 
 /// Whether `value` holds nothing an operator could lose by not moving it.
 ///
-/// An empty table, an empty array, and an array of tables that are all
-/// empty. That last one is why this recurses rather than testing
-/// `Table::is_empty` directly: `[[dog.metrics]]` with nothing under it used
-/// to reach [`DogMigrationError::SectionsUnreadable`], because the name was
-/// declared and [`ShepToml::take_dog_sections`] hands back no array. Under
-/// the pre-flight that refusal is a boot the operator has to repair by
-/// hand, over a header holding nothing.
+/// An empty table, an empty array, and an array of tables that are all empty.
+/// The last is why this recurses rather than testing `Table::is_empty`: an
+/// empty `[[dog.metrics]]` is a declared name that
+/// [`ShepToml::take_dog_sections`] hands back nothing for.
 ///
-/// A `[[dog.metrics]]` that DOES carry values is a different question and
-/// still refuses: there is no one section for it to become, and dropping it
-/// silently is the outcome the name guard exists to prevent.
+/// A `[[dog.metrics]]` that carries values is not this, and still refuses:
+/// there is no one section for it to become.
 fn declares_nothing(value: &toml::Value) -> bool {
     match value {
         toml::Value::Table(table) => table.is_empty(),
@@ -401,16 +220,11 @@ fn declares_nothing(value: &toml::Value) -> bool {
 /// The highest render position any table inside `item` holds, or `None`
 /// when it holds no positioned table at all.
 ///
-/// [`renumber_tables`]'s read-only twin, and it walks the same three
-/// shapes for the same reason: `toml_edit` positions every table
-/// individually, so a nested `[bark.sinks]` and an `[[bark.rules]]` entry
-/// each carry one and neither is an `Item::Table` at the top level. A scan
-/// that looked only there reported no positions for a `dogs.toml` made
-/// entirely of those, and the migration then appended at 0.
-///
-/// An implicit parent (`bark` itself, when the file only ever wrote
-/// `[bark.sinks]`) has no position of its own, hence the descent into
-/// children rather than a test on the parent alone.
+/// [`renumber_tables`]'s read-only twin, walking the same three shapes:
+/// `toml_edit` positions every table individually, so a nested `[bark.sinks]`
+/// and an `[[bark.rules]]` entry each carry one and neither is an
+/// `Item::Table` at the top level. An implicit parent has no position of its
+/// own, hence the descent into children.
 fn last_position(item: &Item) -> Option<usize> {
     match item {
         Item::Table(table) => table
@@ -427,26 +241,20 @@ fn last_position(item: &Item) -> Option<usize> {
                     .chain(table.iter().filter_map(|(_, child)| last_position(child)))
             })
             .max(),
-        // Neither holds a positioned table: an inline `metrics = { .. }`
-        // is a key/value pair and renders above the tables, with the other
-        // pairs.
+        // Neither holds a positioned table: an inline `metrics = { .. }` is a
+        // key/value pair and renders above the tables, with the other pairs.
         Item::Value(_) | Item::None => None,
     }
 }
 
-/// Walks `item` depth-first and gives every table it holds the next
-/// document position, so a section moved out of `shep.toml` renders after
-/// everything already in `dogs.toml` rather than at the index it happened
-/// to hold in the file it came from.
+/// Walks `item` depth-first and gives every table it holds the next document
+/// position, so a section moved out of `shep.toml` renders after everything
+/// already in `dogs.toml`.
 ///
-/// Depth-first and over sub-tables too, because `toml_edit` renders every
-/// table by its own position and not by its parent's: renumbering only the
-/// top-level `bark` would leave `[bark.sinks]` back at `shep.toml`'s
-/// index, split away from the header it belongs under.
-///
-/// [`Item::Value`] and [`Item::None`] hold no positioned table --- an
-/// inline `metrics = { .. }` is a key/value pair and renders with the
-/// others, above the tables --- so both are left alone.
+/// Over sub-tables too, because `toml_edit` renders every table by its own
+/// position and not by its parent's: renumbering only the top-level `bark`
+/// would leave `[bark.sinks]` back at `shep.toml`'s index. [`Item::Value`]
+/// and [`Item::None`] hold no positioned table and are left alone.
 fn renumber_tables(item: &mut Item, next: &mut usize) {
     match item {
         Item::Table(table) => {
@@ -472,77 +280,49 @@ fn renumber_tables(item: &mut Item, next: &mut usize) {
 /// Writes `rendered` to `path`: staged in a sibling temp file at
 /// `OWNER_ONLY_FILE_MODE`, `fsync`ed, then `rename`d over `path`.
 ///
-/// The same three steps, through the same helper, that
-/// [`ShepToml::save`] writes `shep.toml` with, and for the same two
-/// reasons. **Mode**: these bytes are the ones that used to sit inside
-/// `shep.toml` at `0600`, and they are where `docs/dogs.md` tells an
-/// operator to paste a Discord or Slack webhook URL, which is a bearer
-/// token in a path. A `std::fs::write` here would create the file at the
-/// ambient umask, typically `0644`, so the migration itself would be the
-/// downgrade. `$SHEP_HOME` being `0700` does not answer it: a `tar`, a
-/// `cp -p` or a backup carries a file's own mode somewhere no directory
-/// mode follows. **Atomicity**: `std::fs::write` opens `O_TRUNC`, so a
-/// crash between the truncate and the write leaves a half-written
-/// `dogs.toml` behind; the rename installs the whole file or none of it.
-/// **Durability**: on unix the rename is then published by flushing the
-/// directory that holds it, without which a power cut can lose the rename
-/// while keeping the bytes it pointed at. Both callers order this write
-/// against a `shep.toml` write and argue from that order, and an order
-/// between two renames means nothing until each one is durable on its own.
-/// That flush is a no-op on Windows, which is why those two arguments name
-/// the platform rather than claiming the order outright.
+/// The mode matters: this file holds dog webhook URLs, and a plain
+/// `std::fs::write` would create it at the ambient umask instead. The
+/// rename avoids the half-written file a plain write's `O_TRUNC` leaves on
+/// a crash. The directory flush publishes the rename and is a no-op on
+/// Windows.
 fn write_dogs_config(path: &Path, rendered: &str) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = create_config_file(parent)?;
     tmp.write_all(rendered.as_bytes())?;
     tmp.as_file().sync_all()?;
-    // `persist` is `rename(2)`. On failure the `NamedTempFile` comes back
-    // inside the error and its `Drop` removes the staging file, so a failed
-    // replace leaves nothing behind in `$SHEP_HOME`.
+    // `persist` is `rename(2)`. On failure the `NamedTempFile` comes back in
+    // the error and its `Drop` removes the staging file.
     tmp.persist(path).map_err(|err| err.error)?;
 
-    // The `sync_all` above made the CONTENTS durable; this makes the rename
-    // that published them durable. See `shep_core::atomic_file`.
+    // The `sync_all` above made the contents durable; this makes the rename
+    // that published them durable.
     shep_core::atomic_file::sync_dir(parent)?;
     Ok(())
 }
 
 /// Why `[dog.<name>]` could not be moved into `dogs.toml`
 ///
-/// Derived `Debug`, deliberately (IR-41): every variant carries a dog name,
-/// an I/O error, or a serializer's complaint, and never a section's
-/// contents, so there is nothing here to redact. That is a claim about the
-/// two wrapped types that COULD carry a file, and both of them redact their
-/// own `Debug` for exactly that reason: [`ShepTomlError`] for `shep.toml`,
-/// and [`DogsConfigError`] for `dogs.toml`. The second one did not, for a
-/// while, and this comment asserted it anyway -- a derive over
-/// `toml::de::Error` prints the parser's `raw` field, which is the whole
-/// source document. A derive here is only ever as safe as what it forwards
-/// to, so a new variant wrapping a parse error needs the same check.
+/// Derived `Debug`: every variant carries a dog name, an I/O error or a
+/// serializer's complaint, never a section's contents. That holds only
+/// because [`ShepTomlError`] and [`DogsConfigError`] redact their own
+/// `Debug`, so a new variant wrapping a parse error needs the same check.
 #[derive(Debug)]
-// `#[non_exhaustive]`: the migration is the one writer of `dogs.toml` and
-// will grow refusals as operators meet shapes nobody predicted, so a
-// seventh variant should be additive rather than breaking (IR-20).
 #[non_exhaustive]
 pub(crate) enum DogMigrationError {
     /// `shep.toml` itself could not be read.
     Read(std::io::Error),
     /// `dogs.toml` exists and could not be read.
     ///
-    /// Its own variant rather than [`Self::Read`]: both are the same I/O
-    /// failure, and an operator's next move depends entirely on which of
-    /// the two files it was.
+    /// Its own variant rather than [`Self::Read`]: an operator's next move
+    /// depends on which of the two files it was.
     ReadDogs(std::io::Error),
     /// `dogs.toml` already exists and is not valid TOML.
     Parse(DogsConfigError),
     /// `name` has a section carrying values in both files, so the move
     /// would silently pick one of the two.
     ///
-    /// An empty section never raises this, on either side. It is not a
-    /// value, it is what every `shep enable` before this branch
-    /// scaffolded, and refusing on it took a mixed-version host to a
-    /// shepherd that would not boot. In the source it is skipped; in
-    /// `dogs.toml` it is the header the moved section lands on.
+    /// An empty section never raises this on either side: in the source it is
+    /// skipped, in `dogs.toml` it is the header the moved section lands on.
     WouldOverwrite {
         /// The dog named in both `shep.toml` and `dogs.toml`.
         name: String,
@@ -552,18 +332,11 @@ pub(crate) enum DogMigrationError {
     SectionsUnreadable {
         /// The names that were declared and did not come back, empty when
         /// the source could not be parsed closely enough to name them.
-        /// Keys, never values: a dog's name is what an operator typed as a
-        /// section header, and it is already what `WouldOverwrite` carries.
         names: Vec<String>,
     },
     /// `dogs.toml` could not be written.
     Write(std::io::Error),
     /// `dogs.toml`'s sibling lock file could not be created or locked.
-    ///
-    /// Refused rather than pressed on without the lock: the guarantee the
-    /// dogs page makes to a provisioning script is the whole reason the
-    /// lock is taken, and a write that skips it quietly is worse than one
-    /// that says it could not run.
     Lock(std::io::Error),
     /// Reading, locking or rewriting `shep.toml` failed.
     Toml(ShepTomlError),
@@ -694,13 +467,8 @@ mod tests {
         );
     }
 
-    // `take_dog_sections` answers an empty map on two paths that have
-    // already struck the sections from the document: a failed internal
-    // reparse, and a value under `[dog]` that is not a table. Both are
-    // close to unreachable, and treating either as "nothing to move" would
-    // write an empty `dogs.toml` over a `shep.toml` it had just stripped.
-    // `metrics = 5` is the reachable half: legal TOML, a non-table under
-    // `[dog]`, and dropped by that method's own filter.
+    // `metrics = 5` is legal TOML: a non-table value under `[dog]`, dropped
+    // by `declared_dog_names`'s own filter.
     #[test]
     fn entries_under_dog_that_come_back_as_nothing_make_the_migration_refuse() {
         let (_dir, paths) = home_with("[dog]\nmetrics = 5\n");
@@ -716,11 +484,8 @@ mod tests {
         assert!(!paths.dogs_config.exists(), "nor writes anything");
     }
 
-    // The counterpart to the refusal above, and the reason it is keyed on
-    // what the file actually holds rather than on the substring gate: a
-    // header with nothing under it has no section to move and no section to
-    // lose, so it is neither migrated nor refused. Refusing it would leave
-    // an operator with a `[dog]` line unable to boot at all.
+    // A `[dog]` header with nothing under it has no section to move or
+    // lose, so it is left alone rather than refused.
     #[test]
     fn an_empty_dog_table_is_left_exactly_as_it_was() {
         let before = "[daemon]\nlog_level = \"info\"\n\n[dog]\n";
@@ -736,11 +501,8 @@ mod tests {
         assert!(!paths.dogs_config.exists(), "no sections means no file");
     }
 
-    // Partial loss, which a count cannot see and a name can: the whole
-    // `[dog]` table is struck, `metrics` comes back, `stray` does not, and
-    // a migration that shipped what came back would drop `stray` from disk
-    // with no error and no warning. Refused instead, with the name in the
-    // message, because nothing else on the machine holds that line.
+    // `stray` comes back as an entry, not a section, so it would be
+    // silently dropped rather than moved; refused instead, naming it.
     #[test]
     fn an_entry_that_comes_back_beside_a_section_but_not_as_one_makes_the_migration_refuse() {
         let (_dir, paths) =
@@ -762,10 +524,9 @@ mod tests {
         assert!(!paths.dogs_config.exists(), "nor writes anything");
     }
 
-    /// `dogs.toml` holds the webhook URLs that used to sit inside
-    /// `shep.toml` at `0600`, so it is created at `0600` too, at the `open`
-    /// rather than by a later `chmod`. Fails if the migration goes back to
-    /// `std::fs::write`, which would leave it at the ambient umask.
+    /// `dogs.toml` is created at `0600`, at the `open` rather than by a
+    /// later `chmod`. Fails if the migration goes back to `std::fs::write`,
+    /// which would leave it at the ambient umask.
     #[cfg(unix)]
     #[test]
     fn the_written_file_is_owner_only() {
@@ -783,20 +544,10 @@ mod tests {
         assert_eq!(mode, 0o600, "mode was {mode:o}");
     }
 
-    /// The bug the lock exists for, forced rather than hoped for: two
-    /// `shep rehome` calls for two DIFFERENT dogs, started together the way
-    /// a provisioning script backgrounds them, and both removals have to
-    /// land. Each call is a whole-file read, remove, rename, so without a
-    /// lock both threads read the two-dog file and the second rename puts
-    /// the first one's dog back, with nothing anywhere reporting it.
-    ///
-    /// Two threads and a barrier, not two processes: `flock(2)` is
-    /// per-open-file-description rather than per-process, so two threads
-    /// that each open the lock file contend exactly as two `shep`
-    /// invocations do, and this needs no re-exec harness to prove it.
-    /// Repeated over fresh homes because the losing interleaving is a
-    /// race, and one round of a race that happens to serialise itself
-    /// proves nothing.
+    /// Two threads sharing a barrier, not two processes: `flock(2)` is
+    /// per-open-file-description, so two threads contend the same as two
+    /// `shep` invocations. Repeated because a race that serialises itself
+    /// once proves nothing.
     #[test]
     fn two_rehomes_at_once_both_land() {
         use std::sync::{Arc, Barrier};
@@ -834,16 +585,13 @@ mod tests {
         }
     }
 
-    /// The other pair of writers, and the reason the migration takes the
-    /// same lock rather than only the verb that races itself: a boot
-    /// migrating a section INTO `dogs.toml` while an operator's `shep
-    /// rehome` takes a different dog's section out. Whoever renames second
-    /// wins the whole file, so an unlocked pair either resurrects the
-    /// rehomed dog or drops the migrated one, and both are silent.
+    /// A boot migrating a section in while `shep rehome` takes a different
+    /// one out. Whoever renames second wins the whole file, so without the
+    /// shared lock one write silently drops the other.
     ///
-    /// The migration holds `shep.toml`'s lock while it takes `dogs.toml`'s.
-    /// The rehome half takes only `dogs.toml`'s and holds nothing else, so
-    /// there is no second ordering for the two to deadlock across.
+    /// The migration holds `shep.toml`'s lock while it takes `dogs.toml`'s;
+    /// `forget_dog_section` takes only `dogs.toml`'s, so there is no second
+    /// ordering for the two to deadlock across.
     #[test]
     fn a_boot_migration_and_a_rehome_at_once_both_land() {
         use std::sync::{Arc, Barrier};
@@ -880,11 +628,8 @@ mod tests {
             let _removed = rehoming.join().expect("thread");
 
             let left = read_dogs_document(&paths.dogs_config).expect("read");
-            // Which of the two ran first is genuinely undecided, and only
-            // one ordering has a section for the rehome to find: if it
-            // went first, `otel` was struck before the migration merged
-            // `metrics` in beside nothing. Both orderings agree on the
-            // file that has to be left behind, which is the property.
+            // Both orderings must agree on the file left behind, whichever
+            // ran first.
             assert_eq!(moved, vec!["metrics".to_string()], "round {round}");
             assert_eq!(
                 left.iter().map(|(name, _)| name).collect::<Vec<_>>(),
@@ -894,15 +639,9 @@ mod tests {
         }
     }
 
-    /// The whole of spec decision 9, at the writer that reproduced its
-    /// absence: `shep rehome` used to turn a commented `dogs.toml` with
-    /// inline tables into header-per-key output with every comment gone.
-    ///
-    /// Exact string, not a parse-and-compare, for the same reason
-    /// `taking_dog_sections_leaves_every_other_section_alone` pins one: a
-    /// reparse agrees on the values, which is precisely what a wrecked
-    /// file also does. The comments, the inline table and the blank lines
-    /// are the assertion.
+    /// Exact string: a reparse agrees on the values whether the comments,
+    /// inline table and blank lines survived or not, so only the string
+    /// tells a correct rewrite from a wrecked one.
     #[test]
     fn forgetting_a_dog_keeps_every_other_comment_and_shape() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -921,21 +660,14 @@ mod tests {
         );
     }
 
-    /// The same promise at the other writer, and the case that says the
-    /// migration's first write is not the only one it makes: a second
-    /// `[dog.<name>]` appearing in `shep.toml` after an operator has spent
-    /// months hand-editing the `dogs.toml` the first migration created.
+    /// Exact string: it pins both that the destination keeps its own
+    /// comment and inline table, and that the moved section arrives
+    /// carrying its own `shep.toml` comments, which a `toml::to_string` of
+    /// a parsed map would drop.
     ///
-    /// Two properties in one exact string, because they are two halves of
-    /// the same round trip. The destination keeps its own comment and its
-    /// inline table, and the moved section arrives carrying the comments
-    /// an operator wrote around it in `shep.toml` -- both of which a
-    /// `toml::to_string` of a parsed map dropped.
-    ///
-    /// The moved section lands AFTER everything already there, which is
-    /// what `renumber_tables` is for: without it `[metrics]` carries the
-    /// position it held in `shep.toml` and renders between the
-    /// destination's first and second tables.
+    /// The moved section lands after everything already there:
+    /// `renumber_tables` gives it a fresh position instead of the one it
+    /// held in `shep.toml`.
     #[test]
     fn migrating_into_a_hand_edited_file_keeps_both_files_comments() {
         let (_dir, paths) = home_with(
@@ -959,11 +691,10 @@ mod tests {
     /// Fails if a moved dog with sub-tables and an array of tables is
     /// split across the destination's own sections.
     ///
-    /// `toml_edit` renders every table by its own position, not by its
-    /// parent's, so renumbering only the top-level `bark` would leave
-    /// `[bark.sinks]` and `[[bark.rules]]` at the indices they held in
-    /// `shep.toml` -- interleaved with `[a]`, `[b]` and `[c]` here. The
-    /// three destination sections staying consecutive is the property.
+    /// `toml_edit` renders every table by its own position, not its
+    /// parent's, so `renumber_tables` must descend into `[bark.sinks]` and
+    /// `[[bark.rules]]` too, or they stay at the indices they held in
+    /// `shep.toml` and interleave with `[a]`, `[b]` and `[c]` here.
     #[test]
     fn a_moved_dog_with_sub_tables_lands_in_one_piece_at_the_end() {
         let (_dir, paths) = home_with(
@@ -989,30 +720,18 @@ mod tests {
         );
     }
 
-    /// Fails if a destination whose own sections are nested or an array of
-    /// tables sends the moved section to the FRONT of the file.
+    /// Fails if a destination with nested or array-of-tables sections puts
+    /// the moved section at the front instead of the end.
     ///
-    /// The counterpart to
-    /// [`a_moved_dog_with_sub_tables_lands_in_one_piece_at_the_end`], which
-    /// puts the shapes in the source. Here they are in `dogs.toml`, which
-    /// is where the scan for "one past the last table" had to see them and
-    /// did not: it read `Item::Table` positions at the top level only, so
-    /// `[bark.sinks]` (nested one level under an implicit `bark`) and
-    /// `[[bark.rules]]` (an array of tables) both counted as position
-    /// nothing. The scan answered 0, the moved `[metrics]` took position 0,
-    /// and `toml_edit` rendered it first and jammed against `[bark.sinks]`
-    /// with no blank line between them. Reproduced against a real flock on
-    /// exactly this fixture.
+    /// `last_position` must count `[bark.sinks]` (nested under an implicit
+    /// `bark`) and `[[bark.rules]]` (an array of tables), not just
+    /// top-level `Item::Table`s, or it answers 0 and the moved `[metrics]`
+    /// renders first with no blank line before `[bark.sinks]`. Two
+    /// `[[bark.rules]]` entries make the array-arm miss visible; with one,
+    /// a scan of only the nested table would tie with it by chance.
     ///
-    /// TWO `[[bark.rules]]` entries, not one, and that is what makes the
-    /// array arm of the scan load-bearing rather than decorative: with one
-    /// entry a scan that saw only the nested table answered 1, tied with
-    /// the array's own 1, and happened to render correctly anyway. With
-    /// two, the same blind scan wedges `[metrics]` between them.
-    ///
-    /// The exact string is the assertion, blank lines and all: nothing
-    /// here is lost either way, so a reparse agrees with a wrecked file
-    /// and only the rendering tells them apart.
+    /// Exact string: a reparse agrees with a wrong rendering too, so only
+    /// the string tells them apart.
     #[test]
     fn a_moved_dog_lands_after_a_destination_of_nested_and_array_tables() {
         let (_dir, paths) = home_with(
@@ -1031,17 +750,12 @@ mod tests {
 
     /// Fails if an empty `[dog.<name>]` can stop a shepherd booting.
     ///
-    /// Reproduced with a pre-branch `0.1.30` binary: its `shep enable
-    /// metrics` scaffolds an empty `[dog.metrics]`, and the new binary then
-    /// refused the whole migration on `WouldOverwrite` against a
-    /// `dogs.toml` that already held `metrics` -- so `shep start` exited 5
-    /// on a daemon that exited 4. This branch stopped the new `enable` from
-    /// scaffolding, but every older binary still on a box does it and a
-    /// mixed-version host is ordinary.
+    /// An older `shep enable` scaffolds an empty `[dog.metrics]`; that must
+    /// not collide with a `dogs.toml` that already configures the same
+    /// dog, since a mixed-version host is ordinary.
     ///
-    /// Nothing written on either side is the assertion: the configured
-    /// `dogs.toml` is the one that wins, untouched, and `shep.toml` keeps
-    /// its stray header rather than being rewritten to strike it.
+    /// Nothing is written on either side: the configured `dogs.toml` wins
+    /// untouched, and `shep.toml` keeps its stray header.
     #[test]
     fn an_empty_section_colliding_with_a_configured_one_is_not_a_refusal() {
         let before = "[daemon]\nenabled_dogs = [\"metrics\"]\n\n[dog.metrics]\n";
@@ -1062,11 +776,9 @@ mod tests {
         );
     }
 
-    /// The item this subsumes: `[[dog.metrics]]` with nothing under it.
-    ///
-    /// `take_dog_sections` hands back no array, so the name guard used to
-    /// call it `SectionsUnreadable` -- which under the reload pre-flight is
-    /// a refused boot over a header holding nothing.
+    /// `[[dog.metrics]]` with nothing under it: `take_dog_sections` hands
+    /// back no array for it, so the name guard must not call this
+    /// `SectionsUnreadable`, or a header holding nothing refuses the boot.
     #[test]
     fn an_empty_array_of_tables_under_dog_is_skipped_rather_than_refused() {
         let before = "[[dog.metrics]]\n";
@@ -1081,10 +793,8 @@ mod tests {
         );
     }
 
-    /// The other half of the same ruling, and the reason the skip is over
-    /// values rather than over the spelling: an array of tables that DOES
-    /// carry values has no one section to become, and dropping it silently
-    /// is what the name guard exists to prevent.
+    /// An array of tables that carries values has no one section to
+    /// become, so the name guard refuses rather than dropping it silently.
     #[test]
     fn an_array_of_tables_with_values_still_makes_the_migration_refuse() {
         let before = "[[dog.metrics]]\nbind = \"127.0.0.1:9615\"\n";
@@ -1127,13 +837,9 @@ mod tests {
     /// Fails if a bare header in `dogs.toml` can refuse a section that
     /// carries values.
     ///
-    /// The mirror of
-    /// [`an_empty_section_colliding_with_a_configured_one_is_not_a_refusal`],
-    /// which made this exemption on the source side and left the
-    /// destination side alone. `WouldOverwrite` exists because two values
-    /// for one key is a question shep cannot answer; a bare `[metrics]`
-    /// holds no value, so there is no second answer and nothing to guess
-    /// between. Refusing on it took a boot down over a header.
+    /// `WouldOverwrite` exists because two values for one key is a
+    /// question shep cannot answer; a bare `[metrics]` holds no value, so
+    /// there is no second answer to guess between.
     #[test]
     fn a_bare_header_in_dogs_toml_does_not_refuse_a_configured_section() {
         let (_dir, paths) = home_with("[dog.metrics]\nbind = \"127.0.0.1:19615\"\n");
@@ -1151,15 +857,12 @@ mod tests {
         );
     }
 
-    /// Fails if a header an operator spelled with spaces inside the
-    /// brackets strands its section in `shep.toml` forever.
+    /// Fails if a header spelled with spaces inside the brackets strands
+    /// its section in `shep.toml`.
     ///
     /// `[ dog.metrics ]` is ordinary TOML and means exactly what
-    /// `[dog.metrics]` means. A substring test for `"[dog."` matched
-    /// neither it nor `[dog . metrics]`, so the migration returned "nothing
-    /// to do", the section stayed where nothing reads it any more, and the
-    /// dog came up on its compiled defaults with no warning on any surface.
-    /// For bark that is every sink gone and alerting silently off.
+    /// `[dog.metrics]` means, so it must parse the same as the tight form
+    /// rather than by a `"[dog."` substring match.
     #[test]
     fn a_header_spelled_with_whitespace_still_migrates() {
         let (_dir, paths) = home_with(
@@ -1185,13 +888,12 @@ mod tests {
     /// Fails if a boot with nothing to migrate opens `shep.toml` for
     /// editing anyway.
     ///
-    /// The inode is the assertion, not the bytes, because the bytes are
-    /// identical either way. `ShepToml::edit` and `try_edit` stage a temp
-    /// file and rename it over the original whenever `save` runs, so
-    /// opening the document on an idle boot would hand an untouched
-    /// `shep.toml` a fresh inode, force `OWNER_ONLY_FILE_MODE` onto it, and
-    /// turn a symlinked path into a plain file. Every boot after the first
-    /// takes this path, so the cost lands on every operator.
+    /// The inode is the assertion, not the bytes, which are identical
+    /// either way. `try_edit` stages a temp file and renames it over the
+    /// original whenever `save` runs, so opening the document on an idle
+    /// boot would hand an untouched `shep.toml` a fresh inode, force
+    /// `OWNER_ONLY_FILE_MODE` onto it, and turn a symlinked path into a
+    /// plain file.
     #[cfg(unix)]
     #[test]
     fn a_boot_with_nothing_to_move_never_reopens_the_file() {
@@ -1206,12 +908,8 @@ mod tests {
         assert_eq!(before, after, "an idle boot must not rewrite shep.toml");
     }
 
-    // The one case that must never silently merge: an operator who already
-    // hand-wrote dogs.toml and still has a stale section in shep.toml. Two
-    // values for one key, and picking either would be shep guessing. The
-    // destination holding a VALUE is what makes it two, which is the half
-    // `a_bare_header_in_dogs_toml_does_not_refuse_a_configured_section`
-    // does not have.
+    // Two values for one key: picking either would be shep guessing, so
+    // this refuses instead of merging.
     #[test]
     fn an_existing_dogs_file_makes_the_migration_refuse() {
         let (_dir, paths) = home_with("[dog.metrics]\nbind = \"127.0.0.1:9615\"\n");

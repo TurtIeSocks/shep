@@ -1,33 +1,15 @@
 //! Spawn seam between the daemon engine and the OS
 //!
 //! [`ProcessRunner`] spawns a child; the [`RunningProcess`] it returns owns
-//! that one live child for its whole lifetime (pid, wait, signal, kill).
-//! Spawn also hands back a [`ProcIo`] bundle of channels so the owning sheep
-//! task can pump stdout/stderr lines and shepherd-channel messages without
-//! the runner itself blocking on delivery.
+//! that one live child. Spawn also hands back a [`ProcIo`] bundle of
+//! channels, so the sheep task pumps stdout/stderr and shepherd-channel
+//! messages without the runner blocking on delivery.
 //!
-//! Two implementations exist: a deterministic scripted fake (this crate's
-//! test-only `fake` module, `ScriptedRunner`) for engine tests, and a real
-//! runner over OS processes (a later task) for production.
-//!
-//! It also owns the log plane's shared vocabulary — [`LogCtl`] and the two
-//! errors its requests answer with — and, with them, this crate's only
-//! opener of a sheep's log file (`open_log_path`, crate-private) plus the
+//! Also owns the log plane's vocabulary ([`LogCtl`] and its two errors) and
+//! this crate's only opener of a sheep's log file, `open_log_path`, with the
 //! ancestry guard that runs ahead of it. The log pump and `shep flush` both
-//! go through that pair, so neither half can drift from the other on what it
-//! is willing to open.
-//!
-//! A few items here are `#[cfg(unix)]`, and that is a design decision rather
-//! than portability work left unfinished. Windows has no `execve`, so a
-//! shepherd there is replaced by stop-and-start and no image ever adopts a
-//! process it did not spawn; the handover surfaces those items exist for have
-//! nothing to be on that platform. Each one says so at its own definition.
-//!
-//! This whole module is public and stays that way: [`ProcessRunner`] is the
-//! bound on [`boot`](crate::boot::boot), which `shep-cli` calls, so a caller
-//! outside this crate has to be able to name it — and naming it drags in every
-//! type in its signature. `tests/real_runner.rs` drives the same surface
-//! directly against real children.
+//! go through the pair, so neither can drift on what it will open. The
+//! `#[cfg(unix)]` items are the handover's; Windows has no `execve`.
 
 use core::fmt;
 use std::collections::BTreeMap;
@@ -41,12 +23,8 @@ use shep_core::signals::OperatorSignal;
 use crate::channel::{ChildMessage, ShepherdMessage};
 use crate::privilege::Credentials;
 
-/// Re-exported so [`AdoptSpec`] can name it: the reaper lives in the
-/// crate-private `handover` module, and a public signature may not carry a
-/// type nothing outside the crate can reach.
-///
-/// Unix only, as the whole handover is. Windows has no `execve`, so no image
-/// there ever adopts a process it did not spawn.
+/// Re-exported so [`AdoptSpec`]'s public signature can name it: the reaper
+/// itself lives in the crate-private `handover` module.
 #[cfg(unix)]
 pub use crate::handover::reap::AdoptedReaper;
 
@@ -65,15 +43,15 @@ pub struct ExitOutcome {
 /// record identical [`ExitOutcome`]s.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopSignal {
-    /// `SIGTERM` — graceful stop request
+    /// `SIGTERM`: graceful stop request
     Term,
-    /// `SIGINT` — interrupt
+    /// `SIGINT`: interrupt
     Int,
-    /// `SIGQUIT` — quit, core-dumping by default
+    /// `SIGQUIT`: quit, core-dumping by default
     Quit,
-    /// `SIGUSR2` — user-defined signal 2
+    /// `SIGUSR2`: user-defined signal 2
     Usr2,
-    /// `SIGKILL` — unblockable, immediate
+    /// `SIGKILL`: unblockable, immediate
     Kill,
 }
 
@@ -102,168 +80,88 @@ pub struct LogLine {
 
 /// What the supervisor can ask a log pump to do mid-flight.
 ///
-/// # Why a pushed message rather than a generation counter
+/// The [`oneshot`] on each variant is what makes it usable as a barrier:
+/// once it resolves, every live pump has done the thing. A logrotate
+/// `postrotate` stanza needs that of [`Self::Reopen`] before it compresses
+/// what it renamed; `shep flush` needs it of [`Self::Flush`] before it
+/// truncates.
 ///
-/// A counter the pump re-read before each write would only ever promise
-/// "before the next line", and **a quiet sheep never writes a next line** —
-/// so a caller could ask for a rotation, or for the pending writes to land,
-/// and be told nothing about when or whether the daemon caught up. The
-/// [`oneshot`] on each variant below is the whole point of the shape: once it
-/// resolves, every live pump has provably done the thing, which is what makes
-/// either variant usable as a barrier. A logrotate `postrotate` stanza needs
-/// that of [`Self::Reopen`] before it compresses or deletes the file it
-/// renamed; `shep flush` needs it of [`Self::Flush`] before it truncates.
-/// `#[non_exhaustive]` because this crate is published and this enum just
-/// grew a variant. An out-of-tree `ProcessRunner` matching it exhaustively
-/// would break on that addition, and would break again on the next one.
-/// Marking it now costs those matchers one wildcard arm, once, in a 0.1.x
-/// release where that is expected, instead of every time the handover needs
-/// to ask a pump something new (IR-20, and the same call `BootError` makes a
-/// few modules over).
+/// `#[non_exhaustive]`: this crate is published, and an out-of-tree
+/// `ProcessRunner` matching exhaustively would break on the next variant.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum LogCtl {
     /// Drop the current handle and open the path again, then acknowledge.
     /// Sent when an external rotator has renamed the file.
     Reopen {
-        /// Fires once the pump has finished acting on this request, carrying
-        /// what came of it.
+        /// Fires once the pump has finished acting on this request.
         ///
-        /// `Ok` says both old handles were flushed and closed AND both paths
-        /// were opened again — everything a rotator needs before it
-        /// compresses or deletes what it renamed, and everything the sheep
-        /// needs to keep logging. [`ReopenError`] says at least one path
-        /// could not be opened: the old handle is closed either way, so the
-        /// rename is safe to act on, but that stream now has no file at all
-        /// and its lines are dropped until something reopens it. Answering
-        /// `Ok` there would leave a sheep logging into nothing with nobody
-        /// told, which is the failure a reopen exists to end.
+        /// `Ok` says both old handles were flushed and closed and both paths
+        /// were opened again. [`ReopenError`] says at least one path could
+        /// not be opened: the old handle is closed either way, so the rename
+        /// is safe to act on, but that stream's lines are dropped until
+        /// something reopens it.
         ///
-        /// # When it never fires
-        ///
-        /// A pump that ends between accepting a request and serving it drops
-        /// this sender, and the caller's `await` resolves
-        /// [`Err`](oneshot::error::RecvError). The channel buffers several
-        /// requests, so a send that succeeded is not a request that will be
-        /// served: every way a pump ends — both streams reaching EOF, the
-        /// `logs` receiver going away, or the last control sender dropping —
-        /// retires it with whatever is still queued. Treat that error as the
-        /// same stopped-sheep no-op a failed send means (see
-        /// [`ProcIo::log_ctl`]); the two describe one situation observed a
-        /// moment apart, and neither is a reopen that failed.
+        /// The channel buffers, so a request that was accepted is not one
+        /// that will be served: a pump that ends first drops this sender and
+        /// the caller's `await` resolves [`Err`](oneshot::error::RecvError).
+        /// Treat that as the stopped-sheep no-op a failed send means.
         done: oneshot::Sender<Result<(), ReopenError>>,
     },
     /// Write out whatever the pump has buffered, wait for it to reach the
     /// file, keep the handle, then acknowledge. Sent as the first half of
     /// `shep flush`, immediately before the recorded paths are truncated.
     Flush {
-        /// Fires once both handles have nothing buffered and no write left
-        /// in flight, carrying what came of it.
+        /// Fires once both handles have nothing buffered and no write in
+        /// flight.
         ///
-        /// The acknowledgement is the barrier the truncate that follows is
-        /// ordered against: `write_all` on a [`tokio::fs::File`] returns as
-        /// soon as the real `write(2)` is queued, so without waiting here a
-        /// line already dispatched can land at offset 0 of the file *after*
-        /// it was emptied — the one line that survives a flush, in the file
-        /// the operator was told is now empty.
+        /// The barrier the truncate that follows is ordered against:
+        /// `write_all` on a [`tokio::fs::File`] returns as soon as the real
+        /// `write(2)` is queued, so a line already dispatched could otherwise
+        /// land at offset 0 after the file was emptied.
         ///
-        /// [`FlushError`] says at least one stream's owed bytes never
-        /// reached its file. It does not hold up the truncate that follows,
-        /// and cannot: `poll_flush` drives the write already in flight to
-        /// completion either way, so bytes reported here are bytes that
-        /// errored rather than bytes still racing anything. What it changes
-        /// is the answer the operator gets — that sheep could not write its
-        /// log, which is worth a non-zero exit even though the file does end
-        /// up empty. `LogFile::reopen` logs its own flush failure and moves
-        /// on instead, because the handle it belongs to is about to be
-        /// replaced by a working one and the sheep keeps logging either way.
-        ///
-        /// # When it never fires
-        ///
-        /// Exactly as [`Self::Reopen`]'s: a pump that ends between accepting
-        /// a request and serving it drops this sender, and the caller's
-        /// `await` resolves [`Err`](oneshot::error::RecvError). Treat that as
-        /// the same stopped-sheep no-op a failed send means — a pump that is
-        /// gone owes no bytes to anything.
+        /// [`FlushError`] says at least one stream's owed bytes never reached
+        /// its file. It does not hold up the truncate: `poll_flush` drives
+        /// the in-flight write to completion either way. A pump that ends
+        /// first drops this sender, as [`Self::Reopen`]'s does.
         done: oneshot::Sender<Result<(), FlushError>>,
     },
     /// Write out whatever the pump has buffered, wait for it to reach the
     /// files, then acknowledge with the descriptor numbers a blob is to
     /// name for this sheep. Sent while assembling a daemon handover.
     ///
-    /// # Why the flush and the report are one request
+    /// Flush and report are one request: bytes still buffered behind a
+    /// descriptor the blob already claims die with the image at the `execve`,
+    /// and the successor cannot repair a gap it never saw.
     ///
-    /// A pump that reported its numbers and was then asked separately to
-    /// flush would leave a window in which the blob already claims a
-    /// descriptor is ready to carry while the bytes behind it are still in
-    /// the buffer. Those bytes die with the image at the `execve`, and the
-    /// successor cannot repair them because it never saw them — a gap in a
-    /// sheep's log, which is one of the two things a handover exists to
-    /// avoid. Doing both under one acknowledgement makes the ordering
-    /// structural rather than a rule a caller has to keep.
-    ///
-    /// # Why this variant is unix-only when the rest of the enum is not
-    ///
-    /// It answers with raw descriptor numbers, and Windows has none of
-    /// those, no `execve` to carry them across, and no handover:
-    /// `Arm::for_daemon` returns the stop-and-start arm there. Gating the
-    /// variant rather than the enum keeps [`Self::Reopen`] and
-    /// [`Self::Flush`] portable, which they are.
+    /// Unix only: it answers with raw descriptor numbers, and Windows has no
+    /// `execve` and no handover.
     #[cfg(unix)]
     ReportFds {
-        /// Fires once both handles have nothing buffered and no write left
-        /// in flight, carrying the descriptors the blob is to name.
+        /// Fires once both handles have nothing buffered and no write in
+        /// flight, carrying the descriptors the blob is to name.
         ///
         /// `CarriedFds::none` is the honest answer for a pump holding
-        /// nothing — a stream that reached EOF has had its read end closed,
-        /// and a log file whose open failed has no handle. It is never an
-        /// error: a number that names nothing is what the successor must not
-        /// be handed.
+        /// nothing, never an error: a number that names nothing is what the
+        /// successor must not be handed. A pump that ends first drops this
+        /// sender, as [`Self::Reopen`]'s does.
         ///
-        /// # When it never fires
-        ///
-        /// Exactly as [`Self::Reopen`]'s: a pump that ends between accepting
-        /// a request and serving it drops this sender. Treat that as the
-        /// same stopped-sheep no-op a failed send means; a pump that is gone
-        /// holds no descriptors.
-        ///
-        /// `CarriedFds` is `shep-daemon`'s own type and is not reachable
-        /// from outside the crate, so an out-of-tree runner can drop this
-        /// sender but cannot answer it. That is the same no-op a pump that
-        /// has ended produces, and a runner with no handover support is
-        /// exactly a runner nothing hands over.
+        /// `CarriedFds` is crate-private, so an out-of-tree runner can drop
+        /// this sender but cannot answer it.
         done: oneshot::Sender<crate::handover::CarriedFds>,
     },
     /// Read the sheep's streams again after a [`Self::ReportFds`] that no
     /// exec followed. Sent when a handover is abandoned.
     ///
-    /// A report parks the pump, because a snapshot only stays true while
-    /// nothing moves behind it. The exec is what normally ends that park,
-    /// and it ends it by replacing the whole image. Every other way out of
-    /// a handover leaves this daemon running with a pump that has stopped
-    /// reading, and it stays stopped for the rest of that daemon's life. So
-    /// an abandoned handover owes every pump it reported one of these.
+    /// A report parks the pump, since a snapshot only stays true while
+    /// nothing moves behind it, and normally the exec ends the park by
+    /// replacing the image. Every other way out leaves this daemon with a
+    /// pump that has stopped reading for the rest of its life, so an
+    /// abandoned handover owes every pump it reported one of these.
     ///
-    /// Today that life is short: both aborts fall back to a graceful stop,
-    /// so what a missing resume costs is every line the flock writes while
-    /// it is being stopped, which is the stretch an operator asking why
-    /// reads first. It is not bounded by that, though, and should not be
-    /// reasoned about as if it were: anything that ever abandons a handover
-    /// without also stopping makes the same omission permanent.
-    ///
-    /// # Why there is no acknowledgement
-    ///
-    /// Nobody is ordered against it. The caller is on its way to a graceful
-    /// stop or back to normal service, and neither reads the pump's files
-    /// or its descriptors, which is what [`Self::Flush`] and
-    /// [`Self::Reopen`] have callers waiting on. Sending one to a pump that
-    /// was never parked is a no-op, so this is safe to send widely rather
-    /// than exactly.
-    ///
-    /// # Why this variant is unix-only when the rest of the enum is not
-    ///
-    /// As [`Self::ReportFds`]: there is no handover to abandon on a
-    /// platform with no `execve`, so there is no park to end.
+    /// No acknowledgement: nobody is ordered against it, and sending one to
+    /// a pump that was never parked is a no-op, so it is safe to send widely
+    /// rather than exactly. Unix only, as [`Self::ReportFds`] is.
     #[cfg(unix)]
     Resume,
 }
@@ -271,22 +169,19 @@ pub enum LogCtl {
 /// A [`LogCtl::Reopen`] that could not open one or both of a sheep's log
 /// files again.
 ///
-/// Carries a rendered message rather than the `io::Error`s behind it, the
-/// same way [`RunnerError`] does: it crosses a channel, ends up in an RPC
-/// error message, and every layer between only ever prints it. Keeping it a
-/// `String` is also what keeps this `Clone`/`Eq`, which `io::Error` is not.
+/// Carries a rendered message rather than the `io::Error`s behind it, as
+/// [`RunnerError`] does: it crosses a channel and every layer between only
+/// prints it, and a `String` is what keeps this `Clone`/`Eq`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReopenError {
     /// Every log file the reopen could not open again, as
     /// `"<path>: <what the open reported>"`, joined by `", "` when both
-    /// streams failed. Never empty: a reopen that opened both files answers
-    /// `Ok`.
+    /// streams failed. Never empty: a reopen that opened both answers `Ok`.
     ///
-    /// `", "` and not `"; "` because this list gets nested inside another
-    /// one: [`SupervisorError::ReopenFailed`] joins one of these per sheep
-    /// with `"; "`, and a single separator at both levels would punctuate one
-    /// sheep that failed on both streams exactly like two sheep that failed
-    /// on one each.
+    /// `", "` and not `"; "` because this list nests:
+    /// [`SupervisorError::ReopenFailed`] joins one of these per sheep with
+    /// `"; "`, and one separator at both levels would punctuate one sheep
+    /// that failed on both streams like two sheep that failed on one each.
     ///
     /// [`SupervisorError::ReopenFailed`]: crate::supervisor::SupervisorError::ReopenFailed
     pub message: String,
@@ -300,19 +195,14 @@ impl fmt::Display for ReopenError {
 
 impl core::error::Error for ReopenError {}
 
-/// A `shep flush` that could not empty a log file, from either of the two
-/// halves that verb is made of: a pump whose pending writes would not reach
-/// the file ([`LogCtl::Flush`]), or a path that could not be truncated once
-/// they had.
+/// A `shep flush` that could not empty a log file, from either half of that
+/// verb: a pump whose pending writes would not reach the file
+/// ([`LogCtl::Flush`]), or a path that could not be truncated once they had.
 ///
-/// One type for both halves because an operator is owed one answer about one
-/// file, and because either half failing costs them the same non-zero exit.
-/// What it leaves behind differs, and this type says nothing about which: a
-/// truncate that failed leaves its file as it was, while a flush that failed
-/// does not hold up the truncate — the bytes it reports are bytes that
-/// errored, not bytes still in flight — so that file does end up empty and
-/// the lines it held are gone unwritten. Carries a rendered message for the
-/// reasons [`ReopenError`] gives.
+/// What the two leave behind differs: a truncate that failed leaves its file
+/// as it was, while a failed flush does not hold up the truncate, so that
+/// file ends up empty with the lines it held gone unwritten. Carries a
+/// rendered message for the reasons [`ReopenError`] gives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlushError {
     /// Every log file the flush could not empty, as
@@ -321,18 +211,11 @@ pub struct FlushError {
     /// file answers `Ok`.
     ///
     /// `", "` for the reason [`ReopenError::message`] gives about its own
-    /// separator: [`SupervisorError::FlushFailed`] joins one of these per
-    /// failing path with `"; "`, and one separator at both levels would make
-    /// the nesting unreadable.
+    /// separator.
     ///
-    /// Keyed by path and never by sheep, unlike [`SupervisorError`]'s
-    /// reopen failures: several sheep can share one log path (`merge_logs`,
-    /// or an explicit `out_file` on a multi-instance app), so naming one of
-    /// them would be arbitrary and naming all of them would repeat the path
-    /// the reader actually needs.
-    ///
-    /// [`SupervisorError`]: crate::supervisor::SupervisorError
-    /// [`SupervisorError::FlushFailed`]: crate::supervisor::SupervisorError::FlushFailed
+    /// Keyed by path and never by sheep: several sheep can share one log
+    /// path (`merge_logs`, or an explicit `out_file` on a multi-instance
+    /// app), so naming one of them would be arbitrary.
     pub message: String,
 }
 
@@ -346,68 +229,25 @@ impl core::error::Error for FlushError {}
 
 /// What an operator is told when a log path turns out to be a symlink.
 ///
-/// One owner for the sentence, cited by [`open_log_path`]'s doc and by both
-/// openers' tests: an operator who legitimately keeps `/var/log/app` as a
-/// symlink to another filesystem reads this, not a bare `ELOOP`, and the
-/// remedy is in the sentence itself. The path is NOT in here — every caller
-/// already prefixes one (`"<path>: <what the open reported>"`, see
-/// [`ReopenError::message`] and [`FlushError::message`]), and repeating it
-/// would print it twice.
+/// One owner for the sentence, cited by [`open_log_path`] and by both
+/// openers' tests, so the operator reads a remedy rather than a bare
+/// `ELOOP`. The path is not in here: every caller already prefixes one.
 #[cfg_attr(windows, allow(dead_code))]
 pub(crate) const SYMLINK_REFUSED: &str = "refusing to follow a symlink at this log path; shep \
      opens log files with O_NOFOLLOW, so point out_file/err_file at the real file";
 
-/// Opens `path` through `options`, refusing to follow a symlink standing at
-/// the path itself.
+/// Opens `path` through `options`, refusing a symlink at the path itself
 ///
-/// The one opener of a log file in this crate, in both directions: the log
-/// pump's append handle (`tokio_runner`'s `open_append`) and `shep flush`'s
-/// truncating one (`supervisor`'s `truncate_log`) both come through here, so
-/// the two halves of the log plane cannot drift on what they will open.
-///
-/// [`check_log_ancestry`] is this function's other half and runs BEFORE it at
-/// both call sites — before `open_append`'s `mkdir` in particular, so no
-/// directory is created down an ancestry that is about to be refused. The two
-/// are split rather than nested for exactly that ordering; neither is
-/// meaningful without the other.
-///
-/// # Security
-///
-/// An app's `out_file`/`err_file` are free-form config the assembler takes
-/// verbatim, so a log path can name anywhere the daemon can write. Under a
-/// root daemon that turns a pre-existing loose directory into a
-/// write-and-truncate primitive: another local user plants a symlink where
-/// the log file will be, the pump appends through it, and `shep flush`
-/// empties whatever it points at. `O_NOFOLLOW` closes that: the open fails
-/// with `ELOOP` instead, the symlink is left alone, and its target is
-/// untouched.
-///
-/// What it does NOT cover, stated plainly because the gap is real:
-/// `O_NOFOLLOW` guards only the FINAL path component. A symlinked *parent*
-/// directory still resolves, so `logs -> /elsewhere` followed by
-/// `logs/app.log` reaches `/elsewhere/app.log` exactly as before. Closing
-/// that in the open itself needs `openat2(RESOLVE_NO_SYMLINKS)`, which is
-/// Linux-only — so it cannot be the only path here, though it could be a
-/// Linux fast path beside this one. What that would cost, and why Phase 10
-/// did not spend it, is on [`check_log_ancestry`] and in
-/// `docs/specs/deferred.md`. [`check_log_ancestry`] covers that case from the
-/// other side — by refusing an ancestry a privileged daemon should not be
-/// writing below at all — but it checks rather than resolves, so a TOCTOU
-/// window remains between the two. This stops the realistic attack; it does
-/// not make the operation atomic.
-///
-/// `custom_flags` is safe, so none of this is the exception to
-/// `shep-daemon/src/sys.rs` owning every `unsafe` block in this crate
-/// (IR-22).
+/// The one opener of a log file in this crate: the pump's append handle and
+/// `shep flush`'s truncating one both come through here.
+/// [`check_log_ancestry`] runs before it at both call sites, ahead of
+/// `open_append`'s `mkdir`. `O_NOFOLLOW` guards only the final component, so
+/// a symlinked parent still resolves; only that check covers it.
 ///
 /// # Errors
 ///
-/// Whatever the open reported. An `ELOOP` — the refusal above — is relabelled
-/// to [`SYMLINK_REFUSED`] on the way out, because `ELOOP`'s own strerror
-/// ("too many levels of symbolic links") reads as a symlink *loop* and tells
-/// an operator with one perfectly ordinary symlink neither what shep did nor
-/// what to change. Every other error is passed through untouched, `NotFound`
-/// included — `truncate_log` still recognises it.
+/// Whatever the open reported, with `ELOOP` relabelled to
+/// [`SYMLINK_REFUSED`]: `NotFound` passes through untouched.
 pub(crate) async fn open_log_path(
     options: &mut tokio::fs::OpenOptions,
     path: &Path,
@@ -420,10 +260,9 @@ pub(crate) async fn open_log_path(
 /// Relabels the `ELOOP` an `O_NOFOLLOW` open answers with, leaving every
 /// other error exactly as the OS reported it.
 ///
-/// Both platforms shep supports report the refusal the same way — POSIX
-/// specifies `ELOOP`, and Darwin's `open(2)` matches it (measured, not
-/// assumed) — so one errno covers the tier rather than a per-platform list.
-/// The kind is carried over rather than invented: only the message changes.
+/// One errno covers both supported platforms: POSIX specifies `ELOOP` and
+/// Darwin's `open(2)` matches. The kind is carried over; only the message
+/// changes.
 #[cfg(unix)]
 fn name_the_symlink(error: io::Error) -> io::Error {
     if error.raw_os_error() == Some(nix::libc::ELOOP) {
@@ -433,72 +272,32 @@ fn name_the_symlink(error: io::Error) -> io::Error {
     }
 }
 
-/// The non-unix arm of [`name_the_symlink`]: there is no `O_NOFOLLOW` to
-/// apply on this tier, so there is no refusal to relabel either.
+/// The non-unix arm of [`name_the_symlink`]: no `O_NOFOLLOW`, so no refusal
+/// to relabel.
 #[cfg(not(unix))]
 fn name_the_symlink(error: io::Error) -> io::Error {
     error
 }
 
-/// Refuses — under a privileged shepherd — to open a log file whose ancestry
-/// another local user could redirect, and warns about it under any other.
+/// Refuses a log path another local user could redirect, under root only
 ///
-/// [`open_log_path`]'s other half, run before it (and before any `mkdir`) at
-/// both of that function's call sites.
-///
-/// # Why the split by uid
-///
-/// The chain is an ESCALATION only when the daemon is privileged. A shepherd
-/// running as an ordinary user that logs into a shared directory has handed
-/// nobody anything they could not already do as themselves — it is a footgun,
-/// not a vulnerability — and refusing it outright would break a developer
-/// logging to `/tmp`, which is a legitimate thing to do. So root refuses and
-/// everyone else is warned, once per path. The warning costs nothing at the
-/// default level: the subscriber ships at `warn`.
-///
-/// # What counts as loose
-///
-/// See [`loose_ancestor`]. Two things, both about the components of the path
-/// itself rather than about where it points: an ancestor owned by neither the
-/// daemon's uid nor root, and a world-writable ancestor DIRECTORY. Ownership
-/// is the load-bearing half — it is what catches an intermediate component
-/// swapped for a symlink, which `O_NOFOLLOW` on the final component cannot
-/// see, and it catches a plain `0755` directory owned by the app's own
-/// dropped-privilege user, which the write bit alone would wave through.
-///
-/// # What remains
-///
-/// A TOCTOU window. This checks the ancestry and then opens the path with no
-/// atomic tie between the two, so an attacker who can rearrange a directory
-/// between the check and the open still wins that race. The bar is raised
-/// substantially; the operation is not atomic.
-///
-/// The syscall that would close it on Linux is
-/// `openat2(RESOLVE_NO_SYMLINKS)`, and it IS reachable — `nix 0.29` exposes
-/// `fcntl::openat2` under the `fs` feature this crate already enables. What
-/// stops it being a Linux fast path here is not availability but cost:
-/// `openat2` hands back a `RawFd`, so adopting it into a `File` needs
-/// `FromRawFd`, which is `unsafe` and belongs in `sys.rs` (IR-22), behind a
-/// `cfg(target_os = "linux")` with an `ENOSYS`/`EPERM` fallback ladder for
-/// pre-5.6 kernels and seccomp sandboxes — new unsafe on a Linux-only path
-/// this project cannot execute a test for from a macOS development machine.
-/// The design is written down in `docs/specs/deferred.md` rather than
-/// half-built here.
+/// [`open_log_path`]'s other half, run before it (and before any `mkdir`)
+/// at both call sites. A loose ancestry escalates only under a privileged
+/// daemon, so root refuses and everyone else is warned once per path.
+/// [`loose_ancestor`] defines loose, and the window between the check and
+/// the open stays open (`docs/specs/deferred.md`).
 ///
 /// # Errors
 ///
-/// [`io::ErrorKind::PermissionDenied`], naming the offending ancestor and
-/// why, when the daemon's effective uid is root and an ancestor is loose. The
-/// message carries no path of its own — every caller prefixes the log path
-/// already.
+/// [`io::ErrorKind::PermissionDenied`] naming the loose ancestor, when the
+/// daemon's effective uid is root. The message carries no path of its own.
 pub(crate) fn check_log_ancestry(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         check_log_ancestry_as(path, crate::server::daemon_uid())
     }
     // Windows has neither the uid model this reads nor the `shep flush`
-    // surface that reaches it (spec §11's functional tier is unbuilt), so
-    // there is nothing here to check and nothing to warn about yet.
+    // surface that reaches it, so there is nothing to check.
     #[cfg(not(unix))]
     {
         let _ = path;
@@ -512,20 +311,18 @@ pub(crate) fn check_log_ancestry(path: &Path) -> io::Result<()> {
 const ROOT_UID: u32 = 0;
 
 /// The permission bit that lets every local user create entries in a
-/// directory. Narrower on purpose than `boot`'s socket-directory check, which
-/// tests `0o022` (group OR world): a group-writable log directory names a
-/// specific set of accounts an operator chose, while this bit names everyone.
+/// directory. Narrower than `boot`'s socket-directory check (`0o022`, group
+/// or world): a group-writable log directory names accounts an operator
+/// chose, while this bit names everyone.
 #[cfg(unix)]
 const WORLD_WRITABLE: u32 = 0o002;
 
 /// Log paths whose loose ancestry has already been reported, so an
-/// unprivileged shepherd says it once rather than on every respawn, every
-/// reopen and every flush of the same file.
+/// unprivileged shepherd says it once rather than on every open.
 ///
-/// Keyed by the LOG path, not by the offending ancestor: the warning names
-/// both, and an operator asking "which of my apps is this about?" is asking
-/// about the one this set is keyed on. Bounded by the number of distinct log
-/// paths in the flock.
+/// Keyed by the log path, not by the offending ancestor: that is what an
+/// operator asking which of their apps this is about is asking. Bounded by
+/// the number of distinct log paths in the flock.
 #[cfg(unix)]
 static WARNED_LOOSE_LOG_PATHS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<PathBuf>>,
@@ -576,7 +373,7 @@ fn check_log_ancestry_as(path: &Path, daemon_uid: u32) -> io::Result<()> {
 struct LooseAncestor {
     /// The offending component, as it appears in the log path.
     path: PathBuf,
-    /// Why it offends — reads as the predicate in `"<path> <reason>"`.
+    /// Why it offends: reads as the predicate in `"<path> <reason>"`.
     reason: LooseReason,
 }
 
@@ -604,45 +401,18 @@ impl fmt::Display for LooseReason {
     }
 }
 
-/// The nearest ancestor of `path` that another local user could use to
-/// redirect it, or `None` when every one of them is already the daemon's to
-/// trust.
+/// The nearest ancestor of `path` another local user could redirect it
+/// through, or `None` when every one is the daemon's to trust.
 ///
-/// Walks the path's own textual components from its parent upwards and stops
-/// at the first offender, so the ancestor reported is the one closest to the
-/// log file — the one an operator can actually do something about, and the
-/// one a test can pin without knowing what `/tmp` looks like on the runner.
+/// Walks the path's own textual components upwards from its parent and stops
+/// at the first offender. `symlink_metadata`, never `metadata`: a symlinked
+/// component must be read as the link it is, owned by whoever planted it. An
+/// ancestor that does not exist, or cannot be stat'd, is skipped, since
+/// `open_append` is about to create it at `boot::DIR_MODE` as the daemon.
 ///
-/// `symlink_metadata`, never `metadata`: a symlinked component must be read
-/// as the link it is (owned by whoever planted it) rather than as whatever it
-/// resolves to. That is the whole reason ownership is checked at all —
-/// `O_NOFOLLOW` on the final component cannot see a redirect one level up.
-///
-/// An ancestor that does not exist is skipped rather than trusted or blamed:
-/// `open_append` is about to create it, and every directory shep creates it
-/// creates at `boot::DIR_MODE` (`0700`) as the daemon's own user, which is
-/// exactly what this function would then wave through. An ancestor that
-/// cannot be stat'd at all is skipped for the same reason it cannot be
-/// judged.
-///
-/// # Cost
-///
-/// One `lstat(2)` per component of the path, once per log-file open — so
-/// every spawn, every respawn, every reopen, and once per distinct path in a
-/// flush. The syscalls hit the kernel's dentry cache after the first, and the
-/// walk stops early on the first offender, which on a loose ancestry is
-/// usually the first component it looks at.
-///
-/// Measured on macOS (release, warm cache, no offender so the walk runs to
-/// the root): **7.8 µs** for a nine-component path — the shape
-/// `$SHEP_HOME/logs/<name>-<n>-out.log` has under a home directory — and
-/// **26 µs** for a twenty-four-component one, so about 1.1 µs per component.
-/// That is against an `open(2)` this crate already dispatches to the blocking
-/// pool, and against the process spawn a pump's first open belongs to, which
-/// costs milliseconds. It is run inline rather than on the blocking pool
-/// because a few microseconds is well inside what a runtime worker may do
-/// between yields, and a `spawn_blocking` hop per open would cost more than
-/// the walk.
+/// One `lstat(2)` per component per log-file open, 7.8 µs for a
+/// nine-component path on macOS, so it runs inline rather than paying a
+/// `spawn_blocking` hop.
 #[cfg(unix)]
 fn loose_ancestor(path: &Path, daemon_uid: u32) -> Option<LooseAncestor> {
     use std::os::unix::fs::MetadataExt as _;
@@ -665,11 +435,11 @@ fn loose_ancestor(path: &Path, daemon_uid: u32) -> Option<LooseAncestor> {
         })
 }
 
-/// IO endpoints handed back by spawn — the runner pumps internally.
+/// IO endpoints handed back by spawn; the runner pumps internally.
 ///
-/// The sheep task owns this and MUST drain every receiver: an undrained
+/// The sheep task owns this and must drain every receiver: an undrained
 /// `from_child` back-pressures a metric-emitting child until it stalls on
-/// its own fd-3 write (see the supervisor's `select!` model, a later task).
+/// its own fd-3 write.
 #[derive(Debug)]
 pub struct ProcIo {
     /// stdout+stderr lines
@@ -681,56 +451,41 @@ pub struct ProcIo {
     /// Control channel into this sheep's log pump
     ///
     /// The pump is the only reader of the child's stdout and stderr, and it
-    /// ends when the last of these senders drops — so hold this for as long
-    /// as the child is alive. Ending the pump drops the read ends of those
-    /// two pipes along with it, and the child's next write to either then
-    /// gets `EPIPE`/`SIGPIPE`: the child typically dies on the spot rather
-    /// than stalling on a pipe nobody drains.
+    /// ends when the last of these senders drops, so hold this while the
+    /// child is alive: ending the pump drops the read ends of both pipes and
+    /// the child's next write gets `EPIPE`/`SIGPIPE`. The supervisor clones
+    /// it (`SheepSlot::log_ctl`); what keeps a clone from stretching a
+    /// pump's life is the pump's own exit on the `logs` receiver going away.
     ///
-    /// Cloning it is therefore not free of consequence, and the supervisor
-    /// does clone it (`SheepSlot::log_ctl`, so a `Reopen` or a `Flush` can
-    /// reach a pump without going through the sheep task). What keeps a clone
-    /// from
-    /// stretching a pump's life is the pump's own exit on the `logs`
-    /// receiver going away — see `tokio_runner`'s `spawn_log_pump` — which
-    /// the owner of this bundle drops when it drops the bundle.
-    ///
-    /// A send that fails means the pump is already gone (its `logs` receiver
-    /// dropped, or both streams reached EOF — normally the child exiting),
-    /// which makes a reopen a no-op rather than an error.
-    /// [`LogCtl::Reopen`]'s acknowledgement resolving `Err` says the same
-    /// thing about a request that was accepted and then never served.
+    /// A send that fails means the pump is already gone, which makes a
+    /// reopen a no-op rather than an error.
     pub log_ctl: mpsc::Sender<LogCtl>,
     /// The shepherd's writing end of this sheep's stdin.
     ///
-    /// Always present, and closed rather than absent when the app did not ask
-    /// for a pipe: the runner drops the receiving end in that case, so
-    /// `is_closed()` is the one question a caller has to ask — the same shape
-    /// [`Self::to_child`] uses for a sheep configured without a shepherd
-    /// channel.
+    /// Always present, and closed rather than absent when the app asked for
+    /// no pipe: the runner drops the receiving end, so `is_closed()` is the
+    /// one question a caller asks, the same shape [`Self::to_child`] uses.
     ///
-    /// Hold it only for as long as the child is alive. The task on the far end
-    /// parks on `recv()` and has no other way to finish, so a sender kept past
-    /// the child's exit parks that task and holds the pipe's write end with it.
+    /// Hold it only for as long as the child is alive: the task on the far
+    /// end parks on `recv()`, so a sender kept past the child's exit parks
+    /// that task and holds the pipe's write end with it.
     pub to_stdin: mpsc::Sender<StdinWrite>,
 }
 
 /// One line to write to a sheep's stdin, and where the answer goes.
 ///
-/// The acknowledgement is the point, exactly as it is on [`LogCtl`]: an
-/// `mpsc::send` only proves the message was queued, and a caller told "sent"
-/// on that basis would be told it about a line still sitting in a channel
-/// behind a pipe the app has stopped reading. The `oneshot` fires after the
-/// bytes are written AND flushed, which is the strongest claim this side of
-/// the pipe can honestly make.
+/// The acknowledgement is the point, as on [`LogCtl`]: an `mpsc::send` only
+/// proves the message was queued, and the line may still be sitting behind a
+/// pipe the app has stopped reading. The `oneshot` fires after the bytes are
+/// written and flushed.
 #[derive(Debug)]
 pub struct StdinWrite {
-    /// The line, without its terminator — the writer appends exactly one `\n`.
+    /// The line, without its terminator: the writer appends one `\n`.
     pub line: String,
     /// Fires once the line has landed, or with why it could not.
     ///
     /// A dropped sender means the writer task ended before serving this
-    /// request, which happens when the child's stdin closed — the caller reads
+    /// request, which happens when the child's stdin closed; the caller reads
     /// that as the pipe being gone.
     pub done: oneshot::Sender<Result<(), RunnerError>>,
 }
@@ -744,70 +499,40 @@ pub trait RunningProcess: Send + 'static {
     ///
     /// # Cancellation safety
     ///
-    /// Dropping the returned future and calling `wait` again is safe: it
-    /// neither restarts the wait nor loses whatever progress was already
-    /// made toward it. [`tokio::process::Child::wait`] documents this
-    /// guarantee for real children; the scripted fake mirrors it by fixing
-    /// its exit deadline once, at spawn time, rather than recomputing it on
-    /// each `wait` call.
+    /// Dropping the returned future and calling `wait` again neither
+    /// restarts the wait nor loses progress toward it, as
+    /// [`tokio::process::Child::wait`] guarantees; the scripted fake mirrors
+    /// it by fixing its exit deadline once, at spawn.
     ///
-    /// The future is also explicitly `Send` (RPITIT) because the sheep task
-    /// that owns the proc is `tokio::spawn`'ed.
+    /// The future is `Send` (RPITIT) because the sheep task that owns the
+    /// proc is `tokio::spawn`'ed.
     fn wait(&mut self) -> impl core::future::Future<Output = ExitOutcome> + Send;
 
     /// Sends a signal to the sheep's whole process group
     ///
-    /// Group-wide, not leader-only. A sheep that forks a child without
-    /// `exec`ing it — the shape every `thing & wait` wrapper script produces —
-    /// keeps that child in its own process group, so a leader-only signal
-    /// stops the wrapper and leaves the child running, orphaned and untracked.
-    /// Signalling the group instead delivers the graceful stop to the lambs
-    /// too, and gives them the same chance to shut down cleanly that the
-    /// sheep gets, rather than only ever meeting [`Self::kill_tree`]'s
-    /// `SIGKILL`.
+    /// Group-wide, not leader-only: a `thing & wait` wrapper's forked child
+    /// stays in its own group, and a leader-only signal would leave it
+    /// running and untracked. Implementors must spawn each child as the
+    /// leader of a fresh group; this and [`Self::kill_tree`] address it by
+    /// [`Self::pid`], so a child that escapes with `setsid` is beyond both.
     ///
     /// # Errors
     ///
-    /// - [`RunnerError::SignalFailed`] — delivery failed (already reaped, `EPERM`).
-    ///
-    /// # Process-group assumption
-    ///
-    /// Implementors must spawn each child as the leader of a fresh process
-    /// group of its own; this method and [`Self::kill_tree`] both address
-    /// that group by the pid [`Self::pid`] reports. A child that escapes its
-    /// group after the fact (the `setsid`-in-a-fork daemonize dance) is
-    /// beyond the reach of either. The real runner's own `signal_group`
-    /// (`tokio_runner.rs`, unix-only, so deliberately not linked from this
-    /// portable tier) documents how it establishes the property and what an
-    /// implementation that dropped it would do instead.
+    /// - [`RunnerError::SignalFailed`] if delivery failed (already reaped,
+    ///   `EPERM`).
     fn signal(&mut self, sig: StopSignal) -> Result<(), RunnerError>;
 
-    /// Sends `sig` to this sheep's OWN process, never its process group.
+    /// Sends `sig` to this sheep's own process, never its process group.
     ///
-    /// The counterpart to [`Self::signal`], and the difference between them is
-    /// the whole design of `shep signal`. That one is group-wide because a
-    /// stop has to reach a `thing & wait` wrapper's child too. This one is not,
-    /// because it exists for a conversation between an operator and one
-    /// application: a `SIGHUP` broadcast to every process in the group reaches
-    /// whatever `sh` and whatever runtime child happen to be in it, none of
-    /// which the operator addressed and several of which have their own
-    /// meaning for the signal.
+    /// Not group-wide, unlike [`Self::signal`]: this exists for a
+    /// conversation between an operator and one application, and a `SIGHUP`
+    /// broadcast to the group would reach whatever `sh` and runtime children
+    /// are in it. The default refuses rather than widening to the group.
     ///
     /// # Errors
     ///
-    /// - [`RunnerError::SignalFailed`] — delivery failed (`ESRCH` for a
-    ///   process reaped between the lookup and the syscall, `EPERM` for one
-    ///   this daemon may not signal), or this implementation has no per-process
-    ///   delivery at all.
-    ///
-    /// # Default implementation
-    ///
-    /// Refuses. A defaulted method rather than a required one so that adding
-    /// it did not break an out-of-tree implementor of this trait, which is a
-    /// `pub` trait in a published library — the same courtesy `#[non_exhaustive]`
-    /// buys an enum (IR-20). An implementation that can deliver a signal to one
-    /// process overrides it; one that cannot says so honestly instead of
-    /// silently widening to the group.
+    /// - [`RunnerError::SignalFailed`] if delivery failed (`ESRCH`, `EPERM`)
+    ///   or this implementation has no per-process delivery at all.
     fn signal_process(&mut self, sig: OperatorSignal) -> Result<(), RunnerError> {
         let _ = sig;
         Err(RunnerError::SignalFailed(
@@ -818,12 +543,12 @@ pub trait RunningProcess: Send + 'static {
     /// SIGKILLs the whole process group/tree
     ///
     /// The escalation rung above [`Self::signal`]: same group, same
-    /// process-group assumption (documented there), but a signal nothing can
-    /// catch or ignore.
+    /// process-group assumption, but a signal nothing can catch or ignore.
     ///
     /// # Errors
     ///
-    /// - [`RunnerError::SignalFailed`] — delivery failed (already reaped, `EPERM`).
+    /// - [`RunnerError::SignalFailed`] if delivery failed (already reaped,
+    ///   `EPERM`).
     fn kill_tree(&mut self) -> Result<(), RunnerError>;
 }
 
@@ -835,68 +560,39 @@ pub trait ProcessRunner: Send + Sync + 'static {
     /// Spawns per the spec, returning the proc + its IO bundle
     ///
     /// Must be called from within a Tokio runtime context: both
-    /// implementations (the scripted fake and the real runner) spawn
-    /// background tasks internally to pump IO.
+    /// implementations spawn background tasks internally to pump IO.
     ///
     /// # Errors
     ///
-    /// - [`RunnerError::SpawnFailed`] — exec failure, permissions, missing binary.
+    /// - [`RunnerError::SpawnFailed`] on an exec failure, bad permissions or
+    ///   a missing binary.
     fn spawn(&self, spec: &SpawnSpec) -> Result<(Self::Proc, ProcIo), RunnerError>;
 
     /// What is knowable about `spec` before anything is spawned
     ///
-    /// Lets a caller refuse a whole batch before registering any of it. The
-    /// defect this exists for: an eleven-app Flockfile whose third app
-    /// pointed at an unbuilt binary registered and started apps one and two,
-    /// failed on three, and never reached four through eleven, leaving a
-    /// flock that matched neither the file nor its previous state.
-    ///
-    /// See [`Preflight`] for what separates a verdict a caller may refuse a
-    /// batch over from one it may only report. That split is the whole
-    /// design: a check that refuses too much is worse than the bug it
-    /// addresses, because it takes a flock down that would have come up.
-    ///
-    /// # Default implementation
-    ///
-    /// [`Preflight::Unknown`], always. A defaulted method rather than a
-    /// required one for the reason [`RunningProcess::signal_process`] gives:
-    /// this is a `pub` trait in a published library, and adding a required
-    /// method to one is a break for an out-of-tree implementor (IR-20). The
-    /// default is also the honest answer for a runner that never touches the
-    /// filesystem, which is what the crate's own fakes are.
+    /// Lets a caller refuse a whole batch before registering any of it,
+    /// rather than registering the apps ahead of the one that cannot spawn.
+    /// See [`Preflight`] for which verdicts a caller may refuse a batch over.
+    /// The default answers [`Preflight::Unknown`], which is also the honest
+    /// answer for a runner that never touches the filesystem.
     #[must_use]
     fn preflight(&self, spec: &SpawnSpec) -> Preflight {
         let _ = spec;
         Preflight::Unknown
     }
 
-    /// Rebuilds a proc around a sheep this process inherited rather than
-    /// started.
+    /// Rebuilds a proc around a sheep this process inherited, not started
     ///
-    /// The successor half of a handover. Every handle in `spec` crossed an
-    /// `execve` with its `FD_CLOEXEC` cleared, so the sheep on the far side
-    /// of them never noticed the shepherd being replaced: same pid, same
-    /// pipes, same open file description on each log. Nothing here spawns,
-    /// signals or reopens anything.
+    /// The successor half of a handover, unix only as the handover is. Every
+    /// handle in `spec` crossed an `execve` with its `FD_CLOEXEC` cleared, so
+    /// the sheep never noticed: same pid, same pipes, same open file
+    /// description on each log. Nothing here spawns or signals.
     ///
     /// # Errors
     ///
-    /// - [`RunnerError::AdoptFailed`] if this runner cannot take a process
-    ///   it did not spawn, which is what the default answers, or if the
-    ///   carried handles could not be wired to a pump.
-    ///
-    /// # Default implementation
-    ///
-    /// Refuses. A defaulted method rather than a required one for the reason
-    /// [`Self::preflight`] gives: this is a `pub` trait in a published
-    /// library, and adding a required method to one breaks every out-of-tree
-    /// implementor with no version bump to warn them (IR-20). The refusal is
-    /// also the truthful answer for a runner that never took part in a
-    /// handover, rather than a stub that pretends to adopt.
-    ///
-    /// Unix only. Windows has no `execve` and `Arm::for_daemon` returns the
-    /// stop-and-start arm there, so no Windows image is ever a successor and
-    /// a portable method would be a promise this workspace could not keep.
+    /// - [`RunnerError::AdoptFailed`] if this runner cannot take a process it
+    ///   did not spawn (what the default answers), or if the carried handles
+    ///   could not be wired to a pump.
     #[cfg(unix)]
     fn adopt(&self, spec: AdoptSpec) -> Result<(Self::Proc, ProcIo), RunnerError> {
         let _ = spec;
@@ -909,15 +605,12 @@ pub trait ProcessRunner: Send + Sync + 'static {
 /// One inherited sheep, and everything a runner needs to supervise it again.
 ///
 /// Produced by the successor's `handover::adopt` and consumed by
-/// [`ProcessRunner::adopt`]. The handles are owned, because adopting is
-/// exactly the act of taking ownership of them; `None` on a pair means the
-/// predecessor had no handle to carry, which is what a sheep whose log open
-/// had failed, or one with no live pump, looks like.
+/// [`ProcessRunner::adopt`]. The handles are owned, since adopting is taking
+/// ownership of them; `None` on a pair means the predecessor had no handle
+/// to carry.
 ///
-/// `Debug` is derived, and deliberately so (IR-41): descriptor numbers, a
-/// pid and two log paths are all an operator already reads out of
-/// `shep flock`, and no environment value or other secret reaches this type.
-/// The blob it is built from carries the same rule.
+/// `Debug` is derived: descriptor numbers, a pid and two log paths are all in
+/// `shep flock` already, and no env value reaches this type.
 #[cfg(unix)]
 #[derive(Debug)]
 pub struct AdoptSpec {
@@ -941,76 +634,53 @@ pub struct AdoptSpec {
     /// for a sheep whose app asked for one.
     ///
     /// The one handle here the daemon writes to. `None` is the commoner
-    /// sheep, which has `/dev/null` on fd 0, and an adoption puts a stdin
-    /// pump back only when there is an end for it to write to.
+    /// sheep, which has `/dev/null` on fd 0.
     pub stdin_pipe: Option<tokio::net::unix::pipe::Sender>,
     /// The daemon's end of its shepherd-channel socketpair, still the one
     /// whose other end is the child's fd 3.
     ///
-    /// The one handle here that goes both ways, so an adoption puts BOTH
-    /// pumps back on it: an app that writes `{"kind":"ready"}` or an action
-    /// reply is read again, and a `shep trigger` or a
-    /// `shutdown_with_message` reaches it again. `None` for a sheep whose
-    /// app asked for no channel, and for one whose child has closed fd 3.
+    /// Goes both ways, so an adoption puts both pumps back on it. `None` for
+    /// a sheep whose app asked for no channel, and for one whose child has
+    /// closed fd 3.
     pub channel: Option<tokio::net::UnixStream>,
     /// The one reaper this successor waits every adopted pid through.
     ///
     /// Shared rather than owned per sheep: a status can be collected once,
-    /// so two reapers racing on one pid would have one take the exit and the
-    /// other meet `ECHILD` with the exit already gone.
+    /// so two reapers racing on one pid would leave one meeting `ECHILD`.
     pub reaper: std::sync::Arc<AdoptedReaper>,
 }
 
 /// What a [`ProcessRunner`] can tell about a [`SpawnSpec`] before anything is
 /// spawned
 ///
-/// Three variants because a caller registering a BATCH has three different
-/// things to do with the answer, and collapsing any two of them costs a
-/// flock. The line that matters runs between [`Self::Impossible`] and
-/// [`Self::Doubtful`], and it is a line between two kinds of claim rather
-/// than between two confidence levels:
-///
-/// - a path with a `/` in it is a claim about the FILESYSTEM, which the
-///   daemon can check with certainty and an operator can fix with a typo
-///   correction.
-/// - a bare command is a claim about an ENVIRONMENT, and the environment
-///   that matters is the daemon's, not the shell the operator tested in. A
-///   `shep startup` unit gives the shepherd whatever `PATH` launchd or
-///   systemd hands it, so `node` from homebrew on Apple Silicon
-///   (`/opt/homebrew/bin`) and `node` from nvm (under `$HOME`) both resolve
-///   in a terminal and neither resolves under the unit.
-///
-/// Refusing a batch on the second kind would mean one app's interpreter
-/// keeping the other twelve down at boot, which is strictly worse than the
-/// partial registration the check exists to prevent.
-// `#[non_exhaustive]`: shep-daemon is a published library, an out-of-tree
-// consumer can match this exhaustively today, and a fourth verdict would
-// break them with no version bump to say so (IR-20).
+/// The line that matters runs between [`Self::Impossible`] and
+/// [`Self::Doubtful`], and it separates two kinds of claim. A path with a
+/// `/` is a claim about the filesystem, which the daemon can check. A bare
+/// command is a claim about the daemon's own environment, which is not the
+/// shell the operator tested in: `node` from homebrew or nvm resolves in a
+/// terminal and under no `shep startup` unit. Refusing a batch on the second
+/// would keep twelve apps down over one interpreter.
+// `#[non_exhaustive]`: an out-of-tree consumer can match this exhaustively,
+// and a fourth verdict would break them with no version bump.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Preflight {
     /// Nothing is knowable in advance.
     ///
-    /// NOT "this will work". Every form an implementation declines to decide
-    /// arrives here, alongside every form it decided is fine, and the two are
-    /// deliberately not distinguished: a caller may only ever act on the
-    /// other two variants.
+    /// Not "this will work": every form an implementation declines to decide
+    /// arrives here alongside every form it decided is fine. A caller may
+    /// only act on the other two variants.
     Unknown,
-    /// The spawn cannot succeed, and that is a certainty rather than a
-    /// suspicion. Carries one reason, no trailing punctuation, ready to be
-    /// printed after a sheep's name.
+    /// The spawn cannot succeed, as a certainty. Carries one reason, no
+    /// trailing punctuation, ready to be printed after a sheep's name.
     ///
-    /// A caller registering a batch should refuse the WHOLE batch on this and
+    /// A caller registering a batch should refuse the whole batch and
     /// register none of it.
     Impossible(String),
     /// The spawn looks like it will fail, and a caller must not refuse a
     /// batch over it. Carries a reason on the same terms as
-    /// [`Self::Impossible`].
-    ///
-    /// Report it and carry on: the spawn then fails for that one sheep
-    /// exactly as it would have anyway, and every other app in the batch
-    /// comes up. See this enum's own doc for why the two are not the same
-    /// question.
+    /// [`Self::Impossible`]. Report it and carry on: the spawn then fails for
+    /// that one sheep as it would have anyway.
     Doubtful(String),
 }
 
@@ -1044,8 +714,7 @@ pub struct SpawnSpec {
 }
 
 /// Redacted: `env` carries whatever the operator configured, and this type is
-/// the one handed to `Command::envs` at exec. Every other env-carrying type
-/// in the workspace redacts (IR-41), and this was the one that did not.
+/// the one handed to `Command::envs` at exec.
 impl fmt::Debug for SpawnSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SpawnSpec")
@@ -1060,12 +729,9 @@ impl fmt::Debug for SpawnSpec {
 
 /// Error type returned from spawn and process control
 ///
-/// `#[non_exhaustive]`: today's variants cover spawn, adoption, signal
-/// delivery and a stdin write, and a future process-control primitive — a cgroup
-/// freeze, or a Windows job-object failure — would need its own variant
-/// rather than stretching one of these to mean something it does not cover,
-/// and shep-daemon is a published library an out-of-tree matcher should not
-/// break for (IR-20).
+/// `#[non_exhaustive]`: a future process-control primitive, a cgroup freeze
+/// or a Windows job-object failure, would need its own variant rather than
+/// stretching one of these, and an out-of-tree matcher should not break.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunnerError {
@@ -1097,8 +763,7 @@ impl core::error::Error for RunnerError {}
 
 // Every case here is `#[cfg(unix)]`, as is everything they exercise: the uid
 // model `loose_ancestor` reads, the mode bits it tests, and
-// `std::os::unix::fs::symlink`. On Windows this module compiles to nothing,
-// which matches `check_log_ancestry`'s own non-unix arm having nothing to do.
+// `std::os::unix::fs::symlink`.
 #[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
@@ -1106,15 +771,13 @@ mod tests {
     use super::*;
     use crate::testing::capture_logs;
 
-    /// A uid no fixture in this module creates anything as. Only reached on a
-    /// root test runner, where `chown` is available and everything the test
-    /// creates would otherwise be root-owned — and root is exempt by
-    /// construction, so a self-owned fixture could not be foreign there.
+    /// A uid no fixture in this module creates anything as. Only reached on
+    /// a root test runner, where everything created is root-owned and root is
+    /// exempt by construction.
     const FOREIGN_UID: u32 = 65_432;
 
-    /// This process's effective uid — what every fixture directory below is
-    /// owned by, and what the cases move the *daemon's* uid relative to
-    /// rather than trying to chown their way around.
+    /// This process's effective uid: what every fixture directory is owned
+    /// by, and what the cases move the daemon's uid relative to.
     fn me() -> u32 {
         nix::unistd::geteuid().as_raw()
     }
@@ -1129,13 +792,9 @@ mod tests {
         (parent, log)
     }
 
-    /// Fails if the walk stops reporting the NEAREST offender — an
-    /// implementation that walked to the filesystem root and kept the last
-    /// hit, or that returned an arbitrary one, would blame `/tmp` on a Linux
-    /// runner (mode `1777`) instead of the directory the operator configured
-    /// and can actually fix. Also the only case pinning the world-writable
-    /// arm on its own: drop that arm and this reddens with `None` while the
-    /// ownership cases below stay green.
+    /// Also the only case pinning the world-writable arm on its own: drop
+    /// that arm and this reddens with `None` while the ownership cases below
+    /// stay green.
     #[test]
     fn the_nearest_loose_ancestor_is_the_one_reported() {
         let dir = tempfile::tempdir().unwrap();
@@ -1150,22 +809,17 @@ mod tests {
         );
     }
 
-    /// Fails if the check tests only the write bit — the shape the guard was
-    /// first specified as. This parent is `0700`, so a world-writable test
-    /// waves it through; its OWNER can still replace it under a root
-    /// shepherd, which is the whole point of widening the predicate. A `0755`
-    /// directory owned by an app's own dropped-privilege `user` is the same
-    /// case wearing ordinary clothes.
+    /// The parent is `0700`, so a write-bit-only check waves it through,
+    /// while its owner can still replace it under a root shepherd.
     #[test]
     fn an_ancestor_owned_by_another_user_is_loose_however_tight_its_mode() {
         let dir = tempfile::tempdir().unwrap();
         let (parent, log) = log_path_under(&dir, 0o700);
 
         // The predicate is symmetric in the two uids, so an unprivileged
-        // runner moves the daemon's rather than the directory's — it cannot
-        // chown. A root runner must move the directory's instead: everything
-        // it creates is root-owned, and root is exempt whatever the daemon's
-        // uid is.
+        // runner moves the daemon's rather than the directory's; it cannot
+        // chown. A root runner must move the directory's: root is exempt
+        // whatever the daemon's uid is.
         let (daemon_uid, owner) = if me() == ROOT_UID {
             std::os::unix::fs::chown(&parent, Some(FOREIGN_UID), None).unwrap();
             (ROOT_UID, FOREIGN_UID)
@@ -1182,20 +836,15 @@ mod tests {
         );
     }
 
-    /// Fails if the walk reads each component with `metadata` instead of
-    /// `symlink_metadata`. The link below is owned by this user and points at
-    /// a root-owned, non-world-writable directory, so following it reports a
-    /// component that is NOT loose and the walk moves on to blame the
-    /// tempdir; reading the link itself blames the link. Only the path in the
-    /// answer tells the two apart, which is why this asserts on it.
-    ///
-    /// This is the case `O_NOFOLLOW` structurally cannot cover: it guards the
-    /// final component, and the redirect here is one level up.
+    /// The link is owned by this user and points at a root-owned, tight
+    /// directory, so following it blames the tempdir instead. Only the path
+    /// in the answer tells the two apart. This is the case `O_NOFOLLOW`
+    /// cannot cover: the redirect is one level up.
     #[test]
     fn a_symlinked_component_is_judged_as_the_link_not_as_its_target() {
         let dir = tempfile::tempdir().unwrap();
         let link = dir.path().join("logs");
-        // `/usr` exists and is root-owned `0755` on both tier-1 platforms —
+        // `/usr` exists and is root-owned `0755` on both tier-1 platforms,
         // an ancestor the walk would wave through if it followed the link.
         std::os::unix::fs::symlink("/usr", &link).unwrap();
         let log = link.join("web-0-out.log");
@@ -1210,16 +859,11 @@ mod tests {
         );
     }
 
-    /// Fails if the two uid arms are collapsed either way round.
-    ///
     /// Refusing everywhere would break a developer logging to `/tmp` as
-    /// themselves — a footgun, not an escalation, since they have handed
-    /// nobody anything they could not already do. Warning everywhere would
-    /// leave the root case, the one that IS an escalation, exiting zero.
+    /// themselves; warning everywhere would leave the root case exiting zero.
     ///
-    /// The warn-once half is asserted in the same case because it is the same
-    /// call: a count of two means the dedup set is gone, and a pump that
-    /// reopens on every respawn would then repeat the line forever.
+    /// The warn-once half rides along because it is the same call: a count of
+    /// two means the dedup set is gone.
     #[test]
     fn a_root_shepherd_refuses_where_an_unprivileged_one_warns_once() {
         let dir = tempfile::tempdir().unwrap();
@@ -1233,9 +877,8 @@ mod tests {
             "the refusal must name the ancestor an operator has to fix: {refused}"
         );
 
-        // Never `me()`: a root test runner would take the arm above instead.
-        // `me() + 1` is non-root by construction and owns nothing here, so
-        // the fixture is loose to it whichever uid this process has.
+        // Never `me()`: a root test runner would take the arm above.
+        // `me() + 1` is non-root by construction and owns nothing here.
         let unprivileged = me() + 1;
         let rendered = capture_logs(|| {
             assert_eq!(check_log_ancestry_as(&log, unprivileged).ok(), Some(()));
@@ -1248,10 +891,9 @@ mod tests {
         );
     }
 
-    /// fails if `SpawnSpec`'s Debug ever prints an env VALUE. This type sits
-    /// on the exec boundary, so a `tracing` call that formats it would put
-    /// every secret an operator configured into the daemon's log (IR-41).
-    /// Exact string pinned so a lazy `derive(Debug)` refactor fails here.
+    /// This type sits on the exec boundary, so a `tracing` call that
+    /// formatted it would put every configured secret in the daemon's log.
+    /// Exact string pinned so a `derive(Debug)` refactor fails here.
     #[test]
     fn debug_redacts_env_values() {
         let mut spec = SpawnSpec {

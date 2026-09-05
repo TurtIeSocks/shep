@@ -4,20 +4,11 @@
 //!
 //! Every renderer is pure `format!` over a [`UnitSpec`]: no filesystem
 //! access, no environment reads, nothing that could fail. Resolving a real
-//! `UnitSpec` — reading `$PATH`, this binary's own path, the target user —
-//! and writing the result to disk is the parent module's.
+//! `UnitSpec` and writing the result to disk is the parent module's job.
 //!
-//! `ExecStart` names the daemon itself (`<exec> daemon --foreground`), not
-//! `shep muster`. Under `Type=notify` systemd supervises the process it
-//! starts, so `ExecStart=shep muster` would have systemd supervising a
-//! client that talks to a daemon and exits immediately — the restore still
-//! happens, because the daemon restores the roll at boot on its own
-//! (decision 14). `--foreground` is on both renderers' argv for the same
-//! reason: launchd has no readiness protocol, so `$NOTIFY_SOCKET` is unset
-//! there and `shep_daemon::notify::notify_ready` reports `Ok(false)`, but
-//! the flag stays so both platforms invoke the daemon through the same
-//! documented entry point rather than one of them depending on the bare
-//! hidden `daemon` verb's private contract (decision 15).
+//! Every unit's argv is `<exec> daemon --foreground`, never `shep muster`:
+//! an init system supervises the process it starts, and `muster` is a client
+//! that exits immediately. The daemon restores the roll at boot on its own.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -33,9 +24,8 @@ pub(crate) struct UnitSpec {
     pub exec: PathBuf,
     /// `$SHEP_HOME` the daemon is given.
     pub home: PathBuf,
-    /// `PATH` captured from the invoking environment — the mechanism that
-    /// makes an interpreter installed under `~/.bun` or `~/.cargo` findable
-    /// after a reboot.
+    /// `PATH` captured from the invoking environment, so an interpreter under
+    /// `~/.bun` or `~/.cargo` is still findable after a reboot.
     pub path: OsString,
     /// The daemon's working directory.
     pub working_dir: PathBuf,
@@ -115,9 +105,8 @@ pub(crate) fn systemd_unit_path(user: &str) -> PathBuf {
     PathBuf::from(format!("/etc/systemd/system/shep-{user}.service"))
 }
 
-/// `io.github.turtiesocks.shep.<user>` — the launchd label, also the plist's
-/// own filename stem via [`launchd_plist_path`] and the job label
-/// `launchctl bootout system/<label>` names.
+/// `io.github.turtiesocks.shep.<user>`: the launchd label, the plist's own
+/// filename stem, and what `launchctl bootout system/<label>` names.
 pub(crate) fn launchd_label(user: &str) -> String {
     format!("io.github.turtiesocks.shep.{user}")
 }
@@ -130,21 +119,17 @@ pub(crate) fn launchd_plist_path(user: &str) -> PathBuf {
     ))
 }
 
-/// Escapes one systemd `Environment=` value: doubles every `%`, which
-/// systemd otherwise expands as a specifier (`%h`, `%t`, ...) — a real
-/// captured `PATH` can contain one by coincidence (`/pct%dir/bin` is a
-/// legal POSIX path), and the expansion is silent rather than a parse
-/// error. The caller wraps the whole `KEY=value` assignment in `"..."`, so
-/// a value containing a space needs nothing further from this function.
+/// Escapes one systemd `Environment=` value: doubles every `%`, which systemd
+/// otherwise expands silently as a specifier (`%h`, `%t`, ...).
+///
+/// The caller wraps the whole `KEY=value` in `"..."`, so a value containing a
+/// space needs nothing further here.
 fn systemd_environment_value(value: &str) -> String {
     value.replace('%', "%%")
 }
 
-/// Escapes plist string content: `&` first (so it cannot re-escape the
-/// entities this function just produced), then `<` and `>`. All three are
-/// XML metacharacters that end the current element early — a raw `&` in a
-/// path (legal in a POSIX filename) makes the whole plist unparseable, and
-/// launchd's own refusal names the file, not the character.
+/// Escapes plist string content: `&` first, so it cannot re-escape the
+/// entities this function just produced, then `<` and `>`.
 fn xml_text(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -154,24 +139,13 @@ fn xml_text(value: &str) -> String {
 
 /// Renders the openrc init script.
 ///
-/// `supervise-daemon` (openrc >= 0.21) rather than `start-stop-daemon`,
-/// because it supervises the foreground process the way systemd does rather
-/// than daemonizing and tracking a pidfile — and `shep daemon --foreground`
-/// is the entry point both other renderers already use.
+/// `supervise-daemon` (openrc >= 0.21) supervises the foreground process
+/// like systemd, instead of tracking a pidfile.
 ///
-/// **openrc has no `sd_notify` analogue.** Nothing tells openrc the shepherd
-/// is ready; `supervise-daemon` marks the service started the instant the
-/// process is spawned, which is before the muster restore has finished. The
-/// `start_post` poll below is what closes that gap, and it is not a
-/// consolation prize: it proves exactly what `READY=1` proves. `boot` binds
-/// the control socket at step 2, restores the roll and starts the dogs at
-/// step 4, and `RpcServer` — the thing that *accepts* on that listener — is
-/// constructed afterwards, in `run`. So a connection lands in the backlog
-/// immediately but **no request is answered until after the restore**, and
-/// the first answered `shep flock` is the same milestone, one step later.
-/// `shep flock` also routes through `connect_client`, which never spawns, so
-/// the poll cannot start a shepherd of its own.
-/// Do not "simplify" the poll away on the assumption that it is a guess.
+/// openrc has no `sd_notify` analogue: `start_post` polls `shep flock`
+/// instead, since the daemon binds its control socket before restoring
+/// the muster roll but does not accept until after. `flock` routes
+/// through `connect_client`, which never spawns a shepherd of its own.
 ///
 /// Every interpolated value goes through [`sh_double_quoted`]: these land
 /// inside double-quoted assignments in a script that runs as root at boot.
@@ -230,38 +204,16 @@ pub(crate) fn openrc_script(spec: &UnitSpec) -> String {
 
 /// Renders the FreeBSD `rc.d` script, `/usr/local/etc/rc.d/shep_<user>`.
 ///
-/// The standard `rc.subr(8)` skeleton: `daemon(8)` runs the process in the
-/// background under a pidfile, `${name}_user`/`${name}_chdir` hand it off to
-/// the right account and directory, and `start_postcmd` closes the same
-/// readiness gap [`openrc_script`]'s `start_post` does and for the same
-/// reason — `daemon(8)` reports the service started as soon as it has
-/// forked, before the muster restore has run, so this polls the shepherd's
-/// own control socket instead, exactly as `openrc_script`'s doc comment
-/// explains at greater length.
+/// `start_postcmd` polls the shepherd's own control socket, since
+/// `daemon(8)` reports the service started as soon as it forks, before
+/// the muster restore runs. `spec.user` must already pass
+/// [`super::is_rc_safe_user`]: `name`, `rcvar` and `shep_<user>_*` are
+/// shell identifiers, interpolated raw; any other single-shell value
+/// uses [`sh_double_quoted`] alone.
 ///
-/// The caller must already have refused any `spec.user`
-/// [`super::is_rc_safe_user`] rejects: `name`, `rcvar`, and every
-/// `shep_<user>_*` name below are shell **identifiers**, not values, so
-/// `spec.user` is interpolated into them raw. Every other interpolated value
-/// that only one shell ever reads goes through [`sh_double_quoted`], same
-/// reasoning as [`openrc_script`] — that covers `home` and `working_dir`,
-/// and covers `exec` in `start_postcmd`, where the script's own shell both
-/// builds the double-quoted string and executes it directly.
-///
-/// `${name}_env` and `command_args` are the two fields that need more than
-/// that, because each is read a *second* time by a shell other than the one
-/// that built the string: `rc.subr(8)` documents `${name}_env` as a list of
-/// environment variables that gets word-split into arguments for `env(1)`,
-/// and it expands `$command_args` unquoted into `daemon(8)`'s argv — so an
-/// unescaped space in `home`, `path`, or `exec` would silently become two
-/// environment entries, or two argv elements, rather than one. All three
-/// values are single-quoted first with [`shell_quote`] so the second
-/// shell's word-split cannot touch them, then escaped a second time for the
-/// double-quoted context the whole line sits in when the first shell builds
-/// it: `sh_double_quoted(shell_quote(value))`. `exec` needs both forms —
-/// [`sh_double_quoted`] alone for `start_postcmd`'s direct invocation, and
-/// the two-context form for `command_args` — because the same path is read
-/// by a different number of shells depending on which line it lands on.
+/// `${name}_env` and `command_args` are re-read by a second shell or
+/// program (`env(1)`'s word-split, `daemon(8)`'s argv): `home`, `path`
+/// and `exec` there are `sh_double_quoted(shell_quote(value))` instead.
 pub(crate) fn freebsd_rc_script(spec: &UnitSpec) -> String {
     let user = &spec.user;
     let exec = sh_double_quoted(&spec.exec.display().to_string());
@@ -320,42 +272,16 @@ pub(crate) fn freebsd_rc_script(spec: &UnitSpec) -> String {
 
 /// Renders the OpenBSD `rc.d` script, `/etc/rc.d/shep_<user>`.
 ///
-/// Like [`freebsd_rc_script`], the caller must already have refused any
-/// `spec.user` [`super::is_rc_safe_user`] rejects, and `spec.user` is
-/// interpolated raw wherever it names something — the header comment and
-/// `daemon_user`'s value — rather than through [`sh_double_quoted`].
+/// Like [`freebsd_rc_script`], `spec.user` must already pass
+/// [`super::is_rc_safe_user`] and is interpolated raw as an identifier.
+/// OpenBSD's `rc.subr(8)` has no post-start hook: `rc_pre` runs before
+/// `start`, `rc_post` after *stop*; `shep --home <home> flock` is the
+/// manual readiness check instead.
 ///
-/// **OpenBSD's `rc.subr(8)` has no post-start hook.** `rc_pre` runs before
-/// `start`; `rc_post` runs after *stop*, not after start — confirmed against
-/// the manual page rather than assumed, and there is nothing in the
-/// framework this script could poll the way [`freebsd_rc_script`] and
-/// [`openrc_script`] do. The header comment says so, and the service is
-/// reported started the instant the shepherd process is spawned, which is
-/// before the muster restore has finished; `shep --home <home> flock` is the
-/// manual check an operator has to run instead. Do not delete this comment
-/// on the assumption that it is hedging — it is not; OpenBSD genuinely has
-/// no equivalent hook.
-///
-/// The environment is passed as literal `VAR=value` prefixes inside the
-/// string handed to `rc_exec`, not exported at the top of the script.
-/// Verified against OpenBSD's own `etc/rc.d/rc.subr` source, not guessed:
-/// `rc_exec` runs the daemon through
-/// `su -fl -c <class> -s /bin/sh <user> -c "..."`, and `su(1)`'s `-l` flag
-/// discards the caller's environment, so an `export` above `rc_start` would
-/// never reach the daemon. Prefixing the assignments inside the string
-/// `rc_exec` evaluates is what survives that — not a hedge against
-/// uncertainty, but the only mechanism that reaches the daemon at all. The
-/// two values are single-quoted for the shell that evaluates the string
-/// ([`shell_quote`]) and then escaped a second time for the double-quoted
-/// context they sit in here ([`sh_double_quoted`]).
-///
-/// `exec` sits in that same second-shell path: `daemon="{exec}"` is read
-/// directly by this script's own shell, but `${{daemon}}` is then
-/// interpolated unquoted into the string `rc_exec` hands to `su -c`, so it
-/// is `su`'s spawned shell — not this one — that word-splits it. `exec`
-/// therefore needs the identical two-context treatment as `home`/`path`
-/// above, not the single [`sh_double_quoted`] this script's other
-/// identifier-only fields use.
+/// The environment is passed as `VAR=value` prefixes inside the string
+/// `rc_exec` hands to `su -fl ... -c "..."`, not exported: `su -l`
+/// discards the environment. `su`'s spawned shell reads `home`, `path`
+/// and `exec` a second time: `sh_double_quoted(shell_quote(value))`.
 pub(crate) fn openbsd_rc_script(spec: &UnitSpec) -> String {
     let user = &spec.user;
     let exec = sh_double_quoted(&shell_quote(&spec.exec.display().to_string()));
@@ -400,16 +326,14 @@ pub(crate) fn openbsd_rc_script(spec: &UnitSpec) -> String {
     )
 }
 
-/// Escapes a value that lands INSIDE a double-quoted shell assignment:
+/// Escapes a value that lands inside a double-quoted shell assignment:
 /// `"`, `$`, `` ` `` and `\` get a backslash.
 ///
-/// Not the same function as [`super::shell_quote`], and the two must not be
-/// folded together: `shell_quote` produces a standalone single-quoted *word*
-/// for a human to paste into a terminal, while this escapes *content* that
-/// is already inside double quotes. Where a value will additionally be
-/// re-evaluated by a shell — OpenBSD's `rc_start` string, FreeBSD's
-/// `${name}_env` — the two compose, innermost first:
-/// `sh_double_quoted(shell_quote(value))`.
+/// Distinct from [`super::shell_quote`]: that produces a standalone
+/// single-quoted word for a human to paste, this escapes content already
+/// inside double quotes. Where a value is re-evaluated by a second shell
+/// (OpenBSD's `rc_start` string, FreeBSD's `${name}_env`), the two
+/// compose, innermost first: `sh_double_quoted(shell_quote(value))`.
 fn sh_double_quoted(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -439,12 +363,10 @@ mod tests {
         }
     }
 
-    /// The systemd unit, byte for byte, exactly as the brief specifies it —
-    /// the strongest check available: a `.contains` assertion proves a
-    /// substring survived, not that nothing else drifted (an extra stray
-    /// line, wrong section order, a missing blank line between sections).
-    /// Every value below round-trips through the real formatter with no
-    /// escaping needed, so this also pins the unescaped happy path.
+    /// Byte for byte, not `.contains`: a substring match can't catch a
+    /// stray line, wrong section order, or a missing blank line between
+    /// sections. Every value here round-trips with no escaping needed, so
+    /// this also pins the unescaped happy path.
     #[test]
     fn the_systemd_unit_matches_the_spec_exactly() {
         let unit = systemd_unit(&spec());
@@ -473,9 +395,8 @@ mod tests {
         );
     }
 
-    /// The launchd plist, byte for byte, exactly as the brief specifies it —
-    /// same rationale as the systemd exact-match test above: a `.contains`
-    /// check cannot see a swapped tag order or a missing sibling key.
+    /// Byte for byte, same rationale as the systemd exact-match test above:
+    /// `.contains` cannot see a swapped tag order or a missing sibling key.
     #[test]
     fn the_launchd_plist_matches_the_spec_exactly() {
         let plist = launchd_plist(&spec());
@@ -565,10 +486,9 @@ mod tests {
     }
 
     /// `systemd_unit_path`/`launchd_label`/`launchd_plist_path` are simple
-    /// format strings, but the verb that installs and removes a unit
-    /// addresses it by exactly these three — `systemctl enable` by the
-    /// file's name, `launchctl bootout` by the label — so they get the same
-    /// exact-match treatment as the two renderers above.
+    /// format strings, but `systemctl enable` and `launchctl bootout`
+    /// address a unit by exactly these, so they get the same exact-match
+    /// treatment as the two renderers above.
     #[test]
     fn the_install_paths_and_label_match_the_spec_exactly() {
         assert_eq!(
@@ -583,8 +503,8 @@ mod tests {
     }
 
     /// Probes `systemd-analyze`'s two conventional install paths with
-    /// `Path::exists` rather than shelling out to `which` — one fewer
-    /// process, and no dependence on the test's own `$PATH`.
+    /// `Path::exists` rather than shelling out to `which`: one fewer
+    /// process, no dependence on the test's own `$PATH`.
     fn which_systemd_analyze() -> Result<PathBuf, ()> {
         for candidate in ["/usr/bin/systemd-analyze", "/bin/systemd-analyze"] {
             let path = Path::new(candidate);
@@ -595,24 +515,16 @@ mod tests {
         Err(())
     }
 
-    /// fails if `systemd-analyze verify` rejects the generated unit —
-    /// systemd's own parser is the only thing that can say the unit is
-    /// well-formed, and every assertion above is our opinion of it.
-    ///
-    /// Skips, loudly, where the tool does not exist: this is a macOS
-    /// development machine's ordinary state, and a test that failed there
-    /// would be disabled rather than fixed. On the Linux CI leg it runs.
+    /// systemd's own parser is the only thing that can say the generated
+    /// unit is well-formed; every assertion above is only our opinion of
+    /// it. Skips, loudly, when the tool is absent (an ordinary macOS
+    /// state); runs on the Linux CI leg.
     ///
     /// Builds its own spec rather than [`spec`]'s: `verify` resolves
     /// `ExecStart`/`ExecReload`/`ExecStop` against the real filesystem and
-    /// rejects the unit if the named command is not an existing, executable
-    /// file — unlike every other test in this file, which only checks the
-    /// rendered text. `spec()`'s `/usr/local/bin/shep` is a fixture value
-    /// the exact-string tests above pin byte for byte; it does not exist on
-    /// the machine running this test (confirmed against CI run 32023586026,
-    /// where `verify` rejected it three times over — once per `Exec*` line
-    /// — with `Command /usr/local/bin/shep is not executable`). This process's
-    /// own executable always exists and is executable, so it stands in.
+    /// rejects a unit whose command is not an existing, executable file.
+    /// This process's own executable always exists and is executable, so
+    /// it stands in for `spec()`'s fixture path.
     #[test]
     fn systemd_analyze_accepts_the_generated_unit() {
         let Ok(analyze) = which_systemd_analyze() else {
@@ -651,9 +563,9 @@ mod tests {
         );
     }
 
-    /// fails if the comment explaining WHY the poll is equivalent to
-    /// READY=1 is deleted. Generated prose that makes a claim gets a test —
-    /// an unpinned caption in a generated artefact can go false silently.
+    /// Guards the rendered script's own explanation of why polling stands
+    /// in for `READY=1`: prose in a generated artefact can go stale
+    /// silently otherwise.
     #[test]
     fn the_openrc_script_says_why_it_polls() {
         let rendered = openrc_script(&spec());
@@ -685,9 +597,8 @@ mod tests {
         );
     }
 
-    /// fails if the service name stops matching the file name — openrc
-    /// derives defaults from `name`/`RC_SVCNAME`, and a constant `name`
-    /// would make two users on one host collide while owning distinct files.
+    /// openrc derives defaults from `name`/`RC_SVCNAME`; a constant `name`
+    /// would make two users on one host collide.
     #[test]
     fn the_openrc_name_is_per_user_and_matches_the_file() {
         let rendered = openrc_script(&spec());
@@ -704,9 +615,8 @@ mod tests {
         assert!(rendered.contains(r#"command_args="daemon --foreground""#));
     }
 
-    /// fails if the FreeBSD rcvar stops matching the script name — the two
-    /// have to agree or `sysrc shep_<user>_enable=YES` sets a variable
-    /// nothing reads, and the service silently never starts at boot.
+    /// The two must agree, or `sysrc shep_<user>_enable=YES` sets a
+    /// variable nothing reads, and the service never starts at boot.
     #[test]
     fn the_freebsd_rcvar_matches_the_script_name() {
         let rendered = freebsd_rc_script(&spec());
@@ -722,9 +632,7 @@ mod tests {
         );
     }
 
-    /// fails if the OpenBSD script grows a readiness claim it cannot back.
-    /// OpenBSD's `rc.subr` has no post-start hook, the script says so
-    /// plainly, and this is what stops that sentence being "tidied away".
+    /// OpenBSD's `rc.subr` has no post-start hook.
     #[test]
     fn the_openbsd_script_admits_it_has_no_readiness_gate() {
         let rendered = openbsd_rc_script(&spec());
@@ -740,9 +648,8 @@ mod tests {
         );
     }
 
-    /// fails if either BSD script forgets `SHEP_HOME` — a shepherd started
-    /// without it uses root's `~/.shep` and restores nothing, silently, and
-    /// the operator finds out at the next reboot.
+    /// A shepherd started without `SHEP_HOME` falls back to root's
+    /// `~/.shep` and restores nothing.
     #[test]
     fn both_bsd_scripts_carry_shep_home_and_path() {
         for rendered in [freebsd_rc_script(&spec()), openbsd_rc_script(&spec())] {

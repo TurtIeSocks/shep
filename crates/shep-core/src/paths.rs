@@ -1,37 +1,20 @@
 //! On-disk layout of `$SHEP_HOME`
 //!
-//! One resolver, no hidden `std::env` reads — the environment comes in as a
+//! One resolver, no hidden `std::env` reads: the environment comes in as a
 //! closure so tests and the daemon share one code path.
 
 use std::path::{Path, PathBuf};
 
 /// Drops the `\\?\` extended-length prefix Windows' `canonicalize` adds
 ///
-/// `std::fs::canonicalize` returns a verbatim path on Windows, so a binary at
-/// `C:\tools\dog.exe` comes back as `\\?\C:\tools\dog.exe`. That form is
-/// correct and every Win32 call accepts it, which is exactly why it leaks
-/// quietly: nothing inside shep breaks, and it surfaces only once the path
-/// reaches something that is not Win32. Two such places are already known.
-/// Node's `require` reads the leading `\\` as a UNC share and fails on `C:`.
-/// And `shep adopt` records the vetted binary in `shep.toml`, where the prefix
-/// is simply noise in a file an operator edits by hand.
+/// For paths leaving shep: written to config, shown to an operator, or
+/// handed to another program. Paths compared against each other internally,
+/// such as `serve`'s docroot containment check, must stay canonical on both
+/// sides and must not go through this.
 ///
-/// So this is for paths that LEAVE shep: written to config, shown to an
-/// operator, or handed to another program. Paths that stay inside and are
-/// compared against each other must not use it. `serve`'s docroot containment
-/// check is the case that matters, where both sides being canonical is the
-/// security property, and rewriting one side would weaken it.
-///
-/// Only `\\?\C:\` is unwrapped, because that is the one shape `canonicalize`
-/// produces for a local file. A verbatim UNC path (`\\?\UNC\server\share`)
-/// is left alone: no host here can mount a share to test that branch, and an
-/// unexercised guess is worth less than a documented gap.
-///
-/// **A path long enough to need the prefix is out of scope.** Above `MAX_PATH`
-/// the prefix is load-bearing rather than decorative, and stripping it can
-/// produce a path that no longer opens. Nothing in shep's own layout comes
-/// close, and the alternative is a conditional rule whose behavior changes at
-/// a length nobody can see, so the simple rule is the one kept.
+/// Only unwraps `\\?\C:\`; a verbatim UNC path (`\\?\UNC\server\share`)
+/// passes through unchanged. Not for paths above `MAX_PATH`, where the
+/// prefix is load-bearing rather than decorative.
 #[cfg(windows)]
 #[must_use]
 pub fn strip_verbatim_prefix(path: &Path) -> std::borrow::Cow<'_, Path> {
@@ -88,25 +71,13 @@ pub struct ShepPaths {
     pub run: PathBuf,
     /// The control address the client dials and the daemon answers on.
     ///
-    /// **Two different kinds of thing behind one field, on purpose.** On
-    /// unix it is a filesystem path, `run/shep.sock`, and a real AF_UNIX
-    /// socket file lives there. On Windows it is [`Self::pipe_name`] — a
-    /// named pipe's `\\.\pipe\...` name, which is path-*shaped* but names an
-    /// object in the kernel's pipe namespace rather than a file on any
-    /// volume.
-    ///
-    /// One field rather than two because every consumer in the workspace
-    /// treats this as an opaque address it hands to `Client::connect`, and a
-    /// second field would make all of them choose. The one place the
-    /// difference is load-bearing is a caller that treats this as a *file* —
-    /// `shep-cli`'s `wait_for_socket_to_disappear` is the only one, and it
-    /// carries its own Windows arm because a pipe has no directory entry to
-    /// watch: it stops existing when its last handle closes, so "has the
-    /// daemon gone" is a connect attempt there, not a `Path::exists`.
-    ///
-    /// A corollary worth stating because it silently breaks otherwise:
-    /// `socket.parent()` is `$SHEP_HOME/run` on unix and the meaningless
-    /// `\\.\pipe` on Windows. Nothing may derive a directory from this field.
+    /// Unix: a filesystem path, `run/shep.sock`, naming a real AF_UNIX
+    /// socket file. Windows: [`Self::pipe_name`], path-shaped but naming an
+    /// object in the kernel's pipe namespace, not a file on any volume.
+    /// Never derive a directory from this field: `socket.parent()` is
+    /// meaningless on Windows. A pipe has no directory entry to watch, so
+    /// "has the daemon gone" needs a connect attempt there, not
+    /// `Path::exists`.
     pub socket: PathBuf,
     /// Bark history ring: `barks.jsonl`
     pub barks: PathBuf,
@@ -131,21 +102,15 @@ impl ShepPaths {
     /// Windows named-pipe identity for this home:
     /// `\\.\pipe\shep-<sanitized>-<digest>`
     ///
-    /// The readable half is the home path with every non-alphanumeric
-    /// character collapsed to `-`, capped, so an operator reading a pipe name
-    /// can tell which home it belongs to. **That half alone does not identify
-    /// a home**: `\`, `:`, `.`, `_` and a literal `-` all become `-`, so
-    /// `C:\a\b` and `C:\a-b` sanitize to one string. The pipe namespace is
-    /// machine-global and [`crate::transport::Listener::bind`] asks for
-    /// `first_pipe_instance`, so a collision does not surface as an error: the
-    /// second home's daemon is refused as already running, and that home's CLI
-    /// then drives the first home's flock. No handshake field carries a home,
-    /// so nothing downstream would catch it.
+    /// The sanitized stem is not unique alone: `\`, `:`, `.`, `_` and a
+    /// literal `-` all collapse to `-`, so `C:\a\b` and `C:\a-b` sanitize to
+    /// one string. The digest of the full home path is what keeps two homes
+    /// distinct; without it a collision would not error, it would refuse the
+    /// second daemon as already running and let its CLI drive the first
+    /// home's flock.
     ///
-    /// The appended digest of the full home path is what makes the name
-    /// distinct. Changing this derivation is a breaking change for any
-    /// already-running daemon: it stays bound under a name a client built
-    /// afterward would never dial.
+    /// Changing this derivation breaks any already-running daemon: it stays
+    /// bound under a name a client built afterward would never dial.
     #[must_use]
     pub fn pipe_name(&self) -> String {
         // Bounds the readable half; a pipe name may be 256 characters.
@@ -165,9 +130,8 @@ impl ShepPaths {
 
     /// Resolves the layout from an environment lookup and the user's home dir
     ///
-    /// [`Self::socket`] resolves per-platform — a socket file under `run/` on
-    /// unix, a `\\.\pipe\...` name on Windows — for the reason that field's
-    /// own doc gives. Everything else is identical on both.
+    /// [`Self::socket`] resolves per-platform: a socket file under `run/` on
+    /// unix, [`Self::pipe_name`] on Windows. Everything else is identical.
     #[must_use]
     pub fn resolve(env: &dyn Fn(&str) -> Option<String>, home_dir: &Path) -> Self {
         let home = env("SHEP_HOME")
@@ -190,10 +154,8 @@ impl ShepPaths {
             run,
             home,
         };
-        // Computed from the already-built value rather than inline above,
-        // because `pipe_name` reads `self.home` and the struct is what owns
-        // that derivation — duplicating the sanitizer here is exactly how
-        // the two would drift.
+        // Computed here, not inlined above: `pipe_name` reads `self.home`,
+        // and duplicating the sanitizer here would let the two drift.
         #[cfg(windows)]
         {
             paths.socket = PathBuf::from(paths.pipe_name());
@@ -204,11 +166,8 @@ impl ShepPaths {
 
 #[cfg(test)]
 mod tests {
-    /// Pins the strip directly, because no end-to-end case can. Node resolves
-    /// a `\\?\` path on some versions and not others, so the `.js` flockfile
-    /// cases passed on the development machine both before this existed and
-    /// after, while failing on the CI runner both times. Asserting on the
-    /// rewritten path is the part that holds either way.
+    /// Unit-level because no end-to-end case can pin this reliably: Node's
+    /// handling of a `\\?\` path differs by version.
     #[cfg(windows)]
     #[test]
     fn a_verbatim_prefix_is_stripped() {
@@ -228,11 +187,9 @@ mod tests {
         );
     }
 
-    /// Guards the assumption the strip rests on: that `canonicalize` really
-    /// does hand back a prefixed path, and that the rewrite clears it without
-    /// breaking what it points at. If a future Windows or std stops adding
-    /// the prefix, this stays green and the strip becomes a no-op rather
-    /// than a wrong answer.
+    /// Guards the assumption that `canonicalize` really prefixes the path.
+    /// If a future Windows or std stops adding it, this stays green and the
+    /// strip becomes a no-op rather than a wrong answer.
     #[cfg(windows)]
     #[test]
     fn a_real_canonicalized_path_comes_back_free_of_the_prefix() {
@@ -254,8 +211,6 @@ mod tests {
         );
     }
 
-    /// The unix build has nothing to strip, and the helper exists there only
-    /// so call sites do not each carry a `cfg`. Pinned so it stays that way.
     #[cfg(not(windows))]
     #[test]
     fn a_unix_path_passes_through_untouched() {
@@ -289,12 +244,9 @@ mod tests {
         assert_eq!(p.overrides, Path::new("/home/ada/.shep/overrides.json"));
     }
 
-    /// The one field that is not the same kind of thing on both platforms —
-    /// see [`ShepPaths::socket`]'s own doc. Asserted per-platform rather
-    /// than skipped on Windows, because "the socket resolves to the pipe
-    /// name" IS the Windows transport's identity and a silent fallback to
-    /// `run/shep.sock` there would produce a daemon that binds a pipe and a
-    /// client that dials a file that does not exist.
+    /// Asserted per-platform rather than skipped on Windows: a silent
+    /// fallback to `run/shep.sock` there would leave a daemon bound to a
+    /// pipe and a client dialing a file that does not exist.
     #[test]
     fn the_control_address_is_a_socket_file_on_unix_and_a_pipe_name_on_windows() {
         let p = ShepPaths::resolve(&no_env, Path::new("/home/ada"));
@@ -329,11 +281,9 @@ mod tests {
 
     #[test]
     fn pipe_name_is_per_home_and_sanitized() {
-        // Windows transport identity (spec §6): derived from SHEP_HOME so
-        // two homes never share a pipe; non-alphanumerics collapse to '-',
-        // then a digest of the whole home path. Both homes come from the env
-        // rather than the default join, whose separator is the host's and
-        // would give the digest a different value per platform.
+        // Both homes come from the env, not the default join: its separator
+        // is host-specific and would give the digest a different value per
+        // platform.
         let env = |key: &str| (key == "SHEP_HOME").then(|| "/home/ada/.shep".to_string());
         let p = ShepPaths::resolve(&env, Path::new("/home/ada"));
         assert_eq!(
@@ -345,10 +295,9 @@ mod tests {
         assert_eq!(q.pipe_name(), r"\\.\pipe\shep-srv-shep-23b467803966a71a");
     }
 
-    /// The sanitizer is not injective (`\`, `:` and a literal `-` all become
-    /// `-`), and a shared name is the one failure that reaches nobody: the
-    /// second daemon is refused as already running and its CLI then drives the
-    /// first home's flock in silence.
+    /// The sanitizer is not injective: `\`, `:` and `-` all become `-`. A
+    /// collision would not error; it would refuse the second daemon as
+    /// already running.
     #[test]
     fn two_homes_that_sanitize_alike_get_distinct_pipe_names() {
         let nested = |key: &str| (key == "SHEP_HOME").then(|| r"C:\a\b".to_string());

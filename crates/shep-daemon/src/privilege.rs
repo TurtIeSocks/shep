@@ -1,26 +1,15 @@
 //! Privilege drop: resolving an app's requested `user`/`group` to numeric ids.
 //!
-//! `resolve` is the only entry point: given an [`AppConfig`], it returns
-//! the [`Credentials`] a spawn should apply, or `None` when the app asked
-//! for neither. Resolution touches the OS passwd/group database (a real, if
-//! hermetic and read-only, syscall), which is why it stays a discrete step
-//! the supervisor calls once per `Start` rather than folding into the pure
-//! `assemble` (see `assemble.rs`'s module doc) — [`crate::supervisor`]
-//! resolves once and stores the result on the `ProcessEntry`, reusing it for
-//! every later restart instead of re-touching the passwd database each time.
+//! `resolve` is the only entry point: given an [`AppConfig`], it returns the
+//! [`Credentials`] a spawn should apply, or `None` when the app asked for
+//! neither. It touches the OS passwd/group database, so [`crate::supervisor`]
+//! resolves once per `Start` and stores the result on `ProcessEntry` rather
+//! than re-touching it on every restart.
 //!
-//! [`Credentials`] is the only name here that leaves the crate: it is a field
-//! type on [`SpawnSpec`](crate::runner::SpawnSpec), and `tests/real_runner.rs`
-//! builds one to prove a real child comes up under the requested uid/gid.
-//! `resolve` and `PrivilegeError` have no reader outside this crate.
-//!
-//! [`Credentials`]/`PrivilegeError` stay plain data (no OS-specific
-//! fields), so they can live inside the portable `SpawnSpec`/`ProcessEntry`
-//! without pulling this crate's "engine tier compiles everywhere" invariant
-//! (see `lib.rs`'s module taxonomy) into the unix-only OS tier. Only the
-//! actual passwd/group lookup — `getpwnam`/`getgrnam` via `nix` — is
-//! unix-specific; on any other target an explicit `user`/`group` request is
-//! simply refused, since the concept doesn't exist there.
+//! [`Credentials`]/`PrivilegeError` stay plain data so they can live inside
+//! the portable `SpawnSpec`/`ProcessEntry`. Only the passwd/group lookup
+//! itself is unix-specific; elsewhere an explicit `user`/`group` request is
+//! refused outright.
 
 use core::fmt;
 
@@ -28,18 +17,10 @@ use serde::{Deserialize, Serialize};
 use shep_core::config::AppConfig;
 
 /// Resolved unix credentials for a spawned sheep
-// IR-25 audit (Task 11): `uid`/`gid` are plain `pub` fields, not accessor
-// methods — reading them is already a zero-cost, un-inlinable field access,
-// so there is nothing here for `#[inline]` to annotate. Noted rather than
-// silently skipped, since the brief named this type alongside two real
-// accessors (`TopicFilter::patterns`, `SnapshotWriter::writes`) that DID get
-// `#[inline]`.
-//
-// `Serialize`/`Deserialize` are here for the handover blob (`handover::Handover`),
-// which carries an entry's resolved identity across an `execve` so a restart
-// cannot re-touch the passwd database. Two numeric ids, so the derived
-// representation is the obvious one; see [`SpawnIdentity`]'s note for what
-// changing it would cost.
+// `uid`/`gid` are plain `pub` fields: already a zero-cost field access.
+// `Serialize`/`Deserialize` support the handover blob, which carries
+// resolved identity across an `execve` so a restart need not re-touch the
+// passwd database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Credentials {
     /// Numeric user id to run the child as
@@ -51,54 +32,31 @@ pub struct Credentials {
 /// What identity an entry's next spawn will run under, and whether that
 /// question has been asked yet.
 ///
-/// "This app asked for nobody in particular, so the child runs as the
-/// shepherd" and "nobody has looked this app's `user` up yet" are different
-/// facts, and a spawn that confuses them starts the child as the shepherd
-/// when the app asked for someone else. A plain `Option<Credentials>` on
-/// `ProcessEntry` spelled both `None`, so the confusion was not something a
-/// caller could be careful about. (`ProcessEntry` is crate-internal, hence
-/// code font rather than a link.)
+/// Distinguishes "asked for nobody" from "not resolved yet": a plain
+/// `Option<Credentials>` on `ProcessEntry` spelled both `None`.
 ///
-/// This type is what [`assemble`](crate::assemble::assemble) does NOT take:
-/// the assembler still wants a settled `Option<Credentials>`, so reaching one
-/// from a stored identity means saying out loud which of the two cases is in
-/// hand.
+/// [`assemble`](crate::assemble::assemble) still wants a settled
+/// `Option<Credentials>`, not this type.
 ///
-/// `Debug` is derived, like [`Credentials`]' own: a uid and a gid are
-/// ordinary numbers an operator can read out of `id`, not secrets, and the
-/// daemon's own logs are more useful for naming which one a refused spawn
-/// wanted.
-///
-/// `Serialize`/`Deserialize` exist for one reader, the handover blob
-/// (`handover::Handover`, crate-internal, hence code font). That blob is
-/// written by one shep image and read by another, possibly newer, one, so
-/// this type's serialized shape is part of the blob's version-1 format:
-/// renaming a variant or retyping a field is a format change and must bump
-/// `handover::VERSION` alongside it.
+/// `Serialize`/`Deserialize` are for the handover blob: this type's shape
+/// is part of its version-1 format, so renaming a variant or retyping a
+/// field must bump `handover::VERSION`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SpawnIdentity {
-    /// `resolve` has never run for this entry (code font, not a link: the
-    /// function is crate-internal while this type is not).
+    /// `resolve` has never run for this entry.
     ///
-    /// Two entries reach this: one registered at rest from the muster roll,
-    /// which is a membership record rather than a `Start`, and one
-    /// registered `Errored` BECAUSE its resolution failed. Both must resolve
-    /// before they can spawn, and neither may fall back to the shepherd's
-    /// own identity.
+    /// Two entries reach this: one registered at rest from the muster roll
+    /// (a membership record, not a `Start`), and one registered `Errored`
+    /// because its resolution failed. Neither may fall back to the
+    /// shepherd's own identity.
     Unresolved,
     /// `resolve` has run, and this is what it said: `Some` when the app
-    /// named a `user` or a `group`, `None` when it named neither and the
-    /// child correctly runs as the shepherd.
+    /// named a `user` or a `group`, `None` when it named neither.
     ///
-    /// Settled for the life of the entry, with one exception. A restart
-    /// reuses this value rather than looking the name up a second time, so a
-    /// running app's identity does not change underneath it and no restart
-    /// re-touches the passwd database. The exception is a config load that
-    /// parks a `user` or `group` change: promoting that config puts the
-    /// entry back to [`Self::Unresolved`] first, so the spawn it precedes
-    /// resolves the new name. See `ProcessEntry::pending_reidentifies`
-    /// (crate-internal, hence code font), which is where that decision is
-    /// recorded.
+    /// Settled for the entry's life, with one exception: a config load
+    /// that parks a `user`/`group` change puts the entry back to
+    /// [`Self::Unresolved`] first, so the next spawn resolves the new name.
+    /// See `ProcessEntry::pending_reidentifies`.
     Resolved(Option<Credentials>),
 }
 
@@ -143,10 +101,10 @@ impl core::error::Error for PrivilegeError {}
 /// Returns `None` when the app asks for neither.
 ///
 /// # Errors
-/// - [`PrivilegeError::UnknownUser`] — no passwd entry for that name.
-/// - [`PrivilegeError::UnknownGroup`] — no group entry for that name.
-/// - [`PrivilegeError::Lookup`] — the passwd/group database could not be read.
-/// - [`PrivilegeError::NotPermitted`] — credentials were requested but this
+/// - [`PrivilegeError::UnknownUser`]: no passwd entry for that name.
+/// - [`PrivilegeError::UnknownGroup`]: no group entry for that name.
+/// - [`PrivilegeError::Lookup`]: the passwd/group database could not be read.
+/// - [`PrivilegeError::NotPermitted`]: credentials were requested but this
 ///   daemon does not run as root, so it cannot change a child's identity.
 #[cfg(unix)]
 pub(crate) fn resolve(app: &AppConfig) -> Result<Option<Credentials>, PrivilegeError> {
@@ -167,8 +125,8 @@ pub(crate) fn resolve(app: &AppConfig) -> Result<Option<Credentials>, PrivilegeE
     };
 
     // Changing identity to the one this process already has needs no
-    // privilege — only asking for a genuinely DIFFERENT uid/gid does. Root
-    // can become anyone; a non-root daemon can only ever "become" itself.
+    // privilege, only a different uid/gid does: root can become anyone, a
+    // non-root daemon only itself.
     let changing_identity = uid != own_uid || gid.is_some_and(|g| g != own_gid);
     if changing_identity && !nix::unistd::geteuid().is_root() {
         return Err(PrivilegeError::NotPermitted {
@@ -230,8 +188,6 @@ mod tests {
 
     #[test]
     fn a_real_user_name_resolves_to_its_uid() {
-        // Resolving our OWN name is always permitted: changing identity to the
-        // one we already have needs no privilege.
         let mut app = AppConfig::minimal("web", "./srv");
         app.user = Some(own_user_name());
         let creds = resolve(&app).unwrap().expect("a user was requested");
@@ -252,9 +208,7 @@ mod tests {
     #[test]
     fn asking_for_another_user_without_root_is_refused_in_plain_english() {
         if nix::unistd::geteuid().is_root() {
-            // Running as root, the refusal cannot trigger; the guard itself is
-            // what this test covers, so there is nothing to assert here.
-            return;
+            return; // the refusal cannot trigger as root
         }
         let mut app = AppConfig::minimal("web", "./srv");
         app.user = Some("root".to_string());

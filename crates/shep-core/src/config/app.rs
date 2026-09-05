@@ -1,4 +1,4 @@
-//! Per-app configuration schema — one sheep's Flockfile entry
+//! Per-app configuration schema: one sheep's Flockfile entry.
 
 use core::fmt;
 
@@ -433,7 +433,7 @@ pub struct AppConfig {
     pub increment_var: Option<String>,
 }
 
-/// Debug implementation does not leak env values (IR-41)
+/// Redacts `env`: only its length is printed.
 impl fmt::Debug for AppConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AppConfig")
@@ -494,7 +494,7 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    /// A minimal config with spec defaults — the programmatic entry point
+    /// A minimal config with spec defaults, the programmatic entry point.
     #[must_use]
     pub fn minimal(name: &str, script: &str) -> Self {
         Self {
@@ -509,7 +509,7 @@ impl AppConfig {
     ///
     /// Names only, never values. The one caller sends this list across the
     /// wire to be printed at an operator, and [`AppConfig::env`] carries
-    /// secrets, so a differing `env` reports `"env"` and stops there (IR-41).
+    /// secrets, so a differing `env` reports `"env"` and stops there.
     ///
     /// Compare configs that have both been through
     /// [`normalize`](fn@crate::config::normalize). Two configs differing only
@@ -534,24 +534,10 @@ impl AppConfig {
         if self == other {
             return Vec::new();
         }
-        // Through serde rather than field by field, so a field added to this
-        // struct is compared without a second edit here. 44 hand-written
-        // comparisons is exactly the list that goes stale. `#[serde(default)]`
-        // with no `skip_serializing_if` means both sides serialize every
-        // field, so the two key sets are identical and iterating one is
-        // enough.
-        //
-        // Sorted explicitly rather than relying on `serde_json::Map` being a
-        // `BTreeMap`: it is one only while `serde_json`'s `preserve_order`
-        // feature is off, and that feature is additive, so ANY crate in the
-        // graph turning it on would make this an `IndexMap` and silently
-        // switch the order to serialization order. Nothing enables it today.
-        // The sort costs a few field names and makes the doc above true by
-        // construction instead of by a dependency's default feature set.
-        //
-        // An empty vector when either side fails to serialize as an object:
-        // there is no honest field list to report, and the caller must not
-        // fail over a warning it could not compute.
+        // Serde-compared, not field by field: a new field needs no edit here.
+        // Sorted since `serde_json::Map` is a `BTreeMap` only while
+        // `preserve_order` is off crate-wide. An empty result means no
+        // drift, or none could be computed.
         let (Ok(serde_json::Value::Object(mine)), Ok(serde_json::Value::Object(theirs))) =
             (serde_json::to_value(self), serde_json::to_value(other))
         else {
@@ -591,11 +577,6 @@ mod tests {
         assert!(!app.channel);
     }
 
-    /// fails if `exp_backoff_restart_delay` reverts to `None` — see this
-    /// field's own doc for why an unset default would burn `max_restarts`
-    /// in well under a second. `restart_delay` (the daemon-side function
-    /// that reads this field) is what actually applies the throttle; this
-    /// test only pins that the default an unconfigured app gets is "on".
     #[test]
     fn unstable_restarts_are_throttled_by_default() {
         let app = AppConfig::minimal("web", "./srv");
@@ -605,11 +586,6 @@ mod tests {
         );
     }
 
-    /// fails if `stdin` defaults to anything but false. The default is the
-    /// whole decision: piping stdin for every sheep would change how a great
-    /// many programs behave (a closed stdin is how they decide they are
-    /// non-interactive), and would hold a descriptor and a task per sheep for
-    /// the life of the process.
     #[test]
     fn stdin_is_not_piped_unless_the_app_asks() {
         let app = AppConfig::minimal("web", "./srv");
@@ -618,10 +594,6 @@ mod tests {
         assert!(!parsed.stdin);
     }
 
-    /// fails if the Flockfile key is spelled anything but `stdin`. It is a
-    /// contract with every config file already written against it the moment
-    /// this ships, and `deny_unknown_fields` means a rename is a hard parse
-    /// failure for the operator rather than a silently ignored key.
     #[test]
     fn the_flockfile_key_is_stdin() {
         let parsed: AppConfig =
@@ -679,7 +651,6 @@ target = "http://127.0.0.1:8080/healthz"
 
     #[test]
     fn debug_redacts_env_values() {
-        // IR-41: env may carry secrets; Debug output lands in daemon logs.
         // Exact string pinned so a lazy derive(Debug) refactor fails here.
         let mut app = AppConfig::minimal("web", "./srv");
         app.env
@@ -700,9 +671,8 @@ target = "http://127.0.0.1:8080/healthz"
 
     #[test]
     fn drift_names_every_edited_field_and_no_other() {
-        // The defect this exists for: an operator edits `cwd` in a Flockfile
-        // and re-runs `shep start`. Two fields, not one, so a comparator
-        // that stopped at the first difference fails here.
+        // Two fields, not one, so a comparator that stopped at the first
+        // difference fails here.
         let stored = AppConfig::minimal("proto-api", "./proto-enum-api");
         let mut edited = stored.clone();
         edited.cwd = Some("/srv/pogo-proto-api".to_string());
@@ -725,8 +695,7 @@ target = "http://127.0.0.1:8080/healthz"
         let fields = edited.drifted_fields(&stored);
 
         assert_eq!(fields, vec!["env".to_string()]);
-        // The whole point of returning names: this list is printed at an
-        // operator, so nothing from a value may reach it (IR-41).
+        // Names go to an operator; a value never should.
         assert!(!fields.concat().contains("hunter2"));
     }
 

@@ -10,9 +10,8 @@ use shep_core::status::ProcStatus;
 
 use super::Reading;
 
-/// Every [`ProcStatus`] value, in a fixed order — the order [`render`]'s
-/// one-series-per-state `shep_sheep_status` rendering walks, so a scrape's
-/// series order is stable across calls.
+/// Every [`ProcStatus`] value, in the order `shep_sheep_status` renders
+/// them, so a scrape's series order is stable across calls.
 const ALL_STATUSES: [ProcStatus; 6] = [
     ProcStatus::Starting,
     ProcStatus::Online,
@@ -40,9 +39,8 @@ impl MetricGroup {
         }
     }
 
-    /// Appends one series line, `label_str` already formatted by
-    /// [`labels`] (including its own braces, or empty for a label-less
-    /// metric).
+    /// Appends one series line. `label_str` comes from [`labels`], braces
+    /// included, or empty for a label-less metric.
     fn push(&mut self, label_str: &str, value: impl fmt::Display) {
         let name = self.name;
         let _ = writeln!(self.series_line(), "{name}{label_str} {value}");
@@ -54,9 +52,7 @@ impl MetricGroup {
     }
 
     /// Renders this group's `# HELP`/`# TYPE` pair and series, or nothing
-    /// at all when it has no series — a metric with no data this scrape
-    /// contributes no lines, not an empty pair a scraper would still have
-    /// to parse.
+    /// at all when it has no series.
     fn render_into(&self, out: &mut String) {
         if self.series.is_empty() {
             return;
@@ -70,9 +66,9 @@ impl MetricGroup {
 }
 
 /// Escapes a label value per the Prometheus text exposition format:
-/// backslash, double quote, and newline are the only three characters that
-/// need it, and they need it in that order — escaping the backslashes a
-/// prior pass introduced would double-escape them.
+/// backslash, double quote and newline are the only three that need it.
+/// One pass over the characters, since sequential replaces would
+/// double-escape the backslashes an earlier one introduced.
 fn escape_label_value(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -87,8 +83,7 @@ fn escape_label_value(value: &str) -> String {
 }
 
 /// Formats a label list as `{k1="v1",k2="v2"}`, or an empty string for no
-/// labels — the shape a label-less series like `shep_daemon_pid` needs, so
-/// [`MetricGroup::push`] can format both cases the same way.
+/// labels, so [`MetricGroup::push`] formats both cases the same way.
 fn labels(pairs: &[(&str, &str)]) -> String {
     if pairs.is_empty() {
         return String::new();
@@ -105,10 +100,7 @@ fn labels(pairs: &[(&str, &str)]) -> String {
 }
 
 /// `DogSource`'s label value. `DogSource` is `#[non_exhaustive]`, so a kind
-/// this client predates renders `unknown` rather than failing to build
-/// against a future daemon — the same fallback `output::rows::dog_source_
-/// label` uses for the same reason, kept as its own copy here since that
-/// one is private to its own module.
+/// this client predates renders `unknown` rather than failing to build.
 fn dog_source_label(source: &DogSource) -> &'static str {
     match source {
         DogSource::BuiltIn => "built-in",
@@ -120,13 +112,11 @@ fn dog_source_label(source: &DogSource) -> &'static str {
 /// Renders `reading` as Prometheus text exposition, format version 0.0.4.
 ///
 /// One `# HELP`/`# TYPE` pair per metric name, every series of a name
-/// grouped beneath it, and a trailing newline — the three things a scraper
-/// is entitled to and the three a hand-rolled renderer gets wrong.
+/// grouped beneath it, and a trailing newline.
 ///
-/// Label values are escaped per the exposition format (`\\`, `"`, `\n`).
-/// A sheep's name is operator-supplied and reaches this function verbatim,
-/// so an unescaped quote in one name would corrupt every series after it in
-/// the same response.
+/// Label values are escaped (`\\`, `"`, `\n`). A sheep's name is
+/// operator-supplied and reaches this function verbatim, so an unescaped
+/// quote in one name would corrupt that series' line.
 #[must_use]
 pub fn render(reading: &Reading) -> String {
     let mut cpu = MetricGroup::new(
@@ -271,10 +261,8 @@ mod tests {
     use super::render;
 
     /// A sheep fixture shared by every test below: id `3`, fold `backend`,
-    /// online, with a real CPU/memory sample. Fixed rather than
-    /// name-derived so the id/fold literals the brief's own assertions
-    /// spell out (`id="3"`, `fold="backend"`) stay true regardless of which
-    /// test calls this.
+    /// online, with a CPU and memory sample. Both are fixed, since the
+    /// assertions spell out `id="3"` and `fold="backend"`.
     fn sample_info(name: &str) -> ProcessInfo {
         ProcessInfo::builder(3, name, ProcStatus::Online)
             .pid(Some(4242))
@@ -286,9 +274,8 @@ mod tests {
             .build()
     }
 
-    /// A baseline [`Reading`] with an empty flock, a real handshake and a
-    /// real host sample — every test overrides only what it cares about via
-    /// `..reading()`.
+    /// A baseline [`Reading`] with an empty flock and a host sample. Tests
+    /// override what they care about with `..reading()`.
     fn reading() -> Reading {
         Reading {
             flock: vec![],
@@ -303,9 +290,6 @@ mod tests {
         }
     }
 
-    /// fails if a sheep with no reading is rendered as a zero. A Grafana
-    /// panel averaging invented zeros reports a flock idler than it is, and
-    /// the daemon says `None` precisely when it will not make that claim.
     #[test]
     fn a_sheep_with_no_reading_contributes_no_series() {
         let mut info = sample_info("web");
@@ -321,9 +305,6 @@ mod tests {
         assert!(text.contains("shep_sheep_restart_total{"));
     }
 
-    /// fails if a status becomes an ordinal. `shep_sheep_status 4` is not a
-    /// metric anyone can write an alert against without the enum's
-    /// declaration order in front of them.
     #[test]
     fn status_is_a_label_with_one_series_per_state() {
         let mut info = sample_info("web");
@@ -338,33 +319,15 @@ mod tests {
         assert!(text.contains(r#"status="online"} 0"#));
     }
 
-    /// fails if a label value goes out unescaped. A sheep's name is
-    /// operator-supplied and reaches the renderer verbatim; one quote in one
-    /// name corrupts every series after it in the same response, and the
-    /// scraper reports a parse error rather than a bad name.
     #[test]
     fn a_label_value_is_escaped_so_one_odd_name_cannot_corrupt_the_response() {
         let text = render(&Reading {
             flock: vec![sample_info(r#"we"b\x"#)],
             ..reading()
         });
-        // Every line must parse as `name{labels} value` — checked before
-        // the exact-string assertion below, so a broken escape reddens
-        // *here* rather than only on that literal check (Step 5's own
-        // instruction: the loop has to be the one doing the catching).
-        //
-        // Escape-aware, not the brief's literal `line.matches('"').count()
-        // % 2` — that naive count is invariant to escaping (a `\"` keeps
-        // the same one quote character an unescaped `"` would have;
-        // escaping only ever inserts backslashes, it never removes or
-        // pairs a quote), so for this exact fixture (one embedded quote —
-        // an odd count) it is 7 either way, and the naive assertion
-        // reddens on a *correct* implementation just as readily as a
-        // broken one — verified with a standalone script before writing
-        // this, not assumed. Counting only quotes not preceded by a
-        // backslash is what actually distinguishes "three real delimiters,
-        // six real quotes, balanced" (this implementation) from "an extra
-        // real delimiter, seven, unbalanced" (the Step 5 mutation below).
+        // Every line must parse as `name{labels} value`. Only quotes not
+        // preceded by a backslash count: a plain quote count is invariant
+        // to escaping, so it balances on a broken implementation too.
         for line in text
             .lines()
             .filter(|l| !l.starts_with('#') && !l.is_empty())
@@ -383,11 +346,6 @@ mod tests {
         assert!(text.contains(r#"sheep="we\"b\\x""#));
     }
 
-    /// fails if a dog that is registered and dead reports nothing. "Is the
-    /// monitoring up" is the one question monitoring cannot answer about
-    /// itself, and a missing series is not an answer an alert can fire on.
-    /// The fixture is a dog whose binary would not spawn — registered and
-    /// `Errored`, which is exactly what a bad `adopt` produces.
     #[test]
     fn a_dog_that_is_down_reports_zero_rather_than_nothing() {
         let mut dead = sample_info("bark");
@@ -404,10 +362,6 @@ mod tests {
         );
     }
 
-    /// fails if a metric name is emitted without exactly one HELP and one
-    /// TYPE, or if a name's series are not contiguous. Both are format
-    /// requirements a scraper rejects the whole response over, and both are
-    /// what a renderer built one series at a time gets wrong.
     #[test]
     fn every_metric_name_carries_one_help_one_type_and_contiguous_series() {
         let mut dog = sample_info("bark");
@@ -474,7 +428,6 @@ mod tests {
         assert!(text.ends_with('\n'), "exposition must end with a newline");
     }
 
-    /// The escaping helper, tested directly per the brief's own Step 3.
     #[test]
     fn escape_label_value_handles_backslash_quote_and_newline() {
         assert_eq!(super::escape_label_value("plain"), "plain");

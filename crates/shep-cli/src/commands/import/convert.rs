@@ -1,32 +1,13 @@
 //! Collapsing pm2 dump rows into shep apps.
 //!
 //! A dump is per-instance: a clustered app comes back as several
-//! [`DumpRow`]s sharing a `name`. [`convert`] groups those rows back into
-//! one [`AppConfig`] per app and maps every field this importer knows how
-//! to map, one row per the design spec's own table. The row count becomes
-//! `instances` — the dump records what was *running*, not what the app was
-//! configured for, which matches the muster roll's own "was up when we
-//! saved" rule — and the first row in each group wins every scalar: two
-//! instances of one app are the same app, and if they disagree about
-//! something like `pm_exec_path`, one of them is a leftover from a deploy
-//! and the first is as good a choice as any.
+//! [`DumpRow`]s sharing a `name`. [`convert`] groups them into one
+//! [`AppConfig`] per app, the row count becoming `instances`, the first row
+//! winning every scalar including `env`.
 //!
-//! Cluster mode is the cutover blocker this importer names rather than
-//! silently drops on the floor: pm2's cluster master holds one listen
-//! socket and hands connections off to its workers, but shep binds
-//! nothing, so N independent processes on one port is `EADDRINUSE` unless
-//! the app itself sets `SO_REUSEPORT`. `exec_mode == "cluster_mode"`
-//! therefore maps to `reuse_port = true` on top of the row-count
-//! `instances`, plus an [`ImportNote::ClusterMode`] the operator hears
-//! about at import time instead of discovering it at the first restart.
-//!
-//! `env` comes from [`super::env::split`], called on the group's first row:
-//! an app's declared env does not differ per instance, any more than its
-//! script or cwd do. The same call supplies the pm2 instance variable, which
-//! becomes an `env` entry templated with `{{instance}}`, and the
-//! [`ImportNote::InstanceVar`]/[`ImportNote::InheritedEnv`] notes; the
-//! first row's [`DumpRow::unrepresentable`] becomes
-//! [`ImportNote::UnrepresentableEnv`] notes alongside them.
+//! `exec_mode == "cluster_mode"` maps to an [`ImportNote::ClusterMode`] and
+//! nothing else: shep binds nothing, so N instances on one port is
+//! `EADDRINUSE` unless the app sets `SO_REUSEPORT` itself.
 
 use std::collections::HashMap;
 
@@ -36,11 +17,7 @@ use shep_core::values::{MemSize, UpDuration};
 use super::dump::DumpRow;
 use super::env;
 
-/// What one dump became: the apps to write, and everything the operator has
-/// to be told about them.
-///
-/// Read by `commands/import/mod.rs`'s `import`, which renders `apps` as the
-/// Flockfile and every `notes` entry as its own stderr line.
+/// What one dump became: the apps to write, and the notes for the operator.
 #[derive(Debug)]
 pub(crate) struct Imported {
     /// One entry per app name, in the order the dump first mentions it.
@@ -60,8 +37,8 @@ pub(crate) enum ImportNote {
         /// How many instances the dump recorded as running.
         instances: u32,
     },
-    /// An env key the app inherited from the shell that started it, which
-    /// was neither declared nor a known session-shell or pm2 key.
+    /// An env key inherited from the starting shell, neither declared nor a
+    /// known session-shell or pm2 key.
     InheritedEnv {
         /// The app's name.
         app: String,
@@ -76,8 +53,7 @@ pub(crate) enum ImportNote {
         key: String,
     },
     /// The app read its instance number from a pm2 variable, recorded as an
-    /// `env` entry templated with `{{instance}}` rather than copied as a
-    /// value.
+    /// `env` entry templated with `{{instance}}`.
     InstanceVar {
         /// The app's name.
         app: String,
@@ -86,11 +62,10 @@ pub(crate) enum ImportNote {
     },
 }
 
-/// Why [`convert`] refused to import a dump.
+/// A dump [`convert`] would not turn into apps.
 #[derive(Debug)]
 pub(crate) enum ConvertError {
-    /// A mapped app does not normalize. Carries the app name and
-    /// [`shep_core::config::NormalizeError`]'s own message.
+    /// A mapped app does not normalize.
     Rejected {
         /// The app name.
         name: String,
@@ -116,7 +91,7 @@ impl core::error::Error for ConvertError {}
 /// [`shep_core::config::normalize()`].
 ///
 /// # Errors
-/// - [`ConvertError::Rejected`] — a mapped app does not normalize (carries the app name and the reason).
+/// - [`ConvertError::Rejected`] if a mapped app does not normalize.
 pub(crate) fn convert(rows: Vec<DumpRow>) -> Result<Imported, ConvertError> {
     let mut order: Vec<String> = Vec::new();
     let mut groups: HashMap<String, Vec<DumpRow>> = HashMap::new();
@@ -149,15 +124,10 @@ pub(crate) fn convert(rows: Vec<DumpRow>) -> Result<Imported, ConvertError> {
 }
 
 /// Builds one [`AppConfig`] from a name's instance rows, plus the notes the
-/// mapping produced. `rows` is never empty: every group [`convert`] builds
-/// was created by pushing at least one row into it.
-///
-/// Env is split from the first row only, same as every other scalar: an
-/// app's declared env does not differ per instance.
+/// mapping produced. `rows` is never empty.
 fn convert_group(name: &str, rows: &[DumpRow]) -> (AppConfig, Vec<ImportNote>) {
     let mut notes = Vec::new();
-    // A dump naming anywhere near u32::MAX instances of one app does not
-    // happen in practice; `AppConfig::instances` is itself a u32.
+    // `AppConfig::instances` is itself a u32.
     let instances = rows.len() as u32;
     let first = &rows[0];
 
@@ -165,8 +135,7 @@ fn convert_group(name: &str, rows: &[DumpRow]) -> (AppConfig, Vec<ImportNote>) {
     app.args = first.args.clone();
     app.cwd = first.pm_cwd.clone();
     // `exec_interpreter: "none"` means run the script directly, which in a
-    // Flockfile is the absence of `interpreter` — not the literal string
-    // "none", which shep would try to exec.
+    // Flockfile is the absence of `interpreter`.
     app.interpreter = first
         .exec_interpreter
         .clone()
@@ -186,17 +155,8 @@ fn convert_group(name: &str, rows: &[DumpRow]) -> (AppConfig, Vec<ImportNote>) {
     app.instances = instances;
 
     if first.exec_mode.as_deref() == Some("cluster_mode") {
-        // No `reuse_port = true` here: shep binds no shared listen socket,
-        // so the APP has to set SO_REUSEPORT itself, and the note below
-        // carries that truth.
-        //
-        // The reason used to be that `normalize` refused the field outright.
-        // It does not any more (see `reuse_port_loads_now_that_reload_reads_it`),
-        // and the remaining reason is stronger: the field now picks reload's
-        // mode, so setting it from a pm2 dump would silently choose the
-        // OVERLAPPING reload for an app nobody has confirmed sets the socket
-        // option. That app takes `EADDRINUSE` on its first reload instead of
-        // a visible gap.
+        // No `reuse_port = true`: the field picks reload's mode, and a dump
+        // cannot say whether the app sets `SO_REUSEPORT`.
         notes.push(ImportNote::ClusterMode {
             app: name.to_string(),
             instances,
@@ -206,8 +166,7 @@ fn convert_group(name: &str, rows: &[DumpRow]) -> (AppConfig, Vec<ImportNote>) {
     let app_env = env::split(first);
     app.env = app_env.env;
     if let Some(var) = app_env.instance_var {
-        // The template, not the value: pm2 reported instance 0's number, and
-        // copying it in would tell every worker it is worker 0.
+        // The template, not the value: pm2 reported instance 0's number.
         app.env.insert(var.clone(), "{{instance}}".to_string());
         notes.push(ImportNote::InstanceVar {
             app: name.to_string(),
@@ -241,10 +200,6 @@ mod tests {
         convert(dump::parse(include_str!("testdata/dump.pm2.json")).unwrap()).unwrap()
     }
 
-    /// fails if instance rows stop collapsing — three apps out of four rows
-    /// is the whole of what "the dump is per-instance" means, and an
-    /// importer that skipped it would register `api` twice under one name,
-    /// which `shep start` then refuses.
     #[test]
     fn four_instance_rows_collapse_into_three_apps() {
         let imported = imported();
@@ -254,12 +209,7 @@ mod tests {
         assert_eq!(imported.apps[1].instances, 1);
     }
 
-    /// fails if grouping only merges rows that happen to sit next to each
-    /// other — chunking consecutive elements looks like a reasonable
-    /// shortcut for "rows sharing a name" and would pass every other test
-    /// here, since the fixture's two `api` rows are already adjacent. This
-    /// interleaves them so a position-based grouping pass sees three
-    /// singleton-ish runs instead of the two groups a name-keyed pass does.
+    /// The fixture's two `api` rows are adjacent, so this interleaves them.
     #[test]
     fn same_named_rows_collapse_even_when_not_adjacent() {
         let mut rows = dump::parse(include_str!("testdata/dump.pm2.json")).unwrap();
@@ -274,10 +224,6 @@ mod tests {
         );
     }
 
-    /// fails if any single mapping is dropped. One case per field rather
-    /// than one per test: the mapping is a table, and a table is worth
-    /// asserting as a table — a reader comparing this against the design
-    /// spec's own table sees the same rows in the same order.
     #[test]
     fn every_mapped_field_lands_where_the_table_says() {
         let imported = imported();
@@ -295,24 +241,12 @@ mod tests {
         assert_eq!(worker.restart_delay, Some(UpDuration::from_millis(5000)));
         assert!(worker.merge_logs);
 
-        // `exec_interpreter: "none"` means run the script directly, which in
-        // a Flockfile is the ABSENCE of `interpreter` — not the literal
-        // string "none", which shep would try to exec.
+        // `exec_interpreter: "none"` maps to the absence of `interpreter`.
         let migrate = &imported.apps[2];
         assert_eq!(migrate.interpreter, None);
         assert_eq!(migrate.script, "/srv/migrate/bin/migrate");
     }
 
-    /// fails if a cluster-mode app comes across without the note, or if the
-    /// importer starts setting `reuse_port` again.
-    ///
-    /// The note is the whole mitigation: shep binds no shared
-    /// listen socket, so N instances on one port is EADDRINUSE unless the app
-    /// sets `SO_REUSEPORT` itself, and the operator has to hear that at
-    /// import time rather than at first start. `normalize` refuses a
-    /// `reuse_port` field outright, so setting one on the cluster app would
-    /// make every imported cluster-mode Flockfile fail to load
-    /// (`deferred.md`).
     #[test]
     fn cluster_mode_says_so_without_setting_a_field_nothing_reads() {
         let imported = imported();
@@ -329,8 +263,6 @@ mod tests {
         }
     }
 
-    /// pm2's instance variable becomes an env entry holding the template, never
-    /// a value. Copying instance 0's number in would pin every worker to 0.
     #[test]
     fn the_pm2_instance_variable_becomes_an_env_template_and_never_a_value() {
         let imported = imported();
@@ -345,10 +277,6 @@ mod tests {
         }));
     }
 
-    /// fails if a mapped app is returned without going through `normalize`.
-    /// Every app this fixture produces must be one the daemon would accept;
-    /// a Flockfile that `shep start` refuses is not an import, it is a
-    /// deferred failure.
     #[test]
     fn every_mapped_app_normalizes() {
         for app in imported().apps {

@@ -1,17 +1,12 @@
 //! The flock table: which columns fit, and what each row's cells say.
 //!
-//! The visual contract is "the table `shep flock` prints, live", so this
-//! builds `Line`s itself rather than handing the job to
-//! `ratatui::widgets::Table`. `crate::output::table::render_table` already
-//! owns the house column algorithm — widest cell, two spaces between, no
-//! box-drawing — and a second, independent algorithm beside it would drift on
-//! the first multi-byte name. Cell values come from the same
-//! `crate::output::{human_bytes, human_duration}` the CLI's own rows use, so a
-//! number reads identically in both surfaces.
+//! Builds `Line`s directly rather than through `ratatui::widgets::Table`,
+//! sourcing cell values from the same `crate::output::{human_bytes,
+//! human_duration}` `shep flock` uses, so a number reads identically in
+//! both surfaces.
 //!
-//! Widths here are FIXED per column rather than measured from content, which
-//! is the one deliberate departure from `render_table`: a live table whose
-//! columns resize as a pid gains a digit is a table that shivers.
+//! Column widths are fixed rather than measured from content: a live table
+//! whose columns resize as a pid gains a digit is a table that shivers.
 
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -20,12 +15,12 @@ use super::super::app::{App, GroupTotals, Row, RowKey};
 use crate::output::width::char_columns;
 use crate::output::{cfg_cell, exit_cell, human_bytes, human_duration};
 
-/// The narrowest terminal the TABLE will draw into.
+/// The narrowest terminal the table will draw into.
 ///
 /// `ID` + `NAME` (floor 8) + `STATUS` (15, the width of `waiting-restart`)
-/// plus two separators. This is the table's own floor, not the terminal's —
+/// plus two separators. This is the table's own floor, not the terminal's:
 /// the terminal also needs room for [`GUTTER`], the selection marker's
-/// column; see [`super::MIN_TERM_WIDTH`] and [`super::draw`].
+/// column.
 pub const MIN_WIDTH: u16 = 31;
 
 /// The shortest terminal the pane will draw into: title, banner, header,
@@ -39,9 +34,9 @@ pub const NAME_MIN: u16 = 8;
 /// The columns the selection marker takes, to the left of the table.
 ///
 /// One for the marker, one for the gap. The table itself is rendered into
-/// `width - GUTTER` starting at `x + GUTTER`, which is why every threshold in
+/// `width - GUTTER` starting at `x + GUTTER`, so every threshold in
 /// [`TIERS`] and every arithmetic in [`name_width`] is untouched by the
-/// marker's arrival — see the phase plan's design decision 6.
+/// marker.
 pub const GUTTER: u16 = 2;
 
 /// The marker for the selected row, or a blank for every other row.
@@ -63,22 +58,20 @@ pub enum Column {
     Id,
     /// Its name. The flexible column.
     Name,
-    /// Its lifecycle status — the one coloured cell.
+    /// Its lifecycle status, the one coloured cell.
     Status,
     /// Its OS pid while running.
     Pid,
     /// Restarts since registration.
     Restarts,
-    /// Its last exit, once it is not running -- task 49, the CLI parity gap
-    /// this variant closes. Rendered by [`crate::output::exit_cell`], the
-    /// same function `output::rows::FlockRows`'s own EXIT column calls, so
-    /// the two surfaces cannot drift on what a code or a signal name looks
-    /// like.
+    /// Its last exit, once it is not running. Rendered by
+    /// [`crate::output::exit_cell`], the same function
+    /// `output::rows::FlockRows`'s own EXIT column calls.
     Exit,
     /// Whether a config load has parked a change for this sheep's next
     /// spawn, or an operator has overridden a field its Flockfile no longer
-    /// declares -- task 12. Rendered by [`crate::output::cfg_cell`], the
-    /// same function `output::rows::FlockRows`'s own CFG column calls.
+    /// declares. Rendered by [`crate::output::cfg_cell`], the same function
+    /// `output::rows::FlockRows`'s own CFG column calls.
     Cfg,
     /// Tree CPU as a percentage of one core.
     Cpu,
@@ -89,19 +82,16 @@ pub enum Column {
     /// Fold membership.
     Fold,
     /// A short marker a dog attaches to a sheep over the client protocol's
-    /// `SetSmit` request -- task 7's own column, last in the header order to
-    /// match `output::rows::FlockRows`'s. shep paints what a dog wrote and
-    /// never parses it.
+    /// `SetSmit` request, last in the header order to match
+    /// `output::rows::FlockRows`'s. shep paints what a dog wrote and never
+    /// parses it.
     Smit,
 }
 
 impl Column {
-    /// The header text, matching `output::rows::FlockRows::headers` exactly
-    /// — one vocabulary across both surfaces. Enforced, not just asserted:
-    /// `the_full_column_set_matches_flock_rows_headers_exactly` (below)
-    /// compares the two lists directly, which is what makes this claim
-    /// something a future column can't quietly break (task 49 found it
-    /// already had).
+    /// The header text, matching `output::rows::FlockRows::headers` exactly:
+    /// one vocabulary across both surfaces, enforced by
+    /// `the_full_column_set_matches_flock_rows_headers_exactly` below.
     #[must_use]
     pub const fn header(self) -> &'static str {
         match self {
@@ -120,7 +110,7 @@ impl Column {
         }
     }
 
-    /// The fixed width of this column's cells. `Name` reports `0` — it is
+    /// The fixed width of this column's cells. `Name` reports `0`: it is
     /// the column that takes the remainder, and [`name_width`] computes it.
     #[must_use]
     pub const fn width(self) -> u16 {
@@ -128,33 +118,22 @@ impl Column {
             Self::Id => 4,
             Self::Name => 0,
             // 15: `waiting-restart`, the longest word `Reported::word`
-            // returns. That vocabulary is the six lifecycle statuses plus
-            // `silent`, which is 6 columns and so does not move this. A
-            // status is never truncated — it is the pane.
+            // returns.
             Self::Status => 15,
             Self::Pid => 7,
             Self::Restarts => 8,
             // 9: `SIGVTALRM`/`SIGSTKFLT`, the longest names
-            // `nix::sys::signal::Signal::as_str` returns. An exit code is at
-            // most a few digits and `-` is one character, both comfortably
-            // inside it -- like STATUS above, sized so its longest real
-            // value is never truncated.
+            // `nix::sys::signal::Signal::as_str` returns.
             Self::Exit => 9,
-            // 4: `!12`/`*12` -- a `cfg_cell`'s own longest realistic value.
-            // `AppConfig` has well under a hundred fields, so two digits
-            // covers it with room to spare, and `-` is one character.
+            // 4: `!12`/`*12`, a `cfg_cell`'s own longest realistic value.
             Self::Cfg => 4,
             Self::Cpu => 6,
             Self::Mem => 8,
             Self::Uptime => 8,
             Self::Fold => 10,
-            // 13: `visible_width("▲ main@a1b2c3")` -- the measured width of
-            // the real strings a deploy dog paints, pinned by
-            // `output::table`'s own `how_wide_the_real_smits_actually_are`.
-            // A smit's own cap is 48 characters (`Smit::MAX_CHARS`), but the
-            // pane is fixed-width like every other column here, not
-            // variable like NAME, so a longer one truncates via [`fit`]
-            // rather than growing the column.
+            // 13: `visible_width("▲ main@a1b2c3")`, the measured width of the
+            // real strings a deploy dog paints. A longer smit truncates via
+            // [`fit`] rather than growing the column.
             Self::Smit => 13,
         }
     }
@@ -174,11 +153,8 @@ const ALL: &[Column] = &[
     Column::Fold,
     Column::Smit,
 ];
-// The full set minus CFG: task 12's own column is the first to go, ahead of
-// even SMIT, so this is the same eleven columns `ALL` was before CFG
-// existed. See `TIERS`'s own doc for why CFG gets the newest, least earned
-// spot in the drop order rather than tying itself to EXIT the way the CLI
-// table's `output::rows::FlockRows::PRIORITIES` does.
+// The full set minus CFG, the first column dropped. See `TIERS`'s own doc
+// for the drop order.
 const NO_CFG: &[Column] = &[
     Column::Id,
     Column::Name,
@@ -255,49 +231,14 @@ const FLOOR: &[Column] = &[Column::Id, Column::Name, Column::Status];
 /// Width thresholds, widest first. Each entry is the narrowest terminal that
 /// still gets that column set.
 ///
-/// The drop order is least-diagnostic first and it is a decision, not an
-/// accident of ordering: FOLD is grouping metadata rather than health;
-/// RESTARTS and PID answer follow-up questions rather than "is it up"; CPU
-/// and MEM are the last two numbers to go because they are the ones that
-/// explain WHY a RUNNING sheep is behaving badly. `ID NAME STATUS` is the
-/// floor because those three are the pane.
+/// The drop order is least-diagnostic first: FOLD is grouping metadata,
+/// RESTARTS and PID answer follow-up questions, CPU and MEM explain why a
+/// running sheep is behaving badly, and EXIT renders `-` for every running
+/// sheep, the common case. `ID NAME STATUS` is the floor.
 ///
-/// EXIT (task 49) sits directly below FOLD rather than beside CPU/MEM, and
-/// that placement is deliberate even though EXIT is arguably the most
-/// diagnostic column of all -- it is the only one that says anything at all
-/// once a sheep is dead. But it says nothing else: for every sheep that is
-/// still running, which is what this pane spends most of its time showing,
-/// EXIT renders `-` in every row, the same silent cell FOLD's own
-/// "grouping metadata" reasoning already earns a place near the front of
-/// the drop order for. CPU and MEM keep their spot because they answer a
-/// question EXIT cannot even ask while a sheep is up: whether a RUNNING
-/// sheep is in trouble. This matches where EXIT landed in
-/// `output::rows::FlockRows::PRIORITIES` -- the CLI table reasons through
-/// the exact same tension in its own comment and reaches the same answer --
-/// so an operator who has learned one table's drop order is not surprised
-/// by the other's.
-///
-/// SMIT (task 7) sits above FOLD, at the very top: it is by far the widest
-/// column, so it is the first one to go. That is the same reasoning
-/// `output::rows::FlockRows::PRIORITIES` gives for its own priority 8, the
-/// highest number in that table.
-///
-/// CFG (task 12) gets the newest, least earned spot in this order: the
-/// FIRST column to go, ahead of even SMIT, rather than tying itself to
-/// EXIT's own tier the way `output::rows::FlockRows::PRIORITIES` does for
-/// the CLI table. That is a deliberate departure from the CLI table's own
-/// choice, not an oversight, and the reason is specific to this pane: every
-/// wide fixture in `docs/lookout/frames.txt`'s own gallery is 120 columns,
-/// and the maintainer's own ruling on SMIT (`output::table`'s
-/// `a_smit_is_never_dropped_at_full_width`) is that its droppability was
-/// conditional on it being seen regularly at a wide terminal. Tying CFG to
-/// EXIT would have pushed the full column set's own threshold from 116 to
-/// 122, past 120, and quietly broken that ruling for the one pane whose
-/// gallery is checked into the repository as documentation -- every `SMIT`
-/// occurrence in that file would vanish the moment CFG landed. Dropping CFG
-/// on its own, one tier earlier, keeps `NO_CFG`'s threshold at exactly 116,
-/// where `ALL`'s was before this task, so 120 columns shows everything
-/// this pane showed before CFG existed, CFG included only past 122.
+/// CFG has its own drop tier, one tier before SMIT's, keeping `NO_CFG`'s
+/// threshold at 116 so a 120-column terminal, the gallery's fixture width,
+/// still shows SMIT.
 const TIERS: &[(u16, &[Column])] = &[
     (122, ALL),
     (116, NO_CFG),
@@ -334,31 +275,14 @@ pub fn name_width(width: u16, columns: &[Column]) -> u16 {
 /// `text` in exactly `width` display columns: padded on the right, or
 /// truncated with a trailing `…`.
 ///
-/// Counted in terminal columns, never bytes and never `char`s. Bytes
-/// over-pad every multi-byte name. `char`s under-pad every double-width one:
-/// a CJK name or an emoji counts as one `char` and draws in two columns, so
-/// a row built by `char` count runs past its cell and shoves every column
-/// after it out of line — which for the last column means running off the
-/// end and losing the `…` that says the text was cut. That was this
-/// function's recorded limitation until [`crate::output::width::char_columns`]
-/// existed to fix it in one place; `output::table` pads by the same rule.
+/// Counted in terminal columns, never bytes or `char`s: bytes over-pad a
+/// multi-byte name, and `char`s under-pad a double-width one, shoving every
+/// column after it out of line. A truncated name looking whole would be one
+/// an operator types into `shep stop`.
 ///
-/// A truncated name that looked whole would be a name an operator types into
-/// `shep stop`, so the ellipsis is not cosmetic.
-///
-/// **Escapes are not discounted here, deliberately** — this is the one place
-/// the two width questions in this crate part company.
-/// [`crate::output::width::visible_width`] skips an ANSI sequence because its
-/// callers write raw bytes to a terminal that will interpret one. Nothing on
-/// this path does: a `Span` hands ratatui text, ratatui draws it, and a log
-/// line carrying `\x1b[32m` puts a literal `32m` on screen occupying three
-/// columns. Measuring it as zero would under-count exactly the cell it was
-/// meant to protect.
-///
-/// The result is exactly `width` columns in **both** branches. A
-/// double-width character that will not fit the last column before the `…`
-/// is dropped and the gap is padded, so a cell never comes out short and the
-/// two-space separators between cells stay where the header put them.
+/// An ANSI escape counts as the literal text a `Span` draws it as, unlike
+/// [`crate::output::width::visible_width`], since nothing here writes to a
+/// real terminal that would interpret it.
 #[must_use]
 pub fn fit(text: &str, width: u16) -> String {
     let width = usize::from(width);
@@ -371,11 +295,9 @@ pub fn fit(text: &str, width: u16) -> String {
     if width == 0 {
         return String::new();
     }
-    // One column pays for the `…`; the rest is filled with as much of `text`
-    // as fits whole. A double-width character straddling the boundary is
-    // dropped rather than split — there is no half of it to draw — and the
-    // column it would have used is padded below so the cell still measures
-    // `width`.
+    // One column pays for the `…`. A double-width character straddling the
+    // boundary is dropped rather than split, and its column is padded below
+    // so the cell still measures `width`.
     let budget = width - 1;
     let mut out = String::new();
     let mut used = 0;
@@ -414,19 +336,14 @@ pub fn header_line(columns: &[Column], width: u16, style: Style) -> Line<'static
 /// One line for a row the table draws: a real sheep, or the header above an
 /// app's grouped instances.
 ///
-/// Every production caller sources `key` from [`App::visible_rows`], whose
-/// `Sheep` ids always name a row still in `app`'s own flock, so the blank
-/// fallback below is never drawn in practice. It exists anyway rather than
-/// as an `expect`, on the same "no honest value" rule this table already
-/// applies to a missing pid or a missing cpu reading: a caller that manages
-/// to hand this a stale id gets a blank row instead of a dead dashboard.
+/// `key`'s `Sheep` ids always name a row still in the flock in practice, so
+/// the blank fallback below is never drawn; it exists rather than an
+/// `expect`, on the same "no honest value" rule this table applies to a
+/// missing pid.
 ///
-/// A `Sheep` row under a group header is drawn as a slot rather than as a
-/// standalone sheep ([`App::is_grouped`] is the one test for which).
-/// Without that, a header reading `web ×3` was followed by three rows each
-/// reading `web` again with the app's FOLD and SMIT repeated down all three,
-/// which is the "several rows sharing one name with nothing tying them
-/// together" this whole feature exists to end, reproduced one level down.
+/// A `Sheep` row under a group header draws as a slot rather than a
+/// standalone sheep ([`App::is_grouped`]), so a header reading `web ×3` is
+/// not followed by three rows each repeating `web`.
 #[must_use]
 pub fn key_line(app: &App, key: &RowKey, columns: &[Column], width: u16) -> Line<'static> {
     match key {
@@ -440,8 +357,8 @@ pub fn key_line(app: &App, key: &RowKey, columns: &[Column], width: u16) -> Line
 
 /// An app's group header row: [`App::group_totals`]'s own rollup, in the
 /// same columns [`row_line`] uses for a real sheep. Mirrors
-/// `output::rows::FlockRows`'s own group row (task 9) so the two surfaces
-/// never disagree about what an app's instances add up to.
+/// `output::rows::FlockRows`'s own group row so the two surfaces never
+/// disagree about what an app's instances add up to.
 ///
 /// No row style beyond STATUS, the same rule [`row_line`] follows: the
 /// selected row is shown by the marker in the gutter column ([`mark`]).
@@ -463,8 +380,7 @@ fn group_line(app: &App, name: &str, columns: &[Column], width: u16) -> Line<'st
         let style = if *column == Column::Status {
             // `palette.status`, not `palette.reported`: a group row is
             // always an app's own instances, never a dog, so it has nothing
-            // to be silent about -- see `App::group_uniform_status`'s own
-            // doc for the argument.
+            // to be silent about.
             app.group_uniform_status(name)
                 .map_or(Style::default(), |status| palette.status(status))
         } else {
@@ -477,11 +393,9 @@ fn group_line(app: &App, name: &str, columns: &[Column], width: u16) -> Line<'st
 
 /// One cell of an app's group header row.
 ///
-/// ID, PID, EXIT and CFG are blank -- not `-`: there is no single id, pid,
-/// exit or config-drift state for a group row to have "no honest value"
-/// about, the way a real sheep's absent pid does -- a load can park a
-/// different set of fields on each slot, so CFG joins the per-instance
-/// facts rather than the per-app ones. FOLD and SMIT read the first
+/// ID, PID, EXIT and CFG are blank, not `-`: there is no single value for a
+/// group row to have "no honest value" about, since a load can park a
+/// different set of fields on each slot. FOLD and SMIT read the first
 /// member's, since both are per-app facts every instance shares.
 fn group_cell(app: &App, name: &str, column: Column, totals: &GroupTotals) -> String {
     match column {
@@ -512,8 +426,8 @@ fn group_cell(app: &App, name: &str, column: Column, totals: &GroupTotals) -> St
 /// One sheep's line. The STATUS cell is the only one that carries colour.
 ///
 /// No row style beyond that: the selected row is shown by the marker in the
-/// gutter column ([`mark`]), not by a REVERSED modifier on the row's own
-/// text — this function has no notion of "selected" to key one off at all.
+/// gutter column ([`mark`]), not by a `REVERSED` modifier on the row's own
+/// text.
 ///
 /// `grouped` says whether a group header sits above this row, which is the
 /// only thing that changes NAME, FOLD and SMIT. See [`cell`].
@@ -550,18 +464,14 @@ pub fn row_line(
 
 /// One cell's text.
 ///
-/// `-` rather than an empty cell for every unknown, exactly as
-/// `output::rows::FlockRows::rows` does and for the same stated reason: an
-/// empty cell in a padded table is indistinguishable from a rendering bug,
-/// and `0.0%` would claim a measurement the shepherd never made.
+/// `-` rather than an empty cell for every unknown: an empty cell in a
+/// padded table is indistinguishable from a rendering bug, and `0.0%` would
+/// claim a measurement the shepherd never made.
 ///
-/// `grouped` changes three cells, matching `output::rows::slot_row` cell for
-/// cell so an operator meets one shape for an app whether they typed
-/// `shep flock` or opened the lookout. NAME becomes `↳ :2`, teaching the
-/// `web:2` selector by sitting under the name the header already printed;
-/// FOLD and SMIT go blank rather than `-`, because the group row above
-/// carries both and the daemon keys a smit by name, so repeating either down
-/// every slot is noise about an app-level fact.
+/// `grouped` changes three cells, matching `output::rows::slot_row`. NAME
+/// becomes `↳ :2`, teaching the `web:2` selector by sitting under the name
+/// the header already printed; FOLD and SMIT go blank rather than `-`,
+/// since the group row above carries both.
 fn cell(app: &App, row: &Row, column: Column, grouped: bool) -> String {
     let info = &row.info;
     match column {
@@ -572,17 +482,17 @@ fn cell(app: &App, row: &Row, column: Column, grouped: bool) -> String {
         Column::Name => info.name.clone(),
         // `Row::reported`, not `info.status.to_string()`: a dog that has
         // never handshook must not read `online` here any more than it does
-        // in `shep flock`'s own table -- see `Row::reported`'s own doc.
+        // in `shep flock`'s own table.
         Column::Status => row.reported().word(),
         Column::Pid => info
             .pid
             .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
         Column::Restarts => info.restarts.to_string(),
         // `crate::output::exit_cell`, not a second implementation of the
-        // code/signal split -- see `Column::Exit`'s own doc.
+        // code/signal split.
         Column::Exit => exit_cell(info.pid, info.last_exit),
         // `crate::output::cfg_cell`, not a second implementation of the
-        // pending-over-overridden precedence -- see `Column::Cfg`'s own doc.
+        // pending-over-overridden precedence.
         Column::Cfg => cfg_cell(info.pending.as_deref(), info.overridden.as_deref()),
         Column::Cpu => info
             .cpu_percent
@@ -590,9 +500,8 @@ fn cell(app: &App, row: &Row, column: Column, grouped: bool) -> String {
         Column::Mem => info
             .memory_bytes
             .map_or_else(|| "-".to_string(), human_bytes),
-        // The live value, not the snapshot's — `App::uptime_ms` advances a
-        // RUNNING sheep between polls and stops entirely once the link is
-        // lost.
+        // The live value, not the snapshot's: `App::uptime_ms` advances a
+        // running sheep between polls and stops once the link is lost.
         Column::Uptime => app
             .uptime_ms(info.id)
             .map_or_else(|| "-".to_string(), human_duration),
@@ -623,22 +532,16 @@ mod tests {
     use super::super::fixtures;
     use super::*;
 
-    /// fails if the drop order changes without someone re-arguing it. FOLD is
-    /// grouping metadata and goes first; EXIT (task 49) goes second, right
-    /// behind it -- diagnostic only for a dead sheep, and silent (`-`) for
-    /// every row while the flock is healthy, which is the common case this
-    /// pane spends most of its time showing; RESTARTS and PID answer
-    /// follow-up questions rather than "is it up"; CPU and MEM are the last
-    /// two numbers to go because they are the ones that explain WHY a
-    /// RUNNING sheep is behaving badly; ID/NAME/STATUS is the floor because
-    /// those three are the pane.
+    /// FOLD goes first (grouping metadata), then EXIT (silent for a running
+    /// sheep, the common case), then RESTARTS and PID, then CPU and MEM (the
+    /// last to explain why a running sheep misbehaves). ID/NAME/STATUS is
+    /// the floor.
     #[test]
     fn columns_drop_in_a_fixed_order_as_the_terminal_narrows() {
         assert_eq!(columns_for(300).len(), 12);
         assert_eq!(columns_for(122).len(), 12);
-        // CFG (task 12) is the first column gone, ahead of even SMIT --
-        // `TIERS`'s own doc gives the reasoning, tied to the gallery's own
-        // 120-column wide fixtures.
+        // CFG is the first column gone, ahead of even SMIT. See `TIERS`'s
+        // own doc for the reasoning.
         assert!(!columns_for(121).contains(&Column::Cfg));
         assert!(columns_for(121).contains(&Column::Smit));
         assert_eq!(columns_for(116).len(), 11);
@@ -654,7 +557,7 @@ mod tests {
         assert!(!columns_for(58).contains(&Column::Mem));
         assert!(!columns_for(48).contains(&Column::Cpu));
         assert_eq!(columns_for(31), &[Column::Id, Column::Name, Column::Status]);
-        // Every tier keeps the three that ARE the pane.
+        // Every tier keeps the three that are the pane.
         for width in [31u16, 40, 48, 58, 67, 77, 88, 100, 300] {
             let cols = columns_for(width);
             for required in [Column::Id, Column::Name, Column::Status] {
@@ -666,25 +569,15 @@ mod tests {
         }
     }
 
-    /// fails if a 120-column terminal -- every wide fixture in
-    /// `docs/lookout/frames.txt`'s own gallery -- ever loses SMIT again.
-    /// This is the maintainer's ruling (`output::table`'s own
-    /// `a_smit_is_never_dropped_at_full_width` states it for the CLI
-    /// table) made concrete for the one width the published gallery
-    /// actually renders at, so a future column's own drop-order choice
-    /// gets checked against it directly rather than only against `TIERS`'s
-    /// own doc.
+    /// The gallery's own fixtures render at 120 columns, so this pins the
+    /// one width a future column's drop-order choice must not narrow past.
     #[test]
     fn smit_survives_the_gallerys_own_wide_fixtures() {
         assert!(columns_for(120).contains(&Column::Smit));
     }
 
-    /// fails if lookout's own column list drifts from
-    /// `output::rows::FlockRows`'s -- `Column::header`'s own doc claims "one
-    /// vocabulary across both surfaces"; this is what makes that claim
-    /// enforceable rather than aspirational. Task 49 is the defect that let
-    /// it go stale once already: `FlockRows` grew an EXIT header and this
-    /// enum did not, and nothing here would have caught it.
+    /// Enforces `Column::header`'s claim of one vocabulary across both
+    /// surfaces, rather than leaving it aspirational.
     #[test]
     fn the_full_column_set_matches_flock_rows_headers_exactly() {
         use crate::output::Render;
@@ -693,26 +586,10 @@ mod tests {
         assert_eq!(headers, crate::output::FlockRows::headers());
     }
 
-    /// fails if a dead sheep's EXIT cell stops matching what `shep flock`
-    /// itself prints, or a running sheep's cell shows anything but `-`. This
-    /// pins the WIRING -- that `cell` reaches `crate::output::exit_cell` at
-    /// all -- not the rule itself: `output::rows`'s own
-    /// `the_exit_column_shows_the_last_exit_only_for_a_sheep_that_is_not_running`
-    /// already pins the code/signal split and the "no honest value" `-`.
-    /// `cfg(unix)` because this case's fixture carries a SIGNALLED exit, and
-    /// `output::rows::signal_label` resolves a signal number against the
-    /// running platform's own table on purpose — its doc argues that a
-    /// `ProcessInfo` is always rendered by a binary on the same OS as the
-    /// daemon that produced it, and `shep_core::signals::OperatorSignal`
-    /// deliberately refuses to map numbers to names at all ("a number means
-    /// different signals on different platforms, and shep will not guess").
-    ///
-    /// So Windows renders `15` where unix renders `SIGTERM`, and that is the
-    /// designed behaviour rather than a gap: a Windows `ExitOutcome` never
-    /// carries a signal in the first place (`tokio_runner`'s `wait` sets it
-    /// `None` unconditionally), so this arm is only ever reached by a
-    /// synthetic fixture like this one. The pinned artifacts under
-    /// `docs/lookout/` are unix renderings for the same reason.
+    /// `cfg(unix)`: the fixture carries a signalled exit, which
+    /// `output::rows::signal_label` resolves against the running platform's
+    /// own signal table. A Windows `ExitOutcome` never carries a signal at
+    /// all, so this arm is only ever reached by a synthetic fixture.
     #[cfg(unix)]
     #[test]
     fn the_exit_cell_reuses_the_same_rendering_flock_rows_uses() {
@@ -755,10 +632,6 @@ mod tests {
         );
     }
 
-    /// fails if a tier can render wider than the terminal it was chosen for.
-    /// This is the check that makes the table above a claim rather than a
-    /// wish: every tier's fixed widths plus its separators plus the minimum
-    /// NAME must fit in that tier's own threshold.
     #[test]
     fn every_tier_fits_the_width_it_claims() {
         for width in MIN_WIDTH..=200 {
@@ -774,8 +647,6 @@ mod tests {
         }
     }
 
-    /// fails if a long name is cut without saying so. A truncated name that
-    /// looks whole is a name an operator will type into `shep stop`.
     #[test]
     fn a_name_too_long_for_its_column_ends_in_an_ellipsis() {
         let cut = fit("payments-reconciliation-worker", 12);
@@ -785,48 +656,38 @@ mod tests {
         assert_eq!(fit("web", 12), "web         ");
     }
 
-    /// fails if `fit` starts counting bytes. `output::table::render_table`'s
-    /// own doc records having avoided the same bug for the same reason.
-    ///
-    /// **These assert on CONTENT, not on length**, and that is the whole
-    /// point: an earlier draft of this test only checked
-    /// `fit(..).chars().count() == width`, which is `width` in *both*
-    /// branches under either measurement — so the byte-vs-char mutation
-    /// could not redden it. The observable difference lives in the PAD
-    /// branch, where a nine-byte name asks for nine columns of padding
-    /// budget it does not need and comes out short, and at the exactly-fits
-    /// boundary, where a byte count truncates a string that already fits.
+    /// Asserts on content, not length: `fit(..).chars().count() == width`
+    /// alone is `width` either way, blind to a byte-vs-char mutation. The
+    /// pad branch under-pads a multi-byte name; the truncate branch cuts a
+    /// string that already fits.
     #[test]
     fn fit_counts_columns_not_bytes_when_it_pads_and_when_it_truncates() {
-        // Pad branch. `日本語` is 9 bytes and 6 columns: measured properly
-        // it exactly fills a 6-wide cell, byte-counted it falls into the
-        // truncate branch.
+        // Pad branch. `日本語` is 9 bytes and 6 columns: measured correctly
+        // it fills a 6-wide cell, byte-counted it falls into the truncate
+        // branch.
         assert_eq!(fit("日本語", 6), "日本語");
-        // Exactly fits. 7 columns / 11 bytes — a byte count cuts it to
+        // Exactly fits: 7 columns, 11 bytes. A byte count would cut it to
         // `ünïcöd…`.
         assert_eq!(fit("ünïcödé", 7), "ünïcödé");
     }
 
-    /// fails if `fit` goes back to counting `char`s — the bug
-    /// `docs/specs/deferred.md` recorded and this change closes. A `char`
-    /// count gives `日本語` three and lets it into a 3-wide cell it draws
-    /// six columns in, and gives `日本語アプリ` a five-`char` prefix of
-    /// `日本語ア…` that draws nine.
+    /// A `char` count gives `日本語` three and lets it into a 3-wide cell it
+    /// draws six columns in, and gives `日本語アプリ` a five-`char` prefix
+    /// of `日本語ア…` that draws nine.
     ///
-    /// Every case asserts on CONTENT and on measured columns, for the same
-    /// reason the byte test above does: `chars().count()` alone is blind to
-    /// the mutation, and here so is `len()`.
+    /// Asserts on content and on measured columns: `chars().count()` alone
+    /// is blind to the mutation, and here so is `len()`.
     #[test]
     fn a_double_width_name_is_cut_to_the_columns_it_draws_in() {
         // Truncate branch. Budget is 4 columns plus the `…`: two characters
         // fit, the third would draw past the cell.
         assert_eq!(fit("日本語アプリ", 5), "日本…");
         assert_eq!(columns_of(&fit("日本語アプリ", 5)), 5);
-        // A `char` count would call this a pad — 3 chars into 3 columns —
-        // and emit `日本語`, six columns wide, with no `…` to say it was cut.
+        // A `char` count would call this a pad (3 chars into 3 columns) and
+        // emit `日本語`, six columns wide, with no `…` to say it was cut.
         assert_eq!(fit("日本語", 3), "日…");
         // The odd-width case the padding exists for: `日` fits the 2-column
-        // budget, `本` does not, and half a character is not drawable — so
+        // budget, `本` does not, and half a character is not drawable, so
         // the leftover column is a space rather than a short cell.
         assert_eq!(fit("日本語", 4), "日… ");
         assert_eq!(columns_of(&fit("日本語", 4)), 4);
@@ -835,11 +696,9 @@ mod tests {
         assert_eq!(fit("日本語", 2), "… ");
     }
 
-    /// fails if a cell can come out narrower or wider than the width it was
-    /// asked for. Every caller concatenates cells with two-space separators
-    /// and no caller re-measures, so one short cell shifts every column
-    /// after it on that row alone — the drift is invisible in a single
-    /// cell's own test and obvious in a rendered table.
+    /// Every caller concatenates cells with two-space separators and no
+    /// caller re-measures, so one short cell shifts every column after it
+    /// on that row, invisibly in a single cell's own test.
     #[test]
     fn every_cell_measures_exactly_the_width_it_was_given() {
         let names = [
@@ -863,12 +722,10 @@ mod tests {
         }
     }
 
-    /// An ANSI escape is text here, not styling — see [`fit`]'s own doc. A
-    /// `Span` is not a terminal, so ratatui draws `\x1b[32m` as the literal
-    /// `32m` it is; measuring it as zero (which
-    /// `crate::output::width::visible_width` would, correctly, on its own
-    /// path) would let a hostile log line claim more columns than the cell
-    /// it was cut to fit.
+    /// An ANSI escape is text here, not styling. Measuring it as zero, which
+    /// [`crate::output::width::visible_width`] does on its own path, would
+    /// let a hostile log line claim more columns than the cell it was cut
+    /// to fit.
     #[test]
     fn an_escape_sequence_is_measured_as_the_text_it_will_be_drawn_as() {
         let styled = "\u{1b}[32mup";
@@ -885,19 +742,14 @@ mod tests {
         s.chars().map(char_columns).sum()
     }
 
-    /// fails if the selection marker stops being a plain character. Colour
-    /// and a `REVERSED` modifier are both rejected here: every signal on this
-    /// screen has to survive `NO_COLOR` and a 16-colour terminal, and a
-    /// decoration-only cursor does not. `>` rather than `▸` because `▸` is
-    /// East-Asian *Ambiguous* width — a terminal rendering it double-wide
-    /// shifts every column of that one row by a cell, which is worse than
-    /// plain.
+    /// Colour and a `REVERSED` modifier are both rejected: every signal on
+    /// this screen has to survive `NO_COLOR` and a 16-colour terminal. `>`
+    /// rather than `▸`, since `▸` is East-Asian Ambiguous width and a
+    /// terminal rendering it double-wide shifts every column of that row.
     #[test]
     fn the_marker_is_one_ascii_column_wide_in_both_states() {
-        // The two literals ARE the test. `chars().count() == 1` and
-        // `is_ascii()` were in the first draft and cannot fail once these two
-        // have passed — `">"` is one ASCII char by inspection — so they were
-        // three assertions dressed as five.
+        // The two literals are the test: `">"` is one ASCII char by
+        // inspection, so a separate length/`is_ascii()` check is redundant.
         assert_eq!(
             mark(true),
             ">",
@@ -906,10 +758,6 @@ mod tests {
         assert_eq!(mark(false), " ");
     }
 
-    /// fails if the viewport stops keeping the selection on screen, or stops
-    /// clamping at either end. A pane whose cursor has walked off the bottom
-    /// draws a page the operator is not pointing at, and a detail pane
-    /// describing a sheep no row on screen shows is worse than either.
     #[test]
     fn the_offset_keeps_the_selection_visible_and_centred_where_it_can() {
         // Everything fits: no scrolling, wherever the cursor is.
@@ -939,13 +787,11 @@ mod tests {
         }
     }
 
-    /// fails if a group row's cells stop showing the app's own rollup:
-    /// `web ×3` in NAME, memory SUMMED across instances, ID/PID/EXIT blank
-    /// (a group has no single one of any of the three to report), and
-    /// UPTIME the MINIMUM rather than any one instance's own reading.
+    /// `web x3` in NAME, memory summed across instances, ID/PID/EXIT blank,
+    /// and UPTIME the minimum rather than any one instance's own reading.
     /// Asserted on the rendered [`Line`], not on `App::group_totals`
-    /// directly -- a change in either the arithmetic or the rendering that
-    /// reads it has to redden this.
+    /// directly, so a change in either the arithmetic or the rendering has
+    /// to redden this.
     #[test]
     fn a_group_rows_cells_show_the_apps_rollup() {
         use shep_core::protocol::ProcessInfo;
@@ -975,11 +821,8 @@ mod tests {
         let line = key_line(&app, &RowKey::Group("web".to_string()), ALL, 200);
         let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
 
-        // The exact row, column by column, rather than a substring search:
-        // a substring check on a run of blank cells can pass by accident on
-        // neighbouring padding. `name_width` is the same helper `key_line`
-        // itself calls for the NAME column's own width, not a re-derivation
-        // of the arithmetic under test.
+        // The exact row, column by column: a substring check on a run of
+        // blank cells can pass by accident on neighbouring padding.
         let name = name_width(200, ALL);
         let expected = [
             fit("", Column::Id.width()),           // ID: blank, no single id
@@ -1003,18 +846,11 @@ mod tests {
         assert_eq!(rendered, expected, "got {rendered:?}");
     }
 
-    /// fails if a slot row under a group header renders as a standalone
-    /// sheep.
+    /// A slot row drawn like a standalone sheep repeats FOLD and SMIT down
+    /// every row and shows no slot number, unlike `shep flock`'s own `↳ :1`.
     ///
-    /// `key_line`'s `Sheep` arm drew every row the same way, so a header
-    /// reading `web x3` was followed by three rows each repeating `web` with
-    /// the app's FOLD and SMIT down all three, and the slot number appeared
-    /// nowhere in the dashboard at all. `shep flock` had shown `↳ :1` since
-    /// task 9, so one app read as two different shapes in two views.
-    ///
-    /// Asserted on the rendered line rather than on `cell`, because the
-    /// defect was in which caller `key_line` picked and a helper-level test
-    /// passes straight over that.
+    /// Asserted on the rendered line rather than on `cell`, since the
+    /// defect was in which caller `key_line` picked.
     #[test]
     fn a_slot_row_under_a_group_header_renders_as_a_slot() {
         use shep_core::protocol::ProcessInfo;
@@ -1057,11 +893,8 @@ mod tests {
         assert_eq!(rendered, expected, "got {rendered:?}");
     }
 
-    /// fails if a single-instance app loses its name to the slot rendering.
-    ///
-    /// The guard on the test above: `is_grouped` is what keeps an ungrouped
-    /// sheep drawing exactly as it did before group rows existed, and an app
-    /// with one instance never gets a header to sit under.
+    /// The guard on the test above: an app with one instance never gets a
+    /// header, so `is_grouped` keeps it drawing as it always did.
     #[test]
     fn an_ungrouped_sheep_still_shows_its_own_name_and_fold() {
         use shep_core::protocol::ProcessInfo;
@@ -1085,10 +918,7 @@ mod tests {
         assert!(!rendered.contains('\u{21b3}'), "got {rendered:?}");
     }
 
-    /// fails if a dog that has never handshook reads `online` in this pane
-    /// -- the same defect task 4 fixed in `shep flock`'s own table, this
-    /// time in the dashboard that never got routed through the fix. The
-    /// process IS alive, so nothing but `handshook` can catch this.
+    /// The process is alive, so nothing but `handshook` can catch this.
     #[test]
     fn a_silent_dog_reads_silent_not_online() {
         use shep_core::protocol::{DogSource, ProcessInfo};
@@ -1116,10 +946,7 @@ mod tests {
         );
     }
 
-    /// fails if this pane starts calling a dog silent once it has actually
-    /// handshook -- passing for the wrong reason is exactly what a test that
-    /// never drives the new lookup would do, so this is the guard on
-    /// [`a_silent_dog_reads_silent_not_online`] above.
+    /// The guard on [`a_silent_dog_reads_silent_not_online`] above.
     #[test]
     fn a_dog_that_has_handshook_still_reads_online() {
         use shep_core::protocol::{DogSource, ProcessInfo};
@@ -1141,9 +968,8 @@ mod tests {
         assert!(!rendered.contains("silent"), "got {rendered:?}");
     }
 
-    /// fails if a sheep -- which has no handshake at all, `handshook` is
-    /// always `None` -- ever gets caught by the same rule. A sheep's own
-    /// STATUS cell must render exactly as it did before this task.
+    /// A sheep's `handshook` is always `None`; it must never get caught by
+    /// the same silent rule a dog does.
     #[test]
     fn a_sheep_still_reads_online_and_has_no_handshake() {
         use shep_core::protocol::ProcessInfo;
@@ -1162,12 +988,10 @@ mod tests {
         assert!(!rendered.contains("silent"), "got {rendered:?}");
     }
 
-    /// fails if the `dog.is_none()` guard in `Row::reported` is ever
-    /// removed. The daemon never sends a sheep `handshook: Some(false)` --
-    /// a sheep has no handshake and no version relationship with the
-    /// shepherd at all, it is a supervised process, not a peer -- so this
-    /// is an input the guard exists for and no other test drives. Same
-    /// precedent as `output::rows`' own `a_sheep_never_reads_as_silent`.
+    /// The daemon never sends a sheep `handshook: Some(false)`; a sheep has
+    /// no version relationship with the shepherd to fail. Exercises the
+    /// `dog.is_none()` guard in `Row::reported` with an input no other test
+    /// drives.
     #[test]
     fn a_sheep_never_reads_as_silent() {
         use shep_core::protocol::ProcessInfo;
