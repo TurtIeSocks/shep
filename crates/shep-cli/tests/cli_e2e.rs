@@ -4721,6 +4721,11 @@ fn available_dogs_names_no_url_that_carries_credentials() {
         "ftp://sentineluser:hunter2@sentinelhost.invalid/dogs.json",
         // Scheme-relative, so there is no `://` to split the authority on.
         "//sentineluser:hunter2@sentinelhost.invalid/dogs.json",
+        // The `@` is in a path here, so the authority predicate says no
+        // and only the blunt printing rule stands between this and
+        // stderr. `parse_url` withheld this url while the sentence around
+        // it printed the same one, until both asked the same question.
+        "file:///etc/sentineluser:hunter2@sentinelhost.invalid",
     ] {
         let home = TempDir::new().unwrap();
 
@@ -4742,7 +4747,7 @@ fn available_dogs_names_no_url_that_carries_credentials() {
             );
         }
         assert!(
-            stderr.contains("a url carrying credentials"),
+            stderr.contains("a url that may carry credentials"),
             "{url}: stderr must say why it withheld the url: {stderr}"
         );
     }
